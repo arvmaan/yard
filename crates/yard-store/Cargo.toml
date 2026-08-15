@@ -1,0 +1,25 @@
+[package]
+name = "yard-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "SQLite persistence for the Yard agent control plane"
+
+[dependencies]
+async-trait.workspace = true
+fs2.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+yard-domain = { path = "../yard-domain" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

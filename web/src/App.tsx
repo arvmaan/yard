@@ -1,0 +1,4971 @@
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type FormEvent,
+} from 'react'
+import {
+  ArrowRightLeft,
+  Bot,
+  Boxes,
+  BriefcaseBusiness,
+  CircleAlert,
+  CircleCheck,
+  CircleHelp,
+  CirclePlay,
+  CircleStop,
+  ChevronUp,
+  FileCode2,
+  FolderPlus,
+  GitBranch,
+  GripVertical,
+  LoaderCircle,
+  Map as MapIcon,
+  MessageSquareText,
+  Moon,
+  Network,
+  Pause,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Server,
+  Sun,
+  SquareTerminal,
+  Unlink,
+  Wifi,
+  WifiOff,
+  X,
+} from 'lucide-react'
+import {
+  confirmWorkerHandoff,
+  confirmWorkerAssignment,
+  createAutomation,
+  createCoordinationNode,
+  createProject,
+  createProjectFromProfile,
+  createProjectRelationship,
+  createProjectWithWorkspace,
+  createWorkerProfile,
+  deleteProjectRelationship,
+  endWorkerSession,
+  fetchAutomation,
+  fetchAutomationRuns,
+  fetchAutomations,
+  fetchInventory,
+  fetchCoordinationNodeRoutes,
+  fetchCoordinationNodes,
+  fetchCoordinationSnapshots,
+  fetchOrchestratorStatusOutput,
+  fetchProjectAssignments,
+  fetchProjectRelationships,
+  fetchProjects,
+  fetchSessions,
+  fetchYardOrchestrator,
+  fetchYardOrchestratorRoutes,
+  fetchWorkerProfiles,
+  fetchWorkers,
+  provisionYardOrchestrator,
+  recoverYardOrchestrator,
+  provisionCoordinationNode,
+  recordCompletionReceipt,
+  requestCoordinationSnapshot,
+  runAutomation,
+  uploadArtifact,
+  updateAutomation,
+  updateAutomationPlacement,
+  updateAutomationState,
+  updateProjectPlacement,
+  updateCoordinationNode,
+  updateCoordinationNodePlacement,
+  updateWorkerProfile,
+} from './api'
+import {
+  RuntimeCanvas,
+  type CanvasSelection,
+} from './RuntimeCanvas'
+import {
+  AgentGroupChat,
+  type AgentGroupTarget,
+} from './AgentGroupChat'
+import {
+  setAllocationDragData,
+  type AllocationDragPayload,
+} from './allocationDrag'
+import {
+  AllocationDialog,
+  type AllocationDetails,
+  type AllocationSubject,
+} from './AllocationDialog'
+import { WorkerInterventions } from './WorkerInterventions'
+import {
+  AgentWorkspaceContext,
+  type AgentWorkspaceMode,
+  type AgentWorkspaceTarget,
+} from './AgentWorkspaceContext'
+import { AgentWorkspaceShell } from './AgentWorkspaceShell'
+import { ProjectPulseWorkspace } from './ProjectPulseWorkspace'
+import {
+  CoordinationNodeDialog,
+  type CoordinationNodeCreationDetails,
+} from './CoordinationNodeDialog'
+import { CoordinationNodeInspector } from './CoordinationNodeInspector'
+import {
+  AutomationDialog,
+  type AutomationDetails,
+} from './AutomationDialog'
+import { AutomationInspector } from './AutomationInspector'
+import {
+  parseStatusReport,
+  statusReportMatchesLatestRoute,
+  type ProjectStatusReports,
+} from './projectUpdates'
+import { EndWorkerSessionDialog } from './EndWorkerSessionDialog'
+import {
+  HandoffDialog,
+  type HandoffDetails,
+} from './HandoffDialog'
+import {
+  CompletionDialog,
+  type CompletionDetails,
+} from './CompletionDialog'
+import { ProfileEditor } from './ProfileEditor'
+import { nextProjectPlacement } from './projectLayout'
+import {
+  defaultProjectAccent,
+  PROJECT_ACCENTS,
+  readProjectAccents,
+  writeProjectAccents,
+} from './projectAppearance'
+import {
+  applyTheme,
+  readTheme,
+  type YardTheme,
+} from './theme'
+import type {
+  Artifact,
+  Assignment,
+  Automation,
+  AutomationRun,
+  AutomationScope,
+  CanvasPlacement,
+  CoordinationNode,
+  CoordinationNodeKind,
+  CoordinationNodeRoute,
+  CoordinationSnapshot,
+  CreateWorkerProfileInput,
+  ObservedChildAgent,
+  ObservedStatus,
+  ObservedWorker,
+  Project,
+  ProjectRelationship,
+  RuntimeInventory,
+  RuntimeObservationState,
+  RuntimeProcessState,
+  RuntimeSession,
+  StatusReport,
+  WorkerAvailability,
+  WorkerCandidate,
+  WorkerProfile,
+  WorkerRuntimeBinding,
+  WorkflowStatus,
+  WorkspaceObservation,
+  YardOrchestrator,
+  YardOrchestratorRoute,
+} from './types'
+import './App.css'
+
+const INVENTORY_REFRESH_INTERVAL_MS = 1_000
+const PROJECT_STATUS_REFRESH_INTERVAL_MS = 15_000
+
+const ArtifactInspector = lazy(() =>
+  import('./ArtifactInspector').then((module) => ({
+    default: module.ArtifactInspector,
+  })),
+)
+
+type Filter = 'all' | 'available' | 'allocated' | 'attention'
+type RailView = 'profiles' | 'workspaces' | 'workers'
+type ProjectCreationDetails =
+  | {
+      mode: 'existing'
+      name: string
+      orchestratorId: string
+    }
+  | {
+      commandId: string
+      mode: 'profile'
+      name: string
+      objective: string
+      profileId: string
+    }
+
+interface WorkspaceProjectCreationDetails {
+  commandId: string
+  cwd: string
+  name: string
+  objective: string
+  profileId: string
+}
+
+const FILTERS: Array<{ value: Filter; label: string }> = [
+  { value: 'all', label: 'All' },
+  { value: 'available', label: 'Available' },
+  { value: 'allocated', label: 'Allocated' },
+  { value: 'attention', label: 'Attention' },
+]
+
+const STATUS_ICONS = {
+  blocked: CircleAlert,
+  done: CircleCheck,
+  idle: Pause,
+  unknown: CircleHelp,
+  working: LoaderCircle,
+} satisfies Record<ObservedStatus, typeof CircleAlert>
+
+const AVAILABILITY_ICONS = {
+  ambiguous: CircleHelp,
+  assigned: Bot,
+  ended: CircleStop,
+  orchestrator: BriefcaseBusiness,
+  resumable: RefreshCw,
+  unavailable: WifiOff,
+  unassigned_live: CircleCheck,
+  yard_orchestrator: Network,
+} satisfies Record<WorkerAvailability, typeof CircleAlert>
+
+const AVAILABILITY_LABELS = {
+  ambiguous: 'Ambiguous',
+  assigned: 'Assigned',
+  ended: 'Ended',
+  orchestrator: 'Orchestrator',
+  resumable: 'Resumable',
+  unavailable: 'Unavailable',
+  unassigned_live: 'Unassigned live',
+  yard_orchestrator: 'Superintendent',
+} satisfies Record<WorkerAvailability, string>
+
+const PROCESS_ICONS = {
+  exited: CircleStop,
+  running: CirclePlay,
+  unknown: CircleHelp,
+} satisfies Record<RuntimeProcessState, typeof CircleAlert>
+
+const OBSERVATION_ICONS = {
+  ambiguous: CircleHelp,
+  missing: WifiOff,
+  observed: Wifi,
+} satisfies Record<RuntimeObservationState, typeof CircleAlert>
+
+function matchesFilter(candidate: WorkerCandidate, filter: Filter) {
+  if (filter === 'all') return true
+  if (filter === 'available') {
+    return (
+      candidate.availability === 'unassigned_live' ||
+      candidate.availability === 'resumable'
+    )
+  }
+  if (filter === 'allocated') {
+    return (
+      candidate.availability === 'orchestrator' ||
+      candidate.availability === 'yard_orchestrator' ||
+      candidate.availability === 'assigned'
+    )
+  }
+  if (filter === 'attention') {
+    return (
+      candidate.availability === 'unavailable' ||
+      candidate.availability === 'ambiguous' ||
+      candidate.worker.runtime?.status === 'blocked' ||
+      candidate.worker.runtime?.status === 'done' ||
+      candidate.worker.runtime?.status === 'unknown'
+    )
+  }
+  return false
+}
+
+function workerLabel(worker: ObservedWorker) {
+  return worker.name ?? worker.display_provider ?? worker.provider ?? 'Worker'
+}
+
+function candidateLabel(candidate: WorkerCandidate) {
+  return (
+    candidate.profile_name ??
+    `Worker ${candidate.worker.id.slice(0, 8)}`
+  )
+}
+
+function canAllocateCandidate(candidate: WorkerCandidate) {
+  return (
+    candidate.availability === 'unassigned_live' ||
+    candidate.availability === 'resumable'
+  )
+}
+
+function canHandoffCandidate(candidate: WorkerCandidate) {
+  return (
+    candidate.availability === 'assigned' &&
+    Boolean(candidate.project_id) &&
+    Boolean(candidate.assignment_id)
+  )
+}
+
+function canEndCandidate(candidate: WorkerCandidate) {
+  return (
+    candidate.worker.desired_state === 'running' &&
+    candidate.availability !== 'yard_orchestrator' &&
+    candidate.availability !== 'orchestrator' &&
+    candidate.availability !== 'assigned'
+  )
+}
+
+function allocationAction(candidate: WorkerCandidate) {
+  if (canHandoffCandidate(candidate)) return 'Hand off worker'
+  return candidate.availability === 'resumable'
+    ? 'Resume worker'
+    : 'Assign worker'
+}
+
+function findObservedWorker(
+  inventory: RuntimeInventory | null,
+  runtime: WorkerRuntimeBinding | null,
+) {
+  if (
+    !inventory ||
+    !runtime ||
+    inventory.adapter !== runtime.adapter ||
+    inventory.session !== runtime.session
+  ) {
+    return undefined
+  }
+
+  const matches = inventory.workers.filter(
+    (worker) => worker.terminal_id === runtime.terminal_id,
+  )
+  return matches.length === 1 ? matches[0] : undefined
+}
+
+function resolvedRuntimeState(
+  runtime: WorkerRuntimeBinding | null,
+  observed: ObservedWorker | undefined,
+) {
+  return {
+    observationState:
+      runtime?.observation_state ??
+      (observed ? ('observed' as const) : ('missing' as const)),
+    processState:
+      runtime?.process_state ??
+      (observed ? ('running' as const) : ('unknown' as const)),
+    status: observed?.status ?? runtime?.status ?? ('unknown' as const),
+  }
+}
+
+function StatusBadge({ status }: { status: ObservedStatus }) {
+  const Icon = STATUS_ICONS[status]
+  return (
+    <span
+      aria-label={`Observed status: ${status}`}
+      className="status-badge"
+      data-status={status}
+    >
+      <Icon
+        aria-hidden="true"
+        className={status === 'working' ? 'status-spin' : ''}
+        size={14}
+      />
+      {status}
+    </span>
+  )
+}
+
+const WORKFLOW_STATUS_LABELS: Record<WorkflowStatus, string> = {
+  idle: 'Idle',
+  needs_attention: 'Needs attention',
+  working: 'Working',
+}
+
+const WORKFLOW_STATUS_ICONS = {
+  idle: Pause,
+  needs_attention: CircleAlert,
+  working: LoaderCircle,
+} satisfies Record<WorkflowStatus, typeof CircleAlert>
+
+function WorkflowStatusSummary({ report }: { report: StatusReport }) {
+  const Icon = WORKFLOW_STATUS_ICONS[report.state]
+  return (
+    <section
+      aria-label="Reported workflow status"
+      className="workflow-status-summary"
+      data-workflow-state={report.state}
+    >
+      <div className="workflow-status-summary__heading">
+        <p className="eyebrow">Reported workflow</p>
+        <span className="workflow-status-badge" data-workflow-state={report.state}>
+          <Icon
+            aria-hidden="true"
+            className={report.state === 'working' ? 'status-spin' : ''}
+            size={13}
+          />
+          {WORKFLOW_STATUS_LABELS[report.state]}
+        </span>
+      </div>
+      <dl>
+        <div>
+          <dt>Last</dt>
+          <dd>{report.last || 'Not reported.'}</dd>
+        </div>
+        <div>
+          <dt>Next</dt>
+          <dd>{report.next || 'Not reported.'}</dd>
+        </div>
+      </dl>
+      {report.blockers.length > 0 ? (
+        <div className="workflow-status-summary__blockers">
+          <strong>
+            {report.blockers.length} blocker
+            {report.blockers.length === 1 ? '' : 's'}
+          </strong>
+          <span>{report.blockers.join(' / ')}</span>
+        </div>
+      ) : null}
+    </section>
+  )
+}
+
+function ProcessStateBadge({ state }: { state: RuntimeProcessState }) {
+  const Icon = PROCESS_ICONS[state]
+  return (
+    <span
+      aria-label={`Process state: ${state}`}
+      className="process-state-badge"
+      data-process-state={state}
+    >
+      <Icon aria-hidden="true" size={14} />
+      {state}
+    </span>
+  )
+}
+
+function ObservationStateBadge({ state }: { state: RuntimeObservationState }) {
+  const Icon = OBSERVATION_ICONS[state]
+  return (
+    <span
+      aria-label={`Observation state: ${state}`}
+      className="observation-state-badge"
+      data-observation-state={state}
+    >
+      <Icon aria-hidden="true" size={14} />
+      {state}
+    </span>
+  )
+}
+
+function RuntimeStateSummary({
+  observed,
+  runtime,
+}: {
+  observed: ObservedWorker | undefined
+  runtime: WorkerRuntimeBinding | null
+}) {
+  const { observationState, processState, status } = resolvedRuntimeState(
+    runtime,
+    observed,
+  )
+
+  return (
+    <dl
+      className="runtime-state-summary"
+      data-current-observation={Boolean(observed)}
+    >
+      <div>
+        <dt>Observed status</dt>
+        <dd>
+          <StatusBadge status={status} />
+        </dd>
+      </div>
+      <div>
+        <dt>Process state</dt>
+        <dd>
+          <ProcessStateBadge state={processState} />
+        </dd>
+      </div>
+      <div>
+        <dt>Observation</dt>
+        <dd>
+          <ObservationStateBadge state={observationState} />
+        </dd>
+      </div>
+    </dl>
+  )
+}
+
+function DetailRow({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string
+  value: string | number | null | undefined
+  mono?: boolean
+}) {
+  return (
+    <div className="detail-row">
+      <dt>{label}</dt>
+      <dd className={mono ? 'mono' : ''}>{value ?? 'Not reported'}</dd>
+    </div>
+  )
+}
+
+function ObservedWorkerInspector({ worker }: { worker: ObservedWorker }) {
+  return (
+    <>
+      <div className="inspector__identity">
+        <span className="inspector__icon" data-status={worker.status}>
+          <Bot aria-hidden="true" size={20} />
+        </span>
+        <div>
+          <p className="eyebrow">Observed worker</p>
+          <h2>{workerLabel(worker)}</h2>
+        </div>
+      </div>
+      <StatusBadge status={worker.status} />
+      <dl className="detail-list">
+        <DetailRow label="Provider" value={worker.provider} />
+        <DetailRow label="Workspace" value={worker.workspace_id} mono />
+        <DetailRow label="Tab" value={worker.tab_id} mono />
+        <DetailRow label="Pane" value={worker.pane_id} mono />
+        <DetailRow label="Working directory" value={worker.cwd} mono />
+        <DetailRow
+          label="Interactive"
+          value={worker.interactive_ready ? 'Ready' : 'Not ready'}
+        />
+        <DetailRow
+          label="Provider session"
+          value={worker.provider_session?.value}
+          mono
+        />
+        <DetailRow
+          label="State sequence"
+          value={worker.state_change_sequence}
+          mono
+        />
+      </dl>
+    </>
+  )
+}
+
+function ProviderChildInspector({ agent }: { agent: ObservedChildAgent }) {
+  const label =
+    agent.name ??
+    agent.description ??
+    `${agent.provider} ${agent.provider_agent_id.slice(0, 8)}`
+  return (
+    <>
+      <div className="inspector__identity">
+        <span className="inspector__icon" data-status={agent.status}>
+          <GitBranch aria-hidden="true" size={20} />
+        </span>
+        <div>
+          <p className="eyebrow">Provider child agent</p>
+          <h2>{label}</h2>
+        </div>
+      </div>
+      <StatusBadge status={agent.status} />
+      <dl className="detail-list">
+        <DetailRow label="Provider" value={agent.provider} />
+        <DetailRow label="Role" value={agent.role} />
+        <DetailRow label="Description" value={agent.description} />
+        <DetailRow label="Child ID" value={agent.provider_agent_id} mono />
+        <DetailRow
+          label="Parent session"
+          value={agent.parent_provider_session.value}
+          mono
+        />
+        <DetailRow
+          label="Parent child"
+          value={agent.parent_agent_id}
+          mono
+        />
+        <DetailRow label="Spawn depth" value={agent.depth} />
+        <DetailRow label="Terminal" value="Shares parent terminal" />
+      </dl>
+    </>
+  )
+}
+
+function WorkerCandidateInspector({
+  activeAssignment,
+  candidate,
+  completedAssignment,
+  observed,
+  onAllocate,
+  onEndSession,
+  projects,
+}: {
+  activeAssignment: Assignment | undefined
+  candidate: WorkerCandidate
+  completedAssignment: Assignment | undefined
+  observed: ObservedWorker | undefined
+  onAllocate: (project: Project) => void
+  onEndSession: () => void
+  projects: Project[]
+}) {
+  const [projectId, setProjectId] = useState(projects[0]?.id ?? '')
+  const isHandoff = canHandoffCandidate(candidate)
+  const isActionable = canAllocateCandidate(candidate) || isHandoff
+  const eligibleProjects = isHandoff
+    ? projects.filter((project) => project.id !== candidate.project_id)
+    : projects
+
+  useEffect(() => {
+    if (!eligibleProjects.some((project) => project.id === projectId)) {
+      setProjectId(eligibleProjects[0]?.id ?? '')
+    }
+  }, [eligibleProjects, projectId])
+
+  const project = eligibleProjects.find(
+    (candidate) => candidate.id === projectId,
+  )
+  const AvailabilityIcon = AVAILABILITY_ICONS[candidate.availability]
+
+  return (
+    <>
+      <div className="inspector__identity">
+        <span
+          className="inspector__icon"
+          data-availability={candidate.availability}
+        >
+          <AvailabilityIcon aria-hidden="true" size={20} />
+        </span>
+        <div>
+          <p className="eyebrow">Worker candidate</p>
+          <h2>{candidateLabel(candidate)}</h2>
+        </div>
+      </div>
+      <span
+        className="availability-badge"
+        data-availability={candidate.availability}
+      >
+        <AvailabilityIcon aria-hidden="true" size={14} />
+        {AVAILABILITY_LABELS[candidate.availability]}
+      </span>
+      <RuntimeStateSummary
+        observed={observed}
+        runtime={candidate.worker.runtime}
+      />
+      <dl className="detail-list">
+        <DetailRow label="Worker ID" value={candidate.worker.id} mono />
+        <DetailRow label="Profile" value={candidate.profile_name} />
+        <DetailRow label="Default role" value={candidate.default_role} />
+        <DetailRow label="Provider" value={observed?.provider} />
+        <DetailRow label="Project ID" value={candidate.project_id} mono />
+        <DetailRow
+          label="Assignment"
+          value={candidate.assignment_id}
+          mono
+        />
+        <DetailRow
+          label="Terminal"
+          value={candidate.worker.runtime?.terminal_id}
+          mono
+        />
+        <DetailRow
+          label="State sequence"
+          value={candidate.worker.runtime?.state_change_sequence}
+          mono
+        />
+        <DetailRow
+          label="Runtime revision"
+          value={candidate.worker.runtime?.revision}
+          mono
+        />
+        <DetailRow label="Reason" value={candidate.reason} />
+        <DetailRow
+          label="Disposition"
+          value={candidate.worker.desired_state}
+        />
+        <DetailRow
+          label="Worker rev"
+          value={`v${candidate.worker.version}`}
+          mono
+        />
+      </dl>
+      {activeAssignment ? (
+        <WorkerInterventions
+          key={[
+            activeAssignment.id,
+            activeAssignment.attempt.id,
+            activeAssignment.worker.runtime?.terminal_id,
+            activeAssignment.worker.runtime?.pane_id,
+            activeAssignment.worker.runtime?.provider_session?.value,
+          ].join(':')}
+          status={
+            observed?.status ??
+            activeAssignment.worker.runtime?.status ??
+            'unknown'
+          }
+          target={{ kind: 'assignment', assignment: activeAssignment }}
+        />
+      ) : null}
+      {completedAssignment &&
+      candidate.worker.desired_state === 'running' ? (
+        <div className="awaiting-disposition" role="status">
+          <CircleCheck aria-hidden="true" size={16} />
+          <span>
+            <strong>Awaiting disposition</strong>
+            <small>
+              Work is complete. This session remains available for inspection
+              or reassignment until you end it.
+            </small>
+          </span>
+        </div>
+      ) : null}
+      {isActionable ? (
+        <div className="inspector-actions">
+          <label className="field-label" htmlFor="worker-allocation-project">
+            {isHandoff ? 'Target project' : 'Project'}
+          </label>
+          <select
+            id="worker-allocation-project"
+            onChange={(event) => setProjectId(event.target.value)}
+            value={projectId}
+          >
+            {eligibleProjects.map((candidate) => (
+              <option key={candidate.id} value={candidate.id}>
+                {candidate.name}
+              </option>
+            ))}
+          </select>
+          <button
+            className="command-button"
+            disabled={!project}
+            onClick={() => {
+              if (project) onAllocate(project)
+            }}
+            type="button"
+          >
+            {isHandoff ? (
+              <ArrowRightLeft aria-hidden="true" size={16} />
+            ) : candidate.availability === 'resumable' ? (
+              <RefreshCw aria-hidden="true" size={16} />
+            ) : (
+              <Plus aria-hidden="true" size={16} />
+            )}
+            {allocationAction(candidate)}
+          </button>
+        </div>
+      ) : null}
+      {canEndCandidate(candidate) ? (
+        <div className="inspector-actions disposition-actions">
+          <button
+            className="destructive-button"
+            onClick={onEndSession}
+            type="button"
+          >
+            <CircleStop aria-hidden="true" size={16} />
+            End session
+          </button>
+        </div>
+      ) : null}
+    </>
+  )
+}
+
+function YardOrchestratorInspector({
+  busy,
+  inventory,
+  onCoordinationChange,
+  onProvision,
+  onRecover,
+  orchestrator,
+  profiles,
+  projects,
+  routes,
+  sessionRunning,
+}: {
+  busy: boolean
+  inventory: RuntimeInventory | null
+  onCoordinationChange: (route: YardOrchestratorRoute) => void
+  onProvision: (profile: WorkerProfile) => void
+  onRecover: () => void
+  orchestrator: YardOrchestrator
+  profiles: WorkerProfile[]
+  projects: Project[]
+  routes: YardOrchestratorRoute[]
+  sessionRunning: boolean | undefined
+}) {
+  const eligibleProfiles = profiles.filter(
+    (profile) => profile.runtime_adapter === 'herdr',
+  )
+  const preferredProfile =
+    eligibleProfiles.find((profile) => profile.default_role === 'orchestrator') ??
+    eligibleProfiles[0]
+  const [profileId, setProfileId] = useState(preferredProfile?.id ?? '')
+  const worker = orchestrator.worker
+  const observed = findObservedWorker(inventory, worker?.runtime ?? null)
+  const runtimeState = resolvedRuntimeState(worker?.runtime ?? null, observed)
+  const isDedicated =
+    worker?.runtime?.session === 'yard-orchestrator'
+  const sessionStopped = isDedicated && sessionRunning === false
+
+  useEffect(() => {
+    if (!eligibleProfiles.some((profile) => profile.id === profileId)) {
+      setProfileId(preferredProfile?.id ?? '')
+    }
+  }, [eligibleProfiles, preferredProfile?.id, profileId])
+
+  const selectedProfile = eligibleProfiles.find(
+    (profile) => profile.id === profileId,
+  )
+
+  return (
+    <>
+      <div className="inspector__identity">
+        <span
+          className="inspector__icon yard-orchestrator-icon"
+          data-status={worker ? runtimeState.status : 'unknown'}
+        >
+          <Network aria-hidden="true" size={20} />
+        </span>
+        <div>
+          <p className="eyebrow">Portfolio control</p>
+          <h2>Superintendent</h2>
+        </div>
+      </div>
+      {worker ? (
+        <>
+          <div className="yard-control-runtime">
+            <StatusBadge status={runtimeState.status} />
+            <span>
+              <strong>
+                {sessionStopped
+                  ? 'Dedicated session stopped'
+                  : isDedicated
+                    ? 'Dedicated Herdr session'
+                    : 'Legacy worker binding'}
+              </strong>
+              <small>
+                {worker.runtime?.session ?? 'Runtime unavailable'}
+                {worker.runtime?.terminal_id
+                  ? ` / ${worker.runtime.terminal_id}`
+                  : ''}
+              </small>
+            </span>
+          </div>
+          {sessionStopped ? (
+            <div className="inspector-actions yard-orchestrator-recovery">
+              <div className="awaiting-disposition" role="status">
+                <CircleAlert aria-hidden="true" size={16} />
+                <span>
+                  <strong>Herdr session is offline</strong>
+                  <small>
+                    Restart and reconcile this orchestrator without replacing it.
+                  </small>
+                </span>
+              </div>
+              <button
+                className="command-button"
+                disabled={busy}
+                onClick={onRecover}
+                type="button"
+              >
+                {busy ? (
+                  <LoaderCircle
+                    aria-hidden="true"
+                    className="status-spin"
+                    size={16}
+                  />
+                ) : (
+                  <RefreshCw aria-hidden="true" size={16} />
+                )}
+                Restart orchestrator session
+              </button>
+            </div>
+          ) : (
+            <WorkerInterventions
+              key={[
+                orchestrator.version,
+                worker.id,
+                worker.runtime?.terminal_id,
+                worker.runtime?.pane_id,
+              ].join(':')}
+              onCoordinationChange={onCoordinationChange}
+              projects={projects}
+              routes={routes}
+              status={runtimeState.status}
+              target={{ kind: 'yard-orchestrator', orchestrator }}
+            />
+          )}
+        </>
+      ) : (
+        <div className="awaiting-disposition" role="status">
+          <CircleAlert aria-hidden="true" size={16} />
+          <span>
+            <strong>Central orchestrator is not running</strong>
+            <small>Start a dedicated Herdr session for portfolio coordination.</small>
+          </span>
+        </div>
+      )}
+      {!isDedicated ? (
+        <div className="inspector-actions yard-orchestrator-configuration">
+          <div className="yard-orchestrator-configuration__heading">
+            <Server aria-hidden="true" size={17} />
+            <span>
+              <strong>Dedicated control session</strong>
+              <small>Creates a new `yard-orchestrator` Herdr session.</small>
+            </span>
+          </div>
+          <label className="field-label" htmlFor="yard-orchestrator-profile">
+            Orchestrator profile
+          </label>
+          <select
+            disabled={busy || eligibleProfiles.length === 0}
+            id="yard-orchestrator-profile"
+            onChange={(event) => setProfileId(event.target.value)}
+            value={profileId}
+          >
+            {eligibleProfiles.map((profile) => (
+              <option key={profile.id} value={profile.id}>
+                {profile.name} / {profile.provider}
+              </option>
+            ))}
+          </select>
+          <button
+            className="command-button"
+            disabled={busy || !selectedProfile}
+            onClick={() => {
+              if (selectedProfile) onProvision(selectedProfile)
+            }}
+            type="button"
+          >
+            {busy ? (
+              <LoaderCircle
+                aria-hidden="true"
+                className="status-spin"
+                size={16}
+              />
+            ) : (
+              <Network aria-hidden="true" size={16} />
+            )}
+            {worker ? 'Move to dedicated session' : 'Start Superintendent'}
+          </button>
+          {eligibleProfiles.length === 0 ? (
+            <p className="empty-state">Create a Herdr worker profile first.</p>
+          ) : null}
+        </div>
+      ) : null}
+    </>
+  )
+}
+
+function ProjectOrchestratorInspector({
+  inventory,
+  project,
+  statusReport,
+}: {
+  inventory: RuntimeInventory | null
+  project: Project
+  statusReport: StatusReport | undefined
+}) {
+  const runtime = project.orchestrator.runtime
+  const observed = findObservedWorker(inventory, runtime)
+  const runtimeState = resolvedRuntimeState(runtime, observed)
+
+  return (
+    <>
+      <div className="inspector__identity">
+        <span className="inspector__icon" data-status={runtimeState.status}>
+          <BriefcaseBusiness aria-hidden="true" size={20} />
+        </span>
+        <div>
+          <p className="eyebrow">Project orchestrator</p>
+          <h2>{project.name}</h2>
+        </div>
+      </div>
+      {statusReport ? (
+        <WorkflowStatusSummary report={statusReport} />
+      ) : null}
+      <section
+        aria-label="Orchestrator runtime"
+        className="durable-runtime-section"
+      >
+        <p className="eyebrow">Orchestrator runtime</p>
+        <RuntimeStateSummary observed={observed} runtime={runtime} />
+        <dl className="detail-list">
+          <DetailRow
+            label="Worker"
+            value={observed ? workerLabel(observed) : 'Durable worker'}
+          />
+          <DetailRow label="Worker ID" value={project.orchestrator.id} mono />
+          <DetailRow label="Herdr session" value={runtime?.session} mono />
+          <DetailRow label="Terminal" value={runtime?.terminal_id} mono />
+        </dl>
+      </section>
+      <WorkerInterventions
+        key={[
+          project.id,
+          project.orchestrator.id,
+          runtime?.terminal_id,
+          runtime?.pane_id,
+        ].join(':')}
+        status={runtimeState.status}
+        target={{ kind: 'orchestrator', project }}
+      />
+    </>
+  )
+}
+
+function ProjectInspector({
+  accent,
+  inventory,
+  onAccentChange,
+  onDisconnect,
+  project,
+  projects,
+  relationships,
+  statusReport,
+}: {
+  accent: string
+  inventory: RuntimeInventory | null
+  onAccentChange: (accent: string) => void
+  onDisconnect: (relationship: ProjectRelationship) => void
+  project: Project
+  projects: Project[]
+  relationships: ProjectRelationship[]
+  statusReport: StatusReport | undefined
+}) {
+  const runtimeMatches =
+    inventory?.adapter === project.runtime.adapter &&
+    inventory.session === project.runtime.session
+  const workspace = runtimeMatches
+    ? inventory.workspaces.find(
+          (candidate) =>
+            candidate.runtime_id === project.runtime.workspace_id,
+        )
+    : undefined
+  const orchestratorRuntime = project.orchestrator.runtime
+  const orchestrator = findObservedWorker(inventory, orchestratorRuntime)
+  const orchestratorState = resolvedRuntimeState(
+    orchestratorRuntime,
+    orchestrator,
+  )
+
+  return (
+    <>
+      <div className="inspector__identity">
+        <span
+          className="inspector__icon"
+          data-status={orchestratorState.status}
+        >
+          <BriefcaseBusiness aria-hidden="true" size={20} />
+        </span>
+        <div>
+          <p className="eyebrow">Yard project</p>
+          <h2>{project.name}</h2>
+        </div>
+      </div>
+      <div className="project-workspace-state">
+        <span>Workspace</span>
+        {workspace ? (
+          <StatusBadge status={workspace.status} />
+        ) : (
+          <span className="runtime-badge" data-runtime="offline">
+            <WifiOff aria-hidden="true" size={14} />
+            offline
+          </span>
+        )}
+      </div>
+      {statusReport ? (
+        <WorkflowStatusSummary report={statusReport} />
+      ) : null}
+      <dl className="detail-list">
+        <DetailRow label="Project ID" value={project.id} mono />
+        <DetailRow label="Session" value={project.runtime.session} mono />
+        <DetailRow
+          label="Workspace"
+          value={project.runtime.workspace_id}
+          mono
+        />
+        <DetailRow
+          label="Placement"
+          value={`v${project.placement.version}`}
+          mono
+        />
+      </dl>
+      {relationships.length > 0 ? (
+        <section
+          aria-label="Project connections"
+          className="project-connections"
+        >
+          <p className="eyebrow">Connections</p>
+          {relationships.map((relationship) => {
+            const outgoing =
+              relationship.source_project_id === project.id
+            const otherProject = projects.find(
+              (candidate) =>
+                candidate.id ===
+                (outgoing
+                  ? relationship.target_project_id
+                  : relationship.source_project_id),
+            )
+            return (
+              <div
+                className="project-connection-row"
+                key={relationship.id}
+              >
+                <span>
+                  <strong>{otherProject?.name ?? 'Unknown project'}</strong>
+                  <small>
+                    {outgoing ? 'depends on' : 'required by'}
+                  </small>
+                </span>
+                <button
+                  aria-label={`Remove connection with ${otherProject?.name ?? 'project'}`}
+                  className="icon-button"
+                  onClick={() => onDisconnect(relationship)}
+                  title="Remove project connection"
+                  type="button"
+                >
+                  <Unlink aria-hidden="true" size={15} />
+                </button>
+              </div>
+            )
+          })}
+        </section>
+      ) : null}
+      <fieldset className="project-color-control">
+        <legend>Territory border</legend>
+        <div aria-label="Project border color" className="color-swatches">
+          {PROJECT_ACCENTS.map((option) => (
+            <button
+              aria-label={option.label}
+              aria-pressed={accent === option.value}
+              key={option.value}
+              onClick={() => onAccentChange(option.value)}
+              style={{ '--swatch': option.value } as CSSProperties}
+              title={option.label}
+              type="button"
+            />
+          ))}
+        </div>
+      </fieldset>
+      <section
+        aria-label="Orchestrator runtime"
+        className="durable-runtime-section"
+      >
+        <p className="eyebrow">Orchestrator runtime</p>
+        <RuntimeStateSummary
+          observed={orchestrator}
+          runtime={orchestratorRuntime}
+        />
+        <dl className="detail-list">
+          <DetailRow
+            label="Orchestrator"
+            value={orchestrator ? workerLabel(orchestrator) : 'Durable worker'}
+          />
+          <DetailRow
+            label="Worker ID"
+            value={project.orchestrator.id}
+            mono
+          />
+          <DetailRow
+            label="Terminal"
+            value={orchestratorRuntime?.terminal_id}
+            mono
+          />
+          <DetailRow
+            label="State sequence"
+            value={orchestratorRuntime?.state_change_sequence}
+            mono
+          />
+          <DetailRow
+            label="Runtime revision"
+            value={orchestratorRuntime?.revision}
+            mono
+          />
+        </dl>
+      </section>
+      <WorkerInterventions
+        key={[
+          project.id,
+          project.orchestrator.id,
+          orchestratorRuntime?.terminal_id,
+          orchestratorRuntime?.pane_id,
+          orchestratorRuntime?.provider_session?.value,
+        ].join(':')}
+        status={orchestratorState.status}
+        target={{ kind: 'orchestrator', project }}
+      />
+    </>
+  )
+}
+
+function ProfileInspector({
+  onAllocate,
+  onEdit,
+  profile,
+  projects,
+}: {
+  onAllocate: (project: Project) => void
+  onEdit: () => void
+  profile: WorkerProfile
+  projects: Project[]
+}) {
+  const [projectId, setProjectId] = useState(projects[0]?.id ?? '')
+
+  useEffect(() => {
+    if (!projects.some((project) => project.id === projectId)) {
+      setProjectId(projects[0]?.id ?? '')
+    }
+  }, [projectId, projects])
+
+  const project = projects.find((candidate) => candidate.id === projectId)
+
+  return (
+    <>
+      <div className="inspector__identity">
+        <span className="inspector__icon profile-icon">
+          <Bot aria-hidden="true" size={20} />
+        </span>
+        <div>
+          <p className="eyebrow">Worker profile</p>
+          <h2>{profile.name}</h2>
+        </div>
+      </div>
+      <span className="runtime-badge">
+        {profile.provider}
+        {profile.model ? ` / ${profile.model}` : ''}
+      </span>
+      <dl className="detail-list">
+        <DetailRow label="Default role" value={profile.default_role} />
+        <DetailRow label="Runtime" value={profile.runtime_adapter} mono />
+        <DetailRow label="Worktree" value={profile.worktree_policy} />
+        <DetailRow label="Sandbox" value={profile.sandbox_policy} />
+        <DetailRow label="Permissions" value={profile.permission_policy} />
+        <DetailRow label="Revision" value={`v${profile.version}`} mono />
+      </dl>
+      <div className="inspector-actions">
+        <button className="secondary-button" onClick={onEdit} type="button">
+          <Pencil aria-hidden="true" size={15} />
+          Edit profile
+        </button>
+        <label className="field-label" htmlFor="allocation-project">
+          Allocate to project
+        </label>
+        <select
+          id="allocation-project"
+          onChange={(event) => setProjectId(event.target.value)}
+          value={projectId}
+        >
+          {projects.map((candidate) => (
+            <option key={candidate.id} value={candidate.id}>
+              {candidate.name}
+            </option>
+          ))}
+        </select>
+        <button
+          className="command-button"
+          disabled={!project}
+          onClick={() => {
+            if (project) onAllocate(project)
+          }}
+          type="button"
+        >
+          <Plus aria-hidden="true" size={16} />
+          Allocate worker
+        </button>
+      </div>
+    </>
+  )
+}
+
+function AssignmentInspector({
+  assignment,
+  inventory,
+  onEndSession,
+  onRecordCompletion,
+}: {
+  assignment: Assignment
+  inventory: RuntimeInventory | null
+  onEndSession?: () => void
+  onRecordCompletion: () => void
+}) {
+  const [selectedArtifact, setSelectedArtifact] = useState<Artifact | null>(null)
+  const artifactTrigger = useRef<HTMLButtonElement | null>(null)
+  const runtime = assignment.worker.runtime
+  const observed = findObservedWorker(inventory, runtime)
+  const { status } = resolvedRuntimeState(runtime, observed)
+  const receipt = assignment.completion_receipt
+
+  return (
+    <>
+      <div className="inspector__identity">
+        <span className="inspector__icon" data-status={status}>
+          <Bot aria-hidden="true" size={20} />
+        </span>
+        <div>
+          <p className="eyebrow">Assignment</p>
+          <h2>{assignment.profile_name}</h2>
+        </div>
+      </div>
+      <span className="runtime-badge">{assignment.lifecycle}</span>
+      <RuntimeStateSummary observed={observed} runtime={runtime} />
+      <dl className="detail-list">
+        <DetailRow label="Role" value={assignment.role} />
+        <DetailRow label="Objective" value={assignment.objective} />
+        <DetailRow label="Attempt" value={assignment.attempt.lifecycle} />
+        <DetailRow label="Worker ID" value={assignment.worker.id} mono />
+        <DetailRow label="Terminal" value={runtime?.terminal_id} mono />
+        <DetailRow label="Tab" value={runtime?.tab_id} mono />
+        <DetailRow
+          label="State sequence"
+          value={runtime?.state_change_sequence}
+          mono
+        />
+        <DetailRow label="Runtime revision" value={runtime?.revision} mono />
+        <DetailRow
+          label="Profile rev"
+          value={`v${assignment.profile_version}`}
+          mono
+        />
+        {assignment.attempt.error ? (
+          <DetailRow label="Failure" value={assignment.attempt.error} />
+        ) : null}
+      </dl>
+      <WorkerInterventions
+        key={[
+          assignment.id,
+          assignment.attempt.id,
+          runtime?.terminal_id,
+          runtime?.pane_id,
+          runtime?.provider_session?.value,
+        ].join(':')}
+        status={status}
+        target={{ kind: 'assignment', assignment }}
+      />
+      {assignment.lifecycle === 'active' && status === 'done' ? (
+        <div className="awaiting-disposition" role="status">
+          <CircleCheck aria-hidden="true" size={16} />
+          <span>
+            <strong>Completion review</strong>
+            <small>Agent reports done. Evidence-backed receipt required.</small>
+          </span>
+        </div>
+      ) : null}
+      {receipt ? (
+        <section
+          aria-label="Completion receipt"
+          className="completion-receipt"
+        >
+          <p className="eyebrow">Completion receipt</p>
+          <dl className="detail-list">
+            <DetailRow label="Summary" value={receipt.summary} />
+            <DetailRow label="Outcome" value={receipt.outcome} />
+            <div className="detail-row">
+              <dt>Evidence</dt>
+              <dd>
+                <ReceiptValues values={receipt.evidence_refs} />
+              </dd>
+            </div>
+            <div className="detail-row">
+              <dt>Artifacts</dt>
+              <dd>
+                <ReceiptArtifacts
+                  artifacts={receipt.artifacts}
+                  onOpen={(artifact, trigger) => {
+                    artifactTrigger.current = trigger
+                    setSelectedArtifact(artifact)
+                  }}
+                />
+              </dd>
+            </div>
+            <div className="detail-row">
+              <dt>References</dt>
+              <dd>
+                <ReceiptValues values={receipt.artifact_refs} />
+              </dd>
+            </div>
+            <div className="detail-row">
+              <dt>Blockers</dt>
+              <dd>
+                <ReceiptValues values={receipt.unresolved_blockers} />
+              </dd>
+            </div>
+            <DetailRow label="Actor" value={receipt.actor} mono />
+            <DetailRow
+              label="Recorded"
+              value={new Date(receipt.created_at_unix_ms).toISOString()}
+              mono
+            />
+          </dl>
+        </section>
+      ) : null}
+      {receipt && onEndSession ? (
+        <div className="inspector-actions disposition-actions">
+          <div className="awaiting-disposition" role="status">
+            <CircleCheck aria-hidden="true" size={16} />
+            <span>
+              <strong>Awaiting disposition</strong>
+              <small>
+                The completion receipt is retained whether this session is
+                reassigned or ended.
+              </small>
+            </span>
+          </div>
+          <button
+            className="destructive-button"
+            onClick={onEndSession}
+            type="button"
+          >
+            <CircleStop aria-hidden="true" size={16} />
+            End session
+          </button>
+        </div>
+      ) : null}
+      {assignment.lifecycle === 'active' ? (
+        <div className="inspector-actions">
+          <button
+            className="command-button"
+            onClick={onRecordCompletion}
+            type="button"
+          >
+            <CircleCheck aria-hidden="true" size={16} />
+            Record completion
+          </button>
+        </div>
+      ) : null}
+      {selectedArtifact ? (
+        <Suspense fallback={null}>
+          <ArtifactInspector
+            artifact={selectedArtifact}
+            onClose={() => setSelectedArtifact(null)}
+            returnFocus={artifactTrigger.current}
+          />
+        </Suspense>
+      ) : null}
+    </>
+  )
+}
+
+function ReceiptArtifacts({
+  artifacts,
+  onOpen,
+}: {
+  artifacts: Artifact[]
+  onOpen: (artifact: Artifact, trigger: HTMLButtonElement) => void
+}) {
+  if (artifacts.length === 0) {
+    return <span className="receipt-values__empty">None</span>
+  }
+
+  return (
+    <ul className="receipt-artifacts">
+      {artifacts.map((artifact) => (
+        <li key={artifact.id}>
+          <button
+            onClick={(event) => onOpen(artifact, event.currentTarget)}
+            type="button"
+          >
+            <FileCode2 aria-hidden="true" size={15} />
+            <span>
+              <strong>{artifact.display_name}</strong>
+              <small>{artifact.media_type}</small>
+            </span>
+          </button>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+function ReceiptValues({ values }: { values: string[] }) {
+  if (values.length === 0) {
+    return <span className="receipt-values__empty">None</span>
+  }
+
+  return (
+    <ul className="receipt-values">
+      {values.map((value, index) => (
+        <li key={`${index}:${value}`}>{value}</li>
+      ))}
+    </ul>
+  )
+}
+
+function NewProjectInspector({
+  busy,
+  onCreate,
+  onNewProfile,
+  profiles,
+  session,
+}: {
+  busy: boolean
+  onCreate: (details: WorkspaceProjectCreationDetails) => Promise<void>
+  onNewProfile: () => void
+  profiles: WorkerProfile[]
+  session: string
+}) {
+  const [name, setName] = useState('')
+  const [cwd, setCwd] = useState('')
+  const [profileId, setProfileId] = useState(profiles[0]?.id ?? '')
+  const [objective, setObjective] = useState('')
+  const commandId = useRef(crypto.randomUUID())
+
+  useEffect(() => {
+    if (!profiles.some((profile) => profile.id === profileId)) {
+      setProfileId(profiles[0]?.id ?? '')
+      commandId.current = crypto.randomUUID()
+    }
+  }, [profileId, profiles])
+
+  const updateCommand = () => {
+    commandId.current = crypto.randomUUID()
+  }
+  const submit = (event: FormEvent) => {
+    event.preventDefault()
+    void onCreate({
+      commandId: commandId.current,
+      cwd,
+      name,
+      objective,
+      profileId,
+    })
+  }
+
+  return (
+    <>
+      <div className="inspector__identity">
+        <span className="inspector__icon project-bootstrap__icon">
+          <FolderPlus aria-hidden="true" size={20} />
+        </span>
+        <div>
+          <p className="eyebrow">New workspace</p>
+          <h2>Create project</h2>
+        </div>
+      </div>
+      <dl className="detail-list">
+        <DetailRow label="Herdr session" value={session || 'Unavailable'} mono />
+      </dl>
+      {profiles.length > 0 ? (
+        <form
+          className="project-adoption-form project-bootstrap-form"
+          onSubmit={submit}
+        >
+          <label className="field-label" htmlFor="new-project-name">
+            Project name
+          </label>
+          <input
+            autoComplete="off"
+            id="new-project-name"
+            maxLength={120}
+            onChange={(event) => {
+              setName(event.target.value)
+              updateCommand()
+            }}
+            required
+            value={name}
+          />
+          <label className="field-label" htmlFor="new-project-cwd">
+            Checkout path
+          </label>
+          <input
+            autoComplete="off"
+            id="new-project-cwd"
+            maxLength={4096}
+            onChange={(event) => {
+              setCwd(event.target.value)
+              updateCommand()
+            }}
+            placeholder="/path/to/project"
+            required
+            value={cwd}
+          />
+          <label className="field-label" htmlFor="new-project-profile">
+            Orchestrator profile
+          </label>
+          <select
+            id="new-project-profile"
+            onChange={(event) => {
+              setProfileId(event.target.value)
+              updateCommand()
+            }}
+            required
+            value={profileId}
+          >
+            {profiles.map((profile) => (
+              <option key={profile.id} value={profile.id}>
+                {profile.name}
+              </option>
+            ))}
+          </select>
+          <label className="field-label" htmlFor="new-project-objective">
+            Orchestrator brief
+          </label>
+          <textarea
+            id="new-project-objective"
+            maxLength={16000}
+            onChange={(event) => {
+              setObjective(event.target.value)
+              updateCommand()
+            }}
+            required
+            rows={5}
+            value={objective}
+          />
+          <button
+            className="command-button"
+            disabled={
+              busy ||
+              !session ||
+              !name.trim() ||
+              !cwd.trim() ||
+              !profileId ||
+              !objective.trim()
+            }
+            type="submit"
+          >
+            {busy ? (
+              <LoaderCircle
+                aria-hidden="true"
+                className="status-spin"
+                size={16}
+              />
+            ) : (
+              <FolderPlus aria-hidden="true" size={16} />
+            )}
+            Create project
+          </button>
+        </form>
+      ) : (
+        <div className="project-bootstrap__empty">
+          <p>No orchestrator profiles.</p>
+          <button
+            className="secondary-button"
+            onClick={onNewProfile}
+            type="button"
+          >
+            <Plus aria-hidden="true" size={15} />
+            New profile
+          </button>
+        </div>
+      )}
+    </>
+  )
+}
+
+function WorkspaceInspector({
+  busy,
+  onCreate,
+  profiles,
+  workers,
+  workspace,
+}: {
+  busy: boolean
+  onCreate: (details: ProjectCreationDetails) => Promise<void>
+  profiles: WorkerProfile[]
+  workers: ObservedWorker[]
+  workspace: WorkspaceObservation
+}) {
+  const [name, setName] = useState(workspace.label)
+  const [mode, setMode] = useState<'existing' | 'profile'>(
+    workers.length > 0 ? 'existing' : 'profile',
+  )
+  const [orchestratorId, setOrchestratorId] = useState(
+    workers[0]?.runtime_id ?? '',
+  )
+  const [profileId, setProfileId] = useState(profiles[0]?.id ?? '')
+  const [objective, setObjective] = useState(
+    `Coordinate work for ${workspace.label}.`,
+  )
+  const profileCommandId = useRef(crypto.randomUUID())
+
+  useEffect(() => {
+    if (!workers.some((worker) => worker.runtime_id === orchestratorId)) {
+      setOrchestratorId(workers[0]?.runtime_id ?? '')
+      if (workers.length === 0) setMode('profile')
+    }
+  }, [orchestratorId, workers])
+
+  useEffect(() => {
+    if (!profiles.some((profile) => profile.id === profileId)) {
+      setProfileId(profiles[0]?.id ?? '')
+      if (profiles.length === 0 && workers.length > 0) setMode('existing')
+    }
+  }, [profileId, profiles, workers.length])
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault()
+    void onCreate(
+      mode === 'existing'
+        ? { mode, name, orchestratorId }
+        : {
+            commandId: profileCommandId.current,
+            mode,
+            name,
+            objective,
+            profileId,
+          },
+    )
+  }
+
+  return (
+    <>
+      <div className="inspector__identity">
+        <span className="inspector__icon" data-status={workspace.status}>
+          <Boxes aria-hidden="true" size={20} />
+        </span>
+        <div>
+          <p className="eyebrow">Observed workspace</p>
+          <h2>{workspace.label}</h2>
+        </div>
+      </div>
+      <StatusBadge status={workspace.status} />
+      <dl className="detail-list">
+        <DetailRow label="Runtime ID" value={workspace.runtime_id} mono />
+        <DetailRow label="Active tab" value={workspace.active_tab_id} mono />
+        <DetailRow label="Tabs" value={workspace.tab_count} />
+        <DetailRow label="Panes" value={workspace.pane_count} />
+        <DetailRow
+          label="Repository"
+          value={workspace.worktree?.repository_name}
+        />
+        <DetailRow
+          label="Checkout"
+          value={workspace.worktree?.checkout_path}
+          mono
+        />
+      </dl>
+      <form className="project-adoption-form" onSubmit={submit}>
+        <p className="eyebrow">Create project</p>
+        <label className="field-label" htmlFor="project-name">
+          Project name
+        </label>
+        <input
+          autoComplete="off"
+          id="project-name"
+          maxLength={120}
+          onChange={(event) => {
+            setName(event.target.value)
+            profileCommandId.current = crypto.randomUUID()
+          }}
+          required
+          value={name}
+        />
+        <div
+          aria-label="Orchestrator source"
+          className="segmented-control project-creation-mode"
+          role="group"
+        >
+          <button
+            aria-pressed={mode === 'existing'}
+            className={mode === 'existing' ? 'is-active' : ''}
+            disabled={workers.length === 0}
+            onClick={() => setMode('existing')}
+            type="button"
+          >
+            Existing
+          </button>
+          <button
+            aria-pressed={mode === 'profile'}
+            className={mode === 'profile' ? 'is-active' : ''}
+            disabled={profiles.length === 0}
+            onClick={() => setMode('profile')}
+            type="button"
+          >
+            Profile
+          </button>
+        </div>
+        {mode === 'existing' ? (
+          <>
+            <label className="field-label" htmlFor="orchestrator-select">
+              Orchestrator
+            </label>
+            <select
+              disabled={workers.length === 0}
+              id="orchestrator-select"
+              onChange={(event) => setOrchestratorId(event.target.value)}
+              required
+              value={orchestratorId}
+            >
+              {workers.map((worker) => (
+                <option key={worker.runtime_id} value={worker.runtime_id}>
+                  {workerLabel(worker)}
+                </option>
+              ))}
+            </select>
+          </>
+        ) : (
+          <>
+            <label className="field-label" htmlFor="orchestrator-profile">
+              Worker profile
+            </label>
+            <select
+              disabled={profiles.length === 0}
+              id="orchestrator-profile"
+              onChange={(event) => {
+                setProfileId(event.target.value)
+                profileCommandId.current = crypto.randomUUID()
+              }}
+              required
+              value={profileId}
+            >
+              {profiles.map((profile) => (
+                <option key={profile.id} value={profile.id}>
+                  {profile.name}
+                </option>
+              ))}
+            </select>
+            <label className="field-label" htmlFor="orchestrator-objective">
+              Orchestrator objective
+            </label>
+            <textarea
+              id="orchestrator-objective"
+              maxLength={16000}
+              onChange={(event) => {
+                setObjective(event.target.value)
+                profileCommandId.current = crypto.randomUUID()
+              }}
+              required
+              rows={4}
+              value={objective}
+            />
+          </>
+        )}
+        <button
+          className="command-button"
+          disabled={
+            busy ||
+            !name.trim() ||
+            (mode === 'existing'
+              ? !orchestratorId
+              : !profileId || !objective.trim())
+          }
+          type="submit"
+        >
+          {busy ? (
+            <LoaderCircle
+              aria-hidden="true"
+              className="status-spin"
+              size={16}
+            />
+          ) : (
+            <FolderPlus aria-hidden="true" size={16} />
+          )}
+          Create project
+        </button>
+      </form>
+    </>
+  )
+}
+
+function App() {
+  const [theme, setTheme] = useState<YardTheme>(readTheme)
+  const [sessions, setSessions] = useState<RuntimeSession[]>([])
+  const [selectedSession, setSelectedSession] = useState('')
+  const [inventory, setInventory] = useState<RuntimeInventory | null>(null)
+  const [yardOrchestrator, setYardOrchestrator] =
+    useState<YardOrchestrator | null>(null)
+  const [projects, setProjects] = useState<Project[]>([])
+  const [projectRelationships, setProjectRelationships] = useState<
+    ProjectRelationship[]
+  >([])
+  const [yardOrchestratorRoutes, setYardOrchestratorRoutes] = useState<
+    YardOrchestratorRoute[]
+  >([])
+  const [coordinationNodes, setCoordinationNodes] = useState<
+    CoordinationNode[]
+  >([])
+  const [coordinationNodeRoutes, setCoordinationNodeRoutes] = useState<
+    CoordinationNodeRoute[]
+  >([])
+  const [coordinationSnapshots, setCoordinationSnapshots] = useState<
+    Record<string, CoordinationSnapshot[]>
+  >({})
+  const [automations, setAutomations] = useState<Automation[]>([])
+  const [automationRuns, setAutomationRuns] = useState<
+    Record<string, AutomationRun[]>
+  >({})
+  const [profiles, setProfiles] = useState<WorkerProfile[]>([])
+  const [workerCandidates, setWorkerCandidates] = useState<
+    WorkerCandidate[]
+  >([])
+  const [assignments, setAssignments] = useState<Assignment[]>([])
+  const [projectStatusReports, setProjectStatusReports] =
+    useState<ProjectStatusReports>({})
+  const [projectPulseOpen, setProjectPulseOpen] = useState(false)
+  const [filter, setFilter] = useState<Filter>('all')
+  const [railView, setRailView] = useState<RailView>('profiles')
+  const [resourceShelfOpen, setResourceShelfOpen] = useState(true)
+  const [selection, setSelection] = useState<CanvasSelection>(null)
+  const [agentWorkspaceMode, setAgentWorkspaceMode] = useState<
+    AgentWorkspaceMode | 'map'
+  >('map')
+  const [agentWorkspaceTarget, setAgentWorkspaceTarget] =
+    useState<AgentWorkspaceTarget | null>(null)
+  const [projectAccents, setProjectAccents] = useState<
+    Record<string, string>
+  >(readProjectAccents)
+  const [runtimeLoading, setRuntimeLoading] = useState(true)
+  const [projectLoading, setProjectLoading] = useState(true)
+  const [yardOrchestratorBusy, setYardOrchestratorBusy] = useState(false)
+  const [coordinationNodeBusy, setCoordinationNodeBusy] = useState(false)
+  const [coordinationNodeError, setCoordinationNodeError] = useState<
+    string | null
+  >(null)
+  const [coordinationNodePlacement, setCoordinationNodePlacement] =
+    useState<CanvasPlacement | null>(null)
+  const [coordinationNodeInitialKind, setCoordinationNodeInitialKind] =
+    useState<CoordinationNodeKind>('workstream')
+  const [automationCreation, setAutomationCreation] = useState<{
+    initialScope?: AutomationScope
+    placement: CanvasPlacement
+  } | null>(null)
+  const [automationBusy, setAutomationBusy] = useState(false)
+  const [automationHistoryLoading, setAutomationHistoryLoading] =
+    useState(false)
+  const [automationError, setAutomationError] = useState<string | null>(null)
+  const [adoptingWorkspace, setAdoptingWorkspace] = useState<string | null>(
+    null,
+  )
+  const [workspaceProjectBusy, setWorkspaceProjectBusy] = useState(false)
+  const [workspaceProjectOpen, setWorkspaceProjectOpen] = useState(false)
+  const [profileEditor, setProfileEditor] = useState<
+    WorkerProfile | null | undefined
+  >(undefined)
+  const [profileSaving, setProfileSaving] = useState(false)
+  const [allocationProposal, setAllocationProposal] = useState<{
+    subject: AllocationSubject
+    project: Project
+    commandId: string
+  } | null>(null)
+  const [allocationBusy, setAllocationBusy] = useState(false)
+  const [allocationError, setAllocationError] = useState<string | null>(null)
+  const [handoffProposal, setHandoffProposal] = useState<{
+    commandId: string
+    sourceAssignment: Assignment
+    sourceProject: Project
+    targetProject: Project
+  } | null>(null)
+  const [handoffBusy, setHandoffBusy] = useState(false)
+  const [handoffError, setHandoffError] = useState<string | null>(null)
+  const [completionProposal, setCompletionProposal] = useState<{
+    assignment: Assignment
+    commandId: string
+  } | null>(null)
+  const [completionBusy, setCompletionBusy] = useState(false)
+  const [completionError, setCompletionError] = useState<string | null>(null)
+  const [endSessionProposal, setEndSessionProposal] = useState<{
+    candidate: WorkerCandidate
+    commandId: string
+  } | null>(null)
+  const [endSessionBusy, setEndSessionBusy] = useState(false)
+  const [endSessionError, setEndSessionError] = useState<string | null>(null)
+  const [runtimeError, setRuntimeError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [actionNotice, setActionNotice] = useState<string | null>(null)
+  const placementUpdates = useRef(new Set<string>())
+  const pendingPlacements = useRef(new Map<string, CanvasPlacement>())
+  const projectsRef = useRef<Project[]>([])
+  const coordinationNodesRef = useRef<CoordinationNode[]>([])
+  const coordinationPlacementUpdates = useRef(new Set<string>())
+  const pendingCoordinationPlacements = useRef(
+    new Map<string, CanvasPlacement>(),
+  )
+  const automationsRef = useRef<Automation[]>([])
+  const automationPlacementUpdates = useRef(new Set<string>())
+  const pendingAutomationPlacements = useRef(
+    new Map<string, CanvasPlacement>(),
+  )
+  const projectPulseTrigger = useRef<HTMLButtonElement | null>(null)
+
+  useEffect(() => {
+    applyTheme(theme)
+  }, [theme])
+
+  useEffect(() => {
+    projectsRef.current = projects
+  }, [projects])
+
+  useEffect(() => {
+    coordinationNodesRef.current = coordinationNodes
+  }, [coordinationNodes])
+
+  useEffect(() => {
+    automationsRef.current = automations
+  }, [automations])
+
+  const loadSessions = useCallback(async (signal?: AbortSignal) => {
+    const result = await fetchSessions(signal)
+    setSessions(result.sessions)
+    setSelectedSession((current) => {
+      if (
+        current &&
+        result.sessions.some(
+          (session) => session.name === current && session.running,
+        )
+      ) {
+        return current
+      }
+      return (
+        result.sessions.find(
+          (session) => session.is_default && session.running,
+        )?.name ??
+        result.sessions.find((session) => session.running)?.name ??
+        ''
+      )
+    })
+    return result.sessions
+  }, [])
+
+  const loadProjects = useCallback(async (signal?: AbortSignal) => {
+    const result = await fetchProjects(signal)
+    setProjects(result.projects)
+    const assignmentResults = await Promise.all(
+      result.projects.map((project) =>
+        fetchProjectAssignments(project.id, signal),
+      ),
+    )
+    const loadedAssignments = assignmentResults.flatMap(
+      (result) => result.assignments,
+    )
+    setAssignments(loadedAssignments)
+    return loadedAssignments
+  }, [])
+
+  const loadYardOrchestrator = useCallback(
+    async (signal?: AbortSignal) => {
+      const result = await fetchYardOrchestrator(signal)
+      setYardOrchestrator(result)
+      return result
+    },
+    [],
+  )
+
+  const loadAutomations = useCallback(async (signal?: AbortSignal) => {
+    const result = await fetchAutomations(signal)
+    setAutomations(result.automations)
+    return result.automations
+  }, [])
+
+  const loadAutomationRuns = useCallback(
+    async (automationId: string, signal?: AbortSignal) => {
+      const result = await fetchAutomationRuns(automationId, signal)
+      setAutomationRuns((current) => ({
+        ...current,
+        [automationId]: result.runs,
+      }))
+      return result.runs
+    },
+    [],
+  )
+
+  const loadCoordination = useCallback(
+    async (signal?: AbortSignal) => {
+      const [relationshipResult, routeResult, nodeResult] = await Promise.all([
+        fetchProjectRelationships(signal),
+        fetchYardOrchestratorRoutes(100, signal),
+        fetchCoordinationNodes(signal),
+      ])
+      const nodeDetails = await Promise.all(
+        nodeResult.nodes.map(async (node) => {
+          const [routes, snapshots] = await Promise.all([
+            node.kind === 'workstream'
+              ? fetchCoordinationNodeRoutes(node.id, 100, signal)
+              : Promise.resolve({ routes: [] }),
+            node.kind === 'knowledge_store'
+              ? fetchCoordinationSnapshots(node.id, signal)
+              : Promise.resolve({ snapshots: [] }),
+          ])
+          return { node, routes: routes.routes, snapshots: snapshots.snapshots }
+        }),
+      )
+      setProjectRelationships(relationshipResult.relationships)
+      setYardOrchestratorRoutes(routeResult.routes)
+      setCoordinationNodes(nodeResult.nodes)
+      setCoordinationNodeRoutes(
+        nodeDetails.flatMap((details) => details.routes),
+      )
+      setCoordinationSnapshots(
+        Object.fromEntries(
+          nodeDetails.map((details) => [
+            details.node.id,
+            details.snapshots,
+          ]),
+        ),
+      )
+    },
+    [],
+  )
+
+  const loadProfiles = useCallback(async (signal?: AbortSignal) => {
+    const result = await fetchWorkerProfiles(signal)
+    setProfiles(result.profiles)
+  }, [])
+
+  const loadWorkers = useCallback(async (signal?: AbortSignal) => {
+    const result = await fetchWorkers(signal)
+    setWorkerCandidates(result.workers)
+    return result.workers
+  }, [])
+
+  const loadInventory = useCallback(
+    async (
+      session: string,
+      signal?: AbortSignal,
+      background = false,
+    ) => {
+      if (!session) {
+        setInventory(null)
+        return
+      }
+      if (!background) {
+        setRuntimeLoading(true)
+        setInventory((current) =>
+          current?.session === session ? current : null,
+        )
+        setSelection((current) =>
+          current?.kind === 'project' ||
+          current?.kind === 'orchestrator' ||
+          current?.kind === 'yard-orchestrator' ||
+          current?.kind === 'coordination-node' ||
+          current?.kind === 'automation' ||
+          current?.kind === 'profile' ||
+          current?.kind === 'worker' ||
+          current?.kind === 'assignment' ||
+          current?.kind === 'agent-group'
+            ? current
+            : null,
+        )
+      }
+      try {
+        const result = await fetchInventory(session, signal)
+        setInventory(result)
+        await Promise.all([
+          loadWorkers(signal),
+          loadYardOrchestrator(signal),
+        ])
+        setRuntimeError(null)
+      } catch (caught) {
+        if (caught instanceof DOMException && caught.name === 'AbortError') {
+          return
+        }
+        setRuntimeError(
+          caught instanceof Error ? caught.message : 'Inventory request failed',
+        )
+      } finally {
+        if (!background && !signal?.aborted) setRuntimeLoading(false)
+      }
+    },
+    [loadWorkers, loadYardOrchestrator],
+  )
+
+  useEffect(() => {
+    const controller = new AbortController()
+    setRuntimeLoading(true)
+    loadSessions(controller.signal)
+      .then((availableSessions) => {
+        if (!availableSessions.some((session) => session.running)) {
+          setRuntimeLoading(false)
+        }
+      })
+      .catch((caught: unknown) => {
+        if (caught instanceof DOMException && caught.name === 'AbortError') {
+          return
+        }
+        setRuntimeError(
+          caught instanceof Error ? caught.message : 'Session discovery failed',
+        )
+        setRuntimeLoading(false)
+      })
+    return () => controller.abort()
+  }, [loadSessions])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void loadSessions(controller.signal).catch(() => undefined)
+      }
+    }, 5_000)
+    return () => {
+      window.clearInterval(interval)
+      controller.abort()
+    }
+  }, [loadSessions])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    setProjectLoading(true)
+    Promise.all([
+      loadProjects(controller.signal),
+      loadYardOrchestrator(controller.signal),
+      loadCoordination(controller.signal),
+      loadAutomations(controller.signal),
+      loadProfiles(controller.signal),
+      loadWorkers(controller.signal),
+    ])
+      .catch((caught: unknown) => {
+        if (caught instanceof DOMException && caught.name === 'AbortError') {
+          return
+        }
+        setActionError(
+          caught instanceof Error ? caught.message : 'Project loading failed',
+        )
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setProjectLoading(false)
+      })
+    return () => controller.abort()
+  }, [
+    loadCoordination,
+    loadAutomations,
+    loadProfiles,
+    loadProjects,
+    loadWorkers,
+    loadYardOrchestrator,
+  ])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    let inFlight = false
+
+    const refreshInventory = async (background: boolean) => {
+      if (inFlight) return
+      inFlight = true
+      try {
+        await loadInventory(selectedSession, controller.signal, background)
+      } finally {
+        inFlight = false
+      }
+    }
+
+    void refreshInventory(false)
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshInventory(true)
+      }
+    }
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void refreshInventory(true)
+      }
+    }, INVENTORY_REFRESH_INTERVAL_MS)
+    document.addEventListener('visibilitychange', refreshWhenVisible)
+    return () => {
+      window.clearInterval(interval)
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
+      controller.abort()
+    }
+  }, [loadInventory, selectedSession])
+
+  const projectStatusTargets = useMemo(
+    () =>
+      projects.flatMap((project) =>
+        project.orchestrator.runtime
+          ? [
+              {
+                projectId: project.id,
+                workerId: project.orchestrator.id,
+              },
+            ]
+          : [],
+      ),
+    [projects],
+  )
+
+  useEffect(() => {
+    const controller = new AbortController()
+    let inFlight = false
+
+    const refreshProjectStatuses = async () => {
+      if (inFlight) return
+      inFlight = true
+      const results = await Promise.allSettled(
+        projectStatusTargets.map(async (target) => ({
+          output: await fetchOrchestratorStatusOutput(
+            target.projectId,
+            controller.signal,
+          ),
+          target,
+        })),
+      )
+      if (!controller.signal.aborted) {
+        setProjectStatusReports((current) => {
+          const activeProjectIds = new Set(
+            projectStatusTargets.map((target) => target.projectId),
+          )
+          const next = Object.fromEntries(
+            Object.entries(current).filter(([projectId]) =>
+              activeProjectIds.has(projectId),
+            ),
+          )
+          results.forEach((result, index) => {
+            const target = projectStatusTargets[index]
+            if (!target) return
+            if (result.status === 'rejected') {
+              delete next[target.projectId]
+              return
+            }
+            const { output } = result.value
+            const report = parseStatusReport(output.status_report)
+            // Reject stale terminal JSON after a newer route. Otherwise an
+            // old report could stop the map's active communication signal.
+            if (
+              report &&
+              output.project_id === target.projectId &&
+              output.worker_id === target.workerId &&
+              statusReportMatchesLatestRoute(
+                report,
+                target.projectId,
+                yardOrchestratorRoutes,
+              )
+            ) {
+              next[target.projectId] = report
+            } else {
+              delete next[target.projectId]
+            }
+          })
+          return next
+        })
+      }
+      inFlight = false
+    }
+
+    void refreshProjectStatuses()
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshProjectStatuses()
+      }
+    }
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void refreshProjectStatuses()
+      }
+    }, PROJECT_STATUS_REFRESH_INTERVAL_MS)
+    document.addEventListener('visibilitychange', refreshWhenVisible)
+    return () => {
+      window.clearInterval(interval)
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
+      controller.abort()
+    }
+  }, [projectStatusTargets, yardOrchestratorRoutes])
+
+  const visibleCandidates = useMemo(
+    () => workerCandidates.filter((candidate) => matchesFilter(candidate, filter)),
+    [filter, workerCandidates],
+  )
+  const visibleWorkers = inventory?.workers ?? []
+  const allocationPayloadByRuntimeId = useMemo(
+    () =>
+      Object.fromEntries(
+        workerCandidates.flatMap((candidate) => {
+          const runtimeId = candidate.worker.runtime?.terminal_id
+          return runtimeId && canAllocateCandidate(candidate)
+            ? [[runtimeId, { kind: 'worker' as const, id: candidate.worker.id }]]
+            : []
+        }),
+      ),
+    [workerCandidates],
+  )
+  const boundWorkspaceIds = useMemo(
+    () =>
+      new Set(
+        projects
+          .filter(
+            (project) =>
+              project.runtime.adapter === 'herdr' &&
+              project.runtime.session === selectedSession,
+          )
+          .map((project) => project.runtime.workspace_id),
+      ),
+    [projects, selectedSession],
+  )
+  const availableWorkspaces = useMemo(
+    () =>
+      inventory?.workspaces.filter(
+        (workspace) => !boundWorkspaceIds.has(workspace.runtime_id),
+      ) ?? [],
+    [boundWorkspaceIds, inventory],
+  )
+
+  const selectedObservedWorker =
+    selection?.kind === 'observed-worker'
+      ? inventory?.workers.find(
+          (worker) => worker.runtime_id === selection.id,
+        )
+      : undefined
+  const selectedProviderChild =
+    selection?.kind === 'provider-child'
+      ? inventory?.child_agents?.find(
+          (agent) => agent.runtime_id === selection.id,
+        )
+      : undefined
+  const selectedWorkerCandidate =
+    selection?.kind === 'worker'
+      ? workerCandidates.find(
+          (candidate) => candidate.worker.id === selection.id,
+        )
+      : selectedObservedWorker
+        ? workerCandidates.find(
+            (candidate) =>
+              candidate.worker.runtime?.terminal_id ===
+              selectedObservedWorker.terminal_id,
+          )
+        : undefined
+  const selectedCandidateObservation = findObservedWorker(
+    inventory,
+    selectedWorkerCandidate?.worker.runtime ?? null,
+  )
+  const selectedWorkspace =
+    selection?.kind === 'workspace'
+      ? inventory?.workspaces.find(
+          (workspace) => workspace.runtime_id === selection.id,
+        )
+      : undefined
+  const selectedProject =
+    selection?.kind === 'project'
+      ? projects.find((project) => project.id === selection.id)
+      : undefined
+  const selectedProjectOrchestrator =
+    selection?.kind === 'orchestrator'
+      ? projects.find((project) => project.id === selection.projectId)
+      : undefined
+  const selectedYardOrchestrator =
+    selection?.kind === 'yard-orchestrator'
+      ? yardOrchestrator ?? undefined
+      : undefined
+  const selectedCoordinationNode =
+    selection?.kind === 'coordination-node'
+      ? coordinationNodes.find((node) => node.id === selection.id)
+      : undefined
+  const selectedAutomation =
+    selection?.kind === 'automation'
+      ? automations.find((automation) => automation.id === selection.id)
+      : undefined
+  const selectedProfile =
+    selection?.kind === 'profile'
+      ? profiles.find((profile) => profile.id === selection.id)
+      : undefined
+  const selectedAssignment =
+    selection?.kind === 'assignment'
+      ? assignments.find((assignment) => assignment.id === selection.id)
+      : undefined
+  const selectedAssignmentCandidate = selectedAssignment
+    ? workerCandidates.find(
+        (candidate) =>
+          candidate.worker.id === selectedAssignment.worker.id,
+      )
+    : undefined
+  const selectedAgentGroup = useMemo<AgentGroupTarget[]>(() => {
+    if (selection?.kind !== 'agent-group') return []
+    return selection.targets.flatMap((target): AgentGroupTarget[] => {
+      if (target.kind === 'assignment') {
+        const assignment = assignments.find(
+          (candidate) =>
+            candidate.id === target.id &&
+            candidate.lifecycle === 'active',
+        )
+        if (!assignment) return []
+        const project = projects.find(
+          (candidate) => candidate.id === assignment.project_id,
+        )
+        const observed = findObservedWorker(
+          inventory,
+          assignment.worker.runtime,
+        )
+        return [
+          {
+            assignment,
+            kind: 'assignment',
+            label: assignment.profile_name,
+            projectName: project?.name ?? 'Yard project',
+            status:
+              observed?.status ??
+              assignment.worker.runtime?.status ??
+              'unknown',
+          },
+        ]
+      }
+      const project = projects.find(
+        (candidate) => candidate.id === target.projectId,
+      )
+      if (!project) return []
+      const observed = findObservedWorker(
+        inventory,
+        project.orchestrator.runtime,
+      )
+      return [
+        {
+          kind: 'orchestrator',
+          label: `${project.name} orchestrator`,
+          project,
+          status:
+            observed?.status ??
+            project.orchestrator.runtime?.status ??
+            'unknown',
+        },
+      ]
+    })
+  }, [assignments, inventory, projects, selection])
+  const selectedCandidateCompletion = selectedWorkerCandidate
+    ? assignments
+        .filter(
+          (assignment) =>
+            assignment.worker.id === selectedWorkerCandidate.worker.id &&
+            assignment.lifecycle === 'completed',
+        )
+        .sort(
+          (left, right) =>
+            right.updated_at_unix_ms - left.updated_at_unix_ms,
+        )[0]
+    : undefined
+  const selectedCandidateActiveAssignment = selectedWorkerCandidate
+    ? assignments
+        .filter(
+          (assignment) =>
+            assignment.worker.id === selectedWorkerCandidate.worker.id &&
+            assignment.lifecycle === 'active',
+        )
+        .sort(
+          (left, right) =>
+            right.updated_at_unix_ms - left.updated_at_unix_ms,
+        )[0]
+    : undefined
+
+  useEffect(() => {
+    if (selection?.kind !== 'yard-orchestrator') return
+    const controller = new AbortController()
+    let inFlight = false
+    const refreshPortfolio = async () => {
+      if (inFlight) return
+      inFlight = true
+      try {
+        await Promise.all([
+          loadProjects(controller.signal),
+          loadCoordination(controller.signal),
+        ])
+      } catch (caught) {
+        if (!(caught instanceof DOMException && caught.name === 'AbortError')) {
+          setActionError(
+            caught instanceof Error
+              ? caught.message
+              : 'Portfolio update failed',
+          )
+        }
+      } finally {
+        inFlight = false
+      }
+    }
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void refreshPortfolio()
+    }, 10_000)
+    return () => {
+      window.clearInterval(interval)
+      controller.abort()
+    }
+  }, [loadCoordination, loadProjects, selection?.kind])
+
+  useEffect(() => {
+    if (selection?.kind !== 'coordination-node') return
+    const controller = new AbortController()
+    let inFlight = false
+    const refreshNode = async () => {
+      if (inFlight) return
+      inFlight = true
+      try {
+        await loadCoordination(controller.signal)
+      } catch (caught) {
+        if (!(caught instanceof DOMException && caught.name === 'AbortError')) {
+          setActionError(
+            caught instanceof Error
+              ? caught.message
+              : 'Coordination node refresh failed',
+          )
+        }
+      } finally {
+        inFlight = false
+      }
+    }
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void refreshNode()
+    }, 5_000)
+    return () => {
+      window.clearInterval(interval)
+      controller.abort()
+    }
+  }, [loadCoordination, selection?.kind])
+
+  useEffect(() => {
+    if (selection?.kind !== 'automation') return
+    const controller = new AbortController()
+    let inFlight = false
+    const refreshAutomation = async () => {
+      if (inFlight) return
+      inFlight = true
+      setAutomationHistoryLoading(true)
+      try {
+        const [automation, runs] = await Promise.all([
+          fetchAutomation(selection.id, controller.signal),
+          loadAutomationRuns(selection.id, controller.signal),
+        ])
+        setAutomations((current) =>
+          current.map((candidate) =>
+            candidate.id === automation.id ? automation : candidate,
+          ),
+        )
+        setAutomationRuns((current) => ({
+          ...current,
+          [selection.id]: runs,
+        }))
+        setAutomationError(null)
+      } catch (caught) {
+        if (!(caught instanceof DOMException && caught.name === 'AbortError')) {
+          setAutomationError(
+            caught instanceof Error
+              ? caught.message
+              : 'Automation refresh failed',
+          )
+        }
+      } finally {
+        if (!controller.signal.aborted) setAutomationHistoryLoading(false)
+        inFlight = false
+      }
+    }
+    void refreshAutomation()
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void refreshAutomation()
+    }, 5_000)
+    return () => {
+      window.clearInterval(interval)
+      controller.abort()
+    }
+  }, [loadAutomationRuns, selection])
+  const selectedWorkspaceWorkers = selectedWorkspace
+    ? (inventory?.workers.filter(
+        (worker) => worker.workspace_id === selectedWorkspace.runtime_id,
+      ) ?? [])
+    : []
+  const attentionCount =
+    inventory?.workers.filter(
+      (worker) =>
+        worker.status === 'blocked' ||
+        worker.status === 'done' ||
+        worker.status === 'unknown',
+    ).length ?? 0
+  const agentWorkspaceTargets = useMemo<AgentWorkspaceTarget[]>(() => {
+    const targets: AgentWorkspaceTarget[] = []
+    const yardWorker = yardOrchestrator?.worker
+    const yardRuntime = yardWorker?.runtime
+    if (yardOrchestrator && yardWorker && yardRuntime) {
+      targets.push({
+        key: 'yard-orchestrator',
+        label: 'Superintendent',
+        projectName: 'Yard portfolio',
+        session: yardRuntime.session,
+        status:
+          findObservedWorker(inventory, yardRuntime)?.status ??
+          yardRuntime.status,
+        target: { kind: 'yard-orchestrator', orchestrator: yardOrchestrator },
+        terminalId: yardRuntime.terminal_id,
+        terminalTarget: {
+          kind: 'yard-orchestrator',
+          workerId: yardWorker.id,
+        },
+        workspaceId: yardRuntime.workspace_id,
+      })
+    }
+
+    coordinationNodes.forEach((node) => {
+      const worker = node.worker
+      const runtime = worker?.runtime
+      if (!worker || !runtime || node.kind !== 'workstream') return
+      targets.push({
+        key: `coordination-node:${node.id}`,
+        label: node.name,
+        projectName: 'Workstream',
+        session: runtime.session,
+        status:
+          findObservedWorker(inventory, runtime)?.status ?? runtime.status,
+        target: { kind: 'coordination-node', node },
+        terminalId: runtime.terminal_id,
+        terminalTarget: {
+          kind: 'coordination-node',
+          nodeId: node.id,
+          workerId: worker.id,
+        },
+        workspaceId: runtime.workspace_id,
+      })
+    })
+
+    projects.forEach((project) => {
+      const runtime = project.orchestrator.runtime
+      if (!runtime) return
+      targets.push({
+        key: `orchestrator:${project.id}`,
+        label: `${project.name} orchestrator`,
+        projectName: project.name,
+        session: runtime.session,
+        status:
+          findObservedWorker(inventory, runtime)?.status ?? runtime.status,
+        target: { kind: 'orchestrator', project },
+        terminalId: runtime.terminal_id,
+        terminalTarget: {
+          kind: 'orchestrator',
+          projectId: project.id,
+          workerId: project.orchestrator.id,
+        },
+        workspaceId: runtime.workspace_id,
+      })
+    })
+
+    assignments.forEach((assignment) => {
+      const runtime = assignment.worker.runtime
+      if (!runtime || assignment.lifecycle !== 'active') return
+      const project = projects.find(
+        (candidate) => candidate.id === assignment.project_id,
+      )
+      targets.push({
+        key: `assignment:${assignment.id}`,
+        label: assignment.profile_name,
+        projectName: project?.name ?? 'Yard project',
+        session: runtime.session,
+        status:
+          findObservedWorker(inventory, runtime)?.status ?? runtime.status,
+        target: { kind: 'assignment', assignment },
+        terminalId: runtime.terminal_id,
+        terminalTarget: {
+          kind: 'assignment',
+          assignmentId: assignment.id,
+          projectId: assignment.project_id,
+        },
+        workspaceId: runtime.workspace_id,
+      })
+    })
+    return targets
+  }, [
+    assignments,
+    coordinationNodes,
+    inventory,
+    projects,
+    yardOrchestrator,
+  ])
+  const currentAgentWorkspaceTarget = agentWorkspaceTarget
+    ? agentWorkspaceTargets.find(
+        (target) => target.key === agentWorkspaceTarget.key,
+      )
+    : null
+  const activeAgentWorkspaceTarget = currentAgentWorkspaceTarget
+    ? {
+        ...currentAgentWorkspaceTarget,
+        returnFocus: agentWorkspaceTarget?.returnFocus,
+      }
+    : agentWorkspaceTarget ?? agentWorkspaceTargets[0] ?? null
+  const openAgentChat = useCallback((target: AgentWorkspaceTarget) => {
+    setAgentWorkspaceTarget(target)
+    setAgentWorkspaceMode('chat')
+  }, [])
+  const openAgentTerminal = useCallback(
+    (target: AgentWorkspaceTarget) => {
+      setAgentWorkspaceTarget(target)
+      setAgentWorkspaceMode('terminal')
+    },
+    [],
+  )
+  const agentWorkspaceContext = useMemo(
+    () => ({
+      openChat: openAgentChat,
+      openTerminal: openAgentTerminal,
+    }),
+    [openAgentChat, openAgentTerminal],
+  )
+
+  const refresh = useCallback(async () => {
+    setActionError(null)
+    try {
+      const [refreshedSessions] = await Promise.all([
+        loadSessions(),
+        loadProjects(),
+        loadCoordination(),
+        loadAutomations(),
+        loadProfiles(),
+        loadWorkers(),
+        loadYardOrchestrator(),
+      ])
+      const refreshedSession =
+        refreshedSessions.find(
+          (session) => session.name === selectedSession && session.running,
+        )?.name ??
+        refreshedSessions.find(
+          (session) => session.is_default && session.running,
+        )?.name ??
+        refreshedSessions.find((session) => session.running)?.name ??
+        ''
+      await loadInventory(refreshedSession)
+    } catch (caught) {
+      setActionError(
+        caught instanceof Error ? caught.message : 'Refresh failed',
+      )
+      setRuntimeLoading(false)
+      setProjectLoading(false)
+    }
+  }, [
+    loadInventory,
+    loadAutomations,
+    loadCoordination,
+    loadProfiles,
+    loadProjects,
+    loadSessions,
+    loadWorkers,
+    loadYardOrchestrator,
+    selectedSession,
+  ])
+
+  const proposeEndSession = useCallback((candidate: WorkerCandidate) => {
+    if (!canEndCandidate(candidate)) return
+    setEndSessionError(null)
+    setActionNotice(null)
+    setEndSessionProposal({
+      candidate,
+      commandId: crypto.randomUUID(),
+    })
+  }, [])
+
+  const endSession = useCallback(async () => {
+    if (!endSessionProposal) return
+    const { candidate, commandId } = endSessionProposal
+    setEndSessionBusy(true)
+    setEndSessionError(null)
+    setActionError(null)
+    try {
+      const result = await endWorkerSession(candidate.worker.id, {
+        command_id: commandId,
+        actor: 'local-user',
+        expected_worker_version: candidate.worker.version,
+        ...(candidate.worker.runtime
+          ? {
+              expected_runtime_version:
+                candidate.worker.runtime.version,
+            }
+          : {}),
+      })
+      setActionNotice(
+        result.cleanup_pending
+          ? 'Session ended. Verified runtime cleanup is queued.'
+          : null,
+      )
+      await Promise.all([
+        loadProjects(),
+        loadWorkers(),
+        loadInventory(selectedSession),
+      ])
+      setEndSessionProposal(null)
+    } catch (caught) {
+      const message =
+        caught instanceof Error ? caught.message : 'End session failed'
+      const workers = await loadWorkers().catch(() => null)
+      const reconciled = workers?.find(
+        ({ worker }) => worker.id === candidate.worker.id,
+      )
+      if (reconciled?.worker.desired_state === 'ended') {
+        setActionNotice(
+          'Session ended. Runtime cleanup will continue in the background if needed.',
+        )
+        setEndSessionProposal(null)
+      } else {
+        setEndSessionError(message)
+      }
+    } finally {
+      setEndSessionBusy(false)
+    }
+  }, [
+    endSessionProposal,
+    loadInventory,
+    loadProjects,
+    loadWorkers,
+    selectedSession,
+  ])
+
+  const createWorkspaceProject = useCallback(
+    async (
+      workspace: WorkspaceObservation,
+      details: ProjectCreationDetails,
+    ) => {
+      const workerCount =
+        inventory?.workers.filter(
+          (worker) => worker.workspace_id === workspace.runtime_id,
+        ).length ?? 0
+      setAdoptingWorkspace(workspace.runtime_id)
+      setActionError(null)
+      try {
+        const runtime = {
+          adapter: 'herdr',
+          session: selectedSession,
+          workspace_id: workspace.runtime_id,
+        }
+        const placement = nextProjectPlacement(
+          projects,
+          workerCount + (details.mode === 'profile' ? 1 : 0),
+        )
+        const project =
+          details.mode === 'existing'
+            ? await createProject({
+                name: details.name,
+                runtime,
+                orchestrator_observed_worker_id: details.orchestratorId,
+                placement,
+              })
+            : (
+                await createProjectFromProfile({
+                  command_id: details.commandId,
+                  actor: 'local-user',
+                  name: details.name,
+                  runtime,
+                  profile_id: details.profileId,
+                  expected_profile_version:
+                    profiles.find(
+                      (profile) => profile.id === details.profileId,
+                    )?.version ?? '',
+                  orchestrator_objective: details.objective,
+                  placement,
+                })
+              ).project
+        setProjects((current) => [
+          ...current.filter((candidate) => candidate.id !== project.id),
+          project,
+        ])
+        setSelection({ kind: 'project', id: project.id })
+        await Promise.all([
+          loadInventory(selectedSession),
+          loadWorkers(),
+        ])
+      } catch (caught) {
+        setActionError(
+          caught instanceof Error ? caught.message : 'Project creation failed',
+        )
+        await loadProjects().catch(() => undefined)
+      } finally {
+        setAdoptingWorkspace(null)
+      }
+    },
+    [
+      inventory,
+      loadInventory,
+      loadProjects,
+      loadWorkers,
+      profiles,
+      projects,
+      selectedSession,
+    ],
+  )
+
+  const provisionCentralOrchestrator = useCallback(
+    async (profile: WorkerProfile) => {
+      if (!yardOrchestrator) return
+      setYardOrchestratorBusy(true)
+      setActionError(null)
+      try {
+        const result = await provisionYardOrchestrator({
+          command_id: crypto.randomUUID(),
+          actor: 'local-user',
+          profile_id: profile.id,
+          expected_profile_version: profile.version,
+          expected_orchestrator_version: yardOrchestrator.version,
+        })
+        setYardOrchestrator(result.orchestrator)
+        setSelection({ kind: 'yard-orchestrator' })
+        await Promise.all([
+          loadSessions(),
+          loadWorkers(),
+          loadYardOrchestrator(),
+        ])
+      } catch (caught) {
+        setActionError(
+          caught instanceof Error
+            ? caught.message
+            : 'Superintendent provisioning failed',
+        )
+        await Promise.all([
+          loadWorkers(),
+          loadYardOrchestrator(),
+        ]).catch(() => undefined)
+      } finally {
+        setYardOrchestratorBusy(false)
+      }
+    },
+    [loadSessions, loadWorkers, loadYardOrchestrator, yardOrchestrator],
+  )
+
+  const recoverCentralOrchestrator = useCallback(async () => {
+    if (!yardOrchestrator?.worker) return
+    setYardOrchestratorBusy(true)
+    setActionError(null)
+    try {
+      const result = await recoverYardOrchestrator({
+        command_id: crypto.randomUUID(),
+        actor: 'local-user',
+        expected_orchestrator_version: yardOrchestrator.version,
+      })
+      setYardOrchestrator(result.orchestrator)
+      await Promise.all([
+        loadSessions(),
+        loadWorkers(),
+        loadYardOrchestrator(),
+      ])
+      setActionNotice('Superintendent session restarted.')
+    } catch (caught) {
+      setActionError(
+        caught instanceof Error
+          ? caught.message
+          : 'Superintendent recovery failed',
+      )
+      await Promise.all([
+        loadSessions(),
+        loadWorkers(),
+        loadYardOrchestrator(),
+      ]).catch(() => undefined)
+    } finally {
+      setYardOrchestratorBusy(false)
+    }
+  }, [
+    loadSessions,
+    loadWorkers,
+    loadYardOrchestrator,
+    yardOrchestrator,
+  ])
+
+  const createNewWorkspaceProject = useCallback(
+    async (details: WorkspaceProjectCreationDetails) => {
+      setWorkspaceProjectBusy(true)
+      setActionError(null)
+      try {
+        const profile = profiles.find(
+          (candidate) => candidate.id === details.profileId,
+        )
+        if (!profile) {
+          throw new Error('The selected orchestrator profile is unavailable')
+        }
+        const result = await createProjectWithWorkspace({
+          command_id: details.commandId,
+          actor: 'local-user',
+          name: details.name,
+          runtime_adapter: 'herdr',
+          runtime_session: selectedSession,
+          workspace_label: details.name,
+          cwd: details.cwd,
+          profile_id: profile.id,
+          expected_profile_version: profile.version,
+          orchestrator_objective: details.objective,
+          placement: nextProjectPlacement(projects, 1),
+        })
+        setProjects((current) => [
+          ...current.filter(
+            (candidate) => candidate.id !== result.project.id,
+          ),
+          result.project,
+        ])
+        setSelection({ kind: 'project', id: result.project.id })
+        setWorkspaceProjectOpen(false)
+        await Promise.all([
+          loadInventory(selectedSession),
+          loadWorkers(),
+        ])
+      } catch (caught) {
+        setActionError(
+          caught instanceof Error ? caught.message : 'Project creation failed',
+        )
+        await loadProjects().catch(() => undefined)
+      } finally {
+        setWorkspaceProjectBusy(false)
+      }
+    },
+    [
+      loadInventory,
+      loadProjects,
+      loadWorkers,
+      profiles,
+      projects,
+      selectedSession,
+    ],
+  )
+
+  const flushPlacement = useCallback(
+    async (projectId: string) => {
+      if (placementUpdates.current.has(projectId)) return
+      const currentProject = projectsRef.current.find(
+        (candidate) => candidate.id === projectId,
+      )
+      if (!currentProject) return
+
+      placementUpdates.current.add(projectId)
+      let expectedVersion = currentProject.placement.version
+      try {
+        while (pendingPlacements.current.has(projectId)) {
+          const placement = pendingPlacements.current.get(projectId)
+          pendingPlacements.current.delete(projectId)
+          if (!placement) break
+
+          const updated = await updateProjectPlacement(projectId, {
+            placement,
+            expected_version: expectedVersion,
+          })
+          expectedVersion = updated.placement.version
+          setProjects((current) => {
+            const next = current.map((candidate) => {
+              if (candidate.id !== updated.id) return candidate
+              const queued = pendingPlacements.current.has(projectId)
+              return queued
+                ? {
+                    ...updated,
+                    placement: {
+                      ...updated.placement,
+                      geometry: candidate.placement.geometry,
+                    },
+                  }
+                : updated
+            })
+            projectsRef.current = next
+            return next
+          })
+        }
+      } catch (caught) {
+        pendingPlacements.current.delete(projectId)
+        setActionError(
+          caught instanceof Error ? caught.message : 'Placement update failed',
+        )
+        await loadProjects().catch(() => undefined)
+      } finally {
+        placementUpdates.current.delete(projectId)
+      }
+    },
+    [loadProjects],
+  )
+
+  const persistPlacement = useCallback(
+    (project: Project, placement: CanvasPlacement) => {
+      pendingPlacements.current.set(project.id, placement)
+      setActionError(null)
+      setProjects((current) => {
+        const next = current.map((candidate) =>
+          candidate.id === project.id
+            ? {
+                ...candidate,
+                placement: {
+                  ...candidate.placement,
+                  geometry: placement,
+                },
+              }
+            : candidate,
+        )
+        projectsRef.current = next
+        return next
+      })
+      void flushPlacement(project.id)
+    },
+    [flushPlacement],
+  )
+
+  const connectProjects = useCallback(
+    async (sourceProjectId: string, targetProjectId: string) => {
+      if (
+        sourceProjectId === targetProjectId ||
+        projectRelationships.some(
+          (relationship) =>
+            relationship.source_project_id === sourceProjectId &&
+            relationship.target_project_id === targetProjectId &&
+            relationship.kind === 'depends_on',
+        )
+      ) {
+        return
+      }
+      setActionError(null)
+      try {
+        const result = await createProjectRelationship({
+          command_id: crypto.randomUUID(),
+          actor: 'local-user',
+          relationship_id: crypto.randomUUID(),
+          source_project_id: sourceProjectId,
+          target_project_id: targetProjectId,
+          kind: 'depends_on',
+        })
+        setProjectRelationships((current) => [
+          ...current,
+          result.relationship,
+        ])
+      } catch (caught) {
+        setActionError(
+          caught instanceof Error
+            ? caught.message
+            : 'Project connection failed',
+        )
+        await loadCoordination().catch(() => undefined)
+      }
+    },
+    [loadCoordination, projectRelationships],
+  )
+
+  const disconnectProjects = useCallback(
+    async (relationship: ProjectRelationship) => {
+      setActionError(null)
+      try {
+        await deleteProjectRelationship(relationship.id, {
+          command_id: crypto.randomUUID(),
+          actor: 'local-user',
+          expected_version: relationship.version,
+        })
+        setProjectRelationships((current) =>
+          current.filter(
+            (candidate) => candidate.id !== relationship.id,
+          ),
+        )
+      } catch (caught) {
+        setActionError(
+          caught instanceof Error
+            ? caught.message
+            : 'Project connection removal failed',
+        )
+        await loadCoordination().catch(() => undefined)
+      }
+    },
+    [loadCoordination],
+  )
+
+  const recordYardRoute = useCallback((route: YardOrchestratorRoute) => {
+    setYardOrchestratorRoutes((current) => [
+      route,
+      ...current.filter(
+        (candidate) => candidate.command_id !== route.command_id,
+      ),
+    ])
+  }, [])
+
+  const replaceCoordinationNode = useCallback((node: CoordinationNode) => {
+    setCoordinationNodes((current) => {
+      const exists = current.some((candidate) => candidate.id === node.id)
+      const next = exists
+        ? current.map((candidate) =>
+            candidate.id === node.id ? node : candidate,
+          )
+        : [...current, node]
+      coordinationNodesRef.current = next
+      return next
+    })
+  }, [])
+
+  const createMapNode = useCallback(
+    async (details: CoordinationNodeCreationDetails) => {
+      setCoordinationNodeBusy(true)
+      setCoordinationNodeError(null)
+      setActionError(null)
+      try {
+        const created = await createCoordinationNode({
+          command_id: crypto.randomUUID(),
+          actor: 'local-user',
+          name: details.name,
+          kind: details.kind,
+          placement: details.placement,
+          attached_project_ids: details.attachedProjectIds,
+        })
+        let node = created.node
+        replaceCoordinationNode(node)
+        setCoordinationSnapshots((current) => ({
+          ...current,
+          [node.id]: [],
+        }))
+        setSelection({ kind: 'coordination-node', id: node.id })
+        setCoordinationNodePlacement(null)
+        if (details.kind === 'workstream' && details.profileId) {
+          const profile = profiles.find(
+            (candidate) => candidate.id === details.profileId,
+          )
+          if (!profile) {
+            setActionError(
+              'The node was created, but the selected orchestrator profile is unavailable.',
+            )
+            return
+          }
+          try {
+            const provisioned = await provisionCoordinationNode(node.id, {
+              command_id: crypto.randomUUID(),
+              actor: 'local-user',
+              profile_id: profile.id,
+              expected_profile_version: profile.version,
+              expected_node_version: node.version,
+            })
+            node = provisioned.node
+            replaceCoordinationNode(node)
+          } catch (caught) {
+            setActionError(
+              caught instanceof Error
+                ? `The node was created, but its worker could not be provisioned: ${caught.message}`
+                : 'The node was created, but its worker could not be provisioned.',
+            )
+            await loadCoordination().catch(() => undefined)
+            return
+          }
+        }
+        if (node.worker) {
+          await Promise.all([loadSessions(), loadWorkers()])
+        }
+      } catch (caught) {
+        const message =
+          caught instanceof Error
+            ? caught.message
+            : 'Coordination node creation failed'
+        setCoordinationNodeError(message)
+        await loadCoordination().catch(() => undefined)
+      } finally {
+        setCoordinationNodeBusy(false)
+      }
+    },
+    [
+      loadCoordination,
+      loadSessions,
+      loadWorkers,
+      profiles,
+      replaceCoordinationNode,
+    ],
+  )
+
+  const saveCoordinationNode = useCallback(
+    async (
+      node: CoordinationNode,
+      name: string,
+      attachedProjectIds: string[],
+    ) => {
+      setCoordinationNodeBusy(true)
+      setActionError(null)
+      try {
+        const result = await updateCoordinationNode(node.id, {
+          command_id: crypto.randomUUID(),
+          actor: 'local-user',
+          expected_version: node.version,
+          name,
+          attached_project_ids: attachedProjectIds,
+        })
+        replaceCoordinationNode(result.node)
+      } catch (caught) {
+        setActionError(
+          caught instanceof Error
+            ? caught.message
+            : 'Coordination node update failed',
+        )
+        await loadCoordination().catch(() => undefined)
+      } finally {
+        setCoordinationNodeBusy(false)
+      }
+    },
+    [loadCoordination, replaceCoordinationNode],
+  )
+
+  const connectCoordinationNode = useCallback(
+    async (nodeId: string, projectId: string) => {
+      const node = coordinationNodesRef.current.find(
+        (candidate) => candidate.id === nodeId,
+      )
+      if (!node || node.attached_project_ids.includes(projectId)) return
+      await saveCoordinationNode(node, node.name, [
+        ...node.attached_project_ids,
+        projectId,
+      ])
+    },
+    [saveCoordinationNode],
+  )
+
+  const provisionMapNode = useCallback(
+    async (node: CoordinationNode, profile: WorkerProfile) => {
+      setCoordinationNodeBusy(true)
+      setActionError(null)
+      try {
+        const result = await provisionCoordinationNode(node.id, {
+          command_id: crypto.randomUUID(),
+          actor: 'local-user',
+          profile_id: profile.id,
+          expected_profile_version: profile.version,
+          expected_node_version: node.version,
+        })
+        replaceCoordinationNode(result.node)
+        await Promise.all([loadSessions(), loadWorkers()])
+      } catch (caught) {
+        setActionError(
+          caught instanceof Error
+            ? caught.message
+            : 'Workstream provisioning failed',
+        )
+        await loadCoordination().catch(() => undefined)
+      } finally {
+        setCoordinationNodeBusy(false)
+      }
+    },
+    [
+      loadCoordination,
+      loadSessions,
+      loadWorkers,
+      replaceCoordinationNode,
+    ],
+  )
+
+  const collectKnowledgeSnapshot = useCallback(
+    async (node: CoordinationNode) => {
+      setCoordinationNodeBusy(true)
+      setActionError(null)
+      try {
+        const snapshot = await requestCoordinationSnapshot(node.id, {
+          command_id: crypto.randomUUID(),
+          actor: 'local-user',
+          expected_node_version: node.version,
+        })
+        setCoordinationSnapshots((current) => ({
+          ...current,
+          [node.id]: [
+            snapshot,
+            ...(current[node.id] ?? []).filter(
+              (candidate) => candidate.id !== snapshot.id,
+            ),
+          ],
+        }))
+        setActionNotice(
+          `Knowledge collection requested from ${snapshot.progress.total} project${
+            snapshot.progress.total === 1 ? '' : 's'
+          }.`,
+        )
+      } catch (caught) {
+        setActionError(
+          caught instanceof Error
+            ? caught.message
+            : 'Knowledge snapshot request failed',
+        )
+        await loadCoordination().catch(() => undefined)
+      } finally {
+        setCoordinationNodeBusy(false)
+      }
+    },
+    [loadCoordination],
+  )
+
+  const recordCoordinationNodeRoute = useCallback(
+    (route: CoordinationNodeRoute) => {
+      setCoordinationNodeRoutes((current) => [
+        route,
+        ...current.filter(
+          (candidate) => candidate.command_id !== route.command_id,
+        ),
+      ])
+    },
+    [],
+  )
+
+  const flushCoordinationPlacement = useCallback(
+    async (nodeId: string) => {
+      if (coordinationPlacementUpdates.current.has(nodeId)) return
+      const currentNode = coordinationNodesRef.current.find(
+        (candidate) => candidate.id === nodeId,
+      )
+      if (!currentNode) return
+
+      coordinationPlacementUpdates.current.add(nodeId)
+      let expectedVersion = currentNode.placement.version
+      try {
+        while (pendingCoordinationPlacements.current.has(nodeId)) {
+          const placement =
+            pendingCoordinationPlacements.current.get(nodeId)
+          pendingCoordinationPlacements.current.delete(nodeId)
+          if (!placement) break
+          const result = await updateCoordinationNodePlacement(nodeId, {
+            command_id: crypto.randomUUID(),
+            actor: 'local-user',
+            expected_version: expectedVersion,
+            placement,
+          })
+          expectedVersion = result.node.placement.version
+          replaceCoordinationNode(result.node)
+        }
+      } catch (caught) {
+        pendingCoordinationPlacements.current.delete(nodeId)
+        setActionError(
+          caught instanceof Error
+            ? caught.message
+            : 'Coordination node placement failed',
+        )
+        await loadCoordination().catch(() => undefined)
+      } finally {
+        coordinationPlacementUpdates.current.delete(nodeId)
+      }
+    },
+    [loadCoordination, replaceCoordinationNode],
+  )
+
+  const persistCoordinationPlacement = useCallback(
+    (node: CoordinationNode, placement: CanvasPlacement) => {
+      pendingCoordinationPlacements.current.set(node.id, placement)
+      setCoordinationNodes((current) => {
+        const next = current.map((candidate) =>
+          candidate.id === node.id
+            ? {
+                ...candidate,
+                placement: {
+                  ...candidate.placement,
+                  geometry: placement,
+                },
+              }
+            : candidate,
+        )
+        coordinationNodesRef.current = next
+        return next
+      })
+      void flushCoordinationPlacement(node.id)
+    },
+    [flushCoordinationPlacement],
+  )
+
+  const replaceAutomation = useCallback((automation: Automation) => {
+    setAutomations((current) => {
+      const exists = current.some(
+        (candidate) => candidate.id === automation.id,
+      )
+      const next = exists
+        ? current.map((candidate) =>
+            candidate.id === automation.id ? automation : candidate,
+          )
+        : [...current, automation]
+      automationsRef.current = next
+      return next
+    })
+  }, [])
+
+  const reconcileAutomation = useCallback(
+    async (automationId: string) => {
+      const automation = await fetchAutomation(automationId)
+      replaceAutomation(automation)
+      return automation
+    },
+    [replaceAutomation],
+  )
+
+  const createScheduledAutomation = useCallback(
+    async (
+      details: AutomationDetails & { placement: CanvasPlacement },
+    ) => {
+      setAutomationBusy(true)
+      setAutomationError(null)
+      setActionError(null)
+      try {
+        const automation = await createAutomation({
+          command_id: crypto.randomUUID(),
+          actor: 'local-user',
+          name: details.name,
+          placement: details.placement,
+          prompt_template: details.promptTemplate,
+          schedule: details.schedule,
+          scope: details.scope,
+          selected_project_ids: details.selectedProjectIds,
+        })
+        replaceAutomation(automation)
+        setAutomationRuns((current) => ({
+          ...current,
+          [automation.id]: [],
+        }))
+        setAutomationCreation(null)
+        setSelection({ kind: 'automation', id: automation.id })
+      } catch (caught) {
+        setAutomationError(
+          caught instanceof Error
+            ? caught.message
+            : 'Automation creation failed',
+        )
+        await loadAutomations().catch(() => undefined)
+      } finally {
+        setAutomationBusy(false)
+      }
+    },
+    [loadAutomations, replaceAutomation],
+  )
+
+  const saveAutomation = useCallback(
+    async (automation: Automation, details: AutomationDetails) => {
+      setAutomationBusy(true)
+      setAutomationError(null)
+      try {
+        const updated = await updateAutomation(automation.id, {
+          command_id: crypto.randomUUID(),
+          actor: 'local-user',
+          expected_version: automation.version,
+          name: details.name,
+          prompt_template: details.promptTemplate,
+          schedule: details.schedule,
+          scope: details.scope,
+          selected_project_ids: details.selectedProjectIds,
+        })
+        replaceAutomation(updated)
+      } catch (caught) {
+        setAutomationError(
+          caught instanceof Error
+            ? caught.message
+            : 'Automation update failed',
+        )
+        await reconcileAutomation(automation.id).catch(() => undefined)
+      } finally {
+        setAutomationBusy(false)
+      }
+    },
+    [reconcileAutomation, replaceAutomation],
+  )
+
+  const toggleAutomationPaused = useCallback(
+    async (automation: Automation) => {
+      setAutomationBusy(true)
+      setAutomationError(null)
+      try {
+        const updated = await updateAutomationState(automation.id, {
+          command_id: crypto.randomUUID(),
+          actor: 'local-user',
+          expected_version: automation.version,
+          paused: automation.state === 'active',
+        })
+        replaceAutomation(updated)
+      } catch (caught) {
+        setAutomationError(
+          caught instanceof Error
+            ? caught.message
+            : 'Automation state update failed',
+        )
+        await reconcileAutomation(automation.id).catch(() => undefined)
+      } finally {
+        setAutomationBusy(false)
+      }
+    },
+    [reconcileAutomation, replaceAutomation],
+  )
+
+  const requestAutomationRun = useCallback(
+    async (automation: Automation) => {
+      setAutomationBusy(true)
+      setAutomationError(null)
+      try {
+        const run = await runAutomation(automation.id, {
+          command_id: crypto.randomUUID(),
+          actor: 'local-user',
+          expected_version: automation.version,
+        })
+        setAutomationRuns((current) => ({
+          ...current,
+          [automation.id]: [
+            run,
+            ...(current[automation.id] ?? []).filter(
+              (candidate) => candidate.id !== run.id,
+            ),
+          ],
+        }))
+        setAutomations((current) =>
+          current.map((candidate) =>
+            candidate.id === automation.id
+              ? { ...candidate, latest_run: run }
+              : candidate,
+          ),
+        )
+        setActionNotice(
+          run.status === 'submitted'
+            ? 'Automation run submitted to transport. Completion is not implied.'
+            : `Automation run is ${run.status}.`,
+        )
+        await reconcileAutomation(automation.id).catch(() => undefined)
+      } catch (caught) {
+        setAutomationError(
+          caught instanceof Error
+            ? caught.message
+            : 'Automation run request failed',
+        )
+        await Promise.all([
+          reconcileAutomation(automation.id),
+          loadAutomationRuns(automation.id),
+        ]).catch(() => undefined)
+      } finally {
+        setAutomationBusy(false)
+      }
+    },
+    [loadAutomationRuns, reconcileAutomation],
+  )
+
+  const flushAutomationPlacement = useCallback(
+    async (automationId: string) => {
+      if (automationPlacementUpdates.current.has(automationId)) return
+      const currentAutomation = automationsRef.current.find(
+        (candidate) => candidate.id === automationId,
+      )
+      if (!currentAutomation) return
+
+      automationPlacementUpdates.current.add(automationId)
+      let expectedVersion = currentAutomation.placement.version
+      try {
+        while (pendingAutomationPlacements.current.has(automationId)) {
+          const placement =
+            pendingAutomationPlacements.current.get(automationId)
+          pendingAutomationPlacements.current.delete(automationId)
+          if (!placement) break
+          const updated = await updateAutomationPlacement(automationId, {
+            command_id: crypto.randomUUID(),
+            actor: 'local-user',
+            expected_version: expectedVersion,
+            placement,
+          })
+          expectedVersion = updated.placement.version
+          setAutomations((current) => {
+            const next = current.map((candidate) => {
+              if (candidate.id !== updated.id) return candidate
+              return pendingAutomationPlacements.current.has(automationId)
+                ? {
+                    ...updated,
+                    placement: {
+                      ...updated.placement,
+                      geometry: candidate.placement.geometry,
+                    },
+                  }
+                : updated
+            })
+            automationsRef.current = next
+            return next
+          })
+        }
+      } catch (caught) {
+        pendingAutomationPlacements.current.delete(automationId)
+        setActionError(
+          caught instanceof Error
+            ? caught.message
+            : 'Automation placement update failed',
+        )
+        await loadAutomations().catch(() => undefined)
+      } finally {
+        automationPlacementUpdates.current.delete(automationId)
+      }
+    },
+    [loadAutomations],
+  )
+
+  const persistAutomationPlacement = useCallback(
+    (automation: Automation, placement: CanvasPlacement) => {
+      pendingAutomationPlacements.current.set(automation.id, placement)
+      setAutomations((current) => {
+        const next = current.map((candidate) =>
+          candidate.id === automation.id
+            ? {
+                ...candidate,
+                placement: {
+                  ...candidate.placement,
+                  geometry: placement,
+                },
+              }
+            : candidate,
+        )
+        automationsRef.current = next
+        return next
+      })
+      void flushAutomationPlacement(automation.id)
+    },
+    [flushAutomationPlacement],
+  )
+
+  const saveProfile = useCallback(
+    async (spec: CreateWorkerProfileInput) => {
+      if (profileEditor === undefined) return
+      setProfileSaving(true)
+      setActionError(null)
+      try {
+        const saved = profileEditor
+          ? await updateWorkerProfile(profileEditor.id, {
+              ...spec,
+              expected_version: profileEditor.version,
+            })
+          : await createWorkerProfile(spec)
+        setProfiles((current) => {
+          const exists = current.some((profile) => profile.id === saved.id)
+          return exists
+            ? current.map((profile) =>
+                profile.id === saved.id ? saved : profile,
+              )
+            : [...current, saved]
+        })
+        setSelection({ kind: 'profile', id: saved.id })
+        setProfileEditor(undefined)
+      } catch (caught) {
+        setActionError(
+          caught instanceof Error ? caught.message : 'Profile save failed',
+        )
+        await loadProfiles().catch(() => undefined)
+      } finally {
+        setProfileSaving(false)
+      }
+    },
+    [loadProfiles, profileEditor],
+  )
+
+  const proposeAllocation = useCallback(
+    (payload: AllocationDragPayload, projectId: string) => {
+      const project = projects.find((candidate) => candidate.id === projectId)
+      if (!project) return
+      if (payload.kind === 'profile') {
+        const profile = profiles.find(
+          (candidate) => candidate.id === payload.id,
+        )
+        if (!profile) return
+        setActionError(null)
+        setAllocationError(null)
+        setAllocationProposal({
+          subject: { kind: 'profile', profile },
+          project,
+          commandId: crypto.randomUUID(),
+        })
+        return
+      }
+
+      const candidate = workerCandidates.find(
+        ({ worker }) => worker.id === payload.id,
+      )
+      if (!candidate) return
+      if (canAllocateCandidate(candidate)) {
+        setActionError(null)
+        setAllocationError(null)
+        setAllocationProposal({
+          subject: { kind: 'worker', candidate },
+          project,
+          commandId: crypto.randomUUID(),
+        })
+        return
+      }
+      if (!canHandoffCandidate(candidate)) return
+      if (candidate.project_id === project.id) {
+        setActionError('Select a different target project for the handoff.')
+        return
+      }
+      const sourceAssignment = assignments.find(
+        (assignment) =>
+          assignment.id === candidate.assignment_id &&
+          assignment.lifecycle === 'active',
+      )
+      const sourceProject = projects.find(
+        (source) => source.id === candidate.project_id,
+      )
+      if (!sourceAssignment || !sourceProject) {
+        setActionError('The active source assignment is no longer available.')
+        return
+      }
+      setActionError(null)
+      setHandoffError(null)
+      setHandoffProposal({
+        commandId: crypto.randomUUID(),
+        sourceAssignment,
+        sourceProject,
+        targetProject: project,
+      })
+    },
+    [assignments, profiles, projects, workerCandidates],
+  )
+
+  const allocateWorker = useCallback(
+    async ({ objective, role, profileId }: AllocationDetails) => {
+      if (!allocationProposal) return
+      const selectedProfile = profileId
+        ? profiles.find((profile) => profile.id === profileId)
+        : undefined
+
+      setAllocationBusy(true)
+      setAllocationError(null)
+      setActionError(null)
+      try {
+        const common = {
+          command_id: allocationProposal.commandId,
+          actor: 'local-user',
+          expected_project_version: allocationProposal.project.version,
+          objective,
+          role,
+          isolation_policy: 'project_workspace' as const,
+        }
+        const command =
+          allocationProposal.subject.kind === 'profile'
+            ? {
+                ...common,
+                profile_id: allocationProposal.subject.profile.id,
+                expected_profile_version:
+                  allocationProposal.subject.profile.version,
+              }
+            : {
+                ...common,
+                worker_id:
+                  allocationProposal.subject.candidate.worker.id,
+                expected_worker_version:
+                  allocationProposal.subject.candidate.worker.version,
+                ...(selectedProfile
+                  ? {
+                      profile_id: selectedProfile.id,
+                      expected_profile_version: selectedProfile.version,
+                    }
+                  : {}),
+              }
+        const result = await confirmWorkerAssignment(
+          allocationProposal.project.id,
+          command,
+        )
+        setAssignments((current) => [
+          ...current.filter(
+            (assignment) => assignment.id !== result.assignment.id,
+          ),
+          result.assignment,
+        ])
+        setSelection({ kind: 'assignment', id: result.assignment.id })
+        setAllocationError(null)
+        setAllocationProposal(null)
+        await Promise.all([
+          loadProjects(),
+          loadInventory(selectedSession),
+          loadWorkers(),
+        ])
+      } catch (caught) {
+        setAllocationError(
+          caught instanceof Error ? caught.message : 'Worker allocation failed',
+        )
+        await Promise.all([loadProjects(), loadWorkers()]).catch(
+          () => undefined,
+        )
+      } finally {
+        setAllocationBusy(false)
+      }
+    },
+    [
+      allocationProposal,
+      loadInventory,
+      loadProjects,
+      loadWorkers,
+      profiles,
+      selectedSession,
+    ],
+  )
+
+  const handoffWorker = useCallback(
+    async ({ objective, role, targetRole }: HandoffDetails) => {
+      if (!handoffProposal) return
+      const { commandId, sourceAssignment, sourceProject, targetProject } =
+        handoffProposal
+      setHandoffBusy(true)
+      setHandoffError(null)
+      setActionError(null)
+      try {
+        const result = await confirmWorkerHandoff(
+          sourceProject.id,
+          sourceAssignment.id,
+          {
+            command_id: commandId,
+            actor: 'local-user',
+            worker_id: sourceAssignment.worker.id,
+            expected_worker_version: sourceAssignment.worker.version,
+            expected_source_project_version: sourceProject.version,
+            target_project_id: targetProject.id,
+            expected_target_project_version: targetProject.version,
+            source_attempt_id: sourceAssignment.attempt.id,
+            expected_source_assignment_version: sourceAssignment.version,
+            expected_source_attempt_version: sourceAssignment.attempt.version,
+            target_role: targetRole,
+            objective,
+            role,
+            isolation_policy: 'project_workspace',
+          },
+        )
+        setAssignments((current) => [
+          ...current.filter(
+            (assignment) =>
+              assignment.id !== result.source_assignment.id &&
+              assignment.id !== result.assignment.id,
+          ),
+          result.source_assignment,
+          result.assignment,
+        ])
+        setSelection({ kind: 'assignment', id: result.assignment.id })
+        setHandoffProposal(null)
+        await Promise.all([
+          loadProjects(),
+          loadInventory(selectedSession),
+          loadWorkers(),
+        ])
+      } catch (caught) {
+        setHandoffError(
+          caught instanceof Error ? caught.message : 'Worker handoff failed',
+        )
+        await Promise.all([loadProjects(), loadWorkers()]).catch(
+          () => undefined,
+        )
+      } finally {
+        setHandoffBusy(false)
+      }
+    },
+    [
+      handoffProposal,
+      loadInventory,
+      loadProjects,
+      loadWorkers,
+      selectedSession,
+    ],
+  )
+
+  const completeAssignment = useCallback(
+    async (details: CompletionDetails) => {
+      if (!completionProposal) return
+      const assignment = completionProposal.assignment
+      setCompletionBusy(true)
+      setCompletionError(null)
+      setActionError(null)
+      try {
+        const artifacts = await Promise.all(
+          details.artifacts.map(async ({ file, id, kind }) => {
+            const content = decodeUtf8(await file.arrayBuffer())
+            return uploadArtifact(assignment.project_id, assignment.id, id, {
+              actor: 'local-user',
+              attempt_id: assignment.attempt.id,
+              expected_assignment_version: assignment.version,
+              expected_attempt_version: assignment.attempt.version,
+              kind,
+              display_name: file.name,
+              content,
+            })
+          }),
+        )
+        const result = await recordCompletionReceipt(
+          assignment.project_id,
+          assignment.id,
+          {
+            command_id: completionProposal.commandId,
+            actor: 'local-user',
+            attempt_id: assignment.attempt.id,
+            expected_assignment_version: assignment.version,
+            expected_attempt_version: assignment.attempt.version,
+            outcome: 'completed',
+            summary: details.summary,
+            artifact_refs: details.artifactRefs,
+            artifact_ids: artifacts.map((artifact) => artifact.id),
+            evidence_refs: details.evidenceRefs,
+            unresolved_blockers: details.unresolvedBlockers,
+          },
+        )
+        setAssignments((current) =>
+          current.map((assignment) =>
+            assignment.id === result.assignment.id
+              ? result.assignment
+              : assignment,
+          ),
+        )
+        setSelection({ kind: 'assignment', id: result.assignment.id })
+        setCompletionError(null)
+        setCompletionProposal(null)
+        await loadWorkers().catch(() => undefined)
+      } catch (caught) {
+        setCompletionError(
+          caught instanceof Error
+            ? caught.message
+            : 'Completion receipt failed',
+        )
+        const loaded = await loadProjects().catch(() => null)
+        const reconciled = loaded?.find(
+          (candidate) => candidate.id === assignment.id,
+        )
+        if (reconciled?.completion_receipt) {
+          setCompletionError(null)
+          setSelection({ kind: 'assignment', id: reconciled.id })
+          setCompletionProposal(null)
+        }
+      } finally {
+        setCompletionBusy(false)
+      }
+    },
+    [completionProposal, loadProjects, loadWorkers],
+  )
+
+  const resolvedProjectAccents = useMemo(
+    () =>
+      Object.fromEntries(
+        projects.map((project) => [
+          project.id,
+          projectAccents[project.id] ?? defaultProjectAccent(project.id),
+        ]),
+      ),
+    [projectAccents, projects],
+  )
+  const setProjectAccent = useCallback(
+    (projectId: string, accent: string) => {
+      setProjectAccents((current) => {
+        const next = { ...current, [projectId]: accent }
+        writeProjectAccents(next)
+        return next
+      })
+    },
+    [],
+  )
+  const toggleResourceShelf = useCallback(
+    (view: RailView) => {
+      setRailView(view)
+      setResourceShelfOpen(
+        (current) => view !== railView || !current,
+      )
+    },
+    [railView],
+  )
+  const handleCanvasSelectionChange = useCallback(
+    (nextSelection: CanvasSelection) => {
+      setWorkspaceProjectOpen(false)
+      setSelection(nextSelection)
+    },
+    [],
+  )
+
+  const displayedError = actionError ?? runtimeError
+  const runtimeUnavailable =
+    !runtimeLoading && inventory === null
+
+  return (
+    <AgentWorkspaceContext.Provider value={agentWorkspaceContext}>
+      <div className="app-shell" data-shelf-open={resourceShelfOpen}>
+        <header className="command-bar">
+          <div className="brand">
+            <span className="brand__mark" aria-hidden="true">
+              Y
+            </span>
+            <div>
+              <strong>Yard</strong>
+              <span>Operations atlas</span>
+            </div>
+          </div>
+
+          <div
+            aria-label="Application mode"
+            className="workspace-mode-switcher command-bar__modes"
+            role="tablist"
+          >
+            <button
+              aria-selected={agentWorkspaceMode === 'map'}
+              onClick={() => setAgentWorkspaceMode('map')}
+              role="tab"
+              type="button"
+            >
+              <MapIcon aria-hidden="true" size={14} />
+              <span>Map</span>
+            </button>
+            <button
+              aria-selected={agentWorkspaceMode === 'chat'}
+              disabled={!activeAgentWorkspaceTarget}
+              onClick={() => setAgentWorkspaceMode('chat')}
+              role="tab"
+              type="button"
+            >
+              <MessageSquareText aria-hidden="true" size={14} />
+              <span>Chat</span>
+            </button>
+            <button
+              aria-selected={agentWorkspaceMode === 'terminal'}
+              disabled={!activeAgentWorkspaceTarget}
+              onClick={() => setAgentWorkspaceMode('terminal')}
+              role="tab"
+              type="button"
+            >
+              <SquareTerminal aria-hidden="true" size={14} />
+              <span>Terminal</span>
+            </button>
+          </div>
+
+          <button
+            aria-label="Create project"
+            className="top-command"
+            onClick={() => {
+              setSelection(null)
+              setWorkspaceProjectOpen(true)
+            }}
+            type="button"
+          >
+            <FolderPlus aria-hidden="true" size={16} />
+            <span>Create project</span>
+          </button>
+
+          <div
+            aria-label="Observed resources"
+            className="command-bar__resources"
+            role="tablist"
+          >
+            {(['profiles', 'workers', 'workspaces'] as const).map((view) => (
+              <button
+                aria-controls="resource-shelf"
+                aria-selected={resourceShelfOpen && railView === view}
+                key={view}
+                onClick={() => toggleResourceShelf(view)}
+                role="tab"
+                type="button"
+              >
+                {view === 'profiles'
+                  ? 'Profiles'
+                  : view === 'workers'
+                    ? 'Workers'
+                    : 'Workspaces'}
+              </button>
+            ))}
+          </div>
+
+          <div
+            className="command-bar__metrics"
+            aria-label="Control plane totals"
+          >
+            <span title={`${projects.length} projects`}>
+              <BriefcaseBusiness aria-hidden="true" size={15} />
+              {projects.length} projects
+            </span>
+            <span title={`${inventory?.workers.length ?? 0} workers`}>
+              <Bot aria-hidden="true" size={15} />
+              {runtimeLoading && inventory === null
+                ? '...'
+                : (inventory?.workers.length ?? 0)}{' '}
+              workers
+            </span>
+            <span
+              data-attention={attentionCount > 0}
+              title={`${attentionCount} requiring attention`}
+            >
+              <CircleAlert aria-hidden="true" size={15} />
+              {runtimeLoading && inventory === null ? '...' : attentionCount}
+              {' attention'}
+            </span>
+          </div>
+
+          <label className="session-command" htmlFor="session-select">
+            <Server aria-hidden="true" size={15} />
+            <select
+              aria-label="Herdr session"
+              id="session-select"
+              onChange={(event) => setSelectedSession(event.target.value)}
+              value={selectedSession}
+            >
+              {sessions.map((session) => (
+                <option
+                  disabled={!session.running}
+                  key={session.name}
+                  value={session.name}
+                >
+                  {session.name}
+                  {session.running ? '' : ' (stopped)'}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <button
+            aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
+            aria-pressed={theme === 'dark'}
+            className="icon-button theme-toggle"
+            onClick={() =>
+              setTheme((current) =>
+                current === 'light' ? 'dark' : 'light',
+              )
+            }
+            title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
+            type="button"
+          >
+            {theme === 'light' ? (
+              <Moon aria-hidden="true" size={17} />
+            ) : (
+              <Sun aria-hidden="true" size={17} />
+            )}
+          </button>
+
+          <div className="connection-state">
+            {runtimeLoading ? (
+              <LoaderCircle
+                aria-hidden="true"
+                className="status-spin"
+                size={16}
+              />
+            ) : runtimeUnavailable ? (
+              <WifiOff aria-hidden="true" size={16} />
+            ) : (
+              <Wifi aria-hidden="true" size={16} />
+            )}
+            <span>
+              {runtimeLoading
+                ? 'Observing Herdr'
+                : runtimeUnavailable
+                  ? 'Herdr unavailable'
+                  : 'Herdr observed'}
+            </span>
+            <button
+              aria-label="Refresh Yard and runtime state"
+              className="icon-button"
+              disabled={runtimeLoading || projectLoading}
+              onClick={() => void refresh()}
+              title="Refresh state"
+              type="button"
+            >
+              <RefreshCw
+                aria-hidden="true"
+                className={
+                  runtimeLoading || projectLoading ? 'status-spin' : ''
+                }
+                size={17}
+              />
+            </button>
+          </div>
+        </header>
+
+        {resourceShelfOpen ? (
+          <section
+            aria-label={`${railView} shelf`}
+            className="resource-shelf"
+            id="resource-shelf"
+          >
+          <button
+            aria-label="Collapse resource shelf"
+            className="icon-button resource-shelf__collapse"
+            onClick={() => setResourceShelfOpen(false)}
+            title="Collapse resource shelf"
+            type="button"
+          >
+            <ChevronUp aria-hidden="true" size={16} />
+          </button>
+
+        {railView === 'profiles' ? (
+          <div className="rail-section rail-section--resources" role="tabpanel">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">Reusable</p>
+                <h2>Profiles</h2>
+              </div>
+              <button
+                aria-label="Create worker profile"
+                className="icon-button section-heading__action"
+                onClick={() => setProfileEditor(null)}
+                title="New profile"
+                type="button"
+              >
+                <Plus aria-hidden="true" size={16} />
+              </button>
+            </div>
+            <div className="resource-list profile-list">
+              <div className="profile-list__mobile-actions">
+                <button
+                  aria-label="Create worker profile"
+                  className="icon-button"
+                  onClick={() => setProfileEditor(null)}
+                  title="New profile"
+                  type="button"
+                >
+                  <Plus aria-hidden="true" size={16} />
+                </button>
+              </div>
+              {profiles.map((profile) => (
+                <button
+                  className="profile-row"
+                  data-selected={
+                    selection?.kind === 'profile' &&
+                    selection.id === profile.id
+                  }
+                  draggable
+                  key={profile.id}
+                  onClick={() =>
+                    setSelection({ kind: 'profile', id: profile.id })
+                  }
+                  onDragStart={(event) => {
+                    setAllocationDragData(event.dataTransfer, {
+                      kind: 'profile',
+                      id: profile.id,
+                    })
+                  }}
+                  type="button"
+                >
+                  <span className="profile-row__grip">
+                    <GripVertical aria-hidden="true" size={14} />
+                  </span>
+                  <span>
+                    <strong>{profile.name}</strong>
+                    <small>
+                      {profile.provider}
+                      {profile.model ? ` / ${profile.model}` : ''}
+                    </small>
+                  </span>
+                </button>
+              ))}
+              {!projectLoading && profiles.length === 0 ? (
+                <div className="empty-state profile-empty">
+                  <p>No worker profiles.</p>
+                  <button
+                    className="secondary-button"
+                    onClick={() => setProfileEditor(null)}
+                    type="button"
+                  >
+                    <Plus aria-hidden="true" size={15} />
+                    New profile
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        ) : railView === 'workers' ? (
+          <div className="rail-section rail-section--resources" role="tabpanel">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">Allocation</p>
+                <h2>Workers</h2>
+              </div>
+              <span>{visibleCandidates.length}</span>
+            </div>
+            <div className="segmented-control" aria-label="Filter workers">
+              {FILTERS.map((option) => (
+                <button
+                  aria-pressed={filter === option.value}
+                  key={option.value}
+                  onClick={() => setFilter(option.value)}
+                  type="button"
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+            <div className="resource-list worker-list">
+              {visibleCandidates.map((candidate) => {
+                const observed = findObservedWorker(
+                  inventory,
+                  candidate.worker.runtime,
+                )
+                const runtimeState = resolvedRuntimeState(
+                  candidate.worker.runtime,
+                  observed,
+                )
+                const StatusIcon = STATUS_ICONS[runtimeState.status]
+                const draggable =
+                  canAllocateCandidate(candidate) ||
+                  canHandoffCandidate(candidate)
+                return (
+                  <button
+                    className="worker-row"
+                    data-availability={candidate.availability}
+                    data-draggable={draggable}
+                    data-process-state={runtimeState.processState}
+                    data-status={runtimeState.status}
+                    data-worker-id={candidate.worker.id}
+                    data-selected={
+                      selection?.kind === 'worker' &&
+                      selection.id === candidate.worker.id
+                    }
+                    draggable={draggable}
+                    key={candidate.worker.id}
+                    onClick={() =>
+                      setSelection({
+                        kind: 'worker',
+                        id: candidate.worker.id,
+                      })
+                    }
+                    onDragStart={(event) => {
+                      if (!draggable) {
+                        event.preventDefault()
+                        return
+                      }
+                      setAllocationDragData(event.dataTransfer, {
+                        kind: 'worker',
+                        id: candidate.worker.id,
+                        mode: canHandoffCandidate(candidate)
+                          ? 'handoff'
+                          : 'allocate',
+                      })
+                    }}
+                    type="button"
+                  >
+                    <span
+                      className="worker-row__status"
+                      data-status={runtimeState.status}
+                    >
+                      <StatusIcon
+                        aria-hidden="true"
+                        className={
+                          runtimeState.status === 'working' ? 'status-spin' : ''
+                        }
+                        size={14}
+                      />
+                    </span>
+                    <span>
+                      <strong>{candidateLabel(candidate)}</strong>
+                      <small>
+                        {AVAILABILITY_LABELS[candidate.availability]}
+                        {' / '}
+                        {runtimeState.status}
+                        {' / '}
+                        {observed?.provider ?? candidate.default_role ?? 'no profile'}
+                      </small>
+                    </span>
+                  </button>
+                )
+              })}
+              {!projectLoading && visibleCandidates.length === 0 ? (
+                <p className="empty-state">
+                  No worker candidates in this view.
+                </p>
+              ) : null}
+            </div>
+          </div>
+        ) : (
+          <div className="rail-section rail-section--resources" role="tabpanel">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">Unbound</p>
+                <h2>Workspaces</h2>
+              </div>
+              <span>{availableWorkspaces.length}</span>
+            </div>
+            <div className="resource-list workspace-list">
+              {availableWorkspaces.map((workspace) => (
+                <button
+                  className="workspace-row"
+                  data-selected={
+                    selection?.kind === 'workspace' &&
+                    selection.id === workspace.runtime_id
+                  }
+                  key={workspace.runtime_id}
+                  onClick={() =>
+                    setSelection({
+                      kind: 'workspace',
+                      id: workspace.runtime_id,
+                    })
+                  }
+                  type="button"
+                >
+                  <span
+                    className="worker-row__status"
+                    data-status={workspace.status}
+                  >
+                    <Boxes aria-hidden="true" size={14} />
+                  </span>
+                  <span>
+                    <strong>{workspace.label}</strong>
+                    <small>
+                      {workspace.tab_count} tabs / {workspace.pane_count} panes
+                    </small>
+                  </span>
+                </button>
+              ))}
+              {!runtimeLoading && availableWorkspaces.length === 0 ? (
+                <p className="empty-state">No unbound workspaces.</p>
+              ) : null}
+            </div>
+          </div>
+        )}
+          </section>
+        ) : null}
+
+        <main className="canvas-stage">
+        <div className="canvas-stage__label">
+          <span>Yard projects</span>
+          <strong>{projects.length}</strong>
+          <small>{selectedSession || 'No Herdr session'}</small>
+        </div>
+
+        <RuntimeCanvas
+          allocationPayloadByRuntimeId={allocationPayloadByRuntimeId}
+          assignments={assignments}
+          automations={automations}
+          coordinationNodes={coordinationNodes}
+          coordinationNodeRoutes={coordinationNodeRoutes}
+          inventory={inventory}
+          onAllocationDrop={proposeAllocation}
+          onAutomationPlacementChange={persistAutomationPlacement}
+          onCoordinationNodeConnect={(nodeId, projectId) =>
+            void connectCoordinationNode(nodeId, projectId)
+          }
+          onCoordinationNodePlacementChange={persistCoordinationPlacement}
+          onCreateCoordinationNode={(placement, kind) => {
+            setCoordinationNodeError(null)
+            setCoordinationNodeInitialKind(kind)
+            setCoordinationNodePlacement(placement)
+          }}
+          onCreateAutomation={(placement, initialScope) => {
+            setAutomationError(null)
+            setAutomationCreation({ initialScope, placement })
+          }}
+          onOpenProjectPulse={(trigger) => {
+            projectPulseTrigger.current = trigger
+            setProjectPulseOpen(true)
+          }}
+          onProjectConnect={(sourceProjectId, targetProjectId) =>
+            void connectProjects(sourceProjectId, targetProjectId)
+          }
+          onProjectPlacementChange={persistPlacement}
+          onSelectionChange={handleCanvasSelectionChange}
+          projectAccents={resolvedProjectAccents}
+          projectRelationships={projectRelationships}
+          projectStatusReports={projectStatusReports}
+          projects={projects}
+          runtimeLoading={runtimeLoading}
+          selectedSession={selectedSession}
+          theme={theme}
+          visibleWorkers={visibleWorkers}
+          yardOrchestrator={yardOrchestrator}
+          yardOrchestratorRoutes={yardOrchestratorRoutes}
+        />
+
+        {!projectLoading &&
+        !runtimeLoading &&
+        projects.length === 0 &&
+        coordinationNodes.length === 0 &&
+        automations.length === 0 &&
+        visibleWorkers.length === 0 ? (
+          <div className="canvas-empty">
+            <BriefcaseBusiness aria-hidden="true" size={28} />
+            <strong>No Yard projects</strong>
+          </div>
+        ) : null}
+
+        {displayedError ? (
+          <div className="error-banner" role="alert">
+            <CircleAlert aria-hidden="true" size={18} />
+            <span>{displayedError}</span>
+            <button
+              aria-label="Dismiss error"
+              className="icon-button"
+              onClick={() => {
+                if (actionError) setActionError(null)
+                else setRuntimeError(null)
+              }}
+              title="Dismiss"
+              type="button"
+            >
+              <X aria-hidden="true" size={16} />
+            </button>
+          </div>
+        ) : actionNotice ? (
+          <div className="notice-banner" role="status">
+            <CircleAlert aria-hidden="true" size={18} />
+            <span>{actionNotice}</span>
+            <button
+              aria-label="Dismiss notice"
+              className="icon-button"
+              onClick={() => setActionNotice(null)}
+              title="Dismiss"
+              type="button"
+            >
+              <X aria-hidden="true" size={16} />
+            </button>
+          </div>
+        ) : null}
+        {selection || workspaceProjectOpen ? (
+          <aside className="inspector has-selection">
+          <button
+            aria-label="Close details"
+            className="icon-button inspector__close"
+            onClick={() => {
+              setSelection(null)
+              setWorkspaceProjectOpen(false)
+            }}
+            title="Close details"
+            type="button"
+          >
+            <X aria-hidden="true" size={16} />
+          </button>
+        {selectedAgentGroup.length > 1 ? (
+          <AgentGroupChat targets={selectedAgentGroup} />
+        ) : selectedAutomation ? (
+          <AutomationInspector
+            automation={selectedAutomation}
+            busy={automationBusy}
+            coordinationNodes={coordinationNodes}
+            error={automationError}
+            historyLoading={automationHistoryLoading}
+            key={`${selectedAutomation.id}:${selectedAutomation.version}`}
+            onRun={(automation) => void requestAutomationRun(automation)}
+            onSave={(automation, details) =>
+              void saveAutomation(automation, details)
+            }
+            onTogglePaused={(automation) =>
+              void toggleAutomationPaused(automation)
+            }
+            projects={projects}
+            runs={automationRuns[selectedAutomation.id] ?? []}
+          />
+        ) : selectedYardOrchestrator ? (
+          <YardOrchestratorInspector
+            busy={yardOrchestratorBusy}
+            inventory={inventory}
+            onCoordinationChange={recordYardRoute}
+            onProvision={provisionCentralOrchestrator}
+            onRecover={() => void recoverCentralOrchestrator()}
+            orchestrator={selectedYardOrchestrator}
+            profiles={profiles}
+            projects={projects}
+            routes={yardOrchestratorRoutes}
+            sessionRunning={
+              sessions.find(
+                (session) => session.name === 'yard-orchestrator',
+              )?.running
+            }
+          />
+        ) : selectedCoordinationNode ? (
+          <CoordinationNodeInspector
+            busy={coordinationNodeBusy}
+            node={selectedCoordinationNode}
+            onProvision={(node, profile) =>
+              void provisionMapNode(node, profile)
+            }
+            onRouteChange={recordCoordinationNodeRoute}
+            onSnapshot={(node) => void collectKnowledgeSnapshot(node)}
+            onUpdate={(node, name, attachedProjectIds) =>
+              void saveCoordinationNode(node, name, attachedProjectIds)
+            }
+            profiles={profiles}
+            projects={projects}
+            routes={coordinationNodeRoutes.filter(
+              (route) => route.node_id === selectedCoordinationNode.id,
+            )}
+            snapshots={
+              coordinationSnapshots[selectedCoordinationNode.id] ?? []
+            }
+          />
+        ) : selectedProjectOrchestrator ? (
+          <ProjectOrchestratorInspector
+            inventory={inventory}
+            project={selectedProjectOrchestrator}
+            statusReport={
+              projectStatusReports[selectedProjectOrchestrator.id]
+            }
+          />
+        ) : selectedProject ? (
+          <ProjectInspector
+            accent={resolvedProjectAccents[selectedProject.id]}
+            inventory={inventory}
+            onAccentChange={(accent) =>
+              setProjectAccent(selectedProject.id, accent)
+            }
+            onDisconnect={(relationship) =>
+              void disconnectProjects(relationship)
+            }
+            project={selectedProject}
+            projects={projects}
+            relationships={projectRelationships.filter(
+              (relationship) =>
+                relationship.source_project_id === selectedProject.id ||
+                relationship.target_project_id === selectedProject.id,
+            )}
+            statusReport={projectStatusReports[selectedProject.id]}
+          />
+        ) : selectedAssignment ? (
+          <AssignmentInspector
+            assignment={selectedAssignment}
+            inventory={inventory}
+            onEndSession={
+              selectedAssignmentCandidate &&
+              canEndCandidate(selectedAssignmentCandidate)
+                ? () => proposeEndSession(selectedAssignmentCandidate)
+                : undefined
+            }
+            onRecordCompletion={() =>
+              setCompletionProposal({
+                assignment: selectedAssignment,
+                commandId: crypto.randomUUID(),
+              })
+            }
+          />
+        ) : selectedProfile ? (
+          <ProfileInspector
+            onAllocate={(project) =>
+              proposeAllocation(
+                { kind: 'profile', id: selectedProfile.id },
+                project.id,
+              )
+            }
+            onEdit={() => setProfileEditor(selectedProfile)}
+            profile={selectedProfile}
+            projects={projects}
+          />
+        ) : selectedWorkerCandidate ? (
+          <WorkerCandidateInspector
+            activeAssignment={selectedCandidateActiveAssignment}
+            candidate={selectedWorkerCandidate}
+            completedAssignment={selectedCandidateCompletion}
+            observed={selectedCandidateObservation}
+            onAllocate={(project) =>
+              proposeAllocation(
+                { kind: 'worker', id: selectedWorkerCandidate.worker.id },
+                project.id,
+              )
+            }
+            onEndSession={() =>
+              proposeEndSession(selectedWorkerCandidate)
+            }
+            projects={projects}
+          />
+        ) : selectedObservedWorker ? (
+          <ObservedWorkerInspector worker={selectedObservedWorker} />
+        ) : selectedProviderChild ? (
+          <ProviderChildInspector agent={selectedProviderChild} />
+        ) : selectedWorkspace ? (
+          <WorkspaceInspector
+            busy={adoptingWorkspace === selectedWorkspace.runtime_id}
+            key={selectedWorkspace.runtime_id}
+            onCreate={(details) =>
+              createWorkspaceProject(selectedWorkspace, details)
+            }
+            profiles={profiles}
+            workers={selectedWorkspaceWorkers}
+            workspace={selectedWorkspace}
+          />
+        ) : (
+          <NewProjectInspector
+            busy={workspaceProjectBusy}
+            onCreate={createNewWorkspaceProject}
+            onNewProfile={() => setProfileEditor(null)}
+            profiles={profiles}
+            session={selectedSession}
+          />
+        )}
+          </aside>
+        ) : null}
+        </main>
+      </div>
+      {activeAgentWorkspaceTarget ? (
+        <AgentWorkspaceShell
+          activeTarget={activeAgentWorkspaceTarget}
+          coordinationRoutes={coordinationNodeRoutes}
+          mode={agentWorkspaceMode}
+          onCoordinationChange={recordYardRoute}
+          onCoordinationNodeChange={recordCoordinationNodeRoute}
+          onModeChange={setAgentWorkspaceMode}
+          onTargetChange={(target) =>
+            setAgentWorkspaceTarget({
+              ...target,
+              returnFocus: activeAgentWorkspaceTarget.returnFocus,
+            })
+          }
+          projects={projects}
+          sessions={sessions}
+          targets={agentWorkspaceTargets}
+          yardRoutes={yardOrchestratorRoutes}
+        />
+      ) : null}
+      {projectPulseOpen ? (
+        <ProjectPulseWorkspace
+          assignments={assignments}
+          coordinationNodes={coordinationNodes}
+          coordinationSnapshots={coordinationSnapshots}
+          inventory={inventory}
+          onClose={() => setProjectPulseOpen(false)}
+          onOpenCoordinationNode={(node) => {
+            setProjectPulseOpen(false)
+            setSelection({ kind: 'coordination-node', id: node.id })
+          }}
+          onOpenProject={(project) => {
+            setProjectPulseOpen(false)
+            setSelection({
+              kind: 'orchestrator',
+              projectId: project.id,
+            })
+          }}
+          projects={projects}
+          returnFocus={projectPulseTrigger.current}
+          routes={yardOrchestratorRoutes}
+          statusReports={projectStatusReports}
+        />
+      ) : null}
+      {coordinationNodePlacement ? (
+        <CoordinationNodeDialog
+          busy={coordinationNodeBusy}
+          error={coordinationNodeError}
+          initialKind={coordinationNodeInitialKind}
+          onClose={() => {
+            if (coordinationNodeBusy) return
+            setCoordinationNodeError(null)
+            setCoordinationNodePlacement(null)
+          }}
+          onCreate={(details) => void createMapNode(details)}
+          placement={coordinationNodePlacement}
+          profiles={profiles}
+          projects={projects}
+        />
+      ) : null}
+      {automationCreation ? (
+        <AutomationDialog
+          busy={automationBusy}
+          coordinationNodes={coordinationNodes}
+          error={automationError}
+          initialScope={automationCreation.initialScope}
+          onClose={() => {
+            if (automationBusy) return
+            setAutomationError(null)
+            setAutomationCreation(null)
+          }}
+          onCreate={(details) => void createScheduledAutomation(details)}
+          placement={automationCreation.placement}
+          projects={projects}
+        />
+      ) : null}
+      {profileEditor !== undefined ? (
+        <ProfileEditor
+          busy={profileSaving}
+          onClose={() => setProfileEditor(undefined)}
+          onSave={saveProfile}
+          profile={profileEditor}
+        />
+      ) : null}
+      {allocationProposal ? (
+        <AllocationDialog
+          busy={allocationBusy}
+          error={allocationError}
+          onClose={() => {
+            setAllocationError(null)
+            setAllocationProposal(null)
+          }}
+          onConfirm={allocateWorker}
+          profiles={profiles}
+          project={allocationProposal.project}
+          subject={allocationProposal.subject}
+        />
+      ) : null}
+      {handoffProposal ? (
+        <HandoffDialog
+          busy={handoffBusy}
+          error={handoffError}
+          onClose={() => {
+            setHandoffError(null)
+            setHandoffProposal(null)
+          }}
+          onConfirm={handoffWorker}
+          sourceAssignment={handoffProposal.sourceAssignment}
+          sourceProject={handoffProposal.sourceProject}
+          targetProject={handoffProposal.targetProject}
+        />
+      ) : null}
+      {completionProposal ? (
+        <CompletionDialog
+          assignment={completionProposal.assignment}
+          busy={completionBusy}
+          error={completionError}
+          onClose={() => {
+            setCompletionError(null)
+            setCompletionProposal(null)
+          }}
+          onConfirm={completeAssignment}
+        />
+      ) : null}
+      {endSessionProposal ? (
+        <EndWorkerSessionDialog
+          busy={endSessionBusy}
+          candidate={endSessionProposal.candidate}
+          error={endSessionError}
+          onClose={() => {
+            if (endSessionBusy) return
+            setEndSessionError(null)
+            setEndSessionProposal(null)
+          }}
+          onConfirm={endSession}
+        />
+      ) : null}
+    </AgentWorkspaceContext.Provider>
+  )
+}
+
+export default App
+
+function decodeUtf8(buffer: ArrayBuffer) {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buffer)
+  } catch {
+    throw new Error('Artifact content must be UTF-8 text')
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "sessions": [
+    {
+      "default": true,
+      "name": "default",
+      "running": true,
+      "session_dir": "/tmp/herdr/default",
+      "socket_path": "/tmp/herdr/default/herdr.sock"
+    },
+    {
+      "default": false,
+      "name": "stopped",
+      "running": false,
+      "session_dir": "/tmp/herdr/stopped",
+      "socket_path": "/tmp/herdr/stopped/herdr.sock"
+    }
+  ]
+}

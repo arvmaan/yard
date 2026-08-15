@@ -1,0 +1,93 @@
+{
+  "id": "yard:session:snapshot",
+  "result": {
+    "type": "session_snapshot",
+    "snapshot": {
+      "version": "0.8.0",
+      "protocol": 19,
+      "focused_workspace_id": "w1",
+      "focused_tab_id": "w1:t1",
+      "focused_pane_id": "w1:p1",
+      "workspaces": [
+        {
+          "workspace_id": "w1",
+          "number": 1,
+          "label": "sample-project",
+          "focused": true,
+          "pane_count": 1,
+          "tab_count": 1,
+          "active_tab_id": "w1:t1",
+          "agent_status": "working",
+          "tokens": {
+            "yard_project": "sample"
+          }
+        }
+      ],
+      "tabs": [
+        {
+          "tab_id": "w1:t1",
+          "workspace_id": "w1",
+          "number": 1,
+          "label": "orchestrator",
+          "focused": true,
+          "pane_count": 1,
+          "agent_status": "working"
+        }
+      ],
+      "panes": [
+        {
+          "pane_id": "w1:p1",
+          "terminal_id": "term_sample",
+          "workspace_id": "w1",
+          "tab_id": "w1:t1",
+          "focused": true,
+          "cwd": "/tmp/sample-project",
+          "foreground_cwd": "/tmp/sample-project",
+          "label": "Project orchestrator",
+          "agent": "codex",
+          "display_agent": "Codex",
+          "agent_status": "working",
+          "tokens": {
+            "yard_role": "orchestrator"
+          },
+          "agent_session": {
+            "source": "herdr:codex",
+            "agent": "codex",
+            "kind": "id",
+            "value": "thread_sample"
+          },
+          "revision": 7
+        }
+      ],
+      "layouts": [],
+      "agents": [
+        {
+          "terminal_id": "term_sample",
+          "name": "sample-orchestrator",
+          "agent": "codex",
+          "display_agent": "Codex",
+          "agent_status": "working",
+          "tokens": {
+            "yard_role": "orchestrator"
+          },
+          "agent_session": {
+            "source": "herdr:codex",
+            "agent": "codex",
+            "kind": "id",
+            "value": "thread_sample"
+          },
+          "workspace_id": "w1",
+          "tab_id": "w1:t1",
+          "pane_id": "w1:p1",
+          "focused": true,
+          "launch_pending": false,
+          "interactive_ready": true,
+          "state_change_seq": 12,
+          "cwd": "/tmp/sample-project",
+          "foreground_cwd": "/tmp/sample-project",
+          "revision": 7
+        }
+      ]
+    }
+  }
+}
