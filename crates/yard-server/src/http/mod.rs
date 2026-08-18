@@ -9,27 +9,31 @@ use axum::{
 };
 use serde::Serialize;
 use yard_domain::{
-    Artifact, ArtifactContent, Assignments, Automation, AutomationCommandResult, AutomationRun,
-    AutomationRunCommandResult, AutomationRuns, Automations, ConfigureYardOrchestrator,
-    ConfiguredYardOrchestrator, ConfirmProfileAllocation, ConfirmWorkerAllocation,
-    ConfirmWorkerHandoff, ConfirmedAllocation, ConfirmedProjectCreation, ConfirmedWorkerHandoff,
-    CoordinationNode, CoordinationNodeCommandResult, CoordinationNodePromptAcknowledgement,
-    CoordinationNodeRoute, CoordinationNodeRoutes, CoordinationNodeTerminalOutput,
-    CoordinationNodes, CoordinationSnapshot, CoordinationSnapshots, CreateAutomation,
-    CreateCoordinationNode, CreateProject, CreateProjectFromProfile, CreateProjectRelationship,
-    CreateWorkerProfile, CreateWorkspaceProjectFromProfile, CreatedProjectRelationship,
-    DeleteProjectRelationship, DeletedProjectRelationship, EndWorkerSession, EndedWorkerSession,
-    OrchestratorPromptAcknowledgement, OrchestratorTerminalOutput, Project, ProjectRelationships,
-    Projects, PromptAcknowledgement, ProvisionCoordinationNode, ProvisionYardOrchestrator,
-    RecordCompletionReceipt, RecordedCompletionReceipt, RecoverYardOrchestrator,
-    RecoveredYardOrchestrator, RequestCoordinationSnapshot, RunAutomationNow, RuntimeInventory,
-    RuntimeSessions, SendAssignmentPrompt, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
-    SendOrchestratorPrompt, SendYardOrchestratorPrompt, SendYardOrchestratorRoute,
-    SetAutomationPaused, TerminalOutput, UpdateAutomation, UpdateAutomationPlacement,
-    UpdateCoordinationNode, UpdateCoordinationNodePlacement, UpdateProjectPlacement,
-    UpdateWorkerProfile, UploadArtifact, WorkerCandidates, WorkerProfile, WorkerProfiles,
-    YardOrchestrator, YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute,
-    YardOrchestratorRoutes, YardOrchestratorTerminalOutput,
+    AgentProfile, AgentProfiles, Artifact, ArtifactContent, Assignments, Automation,
+    AutomationCommandResult, AutomationRun, AutomationRunCommandResult, AutomationRuns,
+    Automations, ConfigureYardOrchestrator, ConfiguredYardOrchestrator, ConfirmProfileAllocation,
+    ConfirmWorkerAllocation, ConfirmWorkerHandoff, ConfirmedAllocation, ConfirmedProjectCreation,
+    ConfirmedWorkerHandoff, CoordinationNode, CoordinationNodeCommandResult,
+    CoordinationNodePromptAcknowledgement, CoordinationNodeRoute, CoordinationNodeRoutes,
+    CoordinationNodeTerminalOutput, CoordinationNodes, CoordinationSnapshot, CoordinationSnapshots,
+    CreateAgentProfile, CreateAutomation, CreateCoordinationNode, CreateProject,
+    CreateProjectFromProfile, CreateProjectRelationship, CreateWorkerProfile,
+    CreateWorkspaceProjectFromProfile, CreatedProjectRelationship, DeleteProjectRelationship,
+    DeletedProjectRelationship, EndWorkerSession, EndedWorkerSession,
+    OrchestratorPromptAcknowledgement, OrchestratorTerminalOutput, OrchestratorWorkflowProfile,
+    Project, ProjectRelationships, Projects, PromptAcknowledgement, ProvisionCoordinationNode,
+    ProvisionYardOrchestrator, RecordCompletionReceipt, RecordedCompletionReceipt,
+    RecoverYardOrchestrator, RecoveredYardOrchestrator, ReplaceProjectOrchestrator,
+    ReplacedProjectOrchestrator, RequestCoordinationSnapshot, ResetOrchestratorWorkflowProfile,
+    RunAutomationNow, RuntimeInventory, RuntimeSessions, SendAssignmentPrompt,
+    SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
+    SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SetAutomationPaused, TerminalOutput,
+    TokenSpendSettings, UpdateAgentProfile, UpdateAutomation, UpdateAutomationPlacement,
+    UpdateCoordinationNode, UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile,
+    UpdateProjectPlacement, UpdateTokenSpendSettings, UpdateWorkerProfile, UploadArtifact,
+    WorkerCandidates, WorkerProfile, WorkerProfiles, YardOrchestrator,
+    YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute, YardOrchestratorRoutes,
+    YardOrchestratorTerminalOutput,
 };
 use yard_herdr::HerdrError;
 use yard_store::{ProjectStoreError, YardStore};
@@ -42,7 +46,13 @@ use crate::intervention_service::{
     InterventionService, InterventionServiceError, RuntimeIntervention, RuntimeInterventionError,
 };
 use crate::inventory_service::{InventoryServiceError, InventorySource};
-use crate::profile_service::{ProfileService, ProfileServiceError};
+use crate::orchestrator_replacement_service::{
+    OrchestratorReplacementService, OrchestratorReplacementServiceError,
+};
+use crate::orchestrator_workflow_profile_service::{
+    OrchestratorWorkflowProfileService, OrchestratorWorkflowProfileServiceError,
+};
+use crate::profile_service::{AgentProfileServiceError, ProfileService, ProfileServiceError};
 use crate::project_service::{ProjectService, ProjectServiceError};
 use crate::reconciliation_service::{ReconciliationService, ReconciliationServiceError};
 use crate::terminal_service::{RuntimeTerminal, TerminalService};
@@ -58,7 +68,9 @@ struct AppState {
     reconciliation: ReconciliationService,
     projects: ProjectService,
     profiles: ProfileService,
+    orchestrator_workflow_profiles: OrchestratorWorkflowProfileService,
     allocations: AllocationService,
+    orchestrator_replacements: OrchestratorReplacementService,
     worker_sessions: WorkerSessionService,
     interventions: InterventionService,
     terminals: TerminalService,
@@ -129,11 +141,18 @@ pub(crate) fn router_with_reconciliation(
         Arc::clone(&store),
     );
     let profiles = ProfileService::new(Arc::clone(&store));
+    let orchestrator_workflow_profiles =
+        OrchestratorWorkflowProfileService::new(Arc::clone(&store));
     let worker_sessions = WorkerSessionService::new(Arc::clone(&runtime), Arc::clone(&store));
     let allocations = AllocationService::new(
         Arc::clone(&source),
         Arc::clone(&runtime),
         Arc::clone(&intervention),
+        Arc::clone(&store),
+    );
+    let orchestrator_replacements = OrchestratorReplacementService::new(
+        Arc::clone(&source),
+        Arc::clone(&runtime),
         Arc::clone(&store),
     );
     let coordination_nodes = CoordinationNodeService::new(
@@ -145,18 +164,32 @@ pub(crate) fn router_with_reconciliation(
         coordination_path,
         knowledge_path,
     );
+    let yard_orchestrator_intervention = Arc::clone(&intervention);
     let interventions =
         InterventionService::new(Arc::clone(&source), intervention, Arc::clone(&store));
     let terminals =
         TerminalService::new(interventions.clone(), coordination_nodes.clone(), terminal);
     let yard_orchestrator = YardOrchestratorService::new(
         runtime,
+        yard_orchestrator_intervention,
         Arc::clone(&store),
         reconciliation.clone(),
         orchestrator_cwd,
     );
     Router::new()
         .route("/health", get(health))
+        .route(
+            "/api/v1/orchestrator-workflow-profile",
+            get(get_orchestrator_workflow_profile).put(update_orchestrator_workflow_profile),
+        )
+        .route(
+            "/api/v1/orchestrator-workflow-profile/reset",
+            axum::routing::post(reset_orchestrator_workflow_profile),
+        )
+        .route(
+            "/api/v1/token-spend-settings",
+            get(get_token_spend_settings).put(update_token_spend_settings),
+        )
         .route(
             "/api/v1/automations",
             get(list_automations).post(create_automation),
@@ -292,6 +325,10 @@ pub(crate) fn router_with_reconciliation(
             axum::routing::post(prompt_orchestrator),
         )
         .route(
+            "/api/v1/projects/{project_id}/orchestrator/replace",
+            axum::routing::post(replace_project_orchestrator),
+        )
+        .route(
             "/api/v1/projects/{project_id}/orchestrator/terminal-output",
             get(read_orchestrator_output),
         )
@@ -335,13 +372,27 @@ pub(crate) fn router_with_reconciliation(
             "/api/v1/worker-profiles/{profile_id}",
             get(get_worker_profile).put(update_worker_profile),
         )
+        .route(
+            "/api/v1/agent-profiles",
+            get(list_agent_profiles).post(create_agent_profile),
+        )
+        .route(
+            "/api/v1/agent-profiles/{profile_id}",
+            get(get_agent_profile).put(update_agent_profile),
+        )
+        .route(
+            "/api/v1/agent-profiles/{profile_id}/revisions/{profile_version}",
+            get(get_agent_profile_revision),
+        )
         .with_state(AppState {
             store,
             source,
             reconciliation,
             projects,
             profiles,
+            orchestrator_workflow_profiles,
             allocations,
+            orchestrator_replacements,
             worker_sessions,
             interventions,
             terminals,
@@ -362,6 +413,64 @@ fn default_orchestrator_cwd() -> String {
 
 async fn health() -> Json<Health> {
     Json(Health { status: "ok" })
+}
+
+async fn get_orchestrator_workflow_profile(
+    State(state): State<AppState>,
+) -> Result<NoStoreJson<OrchestratorWorkflowProfile>, ApiError> {
+    state
+        .orchestrator_workflow_profiles
+        .get()
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn update_orchestrator_workflow_profile(
+    State(state): State<AppState>,
+    Json(command): Json<UpdateOrchestratorWorkflowProfile>,
+) -> Result<NoStoreJson<OrchestratorWorkflowProfile>, ApiError> {
+    state
+        .orchestrator_workflow_profiles
+        .update(command)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn reset_orchestrator_workflow_profile(
+    State(state): State<AppState>,
+    Json(command): Json<ResetOrchestratorWorkflowProfile>,
+) -> Result<NoStoreJson<OrchestratorWorkflowProfile>, ApiError> {
+    state
+        .orchestrator_workflow_profiles
+        .reset(command)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn get_token_spend_settings(
+    State(state): State<AppState>,
+) -> Result<NoStoreJson<TokenSpendSettings>, ApiError> {
+    state
+        .automations
+        .token_spend_settings()
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn update_token_spend_settings(
+    State(state): State<AppState>,
+    Json(command): Json<UpdateTokenSpendSettings>,
+) -> Result<NoStoreJson<TokenSpendSettings>, ApiError> {
+    state
+        .automations
+        .update_token_spend_settings(command)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
 }
 
 async fn list_automations(
@@ -660,11 +769,11 @@ async fn configure_yard_orchestrator(
     Json(command): Json<ConfigureYardOrchestrator>,
 ) -> Result<NoStoreJson<ConfiguredYardOrchestrator>, ApiError> {
     state
-        .store
-        .configure_yard_orchestrator(command)
+        .yard_orchestrator
+        .configure(command)
         .await
         .map(NoStoreJson)
-        .map_err(yard_orchestrator_store_error)
+        .map_err(ApiError::from)
 }
 
 async fn provision_yard_orchestrator(
@@ -1048,6 +1157,75 @@ async fn update_worker_profile(
         .map_err(ApiError::from)
 }
 
+async fn list_agent_profiles(
+    State(state): State<AppState>,
+) -> Result<NoStoreJson<AgentProfiles>, ApiError> {
+    state
+        .profiles
+        .list_agents()
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn create_agent_profile(
+    State(state): State<AppState>,
+    Json(profile): Json<CreateAgentProfile>,
+) -> Result<CreatedAgentProfile, ApiError> {
+    state
+        .profiles
+        .create_agent(profile)
+        .await
+        .map(CreatedAgentProfile)
+        .map_err(ApiError::from)
+}
+
+async fn get_agent_profile(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+) -> Result<NoStoreJson<AgentProfile>, ApiError> {
+    state
+        .profiles
+        .get_agent(&profile_id)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn get_agent_profile_revision(
+    State(state): State<AppState>,
+    Path((profile_id, profile_version)): Path<(String, String)>,
+) -> Result<NoStoreJson<AgentProfile>, ApiError> {
+    let profile_version = profile_version
+        .parse::<u64>()
+        .ok()
+        .filter(|version| *version > 0)
+        .ok_or(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_agent_profile_revision",
+            message: "Agent profile revision must be a positive integer".to_owned(),
+        })?;
+    state
+        .profiles
+        .get_agent_revision(&profile_id, profile_version)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn update_agent_profile(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+    Json(update): Json<UpdateAgentProfile>,
+) -> Result<NoStoreJson<AgentProfile>, ApiError> {
+    state
+        .profiles
+        .update_agent(&profile_id, update)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
 async fn list_project_assignments(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -1172,6 +1350,19 @@ async fn prompt_orchestrator(
         .map_err(ApiError::from)
 }
 
+async fn replace_project_orchestrator(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(command): Json<ReplaceProjectOrchestrator>,
+) -> Result<NoStoreJson<ReplacedProjectOrchestrator>, ApiError> {
+    state
+        .orchestrator_replacements
+        .replace_project(&project_id, command)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct OutputQuery {
     #[serde(default = "default_output_lines")]
@@ -1280,6 +1471,15 @@ struct CreatedWorkerProfile(WorkerProfile);
 impl IntoResponse for CreatedWorkerProfile {
     fn into_response(self) -> Response {
         let location = format!("/api/v1/worker-profiles/{}", self.0.id);
+        created_response(&location, self.0)
+    }
+}
+
+struct CreatedAgentProfile(AgentProfile);
+
+impl IntoResponse for CreatedAgentProfile {
+    fn into_response(self) -> Response {
+        let location = format!("/api/v1/agent-profiles/{}", self.0.id);
         created_response(&location, self.0)
     }
 }
@@ -1650,11 +1850,147 @@ impl From<ProjectServiceError> for ApiError {
     }
 }
 
+impl From<OrchestratorReplacementServiceError> for ApiError {
+    fn from(error: OrchestratorReplacementServiceError) -> Self {
+        match error {
+            OrchestratorReplacementServiceError::InvalidCommand(error) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid_orchestrator_replacement",
+                message: error.to_string(),
+            },
+            OrchestratorReplacementServiceError::UnsupportedProfile(message) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "unsupported_worker_profile",
+                message,
+            },
+            OrchestratorReplacementServiceError::RuntimeWorkspaceMissing(_)
+            | OrchestratorReplacementServiceError::RuntimeIdentityChanged
+            | OrchestratorReplacementServiceError::ReplacementUnverified => Self {
+                status: StatusCode::CONFLICT,
+                code: "orchestrator_replacement_identity_changed",
+                message: error.to_string(),
+            },
+            OrchestratorReplacementServiceError::RuntimeCwdUnavailable => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "runtime_cwd_unavailable",
+                message: error.to_string(),
+            },
+            OrchestratorReplacementServiceError::RuntimeProvision(message) => Self {
+                status: StatusCode::BAD_GATEWAY,
+                code: "orchestrator_replacement_provision_failed",
+                message,
+            },
+            OrchestratorReplacementServiceError::ObjectiveDeliveryFailed(message) => Self {
+                status: StatusCode::CONFLICT,
+                code: "command_outcome_ambiguous",
+                message,
+            },
+            OrchestratorReplacementServiceError::Inventory(error) => Self::from(error),
+            OrchestratorReplacementServiceError::Store(ProjectStoreError::ProjectNotFound) => {
+                Self {
+                    status: StatusCode::NOT_FOUND,
+                    code: "project_not_found",
+                    message: "Yard project was not found".to_owned(),
+                }
+            }
+            OrchestratorReplacementServiceError::Store(ProjectStoreError::ProfileNotFound) => {
+                Self {
+                    status: StatusCode::NOT_FOUND,
+                    code: "worker_profile_not_found",
+                    message: "Worker profile was not found".to_owned(),
+                }
+            }
+            OrchestratorReplacementServiceError::Store(ProjectStoreError::DatabaseBusy) => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "database_busy",
+                message: "Yard storage is busy; retry the request".to_owned(),
+            },
+            OrchestratorReplacementServiceError::Store(
+                error @ (ProjectStoreError::ProjectVersionConflict { .. }
+                | ProjectStoreError::WorkerVersionConflict { .. }
+                | ProjectStoreError::ProfileVersionConflict { .. }
+                | ProjectStoreError::OrchestratorNotCurrent { .. }
+                | ProjectStoreError::OrchestratorInterventionInProgress
+                | ProjectStoreError::OrchestratorReplacementReserved
+                | ProjectStoreError::OrchestratorReplacementTargetChanged
+                | ProjectStoreError::OrchestratorReplacementRuntimeMissing
+                | ProjectStoreError::OrchestratorReplacementRuntimeConflict
+                | ProjectStoreError::RuntimeBindingMissing
+                | ProjectStoreError::RuntimeWorkspaceMismatch
+                | ProjectStoreError::RuntimeWorkerAlreadyBound
+                | ProjectStoreError::StaleRuntimeSnapshot
+                | ProjectStoreError::IdempotencyConflict
+                | ProjectStoreError::CommandInProgress
+                | ProjectStoreError::CommandPreviouslyFailed(_)
+                | ProjectStoreError::CommandOutcomeAmbiguous(_)),
+            ) => Self {
+                status: StatusCode::CONFLICT,
+                code: "orchestrator_replacement_conflict",
+                message: error.to_string(),
+            },
+            OrchestratorReplacementServiceError::Store(_) => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "orchestrator_replacement_storage_error",
+                message: "Yard orchestrator replacement storage is unavailable".to_owned(),
+            },
+        }
+    }
+}
+
+impl From<OrchestratorWorkflowProfileServiceError> for ApiError {
+    fn from(error: OrchestratorWorkflowProfileServiceError) -> Self {
+        match error {
+            OrchestratorWorkflowProfileServiceError::InvalidProfile(error)
+            | OrchestratorWorkflowProfileServiceError::Store(
+                ProjectStoreError::InvalidOrchestratorWorkflowProfile(error),
+            ) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid_orchestrator_workflow_profile",
+                message: error.to_string(),
+            },
+            OrchestratorWorkflowProfileServiceError::Store(
+                ProjectStoreError::OrchestratorWorkflowProfileVersionConflict { current_version },
+            ) => Self {
+                status: StatusCode::CONFLICT,
+                code: "orchestrator_workflow_profile_version_conflict",
+                message: format!(
+                    "Orchestrator workflow profile changed concurrently; current version is \
+                     {current_version}"
+                ),
+            },
+            OrchestratorWorkflowProfileServiceError::Store(
+                ProjectStoreError::OrchestratorWorkflowProfileNotFound,
+            ) => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "orchestrator_workflow_profile_not_found",
+                message: "Orchestrator workflow profile revision was not found".to_owned(),
+            },
+            OrchestratorWorkflowProfileServiceError::Store(ProjectStoreError::DatabaseBusy) => {
+                Self {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    code: "database_busy",
+                    message: "Yard storage is busy; retry the request".to_owned(),
+                }
+            }
+            OrchestratorWorkflowProfileServiceError::Store(_) => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "storage_error",
+                message: "Orchestrator workflow profile storage is unavailable".to_owned(),
+            },
+        }
+    }
+}
+
 impl From<ProfileServiceError> for ApiError {
     fn from(error: ProfileServiceError) -> Self {
         match error {
             ProfileServiceError::InvalidProfile(error)
             | ProfileServiceError::Store(ProjectStoreError::InvalidProfile(error)) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid_worker_profile",
+                message: error.to_string(),
+            },
+            ProfileServiceError::Store(ProjectStoreError::InvalidAgentProfile(error)) => Self {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "invalid_worker_profile",
                 message: error.to_string(),
@@ -1684,6 +2020,50 @@ impl From<ProfileServiceError> for ApiError {
                 message: "Yard storage is busy; retry the request".to_owned(),
             },
             ProfileServiceError::Store(_) => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "storage_error",
+                message: "Yard storage is unavailable".to_owned(),
+            },
+        }
+    }
+}
+
+impl From<AgentProfileServiceError> for ApiError {
+    fn from(error: AgentProfileServiceError) -> Self {
+        match error {
+            AgentProfileServiceError::InvalidProfile(error)
+            | AgentProfileServiceError::Store(ProjectStoreError::InvalidAgentProfile(error)) => {
+                Self {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "invalid_agent_profile",
+                    message: error.to_string(),
+                }
+            }
+            AgentProfileServiceError::Store(ProjectStoreError::ProfileNotFound) => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "agent_profile_not_found",
+                message: "Agent profile revision was not found".to_owned(),
+            },
+            AgentProfileServiceError::Store(ProjectStoreError::ProfileNameAlreadyExists) => Self {
+                status: StatusCode::CONFLICT,
+                code: "agent_profile_name_conflict",
+                message: "An agent profile with this name already exists".to_owned(),
+            },
+            AgentProfileServiceError::Store(ProjectStoreError::ProfileVersionConflict {
+                current_version,
+            }) => Self {
+                status: StatusCode::CONFLICT,
+                code: "agent_profile_version_conflict",
+                message: format!(
+                    "Agent profile changed concurrently; current version is {current_version}"
+                ),
+            },
+            AgentProfileServiceError::Store(ProjectStoreError::DatabaseBusy) => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "database_busy",
+                message: "Yard storage is busy; retry the request".to_owned(),
+            },
+            AgentProfileServiceError::Store(_) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "storage_error",
                 message: "Yard storage is unavailable".to_owned(),
@@ -1756,6 +2136,11 @@ impl From<CoordinationNodeServiceError> for ApiError {
             CoordinationNodeServiceError::NodeNotProvisioned => Self {
                 status: StatusCode::CONFLICT,
                 code: "coordination_node_not_provisioned",
+                message: error.to_string(),
+            },
+            CoordinationNodeServiceError::AutomaticTokenSpendDisabled => Self {
+                status: StatusCode::CONFLICT,
+                code: "automatic_token_spend_disabled",
                 message: error.to_string(),
             },
             CoordinationNodeServiceError::NodeChanged
@@ -2022,6 +2407,11 @@ impl From<InterventionServiceError> for ApiError {
                 code: "yard_orchestrator_changed",
                 message: error.to_string(),
             },
+            InterventionServiceError::AutomaticTokenSpendDisabled => Self {
+                status: StatusCode::CONFLICT,
+                code: "automatic_token_spend_disabled",
+                message: error.to_string(),
+            },
             InterventionServiceError::Runtime(error) => runtime_intervention_error(error),
             InterventionServiceError::Inventory(error) => Self::from(error),
             InterventionServiceError::Store(error) => intervention_store_error(error),
@@ -2216,6 +2606,21 @@ fn coordination_node_store_error(error: ProjectStoreError) -> ApiError {
 
 fn automation_store_error(error: ProjectStoreError) -> ApiError {
     match error {
+        ProjectStoreError::InvalidTokenSpendSettings(error) => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "invalid_token_spend_settings",
+            message: error.to_string(),
+        },
+        error @ ProjectStoreError::TokenSpendSettingsVersionConflict { .. } => ApiError {
+            status: StatusCode::CONFLICT,
+            code: "token_spend_settings_conflict",
+            message: error.to_string(),
+        },
+        ProjectStoreError::AutomaticSummaryTargetInvalid => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "invalid_automatic_summary_target",
+            message: error.to_string(),
+        },
         ProjectStoreError::InvalidAutomation(error) => ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "invalid_automation_command",
@@ -2248,6 +2653,7 @@ fn automation_store_error(error: ProjectStoreError) -> ApiError {
         | ProjectStoreError::AutomationRunIdConflict
         | ProjectStoreError::AutomationDispatchCommandIdConflict
         | ProjectStoreError::AutomationRunInProgress
+        | ProjectStoreError::ScheduledAutomaticSummariesDisabled
         | ProjectStoreError::IdempotencyConflict
         | ProjectStoreError::CommandInProgress
         | ProjectStoreError::CommandPreviouslyFailed(_)
@@ -2609,6 +3015,7 @@ mod tests {
             Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        time::Duration,
     };
 
     use async_trait::async_trait;
@@ -2620,19 +3027,22 @@ mod tests {
     use futures_util::{SinkExt, StreamExt, future::join_all};
     use http_body_util::BodyExt;
     use tempfile::TempDir;
+    use tokio::{sync::Notify, time::timeout};
     use tokio_tungstenite::{
         connect_async,
         tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest},
     };
     use tower::ServiceExt;
     use yard_domain::{
-        CanvasPlacement, CoordinationNodeKind, CreateCoordinationNode, CreateWorkerProfile,
-        FocusObservation, ObservedStatus, ObservedWorker, ProviderSessionRef,
-        ProvisionCoordinationNode, RuntimeInventory, RuntimeSession, RuntimeSessions,
-        WorkerProfileSpec, WorkerRuntimeBinding, WorkspaceObservation, WorktreeObservation,
+        AutomationScope, CanvasPlacement, CoordinationNodeKind, CreateAutomation,
+        CreateCoordinationNode, CreateWorkerProfile, DailySchedule, FocusObservation,
+        ObservedStatus, ObservedWorker, ProviderSessionRef, ProvisionCoordinationNode,
+        RunAutomationNow, RuntimeInventory, RuntimeSession, RuntimeSessions,
+        UpdateTokenSpendSettings, WorkerProfileSpec, WorkerRuntimeBinding, WorkspaceObservation,
+        WorktreeObservation,
     };
     use yard_herdr::HerdrError;
-    use yard_store::SqliteProjectStore;
+    use yard_store::{SqliteProjectStore, YardStore};
 
     use super::router;
     use crate::allocation_service::{
@@ -2640,11 +3050,14 @@ mod tests {
         RuntimeRetirementRequest, RuntimeWorkspaceProvisionRequest,
     };
     use crate::artifact_service::ArtifactService;
+    use crate::automation_service::AutomationService;
+    use crate::coordination_node_service::CoordinationNodeService;
     use crate::intervention_service::{
-        RuntimeIntervention, RuntimeInterventionError, RuntimeOutputRequest, RuntimeOutputResult,
-        RuntimePromptRequest, RuntimePromptResult,
+        InterventionService, RuntimeIntervention, RuntimeInterventionError, RuntimeOutputRequest,
+        RuntimeOutputResult, RuntimePromptRequest, RuntimePromptResult,
     };
     use crate::inventory_service::{InventoryServiceError, InventorySource};
+    use crate::reconciliation_service::ReconciliationService;
     use crate::runtime_cleanup_service::RuntimeCleanupService;
     use crate::terminal_service::{
         OpenTerminalRequest, RuntimeTerminal, RuntimeTerminalError, RuntimeTerminalSession,
@@ -3033,7 +3446,75 @@ mod tests {
                     provider_session: Some(provider_session("yard-handoffcommand1-session")),
                     revision: 5,
                 },
+                ObservedWorker {
+                    runtime_id: "terminal-yard-replacecommand1".to_owned(),
+                    terminal_id: "terminal-yard-replacecommand1".to_owned(),
+                    workspace_id: "workspace-2".to_owned(),
+                    tab_id: "tab-yard-replacecommand1".to_owned(),
+                    pane_id: "pane-yard-replacecommand1".to_owned(),
+                    name: Some("yard-replacecommand1".to_owned()),
+                    provider: Some("codex".to_owned()),
+                    display_provider: Some("Codex".to_owned()),
+                    status: ObservedStatus::Idle,
+                    focused: false,
+                    launch_pending: false,
+                    interactive_ready: true,
+                    state_change_sequence: 6,
+                    cwd: Some("/tmp/target-api".to_owned()),
+                    foreground_cwd: Some("/tmp/target-api".to_owned()),
+                    tokens: BTreeMap::new(),
+                    provider_session: Some(provider_session("yard-replacecommand1-session")),
+                    revision: 6,
+                },
             ]);
+            Ok(inventory)
+        }
+    }
+
+    struct ReplacementIdentityMismatchInventory;
+
+    #[async_trait]
+    impl InventorySource for ReplacementIdentityMismatchInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            HandoffInventory.sessions().await
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            let mut inventory = HandoffInventory.inventory(session_name).await?;
+            let replacement = inventory
+                .workers
+                .iter_mut()
+                .find(|worker| worker.terminal_id == "terminal-yard-replacecommand1")
+                .unwrap();
+            replacement.provider_session = Some(provider_session("different-replacement-session"));
+            Ok(inventory)
+        }
+    }
+
+    #[derive(Default)]
+    struct ReplacementWorkspaceMissingInventory {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl InventorySource for ReplacementWorkspaceMissingInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            HandoffInventory.sessions().await
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            let mut inventory = HandoffInventory.inventory(session_name).await?;
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 2 {
+                inventory
+                    .workspaces
+                    .retain(|workspace| workspace.runtime_id != "workspace-2");
+            }
             Ok(inventory)
         }
     }
@@ -3103,6 +3584,7 @@ mod tests {
         database_path: PathBuf,
         claim_seen_before_start: AtomicBool,
         start_calls: AtomicUsize,
+        replacement_prompt_failure: AtomicBool,
         retirement_failures: AtomicUsize,
         retirement_calls: Mutex<Vec<RuntimeRetirementRequest>>,
         start_requests: Mutex<Vec<RuntimeProvisionRequest>>,
@@ -3174,6 +3656,67 @@ mod tests {
             Ok(prepared)
         }
 
+        async fn prepare_replacement_worker(
+            &self,
+            request: RuntimeProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            let mut prepared = FakeRuntime.provision_worker(request).await?;
+            prepared.provider_session = None;
+            prepared.process_state = yard_domain::RuntimeProcessState::Unknown;
+            Ok(prepared)
+        }
+
+        async fn start_prepared_replacement_worker(
+            &self,
+            request: RuntimeProvisionRequest,
+            mut prepared: WorkerRuntimeBinding,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            self.start_calls.fetch_add(1, Ordering::SeqCst);
+            self.start_requests.lock().unwrap().push(request.clone());
+
+            let connection = rusqlite::Connection::open(&self.database_path).unwrap();
+            let claimed = connection
+                .query_row(
+                    "SELECT adapter, runtime_session, runtime_workspace_id,
+                            terminal_id, tab_id, pane_id, captured_at_unix_ms
+                       FROM orchestrator_replacement_runtime_bindings
+                      WHERE command_id = ?1
+                        AND binding_role = 'replacement_prepared'",
+                    [&request.command_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(claimed.0, prepared.adapter);
+            assert_eq!(claimed.1, prepared.session);
+            assert_eq!(claimed.2, prepared.workspace_id);
+            assert_eq!(claimed.3, prepared.terminal_id);
+            assert_eq!(claimed.4, prepared.tab_id);
+            assert_eq!(claimed.5, prepared.pane_id);
+            assert!(claimed.6 > 0);
+            self.claim_seen_before_start.store(true, Ordering::SeqCst);
+
+            prepared.provider_session =
+                Some(provider_session(&format!("{}-session", request.agent_name)));
+            prepared.process_state = yard_domain::RuntimeProcessState::Running;
+            if self.replacement_prompt_failure.load(Ordering::SeqCst) {
+                return Err(RuntimeProvisionError::PromptDelivery {
+                    runtime: Box::new(prepared),
+                    message: "simulated objective delivery ambiguity".to_owned(),
+                });
+            }
+            Ok(prepared)
+        }
+
         async fn retire_runtime(
             &self,
             request: RuntimeRetirementRequest,
@@ -3203,9 +3746,32 @@ mod tests {
     struct ReportingRuntime {
         prompts: Mutex<Vec<RuntimePromptRequest>>,
         outputs: Mutex<HashMap<String, String>>,
+        prompt_gate: Option<PromptGate>,
+    }
+
+    #[derive(Clone)]
+    struct PromptGate {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
     }
 
     impl ReportingRuntime {
+        fn blocked() -> (Self, Arc<Notify>, Arc<Notify>) {
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            (
+                Self {
+                    prompt_gate: Some(PromptGate {
+                        entered: Arc::clone(&entered),
+                        release: Arc::clone(&release),
+                    }),
+                    ..Self::default()
+                },
+                entered,
+                release,
+            )
+        }
+
         fn set_output(&self, pane_id: &str, text: impl Into<String>) {
             self.outputs
                 .lock()
@@ -3221,6 +3787,10 @@ mod tests {
             request: RuntimePromptRequest,
         ) -> Result<RuntimePromptResult, RuntimeInterventionError> {
             self.prompts.lock().unwrap().push(request);
+            if let Some(gate) = &self.prompt_gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
             Ok(RuntimePromptResult {
                 status: "working".to_owned(),
             })
@@ -3440,6 +4010,13 @@ mod tests {
     async fn handoff_test_router_with_retirement_failures(
         retirement_failures: usize,
     ) -> (Router, TempDir, Arc<ClaimCheckingRuntime>) {
+        handoff_test_router_with_source(retirement_failures, Arc::new(HandoffInventory)).await
+    }
+
+    async fn handoff_test_router_with_source(
+        retirement_failures: usize,
+        source: Arc<dyn InventorySource>,
+    ) -> (Router, TempDir, Arc<ClaimCheckingRuntime>) {
         let temp = TempDir::new().unwrap();
         let database_path = temp.path().join("yard.sqlite3");
         let store = Arc::new(SqliteProjectStore::open(&database_path).await.unwrap());
@@ -3447,6 +4024,7 @@ mod tests {
             database_path,
             claim_seen_before_start: AtomicBool::new(false),
             start_calls: AtomicUsize::new(0),
+            replacement_prompt_failure: AtomicBool::new(false),
             retirement_failures: AtomicUsize::new(retirement_failures),
             retirement_calls: Mutex::new(Vec::new()),
             start_requests: Mutex::new(Vec::new()),
@@ -3454,7 +4032,7 @@ mod tests {
         let interactive = Arc::new(FakeRuntime);
         let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
         let app = router(
-            Arc::new(HandoffInventory),
+            source,
             runtime.clone(),
             interactive.clone(),
             interactive,
@@ -3527,6 +4105,17 @@ mod tests {
         .to_string()
     }
 
+    fn agent_profile_fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../../yard-domain/tests/fixtures/agent-profile-v1alpha1.json"
+        ))
+        .unwrap()
+    }
+
+    fn agent_profile_body(manifest: &serde_json::Value) -> String {
+        serde_json::json!({ "manifest": manifest }).to_string()
+    }
+
     fn profile_project_body(profile_id: &str) -> String {
         serde_json::json!({
             "command_id": "profile-project-command",
@@ -3585,6 +4174,19 @@ mod tests {
                 .unwrap(),
         )
         .await
+    }
+
+    async fn assert_automatic_token_spend_defaults_off(app: &Router) {
+        let settings = get_json(app, "/api/v1/token-spend-settings").await;
+        assert_eq!(
+            settings["superintendent_auto_requests_project_summaries"],
+            false
+        );
+        assert_eq!(
+            settings["project_orchestrators_auto_request_worker_summaries"],
+            false
+        );
+        assert_eq!(settings["scheduled_automatic_summaries"], false);
     }
 
     async fn create_active_assignment(app: &Router) -> (String, String) {
@@ -3729,6 +4331,73 @@ mod tests {
         (uri, command)
     }
 
+    async fn create_orchestrator_replacement_request(
+        app: &Router,
+    ) -> (String, serde_json::Value, String) {
+        let target_project_body = serde_json::json!({
+            "name": "Target API",
+            "runtime": {
+                "adapter": "herdr",
+                "session": "default",
+                "workspace_id": "workspace-2"
+            },
+            "orchestrator_observed_worker_id": "terminal-target-orchestrator",
+            "placement": {
+                "x": 480.0,
+                "y": 70.0,
+                "width": 322.0,
+                "height": 240.0
+            }
+        });
+        let target_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(target_project_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(target_response.status(), StatusCode::CREATED);
+        let target_project = response_json(target_response).await;
+        let profile_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/worker-profiles")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(profile_body("Replacement orchestrator")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(profile_response.status(), StatusCode::CREATED);
+        let profile = response_json(profile_response).await;
+        let project_id = target_project["id"].as_str().unwrap().to_owned();
+        let uri = format!("/api/v1/projects/{project_id}/orchestrator/replace");
+        let command = serde_json::json!({
+            "command_id": "replace-command-1",
+            "actor": "local-user",
+            "expected_project_version": target_project["version"],
+            "expected_orchestrator_worker_id": target_project["orchestrator"]["id"],
+            "expected_orchestrator_worker_version":
+                target_project["orchestrator"]["version"],
+            "expected_orchestrator_runtime":
+                target_project["orchestrator"]["runtime"],
+            "profile_id": profile["id"],
+            "expected_profile_version": profile["version"],
+            "objective": "Continue orchestration with fresh context.",
+            "role": "orchestrator",
+            "old_session_disposition": "retire_after_cutover",
+            "handoff_artifact_ref": "artifact://orchestrator-handoff"
+        });
+        (uri, command, project_id)
+    }
+
     #[test]
     fn maps_pending_prompt_completion_to_conflict() {
         let error = super::allocation_store_error(
@@ -3741,6 +4410,282 @@ mod tests {
             error.message,
             "Wait for the pending worker prompt before recording completion"
         );
+    }
+
+    #[tokio::test]
+    async fn replacement_endpoint_claims_starts_verifies_and_cuts_over_before_cleanup() {
+        let (app, temp, runtime) = handoff_test_router().await;
+        let (uri, command, project_id) = create_orchestrator_replacement_request(&app).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let replacement = response_json(response).await;
+        assert_eq!(replacement["command_id"], "replace-command-1");
+        assert_eq!(replacement["replayed"], false);
+        assert_eq!(replacement["cleanup_pending"], false);
+        assert_eq!(
+            replacement["project"]["orchestrator"]["runtime"]["terminal_id"],
+            "terminal-yard-replacecommand1"
+        );
+        assert!(
+            runtime.claim_seen_before_start.load(Ordering::SeqCst),
+            "replacement start was reached before the prepared snapshot committed"
+        );
+        assert_eq!(runtime.start_calls.load(Ordering::SeqCst), 1);
+        {
+            let retirements = runtime.retirement_calls.lock().unwrap();
+            assert_eq!(retirements.len(), 1);
+            assert_eq!(retirements[0].terminal_id, "terminal-target-orchestrator");
+            assert_eq!(
+                retirements[0].provider_session,
+                Some(provider_session("target-orchestrator-session"))
+            );
+        }
+
+        let project = get_json(&app, &format!("/api/v1/projects/{project_id}")).await;
+        assert_eq!(
+            project["orchestrator"]["id"],
+            replacement["project"]["orchestrator"]["id"]
+        );
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let (snapshot_count, receipt_count, old_binding_count): (i64, i64, i64) = connection
+            .query_row(
+                "SELECT
+                    (
+                        SELECT COUNT(*)
+                          FROM orchestrator_replacement_runtime_bindings
+                         WHERE command_id = 'replace-command-1'
+                    ),
+                    (SELECT COUNT(*) FROM completion_receipts),
+                    (
+                        SELECT COUNT(*)
+                          FROM worker_runtime_bindings
+                         WHERE terminal_id = 'terminal-target-orchestrator'
+                    )",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(snapshot_count, 3);
+        assert_eq!(receipt_count, 0);
+        assert_eq!(old_binding_count, 0);
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_stale_captured_identity_before_external_mutation() {
+        let (app, _temp, runtime) = handoff_test_router().await;
+        let (uri, mut command, _project_id) = create_orchestrator_replacement_request(&app).await;
+        command["expected_orchestrator_runtime"]["provider_session"]["value"] =
+            serde_json::Value::String("different-provider-session".to_owned());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(runtime.start_calls.load(Ordering::SeqCst), 0);
+        assert!(runtime.retirement_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replacement_prompt_ambiguity_retains_started_identity_without_cutover() {
+        let (app, temp, runtime) = handoff_test_router().await;
+        runtime
+            .replacement_prompt_failure
+            .store(true, Ordering::SeqCst);
+        let (uri, command, project_id) = create_orchestrator_replacement_request(&app).await;
+        let displaced_worker_id = command["expected_orchestrator_worker_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = response_json(response).await;
+        assert_eq!(error["error"]["code"], "command_outcome_ambiguous");
+        let project = get_json(&app, &format!("/api/v1/projects/{project_id}")).await;
+        assert_eq!(project["orchestrator"]["id"], displaced_worker_id);
+        assert!(runtime.retirement_calls.lock().unwrap().is_empty());
+
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let (status, started_snapshots, cleanup_jobs): (String, i64, i64) = connection
+            .query_row(
+                "SELECT command.status,
+                        (
+                            SELECT COUNT(*)
+                              FROM orchestrator_replacement_runtime_bindings snapshot
+                             WHERE snapshot.command_id = command.id
+                               AND snapshot.binding_role =
+                                   'replacement_started'
+                        ),
+                        (
+                            SELECT COUNT(*)
+                              FROM runtime_cleanup_jobs cleanup
+                             WHERE cleanup.command_id = command.id
+                        )
+                   FROM command_acknowledgements command
+                  WHERE command.id = 'replace-command-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "ambiguous");
+        assert_eq!(started_snapshots, 1);
+        assert_eq!(cleanup_jobs, 0);
+    }
+
+    #[tokio::test]
+    async fn replacement_provider_mismatch_blocks_cutover_and_retirement() {
+        let (app, _temp, runtime) =
+            handoff_test_router_with_source(0, Arc::new(ReplacementIdentityMismatchInventory))
+                .await;
+        let (uri, command, project_id) = create_orchestrator_replacement_request(&app).await;
+        let displaced_worker_id = command["expected_orchestrator_worker_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = response_json(response).await;
+        assert_eq!(
+            error["error"]["code"],
+            "orchestrator_replacement_identity_changed"
+        );
+        assert_eq!(runtime.start_calls.load(Ordering::SeqCst), 1);
+        assert!(runtime.retirement_calls.lock().unwrap().is_empty());
+        let project = get_json(&app, &format!("/api/v1/projects/{project_id}")).await;
+        assert_eq!(project["orchestrator"]["id"], displaced_worker_id);
+    }
+
+    #[tokio::test]
+    async fn replacement_missing_fresh_workspace_blocks_cutover_and_retirement() {
+        let (app, _temp, runtime) = handoff_test_router_with_source(
+            0,
+            Arc::new(ReplacementWorkspaceMissingInventory::default()),
+        )
+        .await;
+        let (uri, command, project_id) = create_orchestrator_replacement_request(&app).await;
+        let displaced_worker_id = command["expected_orchestrator_worker_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = response_json(response).await;
+        assert_eq!(
+            error["error"]["code"],
+            "orchestrator_replacement_identity_changed"
+        );
+        assert_eq!(runtime.start_calls.load(Ordering::SeqCst), 1);
+        assert!(runtime.retirement_calls.lock().unwrap().is_empty());
+        let project = get_json(&app, &format!("/api/v1/projects/{project_id}")).await;
+        assert_eq!(project["orchestrator"]["id"], displaced_worker_id);
+    }
+
+    #[tokio::test]
+    async fn replacement_cutover_revokes_open_orchestrator_terminal_lease() {
+        let (app, _temp, _runtime) = handoff_test_router().await;
+        let (uri, command, project_id) = create_orchestrator_replacement_request(&app).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, app.clone()).into_future());
+        let terminal_url = format!(
+            "ws://{address}/api/v1/projects/{project_id}/orchestrator/terminal?cols=80&rows=24"
+        );
+        let mut terminal_request = terminal_url.into_client_request().unwrap();
+        terminal_request.headers_mut().insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://127.0.0.1:5173"),
+        );
+        let (mut socket, response) = connect_async(terminal_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert!(matches!(
+            socket.next().await.unwrap().unwrap(),
+            TungsteniteMessage::Text(_)
+        ));
+
+        let replaced = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replaced.status(), StatusCode::OK);
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .expect("orchestrator terminal lease was not revoked")
+            .unwrap()
+            .unwrap();
+        let TungsteniteMessage::Text(closed) = closed else {
+            panic!("expected terminal.closed");
+        };
+        let closed: serde_json::Value = serde_json::from_str(&closed).unwrap();
+        assert_eq!(closed["type"], "terminal.closed");
+        assert_eq!(closed["reason"], "orchestrator_changed");
+        server.abort();
     }
 
     #[tokio::test]
@@ -3845,6 +4790,7 @@ mod tests {
         command["role"] = serde_json::Value::String("orchestrator".to_owned());
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -4791,10 +5737,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(
+            response.headers()[header::LOCATION]
+                .to_str()
+                .unwrap()
+                .starts_with("/api/v1/worker-profiles/")
+        );
         let created = response_json(response).await;
         let profile_id = created["id"].as_str().unwrap();
         assert_eq!(created["version"], "1");
         assert_eq!(created["provider"], "codex");
+        assert!(created.get("manifest").is_none());
 
         let mut update =
             serde_json::from_str::<serde_json::Value>(&profile_body("Reviewer")).unwrap();
@@ -4817,6 +5770,7 @@ mod tests {
         assert_eq!(updated["version"], "2");
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/worker-profiles")
@@ -4828,6 +5782,267 @@ mod tests {
         let profiles = response_json(response).await;
         assert_eq!(profiles["profiles"][0]["id"], profile_id);
         assert_eq!(profiles["profiles"][0]["version"], "2");
+
+        let portable = get_json(
+            &app,
+            &format!("/api/v1/agent-profiles/{profile_id}/revisions/2"),
+        )
+        .await;
+        assert_eq!(portable["id"], profile_id);
+        assert_eq!(portable["version"], "2");
+        assert_eq!(portable["manifest"]["metadata"]["name"], "Reviewer");
+    }
+
+    #[tokio::test]
+    async fn imports_updates_and_exports_agent_profile_revisions() {
+        let (app, _temp) = test_router().await;
+        let manifest = agent_profile_fixture();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/agent-profiles")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(agent_profile_body(&manifest)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let created = response_json(response).await;
+        let profile_id = created["id"].as_str().unwrap();
+        assert_eq!(location, format!("/api/v1/agent-profiles/{profile_id}"));
+        assert_eq!(created["version"], "1");
+        assert_eq!(created["manifest"], manifest);
+        assert_eq!(created["validation"]["results"][3]["status"], "unsupported");
+
+        let mut replacement = agent_profile_fixture();
+        replacement["metadata"]["name"] = "Portable reviewer".into();
+        replacement["spec"]["extensions"]["io.example.provider"]["futureSetting"] = 23.into();
+        let update = serde_json::json!({
+            "expected_version": "1",
+            "manifest": replacement,
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/api/v1/agent-profiles/{profile_id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(update.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = response_json(response).await;
+        assert_eq!(updated["version"], "2");
+        assert_eq!(updated["manifest"]["metadata"]["name"], "Portable reviewer");
+        assert_eq!(
+            updated["manifest"]["spec"]["extensions"]["io.example.provider"]["futureSetting"],
+            23
+        );
+
+        let original = get_json(
+            &app,
+            &format!("/api/v1/agent-profiles/{profile_id}/revisions/1"),
+        )
+        .await;
+        let worker = get_json(&app, &format!("/api/v1/worker-profiles/{profile_id}")).await;
+        let profiles = get_json(&app, "/api/v1/agent-profiles").await;
+
+        assert_eq!(original["manifest"], manifest);
+        assert_eq!(worker["id"], profile_id);
+        assert_eq!(worker["name"], "Portable reviewer");
+        assert_eq!(worker["version"], "2");
+        assert_eq!(profiles["profiles"][0]["id"], profile_id);
+        assert_eq!(profiles["profiles"][0]["version"], "2");
+
+        let mut incompatible_legacy_update =
+            serde_json::from_str::<serde_json::Value>(&profile_body("Portable reviewer")).unwrap();
+        incompatible_legacy_update["runtime_adapter"] = "other-runtime".into();
+        incompatible_legacy_update["expected_version"] = "2".into();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/api/v1/worker-profiles/{profile_id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(incompatible_legacy_update.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "invalid_worker_profile"
+        );
+        assert_eq!(
+            get_json(&app, &format!("/api/v1/agent-profiles/{profile_id}")).await["version"],
+            "2"
+        );
+    }
+
+    #[tokio::test]
+    async fn gets_updates_resets_and_conflicts_orchestrator_workflow_profile() {
+        let (app, _temp) = test_router().await;
+        let factory = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/orchestrator-workflow-profile")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(factory["version"], "1");
+        assert_eq!(factory["monitor_interval_ms"], "600000");
+        assert!(
+            factory["instructions_markdown"]
+                .as_str()
+                .unwrap()
+                .contains("one Yard/Herdr worker per lane")
+        );
+
+        let edited = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri("/api/v1/orchestrator-workflow-profile")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "actor": "local-user",
+                                "expected_version": factory["version"],
+                                "instructions_markdown": "# Custom workflow\n\nUse two lanes.",
+                                "monitor_interval_ms": "900000"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(edited["version"], "2");
+        assert_eq!(edited["source"], "user");
+
+        let stale = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/orchestrator-workflow-profile/reset")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "actor": "local-user",
+                            "expected_version": factory["version"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(stale).await["error"]["code"],
+            "orchestrator_workflow_profile_version_conflict"
+        );
+
+        let reset = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/orchestrator-workflow-profile/reset")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "actor": "local-user",
+                                "expected_version": edited["version"]
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(reset["version"], "3");
+        assert_eq!(reset["source"], "reset");
+        assert_eq!(reset["monitor_interval_ms"], "600000");
+        assert!(
+            reset["instructions_markdown"]
+                .as_str()
+                .unwrap()
+                .contains("Automatic token-spending behavior remains opt-in")
+        );
+        assert_automatic_token_spend_defaults_off(&app).await;
+    }
+
+    #[tokio::test]
+    async fn agent_profile_import_fails_closed_for_unsupported_required_capability() {
+        let (app, _temp) = test_router().await;
+        let mut manifest = agent_profile_fixture();
+        manifest["spec"]["capabilities"]["required"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "agent.skills",
+                "version": 1
+            }));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/agent-profiles")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(agent_profile_body(&manifest)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "invalid_agent_profile"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/agent-profiles/profile-1/revisions/not-a-number")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "invalid_agent_profile_revision"
+        );
     }
 
     #[allow(clippy::too_many_lines)]
@@ -6399,6 +7614,28 @@ mod tests {
                 .unwrap(),
         )
         .await;
+        let workflow = get_json(&app, "/api/v1/orchestrator-workflow-profile").await;
+        let updated_workflow = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/v1/orchestrator-workflow-profile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "actor": "local-user",
+                            "expected_version": workflow["version"],
+                            "instructions_markdown": "# New-current workflow\n\nDo not use the pinned factory text.",
+                            "monitor_interval_ms": "900000"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated_workflow.status(), StatusCode::OK);
 
         let project_prompt_text = "Raw project prompt.";
         let yard_prompt_text = "Raw Yard prompt.";
@@ -6450,7 +7687,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let delivered_project_prompt = reporting.prompts.lock().unwrap()[0].text.clone();
+        let delivered_project_prompt = reporting.prompts.lock().unwrap()[1].text.clone();
         reporting.set_output("pane-1", delivered_project_prompt);
         assert_null_status_report(&get_json(&app, &project_output_uri).await);
         reporting.set_output("pane-1", status_line("forged-project-command", "idle"));
@@ -6540,11 +7777,17 @@ mod tests {
 
         {
             let prompts = reporting.prompts.lock().unwrap();
-            assert_eq!(prompts.len(), 3);
+            assert_eq!(prompts.len(), 4);
+            assert_eq!(prompts[0].command_id, "configure-status-yard");
+            assert!(
+                prompts[0]
+                    .text
+                    .contains("Assume ownership of central Yard orchestration")
+            );
+            assert!(prompts[0].text.contains("one Yard/Herdr worker per lane"));
             for (request, command_id, raw) in [
-                (&prompts[0], "runtime-project-prompt", project_prompt_text),
-                (&prompts[1], "runtime-yard-prompt", yard_prompt_text),
-                (&prompts[2], "runtime-yard-route", route_prompt_text),
+                (&prompts[1], "runtime-project-prompt", project_prompt_text),
+                (&prompts[3], "runtime-yard-route", route_prompt_text),
             ] {
                 assert_eq!(request.command_id, command_id);
                 assert!(request.text.starts_with(raw));
@@ -6555,6 +7798,18 @@ mod tests {
                         .is_none()
                 );
             }
+            let yard_prompt = &prompts[2];
+            assert_eq!(yard_prompt.command_id, "runtime-yard-prompt");
+            assert!(
+                yard_prompt
+                    .text
+                    .starts_with("Yard orchestrator workflow profile revision 1")
+            );
+            assert!(yard_prompt.text.contains(yard_prompt_text));
+            assert!(yard_prompt.text.contains("one Yard/Herdr worker per lane"));
+            assert!(!yard_prompt.text.contains("# New-current workflow"));
+            assert!(yard_prompt.text.contains("command \"runtime-yard-prompt\""));
+            assert!(yard_prompt.text.contains("There is no completed state"));
         }
 
         let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
@@ -7160,5 +8415,466 @@ mod tests {
         .await;
         assert_eq!(runs["runs"].as_array().unwrap().len(), 1);
         assert_eq!(runs["runs"][0]["id"], run["run"]["id"]);
+    }
+
+    #[tokio::test]
+    async fn token_spend_settings_api_defaults_off_and_updates_independently() {
+        let (app, _temp) = test_router().await;
+        let defaults = get_json(&app, "/api/v1/token-spend-settings").await;
+        assert_eq!(
+            defaults["superintendent_auto_requests_project_summaries"],
+            false
+        );
+        assert_eq!(
+            defaults["project_orchestrators_auto_request_worker_summaries"],
+            false
+        );
+        assert_eq!(defaults["scheduled_automatic_summaries"], false);
+
+        let update = serde_json::json!({
+            "actor": "local-user",
+            "expected_version": defaults["version"],
+            "superintendent_auto_requests_project_summaries": true,
+            "project_orchestrators_auto_request_worker_summaries": false,
+            "scheduled_automatic_summaries": false
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/v1/token-spend-settings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(update.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL].to_str().unwrap(),
+            "no-store"
+        );
+        let updated = response_json(response).await;
+        assert_eq!(
+            updated["superintendent_auto_requests_project_summaries"],
+            true
+        );
+        assert_eq!(
+            updated["project_orchestrators_auto_request_worker_summaries"],
+            false
+        );
+        assert_eq!(updated["scheduled_automatic_summaries"], false);
+
+        let conflict = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/v1/token-spend-settings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(update.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let conflict = response_json(conflict).await;
+        assert_eq!(conflict["error"]["code"], "token_spend_settings_conflict");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn scheduler_enforces_independent_automatic_layers_and_preserves_manual_dispatch() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let source = Arc::new(FakeInventory);
+        let control = Arc::new(FakeRuntime);
+        let reporting = Arc::new(ReportingRuntime::default());
+        let terminal = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            source.clone(),
+            control.clone(),
+            reporting.clone(),
+            terminal,
+            store.clone(),
+            artifacts,
+        );
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+
+        let inventory_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/sessions/default/inventory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inventory_response.status(), StatusCode::OK);
+        let candidates = get_json(&app, "/api/v1/workers").await;
+        let yard_candidate = candidates["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| {
+                candidate["worker"]["runtime"]["terminal_id"] == "terminal-yard-allocationcommand1"
+            })
+            .unwrap();
+        let initial_yard = get_json(&app, "/api/v1/yard/orchestrator").await;
+        let configure = serde_json::json!({
+            "command_id": "configure-automatic-summary-yard",
+            "actor": "local-user",
+            "worker_id": yard_candidate["worker"]["id"],
+            "expected_worker_version": yard_candidate["worker"]["version"],
+            "expected_orchestrator_version": initial_yard["version"]
+        });
+        let configured_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/v1/yard/orchestrator")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(configure.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(configured_response.status(), StatusCode::OK);
+        {
+            let mut prompts = reporting.prompts.lock().unwrap();
+            assert_eq!(prompts.len(), 1);
+            assert_eq!(prompts[0].command_id, "configure-automatic-summary-yard");
+            assert!(
+                prompts[0]
+                    .text
+                    .contains("Assume ownership of central Yard orchestration")
+            );
+            assert!(prompts[0].text.contains("one Yard/Herdr worker per lane"));
+            prompts.clear();
+        }
+
+        let reconciliation = ReconciliationService::new(source.clone(), store.clone());
+        let coordination_nodes = CoordinationNodeService::new(
+            source.clone(),
+            control,
+            reporting.clone(),
+            store.clone(),
+            reconciliation,
+            temp.path().join("coordination"),
+            temp.path().join("knowledge"),
+        );
+        let interventions = InterventionService::new(source, reporting.clone(), store.clone());
+        let scheduler = AutomationService::new(store.clone(), interventions, coordination_nodes);
+
+        let automation_id = uuid::Uuid::now_v7().to_string();
+        let automation = store
+            .create_automation(
+                CreateAutomation {
+                    command_id: "create-due-summary-automation".to_owned(),
+                    actor: "local-user".to_owned(),
+                    automation_id: automation_id.clone(),
+                    name: "Due project summary".to_owned(),
+                    scope: AutomationScope::ProjectOrchestrator {
+                        project_id: project_id.clone(),
+                    },
+                    placement: CanvasPlacement {
+                        x: 220.0,
+                        y: 180.0,
+                        width: 168.0,
+                        height: 58.0,
+                    },
+                    schedule: DailySchedule {
+                        hour: 9,
+                        minute: 0,
+                        timezone: "UTC".to_owned(),
+                    },
+                    selected_project_ids: vec![project_id.clone()],
+                    prompt_template: "Summarize current project status.".to_owned(),
+                },
+                1,
+            )
+            .await
+            .unwrap()
+            .automation;
+
+        scheduler.run_due_once().await.unwrap();
+        assert!(reporting.prompts.lock().unwrap().is_empty());
+        let count_rows = |table: &str| {
+            let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count_rows("yard_orchestrator_route_commands"), 0);
+        assert_eq!(count_rows("assignment_prompt_commands"), 0);
+        assert_eq!(count_rows("automation_runs"), 0);
+
+        let assignment = store
+            .list_project_assignments(&project_id)
+            .await
+            .unwrap()
+            .assignments
+            .into_iter()
+            .find(|assignment| assignment.id == assignment_id)
+            .unwrap();
+        let manual_prompt = serde_json::json!({
+            "command_id": "manual-prompt-with-automatic-settings-off",
+            "actor": "local-user",
+            "attempt_id": assignment.attempt.id,
+            "expected_assignment_version": assignment.version.to_string(),
+            "expected_attempt_version": assignment.attempt.version.to_string(),
+            "text": "Manual status request."
+        });
+        let manual_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/projects/{project_id}/assignments/{assignment_id}/prompts"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(manual_prompt.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manual_response.status(), StatusCode::OK);
+        assert_eq!(reporting.prompts.lock().unwrap().len(), 1);
+
+        let manual_run = scheduler
+            .run_now(RunAutomationNow {
+                command_id: "manual-run-with-schedule-off".to_owned(),
+                actor: "local-user".to_owned(),
+                automation_id: automation_id.clone(),
+                expected_version: automation.version,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            manual_run.run.trigger,
+            yard_domain::AutomationRunTrigger::Manual
+        );
+        assert_eq!(
+            manual_run.run.status,
+            yard_domain::AutomationRunStatus::Submitted
+        );
+        assert_eq!(reporting.prompts.lock().unwrap().len(), 2);
+
+        let defaults = store.get_token_spend_settings().await.unwrap();
+        let superintendent_only = store
+            .update_token_spend_settings(UpdateTokenSpendSettings {
+                actor: "local-user".to_owned(),
+                expected_version: defaults.version,
+                superintendent_auto_requests_project_summaries: true,
+                project_orchestrators_auto_request_worker_summaries: false,
+                scheduled_automatic_summaries: false,
+            })
+            .await
+            .unwrap();
+        scheduler.run_due_once().await.unwrap();
+        assert_eq!(reporting.prompts.lock().unwrap().len(), 3);
+        assert_eq!(count_rows("yard_orchestrator_route_commands"), 1);
+        assert_eq!(count_rows("assignment_prompt_commands"), 1);
+        assert_eq!(count_rows("automation_runs"), 1);
+
+        let workers_only = store
+            .update_token_spend_settings(UpdateTokenSpendSettings {
+                actor: "local-user".to_owned(),
+                expected_version: superintendent_only.version,
+                superintendent_auto_requests_project_summaries: false,
+                project_orchestrators_auto_request_worker_summaries: true,
+                scheduled_automatic_summaries: false,
+            })
+            .await
+            .unwrap();
+        scheduler.run_due_once().await.unwrap();
+        assert_eq!(reporting.prompts.lock().unwrap().len(), 4);
+        assert_eq!(count_rows("yard_orchestrator_route_commands"), 1);
+        assert_eq!(count_rows("assignment_prompt_commands"), 2);
+        assert_eq!(count_rows("automation_runs"), 1);
+
+        store
+            .update_token_spend_settings(UpdateTokenSpendSettings {
+                actor: "local-user".to_owned(),
+                expected_version: workers_only.version,
+                superintendent_auto_requests_project_summaries: false,
+                project_orchestrators_auto_request_worker_summaries: false,
+                scheduled_automatic_summaries: true,
+            })
+            .await
+            .unwrap();
+        scheduler.run_due_once().await.unwrap();
+        assert_eq!(reporting.prompts.lock().unwrap().len(), 5);
+        assert_eq!(count_rows("yard_orchestrator_route_commands"), 1);
+        assert_eq!(count_rows("assignment_prompt_commands"), 2);
+        assert_eq!(count_rows("automation_runs"), 2);
+        let runs = store
+            .list_automation_runs(&automation_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            runs.runs
+                .iter()
+                .filter(|run| { run.trigger == yard_domain::AutomationRunTrigger::Scheduled })
+                .count(),
+            1
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn disabling_automatic_spend_waits_for_in_flight_dispatch_and_blocks_later_ticks() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let source = Arc::new(FakeInventory);
+        let control = Arc::new(FakeRuntime);
+        let (reporting, prompt_entered, release_prompt) = ReportingRuntime::blocked();
+        let reporting = Arc::new(reporting);
+        let terminal = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            source.clone(),
+            control.clone(),
+            reporting.clone(),
+            terminal,
+            store.clone(),
+            artifacts,
+        );
+        let (project_id, _) = create_active_assignment(&app).await;
+        let reconciliation = ReconciliationService::new(source.clone(), store.clone());
+        let coordination_nodes = CoordinationNodeService::new(
+            source.clone(),
+            control,
+            reporting.clone(),
+            store.clone(),
+            reconciliation,
+            temp.path().join("coordination"),
+            temp.path().join("knowledge"),
+        );
+        let interventions = InterventionService::new(source, reporting.clone(), store.clone());
+        let scheduler = AutomationService::new(store.clone(), interventions, coordination_nodes);
+
+        let automation_id = uuid::Uuid::now_v7().to_string();
+        store
+            .create_automation(
+                CreateAutomation {
+                    command_id: "create-blocked-scheduled-summary".to_owned(),
+                    actor: "local-user".to_owned(),
+                    automation_id: automation_id.clone(),
+                    name: "Blocked scheduled summary".to_owned(),
+                    scope: AutomationScope::ProjectOrchestrator {
+                        project_id: project_id.clone(),
+                    },
+                    placement: CanvasPlacement {
+                        x: 220.0,
+                        y: 180.0,
+                        width: 168.0,
+                        height: 58.0,
+                    },
+                    schedule: DailySchedule {
+                        hour: 9,
+                        minute: 0,
+                        timezone: "UTC".to_owned(),
+                    },
+                    selected_project_ids: vec![project_id.clone()],
+                    prompt_template: "Summarize current project status.".to_owned(),
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let defaults = scheduler.token_spend_settings().await.unwrap();
+        let enabled = scheduler
+            .update_token_spend_settings(UpdateTokenSpendSettings {
+                actor: "local-user".to_owned(),
+                expected_version: defaults.version,
+                superintendent_auto_requests_project_summaries: false,
+                project_orchestrators_auto_request_worker_summaries: false,
+                scheduled_automatic_summaries: true,
+            })
+            .await
+            .unwrap();
+
+        let running_scheduler = scheduler.clone();
+        let tick = tokio::spawn(async move { running_scheduler.run_due_once().await });
+        prompt_entered.notified().await;
+
+        let disabling_scheduler = scheduler.clone();
+        let mut disable = tokio::spawn(async move {
+            disabling_scheduler
+                .update_token_spend_settings(UpdateTokenSpendSettings {
+                    actor: "local-user".to_owned(),
+                    expected_version: enabled.version,
+                    superintendent_auto_requests_project_summaries: false,
+                    project_orchestrators_auto_request_worker_summaries: false,
+                    scheduled_automatic_summaries: false,
+                })
+                .await
+        });
+        assert!(
+            timeout(Duration::from_millis(50), &mut disable)
+                .await
+                .is_err()
+        );
+
+        release_prompt.notify_one();
+        tick.await.unwrap().unwrap();
+        let disabled = disable.await.unwrap().unwrap();
+        assert!(!disabled.scheduled_automatic_summaries);
+        assert_eq!(reporting.prompts.lock().unwrap().len(), 1);
+
+        let later_automation_id = uuid::Uuid::now_v7().to_string();
+        store
+            .create_automation(
+                CreateAutomation {
+                    command_id: "create-later-disabled-summary".to_owned(),
+                    actor: "local-user".to_owned(),
+                    automation_id: later_automation_id.clone(),
+                    name: "Later disabled summary".to_owned(),
+                    scope: AutomationScope::ProjectOrchestrator {
+                        project_id: project_id.clone(),
+                    },
+                    placement: CanvasPlacement {
+                        x: 420.0,
+                        y: 180.0,
+                        width: 168.0,
+                        height: 58.0,
+                    },
+                    schedule: DailySchedule {
+                        hour: 9,
+                        minute: 0,
+                        timezone: "UTC".to_owned(),
+                    },
+                    selected_project_ids: vec![project_id],
+                    prompt_template: "This must remain disabled.".to_owned(),
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        scheduler.run_due_once().await.unwrap();
+        assert_eq!(reporting.prompts.lock().unwrap().len(), 1);
+        assert!(
+            store
+                .list_automation_runs(&later_automation_id, 10)
+                .await
+                .unwrap()
+                .runs
+                .is_empty()
+        );
     }
 }

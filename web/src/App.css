@@ -21,6 +21,10 @@
   --overlay: rgba(23, 32, 30, 0.46);
   --inset-highlight: rgba(255, 255, 255, 0.52);
   --label-shadow: rgba(255, 255, 255, 0.94);
+  --map-depth-face: #aebbb5;
+  --map-depth-shadow: rgba(23, 32, 30, 0.2);
+  --map-grid-major: rgba(23, 32, 30, 0.11);
+  --map-grid-minor: rgba(23, 32, 30, 0.055);
   --terminal-bg: var(--surface-muted);
   --terminal-chrome: var(--paper);
   --terminal-line: var(--line-strong);
@@ -52,6 +56,10 @@
   --overlay: rgba(4, 8, 7, 0.7);
   --inset-highlight: rgba(255, 255, 255, 0.1);
   --label-shadow: rgba(17, 23, 21, 0.96);
+  --map-depth-face: #26332e;
+  --map-depth-shadow: rgba(0, 0, 0, 0.42);
+  --map-grid-major: rgba(225, 235, 231, 0.1);
+  --map-grid-minor: rgba(225, 235, 231, 0.05);
   --terminal-bg: var(--surface-muted);
   --terminal-chrome: var(--paper);
   --terminal-line: var(--line-strong);
@@ -105,16 +113,16 @@ button {
   padding: 0 10px;
   border-bottom: 1px solid var(--line-strong);
   background: var(--paper);
-  z-index: 20;
+  z-index: 130;
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   height: 100%;
   flex: 0 0 auto;
-  padding: 0 10px 0 2px;
+  padding: 0 6px 0 2px;
 }
 
 .brand__mark {
@@ -129,22 +137,9 @@ button {
   font-weight: 600;
 }
 
-.brand div {
-  display: grid;
-  line-height: 1.05;
-}
-
 .brand strong {
   font-family: "Space Grotesk Variable", sans-serif;
   font-size: 16px;
-}
-
-.brand span:last-child {
-  margin-top: 3px;
-  color: var(--muted);
-  font-family: "IBM Plex Mono", monospace;
-  font-size: 10px;
-  text-transform: uppercase;
 }
 
 .command-bar__resources {
@@ -159,7 +154,11 @@ button {
 }
 
 .command-bar__resources button {
+  display: inline-flex;
   min-width: 68px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
   padding: 0 8px;
   border: 0;
   border-radius: 3px;
@@ -234,78 +233,168 @@ button {
   font-weight: 600;
 }
 
-.command-bar__metrics {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+.runtime-health {
+  position: relative;
   min-width: 0;
   margin-left: auto;
-  overflow-x: auto;
 }
 
-.command-bar__metrics span,
-.connection-state {
+.runtime-health__trigger {
   display: inline-flex;
+  width: 100%;
+  max-width: 210px;
+  height: 30px;
+  min-width: 138px;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
+  padding: 0 7px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
   white-space: nowrap;
 }
 
-.command-bar__metrics span {
-  min-width: 42px;
-  min-height: 28px;
-  justify-content: center;
-  padding: 3px 7px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: var(--surface-muted);
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.command-bar__metrics span[data-attention="true"] {
-  border-color: #e0a69d;
-  background: var(--vermilion-soft);
-  color: #8f2f21;
-}
-
-.connection-state {
-  height: 30px;
-  flex: 0 0 auto;
-  padding-left: 2px;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.session-command {
-  display: flex;
-  height: 30px;
-  max-width: 150px;
-  flex: 0 1 150px;
-  align-items: center;
-  gap: 6px;
-  padding: 0 8px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: var(--surface-muted);
+.runtime-health__trigger[data-health="observed"] > svg:first-child,
+.runtime-health__summary[data-health="observed"] > svg {
   color: var(--teal);
 }
 
-.session-command select {
-  width: 100%;
+.runtime-health__trigger[data-health="unavailable"] > svg:first-child,
+.runtime-health__summary[data-health="unavailable"] > svg {
+  color: var(--vermilion);
+}
+
+.runtime-health__trigger[data-health="degraded"] > svg:first-child,
+.runtime-health__summary[data-health="degraded"] > svg {
+  color: var(--yellow);
+}
+
+.runtime-health__session {
   min-width: 0;
-  border: 0;
-  appearance: none;
-  background: transparent;
+  overflow: hidden;
+  color: var(--ink);
+  font-family: "IBM Plex Mono", monospace;
+  font-weight: 600;
+  text-overflow: ellipsis;
+}
+
+.runtime-health__status {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.runtime-health__trigger > svg:last-child {
+  flex: 0 0 auto;
+}
+
+.runtime-health__popover {
+  position: absolute;
+  top: calc(100% + 7px);
+  right: 0;
+  z-index: 40;
+  display: grid;
+  width: min(286px, calc(100vw - 12px));
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--paper);
+  box-shadow: var(--shadow);
+  animation: chrome-popover-in 120ms ease-out;
+}
+
+.runtime-health__summary {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.runtime-health__summary > span {
+  display: grid;
+  min-width: 0;
+}
+
+.runtime-health__summary strong {
+  font-size: 12px;
+}
+
+.runtime-health__summary small {
+  overflow: hidden;
+  color: var(--muted);
+  font: 10px/1.4 "IBM Plex Mono", monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-health__field {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font: 9px/1.2 "IBM Plex Mono", monospace;
+  text-transform: uppercase;
+}
+
+.runtime-health__field select {
+  width: 100%;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface-raised);
+  color: var(--ink);
+  font-family: "IBM Plex Sans Variable", sans-serif;
+  font-size: 11px;
+  text-transform: none;
+}
+
+.runtime-health__refresh {
+  display: inline-flex;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--paper);
   color: var(--ink);
   cursor: pointer;
   font-size: 11px;
+  font-weight: 600;
 }
 
-.theme-toggle {
+.runtime-health__refresh:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.settings-trigger {
   flex: 0 0 32px;
   border-color: var(--line);
   background: var(--surface-muted);
+}
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  clip-path: inset(50%) !important;
+  border: 0 !important;
+  white-space: nowrap !important;
+}
+
+@keyframes chrome-popover-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
 }
 
 .icon-button {
@@ -331,6 +420,11 @@ button {
 }
 
 .icon-button:focus-visible,
+.runtime-health__trigger:focus-visible,
+.runtime-health__refresh:focus-visible,
+.top-command:focus-visible,
+.workspace-mode-switcher button:focus-visible,
+.command-bar__resources button:focus-visible,
 .command-button:focus-visible,
 .destructive-button:focus-visible,
 .chat-composer textarea:focus-visible,
@@ -806,33 +900,6 @@ select:focus-visible {
 
 .app-shell[data-shelf-open="false"] .canvas-stage {
   grid-row: 2;
-}
-
-.canvas-stage__label {
-  position: absolute;
-  top: 12px;
-  left: 14px;
-  z-index: 10;
-  display: grid;
-  min-width: 126px;
-  padding: 8px 10px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--paper) 92%, transparent);
-  box-shadow: 0 3px 12px rgba(23, 32, 30, 0.1);
-}
-
-.canvas-stage__label span,
-.canvas-stage__label small {
-  color: var(--muted);
-  font-family: "IBM Plex Mono", monospace;
-  font-size: 9px;
-  text-transform: uppercase;
-}
-
-.canvas-stage__label strong {
-  margin: 2px 0;
-  font-size: 13px;
 }
 
 .map-context-menu {
@@ -2809,6 +2876,107 @@ html[data-yard-allocation-dragging="true"]
   background: var(--overlay);
 }
 
+.settings-backdrop {
+  z-index: 145;
+}
+
+.settings-dialog {
+  display: grid;
+  width: min(480px, 100%);
+  max-height: min(620px, calc(100vh - 48px));
+  min-width: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid var(--ink);
+  border-radius: 6px;
+  background: var(--paper);
+  box-shadow: var(--shadow-strong);
+  animation: settings-dialog-in 150ms ease-out;
+}
+
+.settings-dialog__header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-dialog__header h2 {
+  margin: 2px 0 0;
+  font-family: "Space Grotesk Variable", sans-serif;
+  font-size: 17px;
+  letter-spacing: 0;
+}
+
+.settings-dialog__body {
+  min-height: 0;
+  padding: 14px;
+  overflow-y: auto;
+}
+
+.settings-dialog__body h3 {
+  margin: 0;
+  font-family: "Space Grotesk Variable", sans-serif;
+  font-size: 12px;
+  letter-spacing: 0;
+}
+
+.settings-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(120px, 1fr) minmax(190px, 0.9fr);
+  align-items: center;
+  gap: 18px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-row:last-child {
+  border-bottom: 0;
+}
+
+.settings-row > div:first-child {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.settings-row strong {
+  font-size: 12px;
+}
+
+.settings-row small {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.settings-segmented-control {
+  margin: 0;
+}
+
+.settings-segmented-control button {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.settings-action {
+  justify-self: end;
+}
+
+@keyframes settings-dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+}
+
 .terminal-backdrop {
   z-index: 140;
   padding: 16px;
@@ -3271,6 +3439,17 @@ html[data-yard-allocation-dragging="true"]
   display: none;
 }
 
+.agent-workspace-shell[data-presentation="focus"] {
+  grid-template:
+    "toolbar" 46px
+    "content" minmax(0, 1fr)
+    / minmax(0, 1fr);
+}
+
+.agent-workspace-shell[data-presentation="focus"] .agent-window-navigator {
+  display: none;
+}
+
 .agent-window-navigator {
   grid-area: navigator;
   display: grid;
@@ -3466,13 +3645,29 @@ html[data-yard-allocation-dragging="true"]
   background: var(--paper);
 }
 
+.terminal-presentation-control {
+  flex: 0 0 auto;
+  grid-template-columns: repeat(2, minmax(0, auto));
+  gap: 2px;
+  margin: 0;
+}
+
+.terminal-presentation-control button {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
 .agent-workspace-toolbar__target {
   display: grid;
   min-width: 0;
+  flex: 1 1 auto;
   grid-template-columns: 8px minmax(0, auto) minmax(0, auto) 30px;
   align-items: center;
   gap: 7px;
-  width: 100%;
 }
 
 .agent-workspace-toolbar__target > span {
@@ -3514,6 +3709,17 @@ html[data-yard-allocation-dragging="true"]
   width: 28px;
   height: 28px;
   border-color: var(--line);
+}
+
+.agent-workspace-shell[data-presentation="focus"]
+  .agent-workspace-toolbar__target {
+  grid-template-columns: 8px minmax(0, 1fr) 30px;
+}
+
+.agent-workspace-shell[data-presentation="focus"]
+  .agent-workspace-toolbar__target
+  small {
+  display: none;
 }
 
 .agent-workspace-content {
@@ -3577,6 +3783,280 @@ html[data-yard-allocation-dragging="true"]
   border-radius: 6px;
   background: var(--paper);
   box-shadow: var(--shadow);
+}
+
+.token-spend-dialog {
+  width: min(520px, 100%);
+}
+
+.workflow-profile-dialog {
+  display: grid;
+  width: min(760px, 100%);
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  overflow: hidden;
+}
+
+.workflow-profile-dialog__header {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) 32px;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.workflow-profile-dialog__header h2 {
+  margin: 2px 0 0;
+  font-family: "Space Grotesk Variable", sans-serif;
+  font-size: 17px;
+  letter-spacing: 0;
+}
+
+.workflow-profile-dialog__icon {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-muted);
+  color: var(--blue);
+}
+
+.workflow-profile-dialog__body {
+  display: grid;
+  min-height: 0;
+  gap: 14px;
+  padding: 14px 16px 0;
+  overflow-y: auto;
+}
+
+.workflow-profile-meta {
+  display: grid;
+  min-height: 48px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-muted);
+}
+
+.workflow-profile-meta > div {
+  display: grid;
+  min-width: 0;
+  align-content: center;
+  gap: 2px;
+  padding: 8px 10px;
+  border-right: 1px solid var(--line);
+}
+
+.workflow-profile-meta > div:last-child {
+  border-right: 0;
+}
+
+.workflow-profile-meta dt {
+  color: var(--muted);
+  font: 9px "IBM Plex Mono", monospace;
+  text-transform: uppercase;
+}
+
+.workflow-profile-meta dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.workflow-profile-field {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.workflow-profile-field input,
+.workflow-profile-field textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--ink);
+}
+
+.workflow-profile-field input {
+  height: 36px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.workflow-profile-field textarea {
+  min-height: 310px;
+  padding: 10px;
+  font: 11px/1.5 "IBM Plex Mono", monospace;
+  resize: vertical;
+}
+
+.workflow-profile-field input:focus-visible,
+.workflow-profile-field textarea:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 1px;
+}
+
+.workflow-profile-dialog__error {
+  margin: 12px 16px 0;
+}
+
+.workflow-profile-dialog__actions {
+  display: grid;
+  grid-template-columns: auto minmax(12px, 1fr) auto auto;
+  padding: 14px 16px 16px;
+}
+
+.token-spend-dialog__header {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) 32px;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.token-spend-dialog__header h2 {
+  margin: 2px 0 0;
+  font-family: "Space Grotesk Variable", sans-serif;
+  font-size: 17px;
+}
+
+.token-spend-dialog__icon {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-muted);
+  color: var(--teal);
+}
+
+.token-spend-options {
+  display: grid;
+  margin: 0;
+  padding: 8px 16px 0;
+  border: 0;
+}
+
+.token-spend-options legend {
+  width: 100%;
+  padding: 10px 0 5px;
+  color: var(--muted);
+  font: 9px "IBM Plex Mono", monospace;
+  text-transform: uppercase;
+}
+
+.token-spend-option {
+  display: grid;
+  min-height: 66px;
+  grid-template-columns: minmax(0, 1fr) 42px;
+  align-items: center;
+  gap: 14px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+
+.token-spend-option > span:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.token-spend-option strong {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.token-spend-option small {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.token-spend-switch {
+  position: relative;
+  display: block;
+  width: 38px;
+  height: 22px;
+}
+
+.token-spend-switch input {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.token-spend-switch > span {
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 11px;
+  background: var(--surface-muted);
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.token-spend-switch > span::after {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--muted);
+  content: "";
+  transition: transform 120ms ease, background 120ms ease;
+}
+
+.token-spend-switch input:checked + span {
+  border-color: var(--teal);
+  background: var(--teal-soft);
+}
+
+.token-spend-switch input:checked + span::after {
+  background: var(--teal);
+  transform: translateX(16px);
+}
+
+.token-spend-switch input:focus-visible + span {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+.token-spend-manual {
+  margin: 14px 16px 0;
+  padding: 10px 0 18px;
+  border-top: 1px solid var(--ink);
+}
+
+.token-spend-manual p:last-child {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.token-spend-dialog__error {
+  margin: 12px 16px 0;
+}
+
+.token-spend-dialog__actions {
+  padding: 14px 16px 16px;
 }
 
 .allocation-dialog {
@@ -3984,7 +4464,7 @@ html[data-yard-allocation-dragging="true"]
 }
 
 .artifact-backdrop {
-  z-index: 120;
+  z-index: 140;
 }
 
 .artifact-inspector {
@@ -4220,10 +4700,6 @@ html[data-yard-allocation-dragging="true"]
     grid-template-columns: 220px minmax(0, 1fr);
   }
 
-  .connection-state {
-    display: none;
-  }
-
   .inspector {
     position: absolute;
     right: 12px;
@@ -4257,20 +4733,6 @@ html[data-yard-allocation-dragging="true"]
 
   .brand {
     padding: 0 10px;
-  }
-
-  .brand span:last-child {
-    display: none;
-  }
-
-  .command-bar__metrics {
-    justify-content: flex-end;
-    padding: 0 8px;
-  }
-
-  .command-bar__metrics span:first-child,
-  .command-bar__metrics span:nth-child(2) {
-    display: none;
   }
 
   .inventory-rail {
@@ -4389,11 +4851,6 @@ html[data-yard-allocation-dragging="true"]
     display: grid;
   }
 
-  .canvas-stage__label {
-    top: 8px;
-    left: 8px;
-  }
-
   .modal-backdrop {
     padding: 8px;
   }
@@ -4494,6 +4951,18 @@ html[data-yard-allocation-dragging="true"]
     max-height: calc(100vh - 16px);
   }
 
+  .workflow-profile-dialog__actions {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .workflow-profile-dialog__actions > span {
+    display: none;
+  }
+
+  .workflow-profile-dialog__actions .secondary-button:first-child {
+    grid-column: 1 / -1;
+  }
+
   .artifact-backdrop {
     padding: 0;
   }
@@ -4543,6 +5012,12 @@ html[data-yard-allocation-dragging="true"]
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .runtime-health__popover,
+  .settings-dialog {
+    animation: none;
+    transition: none;
+  }
+
   .status-spin,
   .worker-marker__motion {
     animation: none;
@@ -4620,6 +5095,19 @@ html[data-yard-allocation-dragging="true"]
     display: none;
   }
 
+  .terminal-presentation-control button {
+    width: 30px;
+    padding: 0;
+  }
+
+  .terminal-presentation-control {
+    display: grid;
+  }
+
+  .terminal-presentation-control button span {
+    display: none;
+  }
+
   .agent-workspace-toolbar__target {
     grid-template-columns: 8px minmax(0, 1fr) 30px;
   }
@@ -4633,16 +5121,6 @@ html[data-yard-allocation-dragging="true"]
   }
 
   .agent-workspace-content .chat-context {
-    display: none;
-  }
-}
-
-@media (max-width: 1100px) {
-  .command-bar__metrics {
-    display: none;
-  }
-
-  .connection-state > span {
     display: none;
   }
 }
@@ -4690,62 +5168,135 @@ html[data-yard-allocation-dragging="true"]
   }
 
   .command-bar {
-    gap: 5px;
-    padding: 0 6px;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-
-  .command-bar::-webkit-scrollbar {
-    display: none;
+    gap: 3px;
+    padding: 0 4px;
+    overflow: visible;
   }
 
   .brand {
-    padding-right: 1px;
+    width: 28px;
+    padding: 0;
   }
 
-  .brand > div {
+  .brand strong {
     display: none;
+  }
+
+  .brand__mark {
+    width: 28px;
+    height: 28px;
+  }
+
+  .command-bar__modes {
+    min-width: 52px;
+    flex: 0 1 72px;
+  }
+
+  .command-bar__modes button {
+    width: auto;
+    min-width: 0;
+    flex: 1;
   }
 
   .command-bar__resources {
     height: 32px;
-    flex: 1 1 150px;
-    min-width: 142px;
+    min-width: 52px;
+    flex: 0 1 72px;
   }
 
   .command-bar__resources button {
     min-width: 0;
     flex: 1;
-    padding: 0 4px;
-    font-size: 9px;
+    padding: 0;
+  }
+
+  .command-bar__resources button span,
+  .command-bar__modes button span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    border: 0;
+    white-space: nowrap;
   }
 
   .top-command {
-    width: 32px;
-    height: 32px;
+    width: 28px;
+    height: 30px;
     padding: 0;
     justify-content: center;
   }
 
-  .top-command span,
-  .connection-state {
+  .top-command span {
     display: none;
   }
 
-  .session-command {
-    height: 32px;
-    max-width: 82px;
-    flex-basis: 82px;
-    padding: 0 6px;
+  .runtime-health {
+    min-width: 88px;
+    flex: 1 1 120px;
+    margin-left: 0;
   }
 
-  .session-command svg {
+  .runtime-health__trigger {
+    height: 30px;
+    min-width: 0;
+    max-width: none;
+    gap: 4px;
+    padding: 0 5px;
+  }
+
+  .runtime-health__session {
+    max-width: 54px;
+  }
+
+  .runtime-health__status {
+    min-width: 0;
+  }
+
+  .runtime-health__trigger[data-health="observed"]
+    .runtime-health__status {
     display: none;
   }
 
-  .session-command select {
-    font-size: 9px;
+  .runtime-health__trigger > svg:last-child {
+    display: none;
+  }
+
+  .settings-trigger {
+    width: 28px;
+    height: 30px;
+    flex-basis: 28px;
+  }
+
+  .runtime-health__popover {
+    position: fixed;
+    top: calc(var(--command-bar-height) + 5px);
+    right: 5px;
+  }
+
+  .settings-backdrop {
+    padding: 0;
+    place-items: end center;
+  }
+
+  .settings-dialog {
+    width: 100%;
+    max-height: min(76vh, 520px);
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 6px 6px 0 0;
+  }
+
+  .settings-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 9px;
+  }
+
+  .settings-segmented-control {
+    display: grid;
   }
 
   .resource-shelf {
@@ -4818,9 +5369,17 @@ html[data-yard-allocation-dragging="true"]
     padding-right: 34px;
   }
 
-  .canvas-stage__label {
-    top: 8px;
-    left: 8px;
+}
+
+@media (max-width: 360px) {
+  .command-bar__modes,
+  .command-bar__resources {
+    min-width: 44px;
+    flex-basis: 48px;
+  }
+
+  .runtime-health {
+    min-width: 100px;
   }
 }
 
@@ -4940,7 +5499,7 @@ html[data-yard-allocation-dragging="true"]
   display: flex;
   gap: 6px;
   z-index: 13;
-  margin: 12px 0 0 154px;
+  margin: 12px 0 0 14px;
 }
 
 .canvas-tools-panel button {
@@ -5066,7 +5625,7 @@ html[data-yard-allocation-dragging="true"]
 .react-flow__edge.coordination-edge--active .react-flow__edge-path {
   stroke-dasharray: 2 8 10 8;
   filter: drop-shadow(0 0 3px var(--information-path-color));
-  animation: information-path-flow 1.8s linear infinite;
+  animation: information-path-flow 0.75s linear infinite;
 }
 
 .react-flow__edge.coordination-edge--failed {
@@ -5082,7 +5641,7 @@ html[data-yard-allocation-dragging="true"]
 @media (max-width: 760px) {
   .canvas-tools-panel {
     margin-top: 8px;
-    margin-left: 144px;
+    margin-left: 8px;
   }
 
   .pulse-backdrop {
@@ -5955,6 +6514,21 @@ html[data-yard-allocation-dragging="true"]
   width: 100%;
 }
 
+.automation-actions {
+  display: grid;
+  gap: 7px;
+}
+
+.automation-actions .eyebrow {
+  margin-top: 2px;
+}
+
+.automation-actions__manual {
+  margin-top: 8px !important;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
 .automation-inspector__error {
   margin-top: 12px;
 }
@@ -6050,5 +6624,817 @@ html[data-yard-allocation-dragging="true"]
 
   .automation-schedule-grid label:last-child {
     grid-column: 1 / -1;
+  }
+}
+
+
+/* ---------------------------------------------------------------------------
+   2.5D projected map.
+
+   Everything visible in this mode belongs to one axonometric ground plane.
+   Territories, skylines, ground anchors, and routes are SVG geometry drawn by
+   ProjectedMap from world coordinates; the only HTML left on the map is the
+   upright chrome that must stay readable — territory labels and the worker,
+   orchestrator, automation, and coordination billboards standing on their
+   projected anchors. Nothing here re-styles a flat card to look raised; that
+   was the rejected approach and it is deliberately gone.
+   --------------------------------------------------------------------------- */
+
+.runtime-canvas[data-visual-mode="depth"] {
+  background-color: var(--canvas);
+  /* A flat ground wash only. The coordinate grid the user reads is the
+     projected one drawn inside the SVG, which pans and zooms with the world;
+     a CSS grid here would imply a plane the geometry does not obey. */
+  background-image: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--canvas) 88%, var(--paper)),
+    var(--canvas) 62%
+  );
+}
+
+.projected-map {
+  overflow: visible;
+  pointer-events: none;
+}
+
+.projected-map * {
+  vector-effect: non-scaling-stroke;
+}
+
+.projected-ground {
+  fill: color-mix(in srgb, var(--canvas) 92%, var(--paper));
+  stroke: var(--map-grid-major);
+  stroke-width: 1;
+}
+
+/* Barely-there ground grid: enough to say the plane keeps going, never enough
+   to compete with the structures standing on it. */
+.projected-ground-grid__line {
+  fill: none;
+  stroke: var(--map-grid-minor);
+  stroke-width: 0.75;
+  opacity: 0.45;
+}
+
+.projected-ground-grid__line.is-major {
+  stroke: var(--map-grid-major);
+  opacity: 0.55;
+}
+
+/* City connections are rail corridors laid on the projected ground axes. The
+   layered strokes produce ballast, sleepers, and two rails without introducing
+   a second coordinate model or screen-space decorations. */
+.projected-route__ballast,
+.projected-route__sleepers,
+.projected-route__rails,
+.projected-route__gauge,
+.projected-route__activity {
+  fill: none;
+  stroke-linejoin: miter;
+}
+
+.projected-route__ballast {
+  stroke: color-mix(in srgb, var(--ink) 20%, var(--canvas));
+  stroke-width: 10;
+}
+
+.projected-route__sleepers {
+  stroke: color-mix(in srgb, var(--ink) 62%, var(--canvas));
+  stroke-dasharray: 1.4 7;
+  stroke-linecap: butt;
+  stroke-width: 11;
+}
+
+.projected-route__rails {
+  stroke: color-mix(in srgb, var(--ink) 76%, var(--paper));
+  stroke-linecap: square;
+  stroke-width: 5.8;
+}
+
+/* Cutting the rail stroke down its centre leaves two continuous steel lines
+   that share the route's exact bends and endpoints. */
+.projected-route__gauge {
+  stroke: var(--canvas);
+  stroke-linecap: butt;
+  stroke-width: 2.5;
+}
+
+.projected-route__junction {
+  fill: var(--line-strong);
+  stroke: var(--canvas);
+  stroke-width: 1;
+}
+
+.projected-route__signal-housing {
+  fill: var(--ink);
+  stroke: var(--paper);
+  stroke-width: 1;
+}
+
+.projected-route__signal-light {
+  fill: var(--muted);
+  stroke: none;
+}
+
+.projected-route {
+  opacity: 0.8;
+}
+
+.projected-route--child {
+  opacity: 0.55;
+}
+
+.projected-route--child .projected-route__ballast {
+  stroke-width: 7;
+}
+
+.projected-route--child .projected-route__sleepers {
+  stroke-width: 8;
+}
+
+.projected-route--child .projected-route__rails {
+  stroke-width: 4.6;
+}
+
+.projected-route--child .projected-route__gauge {
+  stroke-width: 2;
+}
+
+.projected-route--allocation {
+  opacity: 0.62;
+}
+
+.projected-route--active {
+  opacity: 1;
+}
+
+.projected-route--active .projected-route__signal-light {
+  fill: var(--teal);
+}
+
+.projected-route__activity {
+  stroke: var(--teal);
+  stroke-dasharray: 5 95;
+  stroke-linecap: round;
+  stroke-width: 5;
+  animation: projected-train-run 0.7s linear infinite;
+}
+
+.projected-route--failed {
+  opacity: 1;
+}
+
+.projected-route--failed .projected-route__signal-light {
+  fill: var(--vermilion);
+}
+
+@keyframes projected-train-run {
+  to {
+    stroke-dashoffset: -100;
+  }
+}
+
+/* Ground fill stays a flat neutral regardless of the project's accent — the
+   accent lives entirely in the buildings and the outline. Tying the ground's
+   tint to the same accent (as this used to do, at a low mix) put buildings
+   and ground on one monochromatic scale, which read as buildings blending
+   into the floor rather than standing apart from it. */
+.territory-polygon {
+  fill: var(--canvas);
+  stroke: none;
+  cursor: grab;
+  pointer-events: auto;
+}
+
+.territory-polygon:active {
+  cursor: grabbing;
+}
+
+.territory-polygon__outline {
+  fill: none;
+  stroke: color-mix(in srgb, var(--project-accent) 70%, var(--ink));
+  stroke-linejoin: miter;
+  stroke-width: 1.4;
+  pointer-events: none;
+}
+
+.projected-territory--workspace .territory-polygon {
+  fill: color-mix(in srgb, var(--canvas) 92%, var(--paper));
+}
+
+.projected-territory--workspace .territory-polygon__outline {
+  stroke-dasharray: 9 6;
+}
+
+.projected-territory[data-runtime="offline"] .territory-polygon__outline {
+  stroke-dasharray: 7 5;
+}
+
+.projected-territory.is-selected .territory-polygon__outline {
+  stroke: var(--yellow);
+  stroke-width: 3;
+}
+
+.projected-territory.is-allocation-target .territory-polygon {
+  fill: color-mix(in srgb, var(--yellow) 30%, var(--paper));
+}
+
+.projected-territory.is-allocation-target .territory-polygon__outline {
+  stroke: var(--yellow);
+  stroke-width: 4;
+}
+
+.projected-territory__buildings {
+  pointer-events: none;
+}
+
+/* Structures show three faces: a flat lighter top and two darker sides, all
+   flat tonal steps of the project's own accent, with a crisp dark outline
+   and a diagonal hatch on both side faces. A single side face (the original
+   version of this) left the footprint's other camera-facing edge with
+   nothing connecting its top corner down to the ground — that edge of the
+   building read as floating over bare ground rather than standing on it.
+   The two side faces get different accent weights (62% vs 74%, both mixed
+   into --canvas rather than --map-depth-face: canvas is reliably darker
+   than paper in both themes, where map-depth-face is not) so the two planes
+   read as distinct surfaces, the way a real isometric block's two visible
+   sides catch light differently, rather than folding into one shape. */
+.projected-building__face--top {
+  fill: color-mix(in srgb, var(--project-accent) 32%, var(--paper));
+  stroke: color-mix(in srgb, var(--project-accent) 60%, var(--ink));
+  stroke-width: 1;
+  stroke-linejoin: miter;
+}
+
+.projected-building__face--side {
+  fill: color-mix(in srgb, var(--project-accent) 62%, var(--canvas));
+  stroke: color-mix(in srgb, var(--project-accent) 60%, var(--ink));
+  stroke-width: 1;
+  stroke-linejoin: miter;
+}
+
+.projected-building__face--side-b {
+  fill: color-mix(in srgb, var(--project-accent) 74%, var(--canvas));
+  stroke: color-mix(in srgb, var(--project-accent) 60%, var(--ink));
+  stroke-width: 1;
+  stroke-linejoin: miter;
+}
+
+.projected-building__hatch {
+  fill: url(#projected-side-hatch);
+  stroke: none;
+  opacity: 0.5;
+}
+
+/* The hatch pattern lives in <defs>, outside any project's accent scope, so it
+   uses a neutral ink tone rather than a per-project colour. */
+.projected-building__hatch-line {
+  stroke: var(--line-strong);
+  stroke-width: 0.9;
+}
+
+.projected-building.is-completed .projected-building__face--top {
+  fill: color-mix(in srgb, var(--project-accent) 48%, var(--paper));
+}
+
+/* Real observed token usage on the skyline's tallest building — see
+   RuntimeCanvas.tsx's projectTokenTotal. The stroke-then-fill paint order
+   gives it a legible halo against whatever the roof's own tint happens to
+   be, without needing a background rect that would have its own theme and
+   projection concerns. */
+.projected-building__token-label {
+  fill: var(--ink);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  font-weight: 600;
+  paint-order: stroke fill;
+  stroke: var(--paper);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+.projected-anchor__pad {
+  fill: color-mix(in srgb, var(--ink) 22%, transparent);
+  stroke: none;
+  filter: blur(1.5px);
+  pointer-events: none;
+}
+
+.projected-anchor.is-selected .projected-anchor__pad {
+  fill: color-mix(in srgb, var(--yellow) 40%, transparent);
+  stroke: var(--yellow);
+  stroke-width: 2;
+  filter: none;
+}
+
+/* Worker, orchestrator, superintendent, and child-agent billboards now carry
+   real sprite art with its own baked-in ground shadow (visible now that the
+   sprite renders uncropped) — this pad would just double it. Kinds without
+   dedicated art yet (automation, coordination nodes) keep the pad. Selection
+   still needs the pad's yellow ring regardless of kind. */
+.projected-anchor--worker .projected-anchor__pad,
+.projected-anchor--assigned-worker .projected-anchor__pad,
+.projected-anchor--orchestrator .projected-anchor__pad,
+.projected-anchor--yard-orchestrator .projected-anchor__pad,
+.projected-anchor--child-agent .projected-anchor__pad {
+  display: none;
+}
+
+.projected-anchor--worker.is-selected .projected-anchor__pad,
+.projected-anchor--assigned-worker.is-selected .projected-anchor__pad,
+.projected-anchor--orchestrator.is-selected .projected-anchor__pad,
+.projected-anchor--yard-orchestrator.is-selected .projected-anchor__pad,
+.projected-anchor--child-agent.is-selected .projected-anchor__pad {
+  display: block;
+}
+
+/* The flat ReactFlow node stays mounted with all of its classes, data
+   attributes, and aria labels so state, selection, and assistive technology
+   keep working. In 2.5D only its territory chrome stops being drawn: the
+   projected polygon under it is the visible shape. */
+.runtime-canvas[data-visual-mode="depth"] .workspace-region {
+  position: absolute;
+  left: var(--territory-box-left, 0);
+  top: var(--territory-box-top, 0);
+  width: var(--territory-box-width, 100%);
+  height: var(--territory-box-height, 100%);
+  border: 0;
+  background: none;
+  box-shadow: none;
+}
+
+/* Workers, orchestrators, child agents, automations, and coordination nodes
+   stay upright billboards standing on their projected ground anchors. They are
+   drawn at a smaller scale than the flat plan cards because the ground plane is
+   foreshortened; full-size cards would tower over the territories they stand
+   on. Scaling the inner root keeps ReactFlow's own node transform untouched. */
+.runtime-canvas[data-visual-mode="depth"] .worker-node-shell,
+.runtime-canvas[data-visual-mode="depth"] .yard-hub-node,
+.runtime-canvas[data-visual-mode="depth"] .child-agent-marker,
+.runtime-canvas[data-visual-mode="depth"] .coordination-map-node,
+.runtime-canvas[data-visual-mode="depth"] .automation-map-node {
+  width: var(--billboard-width, 100%);
+  height: var(--billboard-height, 100%);
+  transform: scale(var(--billboard-scale, 1));
+  transform-origin: top left;
+}
+
+/* Billboards stand still on their ground anchors. Drift belongs to the flat
+   2D view, where a marker is a card on a board rather than a unit on a map. */
+.runtime-canvas[data-visual-mode="depth"] .worker-marker__motion {
+  animation: none;
+}
+
+/* ReactFlow raises selected nodes above their siblings. In depth mode that
+   would put a selected territory over the intentionally overflowing worker
+   sprites, leaving only the small hit-box-sized center visible. Territories
+   stay below every upright unit while their own resize handles remain active. */
+.runtime-canvas[data-visual-mode="depth"] .react-flow__node-project,
+.runtime-canvas[data-visual-mode="depth"] .react-flow__node-workspace {
+  z-index: 10 !important;
+}
+
+.runtime-canvas[data-visual-mode="depth"] .react-flow__node-worker,
+.runtime-canvas[data-visual-mode="depth"] .react-flow__node-orchestrator,
+.runtime-canvas[data-visual-mode="depth"] .react-flow__node-assigned-worker,
+.runtime-canvas[data-visual-mode="depth"] .react-flow__node-child-agent,
+.runtime-canvas[data-visual-mode="depth"] .react-flow__node-yard-orchestrator,
+.runtime-canvas[data-visual-mode="depth"] .react-flow__node-automation,
+.runtime-canvas[data-visual-mode="depth"] .react-flow__node-coordination-node {
+  z-index: 20 !important;
+}
+
+/* Workstream and knowledge-store nodes use a compact plinth until they have
+   dedicated sprites. Their projected anchor remains visible as the contact
+   shadow under the upright marker. */
+.runtime-canvas[data-visual-mode="depth"] .coordination-map-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  padding-bottom: 3px;
+}
+
+.runtime-canvas[data-visual-mode="depth"] .coordination-map-node__halo {
+  display: none;
+}
+
+.runtime-canvas[data-visual-mode="depth"] .coordination-map-node__glyph {
+  order: 2;
+  flex: none;
+  width: 40px;
+  height: 40px;
+  margin-top: 0;
+  border: 1px solid color-mix(in srgb, var(--node-color) 70%, var(--ink));
+  border-radius: 5px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--node-color) 34%, var(--paper)) 0%,
+    color-mix(in srgb, var(--node-color) 20%, var(--paper)) 100%
+  );
+  box-shadow:
+    0 3px 0 color-mix(in srgb, var(--node-color) 58%, black),
+    0 7px 10px rgba(23, 32, 30, 0.26);
+  color: color-mix(in srgb, var(--node-color) 80%, var(--ink));
+  transition:
+    border-color 140ms ease,
+    box-shadow 140ms ease,
+    transform 140ms ease;
+}
+
+.runtime-canvas[data-visual-mode="depth"]
+  .coordination-map-node:hover
+  .coordination-map-node__glyph {
+  border-color: var(--ink);
+  transform: translateY(-2px);
+}
+
+.runtime-canvas[data-visual-mode="depth"]
+  .coordination-map-node.is-selected
+  .coordination-map-node__glyph {
+  border-color: var(--ink);
+  box-shadow:
+    0 0 0 3px var(--yellow),
+    0 3px 0 color-mix(in srgb, var(--node-color) 58%, black),
+    0 7px 10px rgba(23, 32, 30, 0.26);
+}
+
+.runtime-canvas[data-visual-mode="depth"] .coordination-map-node__label {
+  position: relative;
+  order: 1;
+  inset: auto;
+  width: 116px;
+}
+
+.runtime-canvas[data-visual-mode="depth"] .coordination-map-node__label strong,
+.runtime-canvas[data-visual-mode="depth"] .coordination-map-node__label small {
+  max-width: 116px;
+}
+
+/* Sprite art replaces the flat-mode line icon only in 2.5D; 2D mode keeps
+   its original glyph untouched. Earlier renders had a solid white background
+   (not real alpha), which needed a whole feColorMatrix/feComposite filter to
+   key out — the current renders have genuine per-pixel alpha, so no filter
+   is needed at all; background-image just works. The element is sized well
+   past its badge socket with `background-size: contain` so the whole
+   character — antennae and drop shadow included — renders at a size that
+   actually reads, instead of being cropped into the small circle. The old
+   circular badge chrome (border, background, selected ring) is hidden in
+   2.5D for marker kinds that now carry real art, since a colored ring behind
+   an isolated character reads as competing chrome rather than a frame. */
+.worker-marker__sprite {
+  display: none;
+}
+
+.runtime-canvas[data-visual-mode="depth"] .worker-marker__glyph > svg:first-child,
+.runtime-canvas[data-visual-mode="depth"]
+  .yard-orchestrator-marker__glyph
+  > svg:first-child,
+.runtime-canvas[data-visual-mode="depth"]
+  .child-agent-marker__glyph
+  > svg:first-child {
+  display: none;
+}
+
+.runtime-canvas[data-visual-mode="depth"] .worker-marker__body,
+.runtime-canvas[data-visual-mode="depth"] .worker-marker__glyph,
+.runtime-canvas[data-visual-mode="depth"] .yard-orchestrator-marker__glyph,
+.runtime-canvas[data-visual-mode="depth"] .child-agent-marker__glyph {
+  border-color: transparent;
+  background: none;
+  box-shadow: none;
+}
+
+/* Grown to 250% of the flat footprint (worker/orchestrator/child-agent/
+   superintendent alike) — a further jump up from 140%/150%, per owner
+   request ("things are way too small"). Two earlier attempts at any growth
+   at all broke something: growing the sprite via a big absolute overflow
+   broke a layout-sanity test (an overflowing absolutely-positioned
+   descendant still counts toward its ancestor's scrollWidth). A second
+   attempt grew __motion/__body's actual flow-box size to match the sprite,
+   trading that scrollWidth problem for a worse one: the sprite images have
+   a lot of transparent padding around a visually smaller character, so a
+   real 177px-square hit region extends well past the visible character into
+   what looks like empty ground — right-click menus, drag targets, and
+   allocation drops anywhere near a worker started landing on that invisible
+   square instead of what was actually visible underneath it. That broke far
+   more (9 unrelated test failures) than the narrower dense-grid overlap this
+   goes back to accepting. __motion/__body/child-agent-marker__glyph stay at
+   their original flat-mode size — the real, size-matched-to-what's-visible
+   interactive target — and only the (pointer-events: none) sprite overflows
+   past it for the bigger visual. The marker's own outer box does NOT grow to
+   contain that overflow; expectRuntimeLayout's marker-overflow check is
+   relaxed instead (see its own comment) now that this overflow is
+   deliberate. The superintendent glyph got the same treatment after the
+   same mistake was tried here too: growing `.yard-orchestrator-marker`'s
+   real flow-box to 212x260 was assumed safe because it's a singleton with
+   nothing packed directly against it, but its real hub sits right next to
+   project orchestrator markers on the map, and the grown glyph's dead zone
+   intercepted clicks meant for the project-1 orchestrator underneath it
+   (4 test failures). Reverted to the same small-hit-region-plus-sprite-
+   overflow pattern as everything else. */
+.runtime-canvas[data-visual-mode="depth"]
+  .yard-orchestrator-marker__glyph
+  .worker-marker__sprite {
+  inset: -62px;
+}
+
+/* Standing close to the ground rather than hovering high above it: the
+   label (name/status text) swaps to the top of the flex column and the
+   character (motion/glyph) to the bottom, so the character's own base —
+   where its baked-in shadow sits — lands near the marker box's bottom
+   edge, which is what the projected ground-anchor math (RuntimeCanvas.tsx,
+   the screenOffset using the box's full height) actually targets. With the
+   label last (the original order), the anchor pointed at the bottom of the
+   label instead, well below the character, which read as the character
+   hovering high above its own shadow. */
+.runtime-canvas[data-visual-mode="depth"] .worker-marker__motion,
+.runtime-canvas[data-visual-mode="depth"] .yard-orchestrator-marker__glyph,
+.runtime-canvas[data-visual-mode="depth"] .child-agent-marker__glyph {
+  order: 2;
+}
+
+.runtime-canvas[data-visual-mode="depth"] .worker-marker__label,
+.runtime-canvas[data-visual-mode="depth"] .yard-orchestrator-marker__label,
+.runtime-canvas[data-visual-mode="depth"] .child-agent-marker__label {
+  order: 1;
+}
+
+.runtime-canvas[data-visual-mode="depth"] .worker-marker__sprite {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: block;
+  background-image: var(--sprite-src);
+  background-repeat: no-repeat;
+  background-position: 50% 50%;
+  background-size: contain;
+  pointer-events: none;
+  animation:
+    sprite-hover 2.6s ease-in-out infinite,
+    sprite-wander 10s ease-in-out infinite,
+    sprite-turn 10s steps(1) infinite;
+  /* Reuses --drift-delay, the same per-worker hash-derived value 2D mode's
+     own drift animation already sets (motionProperties in RuntimeCanvas.tsx)
+     — inherited straight through from .worker-marker's inline style, so
+     several workers standing near each other don't wander in lockstep. */
+  animation-delay: var(--drift-delay, 0s);
+}
+
+.runtime-canvas[data-visual-mode="depth"]
+  .worker-marker[data-status="working"]
+  .worker-marker__sprite,
+.runtime-canvas[data-visual-mode="depth"]
+  .yard-orchestrator-marker[data-status="working"]
+  .worker-marker__sprite {
+  animation:
+    sprite-hover 2.6s ease-in-out infinite,
+    sprite-wander 10s ease-in-out infinite,
+    sprite-turn 10s steps(1) infinite,
+    sprite-working-glow 1.3s ease-in-out infinite;
+  animation-delay:
+    var(--drift-delay, 0s),
+    var(--drift-delay, 0s),
+    var(--drift-delay, 0s),
+    0s;
+}
+
+/* Worker/orchestrator specifically: overflow the unchanged 71px body by
+   53px each side (177px total) rather than filling it exactly. See the
+   comment above worker-marker's own depth-mode rule for why body itself
+   deliberately does not grow to this size. */
+.runtime-canvas[data-visual-mode="depth"]
+  .worker-marker__body
+  .worker-marker__sprite {
+  inset: -53px;
+}
+
+/* Child agents share the worker sprite at a smaller base (48px glyph);
+   scaled proportionally rather than reusing the worker's flat 53px so a
+   grown child agent doesn't end up visually as large as a grown worker. */
+.runtime-canvas[data-visual-mode="depth"]
+  .child-agent-marker__glyph
+  .worker-marker__sprite {
+  inset: -36px;
+}
+
+/* Barely off the ground: a couple of pixels of hover, not the original 4 —
+   this is deliberately subtler now that the character sits low in the
+   marker box (see the order rules above) rather than compounding with that
+   change to still read as floating. */
+@keyframes sprite-hover {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-2px);
+  }
+}
+
+/* Idle wandering within a small bounded footprint — purely a local visual
+   loop around the worker's real, persisted position, not a change to it;
+   node.position (and the projected anchor derived from it) never moves.
+   Applied to the sprite, which is pointer-events: none, not to __motion —
+   the real interactive hit target stays exactly at its anchored position
+   throughout the loop, so this can't drift into a neighboring territory's
+   drop target the way animating __motion itself would. */
+@keyframes sprite-wander {
+  0%,
+  100% {
+    translate: 0 0;
+  }
+  22% {
+    translate: 13px -2px;
+  }
+  48% {
+    translate: 5px -4px;
+  }
+  70% {
+    translate: -13px -2px;
+  }
+  88% {
+    translate: -5px 0;
+  }
+}
+
+/* A flat sprite can't actually turn in 3D, so "turning" is simulated the
+   way 2D game sprites always have: mirror horizontally to face whichever
+   way the wander loop is currently heading. `steps(1)` makes each keyframe
+   a hard cut rather than an interpolated flip-through-zero, which would
+   squash the character sideways for a frame. Kept on its own property
+   (scale, not transform) so it composes independently of the hover/hue
+   animations already running on translate/filter. */
+@keyframes sprite-turn {
+  0%,
+  21% {
+    scale: 1 1;
+  }
+  22%,
+  69% {
+    scale: -1 1;
+  }
+  70%,
+  100% {
+    scale: 1 1;
+  }
+}
+
+/* Working status: a soft pulsing glow traced around the character's own
+   silhouette, not a dot guessed at a fixed percentage position. A fixed
+   coordinate ("58%, 40%") only ever lined up with one specific sprite's
+   visor by luck and looked wrong on the other two designs — drop-shadow
+   traces whatever the sprite's actual alpha shape is, so it reads correctly
+   regardless of which character or pose is showing. */
+@keyframes sprite-working-glow {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 0 transparent);
+  }
+  50% {
+    filter: drop-shadow(0 0 14px var(--teal));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .runtime-canvas[data-visual-mode="depth"] .worker-marker__sprite {
+    animation: none !important;
+  }
+}
+
+.runtime-canvas[data-visual-mode="depth"] .city-silhouette {
+  display: none;
+}
+
+.runtime-canvas[data-visual-mode="depth"] .workspace-region__meta {
+  display: none;
+}
+
+/* Upright territory label, pinned to the territory's projected centroid.
+   Labels billboard rather than skew, so project names stay readable. */
+.runtime-canvas[data-visual-mode="depth"] .workspace-region__heading {
+  position: absolute;
+  left: var(--territory-label-x, 50%);
+  top: var(--territory-label-y, 50%);
+  z-index: 3;
+  width: max-content;
+  min-height: 0;
+  max-width: 240px;
+  gap: 6px;
+  padding: 3px 7px;
+  border: 1px solid
+    color-mix(in srgb, var(--project-accent) 55%, var(--ink));
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--paper) 92%, var(--project-accent));
+  pointer-events: auto;
+  translate: -50% -50%;
+}
+
+.runtime-canvas[data-visual-mode="depth"]
+  .workspace-region__heading
+  .workspace-region__index {
+  width: 15px;
+  height: 15px;
+  font-size: 7px;
+}
+
+.runtime-canvas[data-visual-mode="depth"] .workspace-region__title {
+  grid-template-columns: 15px minmax(0, 1fr);
+  gap: 5px;
+}
+
+.runtime-canvas[data-visual-mode="depth"] .workspace-region__title strong {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+
+.runtime-canvas[data-visual-mode="depth"] .workspace-region__count {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 8px;
+}
+
+.runtime-canvas[data-visual-mode="depth"]
+  .workspace-region.is-selected
+  .workspace-region__heading {
+  border-color: var(--yellow);
+  box-shadow: 0 0 0 2px var(--yellow);
+}
+
+/* Connection handles and resize controls opt back into pointer events. See the
+   comments beside <Handle> and <NodeResizer> in RuntimeCanvas.tsx: both are
+   deliberately left operating on the flat node box in this slice. */
+.runtime-canvas[data-visual-mode="depth"] .project-relationship-handle,
+.runtime-canvas[data-visual-mode="depth"] .project-region > .coordination-handle,
+.runtime-canvas[data-visual-mode="depth"] .react-flow__resize-control {
+  pointer-events: all;
+}
+
+/* Flat edges are replaced by the projected routes. They stay in the DOM with
+   their classes and computed styles intact so status assertions and assistive
+   labels keep working; they simply stop being drawn or hit tested. */
+.runtime-canvas[data-visual-mode="depth"] .react-flow__edge {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.runtime-canvas[data-visual-mode="depth"]
+  .react-flow__edge:not(.selected)
+  .react-flow__edge-path {
+  animation: none;
+  filter: none;
+}
+
+.runtime-canvas[data-visual-mode="depth"] .react-flow__edge.selected,
+.runtime-canvas[data-visual-mode="depth"] .react-flow__connectionline {
+  visibility: visible;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .projected-route__activity {
+    animation: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .projected-ground,
+  .territory-polygon,
+  .projected-building__face--top,
+  .projected-building__face--side,
+  .projected-building__face--side-b,
+  .projected-anchor__pad {
+    fill: Canvas;
+    stroke: CanvasText;
+  }
+
+  .projected-ground-grid__line,
+  .projected-route__ballast,
+  .projected-route__sleepers,
+  .projected-route__rails,
+  .projected-route__gauge,
+  .projected-route__activity {
+    stroke: CanvasText;
+  }
+
+  .projected-route__junction,
+  .projected-route__signal-light {
+    fill: CanvasText;
+  }
+
+  .projected-building__hatch {
+    display: none;
+  }
+
+  .projected-territory.is-selected .territory-polygon__outline,
+  .projected-territory.is-allocation-target .territory-polygon__outline {
+    stroke: Highlight;
+    stroke-width: 5;
+  }
+
+  .runtime-canvas[data-visual-mode="depth"] .workspace-region__heading {
+    border-color: CanvasText;
+    box-shadow: none;
   }
 }

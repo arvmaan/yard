@@ -1,3 +1,17 @@
+use yard_domain::OrchestratorWorkflowProfile;
+
+pub(crate) fn with_orchestrator_workflow(
+    prompt: &str,
+    workflow: &OrchestratorWorkflowProfile,
+) -> String {
+    format!(
+        "Yard orchestrator workflow profile revision {} \
+         (monitor interval: {} ms):\n\n{}\n\n\
+         ## Current Yard command\n\n{}",
+        workflow.version, workflow.monitor_interval_ms, workflow.instructions_markdown, prompt
+    )
+}
+
 pub(crate) fn with_orchestrator_status_contract(prompt: &str, command_id: &str) -> String {
     let command_id = serde_json::to_string(command_id)
         .expect("serializing a validated command identifier cannot fail");
@@ -18,7 +32,27 @@ pub(crate) fn with_orchestrator_status_contract(prompt: &str, command_id: &str) 
 mod tests {
     use yard_domain::OrchestratorStatusReport;
 
-    use super::with_orchestrator_status_contract;
+    use yard_domain::{OrchestratorWorkflowProfile, OrchestratorWorkflowProfileSource};
+
+    use super::{with_orchestrator_status_contract, with_orchestrator_workflow};
+
+    #[test]
+    fn composes_the_pinned_workflow_before_the_current_command() {
+        let workflow = OrchestratorWorkflowProfile {
+            version: 7,
+            instructions_markdown: "# Fleet workflow\n\nUse workers.".to_owned(),
+            monitor_interval_ms: 600_000,
+            source: OrchestratorWorkflowProfileSource::User,
+            updated_by: "local-user".to_owned(),
+            created_at_unix_ms: 1,
+        };
+
+        let prompt = with_orchestrator_workflow("Ship the change.", &workflow);
+
+        assert!(prompt.starts_with("Yard orchestrator workflow profile revision 7"));
+        assert!(prompt.contains("monitor interval: 600000 ms"));
+        assert!(prompt.find("Use workers.").unwrap() < prompt.find("Ship the change.").unwrap());
+    }
 
     #[test]
     fn injects_actual_command_without_embedding_a_parseable_report() {

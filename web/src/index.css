@@ -80,21 +80,31 @@ body {
 
 .terminal-session__status {
   display: flex;
-  height: 24px;
+  height: 28px;
   min-width: 0;
   align-items: center;
-  gap: 6px;
-  padding: 0 8px;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 6px 0 8px;
   overflow: hidden;
   border-top: 1px solid var(--terminal-line, #34403c);
   color: var(--terminal-muted, #9fb0aa);
   font-family: "IBM Plex Mono", monospace;
-  font-size: 8px;
+  font-size: 9px;
+}
+
+.terminal-session__status-text {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.terminal-session__status > span {
+.terminal-session__status-text > span {
   width: 6px;
   height: 6px;
   flex: 0 0 6px;
@@ -102,13 +112,66 @@ body {
   background: #e7b32b;
 }
 
-.terminal-session[data-state="connected"] .terminal-session__status > span {
+.terminal-session[data-state="connected"] .terminal-session__status-text > span {
   background: #72b783;
 }
 
-.terminal-session[data-state="closed"] .terminal-session__status > span,
-.terminal-session[data-state="error"] .terminal-session__status > span {
+.terminal-session[data-state="closed"] .terminal-session__status-text > span,
+.terminal-session[data-state="error"] .terminal-session__status-text > span {
   background: #f07869;
+}
+
+.terminal-session__reopen {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  padding: 0;
+  place-items: center;
+  border: 1px solid var(--terminal-line, #34403c);
+  border-radius: 2px;
+  background: var(--terminal-bg, #111715);
+  color: var(--terminal-ink, #dce7e3);
+  cursor: pointer;
+}
+
+.terminal-session__reopen:hover {
+  border-color: var(--terminal-ink, #dce7e3);
+}
+
+.terminal-session__reopen:focus-visible {
+  outline: 2px solid #3978b8;
+  outline-offset: 1px;
+}
+
+.terminal-session__palette {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  color: var(--terminal-muted, #9fb0aa);
+}
+
+.terminal-session__palette-label {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.terminal-session__palette-select {
+  height: 24px;
+  padding: 0 4px;
+  border: 1px solid var(--terminal-line, #34403c);
+  border-radius: 2px;
+  background: var(--terminal-bg, #111715);
+  color: var(--terminal-muted, #9fb0aa);
+  font-family: inherit;
+  font-size: 9px;
+  line-height: 1;
+}
+
+.terminal-session__palette-select:focus-visible {
+  outline: 2px solid #3978b8;
+  outline-offset: 1px;
 }
 
 @media (max-width: 680px) {

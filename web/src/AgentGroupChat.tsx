@@ -8,6 +8,7 @@ import {
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react'
+import { createPortal } from 'react-dom'
 import {
   Bot,
   CircleAlert,
@@ -425,7 +426,7 @@ export function AgentGroupChat({
         </div>
       </section>
 
-      {open ? (
+      {open ? createPortal(
         <div
           className="modal-backdrop chat-backdrop"
           role="presentation"
@@ -655,7 +656,8 @@ export function AgentGroupChat({
               </div>
             </form>
           </section>
-        </div>
+        </div>,
+        document.body,
       ) : null}
     </>
   )

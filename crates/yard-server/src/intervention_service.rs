@@ -3,19 +3,20 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 use yard_domain::{
-    Assignment, AssignmentLifecycle, AttemptLifecycle, OrchestratorPromptAcknowledgement,
-    OrchestratorStatusReport, OrchestratorTerminalOutput, Project, PromptAcknowledgement,
-    SendAssignmentPrompt, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
-    SendYardOrchestratorRoute, TerminalOutput, Worker, WorkerRuntimeBinding, YardOrchestrator,
-    YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute, YardOrchestratorTerminalOutput,
+    Assignment, AssignmentLifecycle, AttemptLifecycle, AutomaticSummaryRequestKind,
+    OrchestratorPromptAcknowledgement, OrchestratorStatusReport, OrchestratorTerminalOutput,
+    Project, PromptAcknowledgement, SendAssignmentPrompt, SendOrchestratorPrompt,
+    SendYardOrchestratorPrompt, SendYardOrchestratorRoute, TerminalOutput, Worker,
+    WorkerRuntimeBinding, YardOrchestrator, YardOrchestratorPromptAcknowledgement,
+    YardOrchestratorRoute, YardOrchestratorTerminalOutput,
 };
 use yard_store::{
     BeginAssignmentPrompt, BeginOrchestratorPrompt, BeginYardOrchestratorPrompt,
-    BeginYardOrchestratorRoute, ProjectStoreError, YardStore,
+    BeginYardOrchestratorRoute, ProjectStoreError, TokenSpendCommandSource, YardStore,
 };
 
 use crate::inventory_service::{InventoryServiceError, InventorySource};
-use crate::status_protocol::with_orchestrator_status_contract;
+use crate::status_protocol::{with_orchestrator_status_contract, with_orchestrator_workflow};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePromptRequest {
@@ -70,6 +71,26 @@ pub struct InterventionService {
     store: Arc<dyn YardStore>,
 }
 
+#[derive(Clone, Copy)]
+enum AutomaticTokenSpendPolicy {
+    Summary(AutomaticSummaryRequestKind),
+    ScheduledSummary,
+}
+
+impl AutomaticTokenSpendPolicy {
+    const fn command_source(self) -> TokenSpendCommandSource {
+        match self {
+            Self::Summary(AutomaticSummaryRequestKind::SuperintendentProject) => {
+                TokenSpendCommandSource::SuperintendentProjectSummary
+            }
+            Self::Summary(AutomaticSummaryRequestKind::ProjectWorker) => {
+                TokenSpendCommandSource::ProjectWorkerSummary
+            }
+            Self::ScheduledSummary => TokenSpendCommandSource::ScheduledSummary,
+        }
+    }
+}
+
 impl InterventionService {
     #[must_use]
     pub fn new(
@@ -96,9 +117,48 @@ impl InterventionService {
         assignment_id: &str,
         command: SendAssignmentPrompt,
     ) -> Result<PromptAcknowledgement, InterventionServiceError> {
+        self.prompt_with_automatic_policy(project_id, assignment_id, command, None)
+            .await
+    }
+
+    pub(crate) async fn request_automatic_worker_summary(
+        &self,
+        project_id: &str,
+        assignment_id: &str,
+        command: SendAssignmentPrompt,
+    ) -> Result<PromptAcknowledgement, InterventionServiceError> {
+        self.prompt_with_automatic_policy(
+            project_id,
+            assignment_id,
+            command,
+            Some(AutomaticTokenSpendPolicy::Summary(
+                AutomaticSummaryRequestKind::ProjectWorker,
+            )),
+        )
+        .await
+    }
+
+    async fn prompt_with_automatic_policy(
+        &self,
+        project_id: &str,
+        assignment_id: &str,
+        command: SendAssignmentPrompt,
+        automatic_policy: Option<AutomaticTokenSpendPolicy>,
+    ) -> Result<PromptAcknowledgement, InterventionServiceError> {
+        if let Some(policy) = automatic_policy {
+            self.ensure_automatic_token_spend_enabled(policy).await?;
+        }
         let (command, assignment) = match self
             .store
-            .begin_assignment_prompt(project_id, assignment_id, command)
+            .begin_assignment_prompt(
+                project_id,
+                assignment_id,
+                command,
+                automatic_policy.map_or(
+                    TokenSpendCommandSource::Manual,
+                    AutomaticTokenSpendPolicy::command_source,
+                ),
+            )
             .await?
         {
             BeginAssignmentPrompt::Replayed(acknowledgement) => return Ok(acknowledgement),
@@ -113,6 +173,14 @@ impl InterventionService {
             .as_ref()
             .ok_or(InterventionServiceError::RuntimeBindingMissing)?;
         if let Err(error) = self.validate_runtime(&assignment).await {
+            self.store
+                .fail_assignment_prompt(&command.command_id, &error.to_string(), false)
+                .await?;
+            return Err(error);
+        }
+        if let Some(policy) = automatic_policy
+            && let Err(error) = self.ensure_automatic_token_spend_enabled(policy).await
+        {
             self.store
                 .fail_assignment_prompt(&command.command_id, &error.to_string(), false)
                 .await?;
@@ -164,9 +232,42 @@ impl InterventionService {
         project_id: &str,
         command: SendOrchestratorPrompt,
     ) -> Result<OrchestratorPromptAcknowledgement, InterventionServiceError> {
+        self.prompt_orchestrator_with_automatic_policy(project_id, command, None)
+            .await
+    }
+
+    pub(crate) async fn prompt_orchestrator_for_scheduled_summary(
+        &self,
+        project_id: &str,
+        command: SendOrchestratorPrompt,
+    ) -> Result<OrchestratorPromptAcknowledgement, InterventionServiceError> {
+        self.prompt_orchestrator_with_automatic_policy(
+            project_id,
+            command,
+            Some(AutomaticTokenSpendPolicy::ScheduledSummary),
+        )
+        .await
+    }
+
+    async fn prompt_orchestrator_with_automatic_policy(
+        &self,
+        project_id: &str,
+        command: SendOrchestratorPrompt,
+        automatic_policy: Option<AutomaticTokenSpendPolicy>,
+    ) -> Result<OrchestratorPromptAcknowledgement, InterventionServiceError> {
+        if let Some(policy) = automatic_policy {
+            self.ensure_automatic_token_spend_enabled(policy).await?;
+        }
         let (command, project) = match self
             .store
-            .begin_orchestrator_prompt(project_id, command)
+            .begin_orchestrator_prompt(
+                project_id,
+                command,
+                automatic_policy.map_or(
+                    TokenSpendCommandSource::Manual,
+                    AutomaticTokenSpendPolicy::command_source,
+                ),
+            )
             .await?
         {
             BeginOrchestratorPrompt::Replayed(acknowledgement) => return Ok(acknowledgement),
@@ -178,6 +279,14 @@ impl InterventionService {
             .as_ref()
             .ok_or(InterventionServiceError::RuntimeBindingMissing)?;
         if let Err(error) = self.validate_orchestrator_binding(&project).await {
+            self.store
+                .fail_orchestrator_prompt(&command.command_id, &error.to_string(), false)
+                .await?;
+            return Err(error);
+        }
+        if let Some(policy) = automatic_policy
+            && let Err(error) = self.ensure_automatic_token_spend_enabled(policy).await
+        {
             self.store
                 .fail_orchestrator_prompt(&command.command_id, &error.to_string(), false)
                 .await?;
@@ -228,16 +337,48 @@ impl InterventionService {
         &self,
         command: SendYardOrchestratorPrompt,
     ) -> Result<YardOrchestratorPromptAcknowledgement, InterventionServiceError> {
-        let (command, orchestrator) =
-            match self.store.begin_yard_orchestrator_prompt(command).await? {
-                BeginYardOrchestratorPrompt::Replayed(acknowledgement) => {
-                    return Ok(acknowledgement);
-                }
-                BeginYardOrchestratorPrompt::Started {
-                    command,
-                    orchestrator,
-                } => (command, orchestrator),
-            };
+        self.prompt_yard_orchestrator_with_automatic_policy(command, None)
+            .await
+    }
+
+    pub(crate) async fn prompt_yard_orchestrator_for_scheduled_summary(
+        &self,
+        command: SendYardOrchestratorPrompt,
+    ) -> Result<YardOrchestratorPromptAcknowledgement, InterventionServiceError> {
+        self.prompt_yard_orchestrator_with_automatic_policy(
+            command,
+            Some(AutomaticTokenSpendPolicy::ScheduledSummary),
+        )
+        .await
+    }
+
+    async fn prompt_yard_orchestrator_with_automatic_policy(
+        &self,
+        command: SendYardOrchestratorPrompt,
+        automatic_policy: Option<AutomaticTokenSpendPolicy>,
+    ) -> Result<YardOrchestratorPromptAcknowledgement, InterventionServiceError> {
+        if let Some(policy) = automatic_policy {
+            self.ensure_automatic_token_spend_enabled(policy).await?;
+        }
+        let (command, orchestrator) = match self
+            .store
+            .begin_yard_orchestrator_prompt(
+                command,
+                automatic_policy.map_or(
+                    TokenSpendCommandSource::Manual,
+                    AutomaticTokenSpendPolicy::command_source,
+                ),
+            )
+            .await?
+        {
+            BeginYardOrchestratorPrompt::Replayed(acknowledgement) => {
+                return Ok(acknowledgement);
+            }
+            BeginYardOrchestratorPrompt::Started {
+                command,
+                orchestrator,
+            } => (command, orchestrator),
+        };
         let runtime = orchestrator
             .worker
             .as_ref()
@@ -249,13 +390,26 @@ impl InterventionService {
                 .await?;
             return Err(error);
         }
+        if let Some(policy) = automatic_policy
+            && let Err(error) = self.ensure_automatic_token_spend_enabled(policy).await
+        {
+            self.store
+                .fail_yard_orchestrator_prompt(&command.command_id, &error.to_string(), false)
+                .await?;
+            return Err(error);
+        }
+        let workflow = self
+            .store
+            .get_orchestrator_workflow_profile_revision(orchestrator.workflow_profile_version)
+            .await?;
+        let prompt = with_orchestrator_workflow(&command.text, &workflow);
         let result = self
             .runtime
             .prompt(RuntimePromptRequest {
                 command_id: command.command_id.clone(),
                 session: runtime.session.clone(),
                 pane_id: runtime.pane_id.clone(),
-                text: with_orchestrator_status_contract(&command.text, &command.command_id),
+                text: with_orchestrator_status_contract(&prompt, &command.command_id),
             })
             .await;
         match result {
@@ -303,15 +457,49 @@ impl InterventionService {
         &self,
         command: SendYardOrchestratorRoute,
     ) -> Result<YardOrchestratorRoute, InterventionServiceError> {
-        let (command, orchestrator, target_project) =
-            match self.store.begin_yard_orchestrator_route(command).await? {
-                BeginYardOrchestratorRoute::Replayed(route) => return Ok(route),
-                BeginYardOrchestratorRoute::Started {
-                    command,
-                    orchestrator,
-                    target_project,
-                } => (command, orchestrator, target_project),
-            };
+        self.route_yard_orchestrator_with_automatic_policy(command, None)
+            .await
+    }
+
+    pub(crate) async fn request_automatic_project_summary(
+        &self,
+        command: SendYardOrchestratorRoute,
+    ) -> Result<YardOrchestratorRoute, InterventionServiceError> {
+        self.route_yard_orchestrator_with_automatic_policy(
+            command,
+            Some(AutomaticTokenSpendPolicy::Summary(
+                AutomaticSummaryRequestKind::SuperintendentProject,
+            )),
+        )
+        .await
+    }
+
+    async fn route_yard_orchestrator_with_automatic_policy(
+        &self,
+        command: SendYardOrchestratorRoute,
+        automatic_policy: Option<AutomaticTokenSpendPolicy>,
+    ) -> Result<YardOrchestratorRoute, InterventionServiceError> {
+        if let Some(policy) = automatic_policy {
+            self.ensure_automatic_token_spend_enabled(policy).await?;
+        }
+        let (command, orchestrator, target_project) = match self
+            .store
+            .begin_yard_orchestrator_route(
+                command,
+                automatic_policy.map_or(
+                    TokenSpendCommandSource::Manual,
+                    AutomaticTokenSpendPolicy::command_source,
+                ),
+            )
+            .await?
+        {
+            BeginYardOrchestratorRoute::Replayed(route) => return Ok(route),
+            BeginYardOrchestratorRoute::Started {
+                command,
+                orchestrator,
+                target_project,
+            } => (command, orchestrator, target_project),
+        };
         let runtime = target_project
             .orchestrator
             .runtime
@@ -320,6 +508,14 @@ impl InterventionService {
         if let Err(error) = self
             .validate_yard_route_bindings(&orchestrator, &target_project)
             .await
+        {
+            self.store
+                .fail_yard_orchestrator_route(&command.command_id, &error.to_string(), false)
+                .await?;
+            return Err(error);
+        }
+        if let Some(policy) = automatic_policy
+            && let Err(error) = self.ensure_automatic_token_spend_enabled(policy).await
         {
             self.store
                 .fail_yard_orchestrator_route(&command.command_id, &error.to_string(), false)
@@ -365,6 +561,22 @@ impl InterventionService {
                     .await?;
                 Err(error.into())
             }
+        }
+    }
+
+    async fn ensure_automatic_token_spend_enabled(
+        &self,
+        policy: AutomaticTokenSpendPolicy,
+    ) -> Result<(), InterventionServiceError> {
+        let settings = self.store.get_token_spend_settings().await?;
+        let enabled = match policy {
+            AutomaticTokenSpendPolicy::Summary(kind) => settings.automatic_summary_enabled(kind),
+            AutomaticTokenSpendPolicy::ScheduledSummary => settings.scheduled_automatic_summaries,
+        };
+        if enabled {
+            Ok(())
+        } else {
+            Err(InterventionServiceError::AutomaticTokenSpendDisabled)
         }
     }
 
@@ -727,6 +939,8 @@ pub enum InterventionServiceError {
     OrchestratorChanged,
     #[error("the Yard orchestrator changed while the intervention was in progress")]
     YardOrchestratorChanged,
+    #[error("the requested automatic token-spend behavior is disabled")]
+    AutomaticTokenSpendDisabled,
     #[error("lines must be between 1 and 1000")]
     InvalidLineCount,
 }

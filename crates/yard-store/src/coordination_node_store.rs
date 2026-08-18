@@ -625,6 +625,7 @@ pub(super) async fn begin_prompt(
     store: &SqliteProjectStore,
     node_id: &str,
     command: SendCoordinationNodePrompt,
+    source: super::TokenSpendCommandSource,
 ) -> Result<BeginCoordinationNodePrompt, ProjectStoreError> {
     let node_id = canonical_node_id(node_id)?;
     let command = command.normalize()?;
@@ -632,6 +633,7 @@ pub(super) async fn begin_prompt(
         .run(move |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            super::token_spend_store::ensure_command_source_enabled(&transaction, source)?;
             if let Some(existing) = select_prompt_command(&transaction, &command.command_id)? {
                 if !existing.matches(&node_id, &command) {
                     return Err(ProjectStoreError::IdempotencyConflict);

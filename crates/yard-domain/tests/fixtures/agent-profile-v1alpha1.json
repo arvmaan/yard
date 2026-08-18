@@ -1,0 +1,118 @@
+{
+  "apiVersion": "yard.dev/agent-profile/v1alpha1",
+  "kind": "AgentProfile",
+  "metadata": {
+    "name": "Portable implementer",
+    "packageVersion": "1.0.0",
+    "provenance": {
+      "importedFrom": "test-fixture"
+    },
+    "futureMetadata": {
+      "preserve": true
+    }
+  },
+  "spec": {
+    "role": {
+      "default": "implementer"
+    },
+    "instructions": [
+      {
+        "id": "project-instructions",
+        "source": {
+          "kind": "workspace",
+          "path": "AGENTS.md"
+        },
+        "required": false
+      }
+    ],
+    "capabilities": {
+      "required": [
+        {
+          "id": "filesystem.workspace.read",
+          "version": 1
+        },
+        {
+          "id": "filesystem.workspace.write",
+          "version": 1
+        },
+        {
+          "id": "process.shell",
+          "version": 1
+        }
+      ],
+      "optional": [
+        {
+          "id": "tool.mcp.client",
+          "version": 1,
+          "allowDegraded": false
+        }
+      ]
+    },
+    "components": {
+      "skills": [],
+      "tools": [],
+      "mcpServers": [
+        {
+          "id": "documentation",
+          "source": {
+            "kind": "registry",
+            "reference": "yard://mcp/documentation"
+          },
+          "required": false,
+          "credentialSlots": [
+            {
+              "id": "docs-token",
+              "kind": "environmentVariable",
+              "name": "DOCS_TOKEN"
+            }
+          ],
+          "futureComponentSetting": "preserved"
+        }
+      ]
+    },
+    "policies": {
+      "isolation": "project-workspace",
+      "sandbox": "runtime-default",
+      "permissions": "runtime-default",
+      "completion": "explicit-receipt"
+    },
+    "extensions": {
+      "dev.yard.herdr": {
+        "apiVersion": "yard.dev/adapters/herdr/v1alpha1",
+        "agentKind": "codex"
+      },
+      "com.openai.codex": {
+        "apiVersion": "yard.dev/providers/codex/v1alpha1",
+        "model": "gpt-5.6",
+        "futureProviderSetting": {
+          "mode": "preserve"
+        }
+      },
+      "io.example.provider": {
+        "apiVersion": "example.dev/provider/v9",
+        "futureSetting": 17
+      }
+    },
+    "futureCoreField": {
+      "preserve": [
+        1,
+        2,
+        3
+      ]
+    }
+  },
+  "artifacts": [
+    {
+      "path": "opaque/provider-settings.json",
+      "mediaType": "application/json",
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "futureArtifactField": "preserved"
+    }
+  ],
+  "x-roundTrip": {
+    "owner": "fixture",
+    "nested": {
+      "unknown": true
+    }
+  }
+}

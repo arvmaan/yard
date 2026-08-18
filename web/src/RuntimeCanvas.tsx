@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
 } from 'react'
 import {
   Controls,
@@ -15,6 +16,7 @@ import {
   Position,
   ReactFlow,
   useNodesState,
+  ViewportPortal,
   MarkerType,
   type Connection,
   type Edge,
@@ -42,6 +44,9 @@ import {
   Pause,
   Radio,
 } from 'lucide-react'
+import orchestratorSpriteUrl from './assets/sprites/orchestrator.png'
+import superintendentSpriteUrl from './assets/sprites/superintendent.png'
+import workerSpriteUrl from './assets/sprites/worker.png'
 import type {
   Assignment,
   Automation,
@@ -73,7 +78,31 @@ import {
   type AllocationDragPayload,
 } from './allocationDrag'
 import { projectHeight } from './projectLayout'
+import {
+  mergeBounds,
+  projectBounds,
+  projectDelta,
+  projectPoint,
+  unprojectDelta,
+  unprojectPoint,
+  type WorldPoint,
+} from './mapProjection'
+import { ProjectedMap } from './ProjectedMap'
+import { createLatestFrameQueue } from './latestFrameQueue'
+import {
+  EMPTY_SCENE,
+  stableHash,
+  territoryBuildings,
+  type ProjectedAnchor,
+  type ProjectedAnchorKind,
+  type ProjectedRoute,
+  type ProjectedRouteKind,
+  type ProjectedRouteState,
+  type ProjectedScene,
+  type ProjectedTerritory,
+} from './mapScene'
 import type { YardTheme } from './theme'
+import type { MapVisualMode } from './mapVisualMode'
 
 export type CanvasSelection =
   | { kind: 'yard-orchestrator' }
@@ -111,6 +140,7 @@ interface RuntimeCanvasProps {
   runtimeLoading: boolean
   selectedSession: string
   theme: YardTheme
+  visualMode: MapVisualMode
   visibleWorkers: ObservedWorker[]
   yardOrchestrator: YardOrchestrator | null
   yardOrchestratorRoutes: YardOrchestratorRoute[]
@@ -152,6 +182,7 @@ interface ProjectNodeData extends Record<string, unknown> {
   accent: string
   buildingCount: number
   completedBuildingCount: number
+  projectTokenTotal: number
   workspace: WorkspaceObservation | null
   runtimePending: boolean
   visibleWorkerCount: number
@@ -279,6 +310,19 @@ const TREE_GROUP_GAP = 28
 const TREE_BOTTOM_GAP = 28
 const WORKSPACE_POSITION_KEY_PREFIX = 'yard:workspace-positions:'
 const AGENT_POSITION_KEY = 'yard:agent-positions:v1'
+const TERRITORY_BOX_PAD = 24
+/**
+ * Billboards are drawn smaller than the flat plan cards. The ground plane
+ * compresses world distances (0.82 across x, 0.44 across y), so a full-size
+ * card would both tower over its territory and collide with its neighbours once
+ * the grid they sit on is projected. The value has to stay below the tightest
+ * projected gap in the agent layouts — the child-agent tree column, which
+ * projects a 113x11.5 world step to roughly 83 screen units — so that a child
+ * still stands clear of its parent.
+ */
+const BILLBOARD_SCALE = 0.78
+/** Vertical room the tallest structures need above their ground footprint. */
+const BUILDING_HEADROOM = 140
 
 type CommunicationPathState = 'active' | 'failed' | 'idle'
 
@@ -313,18 +357,22 @@ type TerritoryProperties = CSSProperties & {
   '--project-accent': string
 }
 
-type BuildingProperties = CSSProperties & {
-  '--building-height': string
-  '--building-width': string
+type ProjectedNodeProperties = CSSProperties & {
+  '--billboard-height'?: string
+  '--billboard-scale'?: string
+  '--billboard-width'?: string
+  '--territory-box-height'?: string
+  '--territory-box-left'?: string
+  '--territory-box-top'?: string
+  '--territory-box-width'?: string
+  '--territory-label-x'?: string
+  '--territory-label-y'?: string
 }
 
-function stableHash(value: string) {
-  let hash = 2166136261
-  for (const character of value) {
-    hash ^= character.charCodeAt(0)
-    hash = Math.imul(hash, 16777619)
-  }
-  return hash >>> 0
+type BuildingProperties = CSSProperties & {
+  '--building-depth': string
+  '--building-height': string
+  '--building-width': string
 }
 
 function motionProperties(identity: string): MotionProperties {
@@ -354,6 +402,7 @@ function cityBuildingStyles(
         (isCompleted ? 12 : 0),
     )
     return {
+      '--building-depth': `${5 + ((hash >>> 12) % 4)}px`,
       '--building-height': `${height}%`,
       '--building-width': `${7 + ((hash >>> 8) % 8)}%`,
     }
@@ -521,6 +570,81 @@ function placementFromResize(params: ResizeParams): CanvasPlacement {
   }
 }
 
+/**
+ * Absolute (root-relative) world position of every node. ReactFlow stores child
+ * node positions relative to their parent, but the projection is defined on
+ * absolute world coordinates, so the offsets have to be resolved first.
+ */
+function absoluteNodePositions(nodes: RuntimeNode[]) {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]))
+  const resolved = new Map<string, CanvasPoint>()
+
+  const resolve = (node: RuntimeNode, seen: Set<string>): CanvasPoint => {
+    const cached = resolved.get(node.id)
+    if (cached) return cached
+    let position = { x: node.position.x, y: node.position.y }
+    const parentId = node.parentId
+    if (parentId && !seen.has(parentId)) {
+      const parent = nodeById.get(parentId)
+      if (parent) {
+        const parentPosition = resolve(parent, new Set(seen).add(node.id))
+        position = {
+          x: position.x + parentPosition.x,
+          y: position.y + parentPosition.y,
+        }
+      }
+    }
+    resolved.set(node.id, position)
+    return position
+  }
+
+  for (const node of nodes) resolve(node, new Set([node.id]))
+  return resolved
+}
+
+const ANCHOR_KINDS: Partial<Record<RuntimeNode['type'], ProjectedAnchorKind>> = {
+  'assigned-worker': 'assigned-worker',
+  automation: 'automation',
+  'child-agent': 'child-agent',
+  'coordination-node': 'coordination-node',
+  orchestrator: 'orchestrator',
+  worker: 'worker',
+  'yard-orchestrator': 'yard-orchestrator',
+}
+
+const ROUTE_KIND_BY_PREFIX: [string, ProjectedRouteKind][] = [
+  ['project-relationship:', 'relationship'],
+  ['yard-route:', 'coordination'],
+  ['coordination-attachment:', 'coordination'],
+  ['automation-target:', 'coordination'],
+  ['allocation:', 'allocation'],
+  ['provider-child-edge:', 'child'],
+]
+
+function routeKind(edgeId: string): ProjectedRouteKind {
+  return (
+    ROUTE_KIND_BY_PREFIX.find(([prefix]) => edgeId.startsWith(prefix))?.[1] ??
+    'coordination'
+  )
+}
+
+function routeState(edge: Edge): ProjectedRouteState {
+  const state = (edge.data as { communicationState?: unknown } | undefined)
+    ?.communicationState
+  return state === 'active' || state === 'failed' ? state : 'idle'
+}
+
+function nodeDimensions(node: RuntimeNode, fallbackWidth = 0, fallbackHeight = 0) {
+  return {
+    width:
+      node.measured?.width ??
+      numericDimension(node.style?.width, fallbackWidth),
+    height:
+      node.measured?.height ??
+      numericDimension(node.style?.height, fallbackHeight),
+  }
+}
+
 function numericDimension(value: string | number | undefined, fallback: number) {
   if (typeof value === 'number' && Number.isFinite(value)) return value
   if (typeof value === 'string') {
@@ -557,6 +681,17 @@ function ProjectRegion({ data, selected }: NodeProps<ProjectNode>) {
       data-completed-building-count={completedBuildingCount}
       style={{ '--project-accent': accent } as TerritoryProperties}
     >
+      {/*
+        Deliberate 2.5D compromise, not an oversight: NodeResizer computes its
+        eight handles from the node's own measured flat rectangle, and there is
+        no supported way to move them onto a projected parallelogram's corners
+        without forking the component. Resizing therefore keeps operating on the
+        flat box; the projected territory re-renders from the new width/height
+        when onResizeEnd fires, so the shape settles on release rather than
+        tracking the drag. Projected corner handles need per-corner delta maths
+        beyond the translation-only inverse projection and are explicit future
+        scope. Do not "fix" this by hiding the resizer in 2.5D.
+      */}
       <NodeResizer
         color={accent}
         isVisible={selected}
@@ -568,6 +703,15 @@ function ProjectRegion({ data, selected }: NodeProps<ProjectNode>) {
           onPlacementChange(project, placementFromResize(params))
         }
       />
+      {/*
+        Deliberate 2.5D compromise, not an oversight: these handles stay live
+        and keep their flat position relative to the node box. ReactFlow's
+        connection-line renderer draws in flat node space and cannot be
+        reprojected without replacing the whole gesture, so connect-by-drag
+        remains a flat interaction over a projected territory. Making the
+        handles pointer-events:none would silently kill relationship and
+        coordination creation with no test catching it.
+      */}
       <Handle
         aria-label={`${project.name} relationship target`}
         className="project-relationship-handle"
@@ -692,6 +836,15 @@ function WorkerMarker({ data, selected }: NodeProps<ObservedWorkerNode>) {
           <span className="worker-marker__body">
             <span className="worker-marker__glyph">
               <Bot aria-hidden="true" size={25} strokeWidth={1.8} />
+              <span
+                aria-hidden="true"
+                className="worker-marker__sprite"
+                style={
+                  {
+                    '--sprite-src': `url(${workerSpriteUrl})`,
+                  } as CSSProperties
+                }
+              />
             </span>
             <StatusIcon
               aria-label={`Observed status: ${worker.status}`}
@@ -750,6 +903,15 @@ function ChildAgentMarker({
       />
       <span className="child-agent-marker__glyph">
         <GitBranch aria-hidden="true" size={18} strokeWidth={1.8} />
+        <span
+          aria-hidden="true"
+          className="worker-marker__sprite worker-marker__sprite--child"
+          style={
+            {
+              '--sprite-src': `url(${workerSpriteUrl})`,
+            } as CSSProperties
+          }
+        />
         <StatusIcon
           aria-label={`Observed status: ${agent.status}`}
           className={agent.status === 'working' ? 'status-spin' : ''}
@@ -834,6 +996,15 @@ function YardOrchestratorMarker({
         />
         <span className="yard-orchestrator-marker__glyph">
           <Network aria-hidden="true" size={35} strokeWidth={1.7} />
+          <span
+            aria-hidden="true"
+            className="worker-marker__sprite"
+            style={
+              {
+                '--sprite-src': `url(${superintendentSpriteUrl})`,
+              } as CSSProperties
+            }
+          />
           <StatusIcon
             aria-label={`Observed status: ${runtimeState.status}`}
             className={runtimeState.status === 'working' ? 'status-spin' : ''}
@@ -968,6 +1139,15 @@ function OrchestratorMarker({
           <span className="worker-marker__body">
             <span className="worker-marker__glyph">
               <Crown aria-hidden="true" size={24} strokeWidth={1.8} />
+              <span
+                aria-hidden="true"
+                className="worker-marker__sprite"
+                style={
+                  {
+                    '--sprite-src': `url(${orchestratorSpriteUrl})`,
+                  } as CSSProperties
+                }
+              />
             </span>
             <StatusIcon
               aria-label={`Observed status: ${runtimeState.status}`}
@@ -1049,6 +1229,15 @@ function AssignedWorkerMarker({
           <span className="worker-marker__body">
             <span className="worker-marker__glyph">
               <Bot aria-hidden="true" size={25} strokeWidth={1.8} />
+              <span
+                aria-hidden="true"
+                className="worker-marker__sprite"
+                style={
+                  {
+                    '--sprite-src': `url(${workerSpriteUrl})`,
+                  } as CSSProperties
+                }
+              />
             </span>
             <StatusIcon
               aria-label={`Observed status: ${runtimeState.status}`}
@@ -1155,6 +1344,22 @@ function observedWorkspace(
   )
 }
 
+function terminalIdentity(
+  adapter: string,
+  session: string,
+  terminalId: string,
+) {
+  return JSON.stringify([adapter, session, terminalId])
+}
+
+function runtimeTerminalIdentity(
+  runtime: WorkerRuntimeBinding | null | undefined,
+) {
+  return runtime
+    ? terminalIdentity(runtime.adapter, runtime.session, runtime.terminal_id)
+    : null
+}
+
 function observedWorker(
   project: Project,
   runtime: WorkerRuntimeBinding | null,
@@ -1164,7 +1369,9 @@ function observedWorker(
     !runtime ||
     !inventory ||
     inventory.adapter !== project.runtime.adapter ||
-    inventory.session !== project.runtime.session
+    inventory.session !== project.runtime.session ||
+    inventory.adapter !== runtime.adapter ||
+    inventory.session !== runtime.session
   ) {
     return null
   }
@@ -1193,7 +1400,22 @@ function observedRuntimeWorker(
   return matches.length === 1 ? matches[0] : null
 }
 
-function projectAtPoint(nodes: RuntimeNode[], point: CanvasPoint) {
+/**
+ * Resolve the project territory under a flow-space point.
+ *
+ * The projection is a linear affine map, so unprojecting the pointer into world
+ * space and testing the stored world rectangle is exactly equivalent to
+ * projecting every territory into a screen-space parallelogram and running
+ * point-in-polygon maths — with none of the fill-rule code. The territory the
+ * user sees is a true projected polygon; only the hit test gets to be simple.
+ */
+function projectAtPoint(
+  nodes: RuntimeNode[],
+  flowPoint: CanvasPoint,
+  visualMode: MapVisualMode = 'flat',
+) {
+  const point =
+    visualMode === 'depth' ? unprojectPoint(flowPoint) : flowPoint
   const node = [...nodes].reverse().find((candidate) => {
     if (candidate.type !== 'project') return false
     const project = (candidate.data as ProjectNodeData).project
@@ -1229,14 +1451,15 @@ function automationTargetNodeId(scope: AutomationScope) {
 }
 
 function isVisibleAssignment(assignment: Assignment, project: Project) {
+  const runtime = assignment.worker.runtime
   return (
     (assignment.lifecycle === 'allocating' ||
       assignment.lifecycle === 'active' ||
       assignment.lifecycle === 'handing_off') &&
     assignment.worker.id !== project.orchestrator.id &&
-    (!assignment.worker.runtime?.terminal_id ||
-      assignment.worker.runtime.terminal_id !==
-        project.orchestrator.runtime?.terminal_id)
+    (!runtime ||
+      runtimeTerminalIdentity(runtime) !==
+        runtimeTerminalIdentity(project.orchestrator.runtime))
   )
 }
 
@@ -1504,11 +1727,12 @@ function buildNodes(
     placement: CanvasPlacement,
   ) => void,
 ): RuntimeNode[] {
-  const yardOrchestratorTerminalId =
-    yardOrchestrator?.worker?.runtime?.terminal_id ?? null
-  const coordinationTerminalIds = coordinationNodes
-    .map((node) => node.worker?.runtime?.terminal_id)
-    .filter((terminalId): terminalId is string => Boolean(terminalId))
+  const yardOrchestratorTerminalIdentity = runtimeTerminalIdentity(
+    yardOrchestrator?.worker?.runtime,
+  )
+  const coordinationTerminalIdentities = coordinationNodes
+    .map((node) => runtimeTerminalIdentity(node.worker?.runtime))
+    .filter((identity): identity is string => identity !== null)
   const projectNodes = projects.flatMap((project): RuntimeNode[] => {
     const workspace = observedWorkspace(project, inventory)
     const runtimePending =
@@ -1520,22 +1744,33 @@ function buildNodes(
     const projectAssignments = allProjectAssignments.filter((assignment) =>
       isVisibleAssignment(assignment, project),
     )
-    const assignedTerminalIds = new Set(
-      allProjectAssignments
-        .map((assignment) => assignment.worker.runtime?.terminal_id)
-        .filter((terminalId): terminalId is string => Boolean(terminalId)),
+    const assignedTerminalIdentities = new Set(
+      projectAssignments
+        .map((assignment) =>
+          runtimeTerminalIdentity(assignment.worker.runtime),
+        )
+        .filter((identity): identity is string => identity !== null),
     )
-    if (project.orchestrator.runtime?.terminal_id) {
-      assignedTerminalIds.add(project.orchestrator.runtime.terminal_id)
+    const orchestratorTerminalIdentity = runtimeTerminalIdentity(
+      project.orchestrator.runtime,
+    )
+    if (orchestratorTerminalIdentity) {
+      assignedTerminalIdentities.add(orchestratorTerminalIdentity)
     }
-    if (yardOrchestratorTerminalId) {
-      assignedTerminalIds.add(yardOrchestratorTerminalId)
+    if (yardOrchestratorTerminalIdentity) {
+      assignedTerminalIdentities.add(yardOrchestratorTerminalIdentity)
     }
-    const workers = workspace
+    const workers = workspace && inventory
       ? visibleWorkers.filter(
           (worker) =>
             worker.workspace_id === workspace.runtime_id &&
-            !assignedTerminalIds.has(worker.terminal_id),
+            !assignedTerminalIdentities.has(
+              terminalIdentity(
+                inventory.adapter,
+                inventory.session,
+                worker.terminal_id,
+              ),
+            ),
         )
       : []
     const orchestratorNodeId = `orchestrator:${project.id}`
@@ -1584,6 +1819,25 @@ function buildNodes(
     const completedBuildingCount = allProjectAssignments.filter(
       (assignment) => assignment.completion_receipt !== null,
     ).length
+    // Real observed usage, not a simulated figure: summed from each assigned
+    // worker's own Herdr-reported token counts, the same `tokens` field
+    // already on ObservedWorker but never surfaced anywhere in the UI before.
+    const projectTokenTotal = allProjectAssignments.reduce(
+      (total, assignment) => {
+        const worker = observedWorker(
+          project,
+          assignment.worker.runtime,
+          inventory,
+        )
+        if (!worker) return total
+        const workerTotal = Object.values(worker.tokens).reduce(
+          (sum, value) => sum + (Number.parseInt(value, 10) || 0),
+          0,
+        )
+        return total + workerTotal
+      },
+      0,
+    )
     const artifactCount = allProjectAssignments.reduce(
       (total, assignment) =>
         total + (assignment.completion_receipt?.artifacts.length ?? 0),
@@ -1610,6 +1864,7 @@ function buildNodes(
         accent,
         buildingCount,
         completedBuildingCount,
+        projectTokenTotal,
         workspace,
         runtimePending,
         visibleWorkerCount,
@@ -1768,10 +2023,10 @@ function buildNodes(
       )
       .map((project) => project.runtime.workspace_id),
   )
-  const representedTerminalIds = new Set(
+  const representedTerminalIdentities = new Set(
     [
-      yardOrchestratorTerminalId,
-      ...coordinationTerminalIds,
+      yardOrchestratorTerminalIdentity,
+      ...coordinationTerminalIdentities,
       ...projects
         .filter(
           (project) =>
@@ -1779,7 +2034,9 @@ function buildNodes(
             project.runtime.adapter === inventory.adapter &&
             project.runtime.session === inventory.session,
         )
-        .map((project) => project.orchestrator.runtime?.terminal_id ?? null),
+        .map((project) =>
+          runtimeTerminalIdentity(project.orchestrator.runtime),
+        ),
       ...assignments
         .filter(
           (assignment) =>
@@ -1790,15 +2047,23 @@ function buildNodes(
               assignment.lifecycle === 'active' ||
               assignment.lifecycle === 'handing_off'),
         )
-        .map((assignment) => assignment.worker.runtime?.terminal_id ?? null),
-    ].filter((terminalId): terminalId is string => terminalId !== null),
+        .map((assignment) =>
+          runtimeTerminalIdentity(assignment.worker.runtime),
+        ),
+    ].filter((identity): identity is string => identity !== null),
   )
   const unboundWorkers =
     inventory?.session === selectedSession
       ? visibleWorkers.filter(
           (worker) =>
             !representedWorkspaceIds.has(worker.workspace_id) &&
-            !representedTerminalIds.has(worker.terminal_id),
+            !representedTerminalIdentities.has(
+              terminalIdentity(
+                inventory.adapter,
+                inventory.session,
+                worker.terminal_id,
+              ),
+            ),
         )
       : []
   const workspaceStartY =
@@ -2081,6 +2346,7 @@ export function RuntimeCanvas({
   runtimeLoading,
   selectedSession,
   theme,
+  visualMode,
   visibleWorkers,
   yardOrchestrator,
   yardOrchestratorRoutes,
@@ -2106,6 +2372,9 @@ export function RuntimeCanvas({
     Record<string, CanvasPoint>
   >(readAgentPositions)
   const instance = useRef<ReactFlowInstance<RuntimeNode> | null>(null)
+  const dragOrigins = useRef(new Map<string, CanvasPoint>())
+  const nodesById = useRef(new Map<string, RuntimeNode>())
+  const framedProjection = useRef(false)
   const showContextMenu = useCallback(
     (
       event: CanvasContextMenuEvent,
@@ -2114,11 +2383,15 @@ export function RuntimeCanvas({
       automationPlacement?: CanvasPlacement,
     ) => {
       event.preventDefault()
-      const point = instance.current?.screenToFlowPosition({
+      const flowPoint = instance.current?.screenToFlowPosition({
         x: event.clientX,
         y: event.clientY,
       })
-      if (!point) return
+      if (!flowPoint) return
+      // Right-click creation stores an unprojected world placement, so the new
+      // node lands where the pointer visibly was on the projected ground.
+      const point =
+        visualMode === 'depth' ? unprojectPoint(flowPoint) : flowPoint
       const flowElement =
         event.target instanceof Element
           ? event.target.closest('.react-flow')
@@ -2145,7 +2418,7 @@ export function RuntimeCanvas({
         ),
       })
     },
-    [],
+    [visualMode],
   )
   const handleSelectionChange = useCallback(
     ({ nodes: selectedNodes }: { nodes: RuntimeNode[] }) => {
@@ -2157,14 +2430,24 @@ export function RuntimeCanvas({
   )
   const commitNodePosition = useCallback(
     (node: RuntimeNode, position: CanvasPoint) => {
+      // In 2.5D a billboard's measured box is its drawn size, not the world
+      // footprint it stands on, so persisted geometry must come from the stored
+      // placement instead. Persisted values stay unprojected, unscaled world
+      // coordinates in both modes.
+      const persistedSize = (geometry: CanvasPlacement) =>
+        visualMode === 'depth'
+          ? { width: geometry.width, height: geometry.height }
+          : {
+              width: node.measured?.width ?? geometry.width,
+              height: node.measured?.height ?? geometry.height,
+            }
       if (node.type === 'project') {
         const project = (node.data as ProjectNodeData).project
         const geometry = project.placement.geometry
         onProjectPlacementChange(project, {
           x: position.x,
           y: position.y,
-          width: node.measured?.width ?? geometry.width,
-          height: node.measured?.height ?? geometry.height,
+          ...persistedSize(geometry),
         })
       } else if (node.type === 'automation') {
         const automation = (node.data as AutomationNodeData).automation
@@ -2172,8 +2455,7 @@ export function RuntimeCanvas({
         onAutomationPlacementChange(automation, {
           x: position.x,
           y: position.y,
-          width: node.measured?.width ?? geometry.width,
-          height: node.measured?.height ?? geometry.height,
+          ...persistedSize(geometry),
         })
       } else if (node.type === 'coordination-node') {
         const coordinationNode = (node.data as CoordinationNodeData).node
@@ -2181,8 +2463,7 @@ export function RuntimeCanvas({
         onCoordinationNodePlacementChange(coordinationNode, {
           x: position.x,
           y: position.y,
-          width: node.measured?.width ?? geometry.width,
-          height: node.measured?.height ?? geometry.height,
+          ...persistedSize(geometry),
         })
       } else if (node.type === 'workspace') {
         const workspace = (node.data as WorkspaceNodeData).workspace
@@ -2210,12 +2491,65 @@ export function RuntimeCanvas({
       onAutomationPlacementChange,
       onProjectPlacementChange,
       selectedSession,
+      visualMode,
     ],
   )
   const handleNodesChange = useCallback(
     (changes: NodeChange<RuntimeNode>[]) => {
-      onNodesChange(changes)
-      for (const change of changes) {
+      // In 2.5D mode a pointer drag is a movement across the projected ground
+      // plane, not across the flat world axes. ReactFlow hands us
+      // `dragStartPosition + screenDelta / zoom`; re-deriving that delta and
+      // running it back through the inverse projection is what makes a
+      // horizontal screen drag change both world axes. Only pointer drags are
+      // remapped: keyboard arrow movement stays on the world axes so nudging a
+      // project remains a predictable, quantised step.
+      const projected = changes.map((change) => {
+        if (
+          visualMode !== 'depth' ||
+          change.type !== 'position' ||
+          !change.position
+        ) {
+          return change
+        }
+        // The origin is captured lazily, on the first drag change, rather than
+        // in onNodeDragStart: ReactFlow's first drag event already carries the
+        // node moved by the first pointer step, so reading the position here —
+        // before this change is applied to our own state — is what keeps the
+        // node under the pointer instead of trailing it by one step.
+        let origin = dragOrigins.current.get(change.id)
+        if (!origin && change.dragging) {
+          // Read the pre-drag position from our own state mirror, not from the
+          // ReactFlow store: the drag machinery mutates its node lookup before
+          // calling onNodesChange, so the store already holds the node moved by
+          // the first pointer step. Anchoring on the stale store position would
+          // leave the node trailing the pointer by that step for the whole
+          // gesture, and persist the shortfall.
+          const current = nodesById.current.get(change.id)
+          if (current) {
+            origin = { x: current.position.x, y: current.position.y }
+            dragOrigins.current.set(change.id, origin)
+          }
+        }
+        if (!origin) return change
+        const worldDelta = unprojectDelta({
+          x: change.position.x - origin.x,
+          y: change.position.y - origin.y,
+        })
+        return {
+          ...change,
+          position: {
+            x: origin.x + worldDelta.x,
+            y: origin.y + worldDelta.y,
+          },
+        }
+      })
+      onNodesChange(projected)
+      for (const change of projected) {
+        if (change.type === 'position' && change.dragging === false) {
+          dragOrigins.current.delete(change.id)
+        }
+      }
+      for (const change of projected) {
         if (
           change.type !== 'position' ||
           !change.position ||
@@ -2227,8 +2561,86 @@ export function RuntimeCanvas({
         if (node) commitNodePosition(node, change.position)
       }
     },
-    [commitNodePosition, onNodesChange],
+    [commitNodePosition, onNodesChange, visualMode],
   )
+  /**
+   * 2.5D placement layer.
+   *
+   * `node.position` always stays in unprojected world coordinates — that is
+   * what gets persisted and what the minimap, fit maths, and 2D mode read.
+   * The projected screen position is applied as a CSS `translate`, which
+   * composes with the `transform: translate(...)` ReactFlow writes for the
+   * node's world position, so the rendered anchor lands exactly on
+   * `projectPoint(worldPosition)` without ever mutating stored geometry.
+   */
+  const projectedNodes = useMemo<RuntimeNode[]>(() => {
+    nodesById.current = new Map(nodes.map((node) => [node.id, node]))
+    if (visualMode !== 'depth') return nodes
+    const absolute = absoluteNodePositions(nodes)
+    return nodes.map((node) => {
+      const world = absolute.get(node.id) ?? node.position
+      const anchor = projectPoint(world)
+      const style = {
+        ...node.style,
+        translate: `${anchor.x - world.x}px ${anchor.y - world.y}px`,
+      } as ProjectedNodeProperties
+      if (node.type === 'project' || node.type === 'workspace') {
+        const width = numericDimension(node.style?.width, 350)
+        const height = numericDimension(node.style?.height, projectHeight(1))
+        // The region element keeps existing as the territory's DOM stand-in for
+        // state, aria, and the billboards parented to it, so its box has to
+        // cover the projected envelope rather than the flat rectangle. The
+        // extra margin leaves room for billboards standing on anchors near the
+        // territory's far corners.
+        const east = projectDelta({ x: width, y: 0 })
+        const west = projectDelta({ x: 0, y: height })
+        const boxLeft = west.x - TERRITORY_BOX_PAD
+        const boxTop = -TERRITORY_BOX_PAD
+        style['--territory-box-left'] = `${boxLeft}px`
+        style['--territory-box-top'] = `${boxTop}px`
+        // The upright territory label is pinned to the territory's projected
+        // centroid so it reads as belonging to the parallelogram the user sees
+        // and stays a valid allocation drop point. Anchoring it to the flat
+        // box's top edge would put it outside the projected shape entirely.
+        // Offsets are relative to the region box, not the node origin, because
+        // that box is itself shifted to cover the projected envelope.
+        const centre = projectDelta({ x: width / 2, y: height / 2 })
+        style['--territory-label-x'] = `${centre.x - boxLeft}px`
+        style['--territory-label-y'] = `${centre.y - boxTop}px`
+        style['--territory-box-width'] =
+          `${east.x - west.x + TERRITORY_BOX_PAD * 2 + WORKER_NODE_WIDTH}px`
+        style['--territory-box-height'] =
+          `${east.y + west.y + TERRITORY_BOX_PAD * 2 + WORKER_NODE_HEIGHT}px`
+        // A territory's visible shape is a parallelogram drawn by ProjectedMap,
+        // so the flat rectangle must stop being the mouse target. ReactFlow
+        // writes `pointerEvents` inline on the node wrapper and inline styles
+        // beat any stylesheet rule, which is why this is set here rather than
+        // in App.css. Descendants that must stay live (the upright label, the
+        // connection handles, the resize controls) opt back in with
+        // `pointer-events: auto` under `[data-visual-mode="depth"]`.
+        style.pointerEvents = 'none'
+        // The territory layer sits above the billboards standing on it so the
+        // upright label is never buried under a worker marker. It intercepts
+        // nothing (see pointerEvents above); only the label opts back in.
+        style.zIndex = 10
+      } else {
+        // Billboard nodes shrink to their drawn size so the wrapper box, the
+        // pointer target, and the visible sprite stay the same rectangle. The
+        // inner layout keeps its original pixel size through --billboard-*, so
+        // nothing inside a marker reflows or overflows. Dimensions come from
+        // the declared style rather than the measured box, because the measured
+        // box is already the scaled one and would compound every render.
+        const width = numericDimension(node.style?.width, WORKER_NODE_WIDTH)
+        const height = numericDimension(node.style?.height, WORKER_NODE_HEIGHT)
+        style['--billboard-width'] = `${width}px`
+        style['--billboard-height'] = `${height}px`
+        style['--billboard-scale'] = String(BILLBOARD_SCALE)
+        style.width = width * BILLBOARD_SCALE
+        style.height = height * BILLBOARD_SCALE
+      }
+      return { ...node, style } as RuntimeNode
+    })
+  }, [nodes, visualMode])
   const arrangeSpaces = useCallback(() => {
     const flowInstance = instance.current
     const yardNode = flowInstance?.getNode('yard-orchestrator')
@@ -2319,18 +2731,24 @@ export function RuntimeCanvas({
     const coordinationPlacements = coordinationNodes.flatMap((node, index) => {
       const flowNode = flowInstance.getNode(`coordination-node:${node.id}`)
       if (!flowNode) return []
+      // Coordination billboards are drawn scaled in 2.5D, so their measured box
+      // must not become the persisted geometry.
       const width =
-        flowNode.measured?.width ??
-        numericDimension(
-          flowNode.style?.width,
-          node.placement.geometry.width,
-        )
+        visualMode === 'depth'
+          ? node.placement.geometry.width
+          : (flowNode.measured?.width ??
+            numericDimension(
+              flowNode.style?.width,
+              node.placement.geometry.width,
+            ))
       const height =
-        flowNode.measured?.height ??
-        numericDimension(
-          flowNode.style?.height,
-          node.placement.geometry.height,
-        )
+        visualMode === 'depth'
+          ? node.placement.geometry.height
+          : (flowNode.measured?.height ??
+            numericDimension(
+              flowNode.style?.height,
+              node.placement.geometry.height,
+            ))
       const angle =
         -Math.PI / 2 +
         (index * Math.PI * 2) / Math.max(1, coordinationNodes.length)
@@ -2383,10 +2801,49 @@ export function RuntimeCanvas({
         'yard-orchestrator',
         ...allPlacements.map(({ nodeId }) => nodeId),
       ])
+      const duration = window.matchMedia('(prefers-reduced-motion: reduce)')
+        .matches
+        ? 0
+        : 420
+      if (visualMode === 'depth') {
+        // `fitView` frames ReactFlow's flat node boxes. Once territories are
+        // projected parallelograms those boxes are no longer what the user
+        // sees, so the camera has to be framed on the projected envelope of the
+        // arranged world rectangles instead. The envelope is computed from the
+        // placements just written rather than read back from the flow instance,
+        // which may not have re-rendered them yet.
+        const bounds = mergeBounds([
+          projectBounds({
+            x: yardNode.position.x,
+            y: yardNode.position.y,
+            width: yardWidth,
+            height: yardHeight,
+          }),
+          ...allPlacements.map(({ placement }) =>
+            projectBounds({
+              x: placement.x,
+              y: placement.y,
+              width: placement.width,
+              height: placement.height,
+            }),
+          ),
+        ])
+        if (bounds.width > 0 && bounds.height > 0) {
+          void flowInstance.fitBounds(
+            {
+              x: bounds.x,
+              // Headroom for structures rising above their ground.
+              y: bounds.y - BUILDING_HEADROOM,
+              width: bounds.width,
+              height: bounds.height + BUILDING_HEADROOM,
+            },
+            { duration, padding: 0.14 },
+          )
+          return
+        }
+      }
       void flowInstance.fitView({
-        duration: window.matchMedia('(prefers-reduced-motion: reduce)').matches
-          ? 0
-          : 420,
+        duration,
         maxZoom: 1.05,
         nodes: flowInstance
           .getNodes()
@@ -2400,6 +2857,7 @@ export function RuntimeCanvas({
     onProjectPlacementChange,
     projects,
     setNodes,
+    visualMode,
   ])
   const edges = useMemo<Edge[]>(
     () => {
@@ -2555,7 +3013,10 @@ export function RuntimeCanvas({
             const route = latestNodeRouteByAttachment.get(
               `${node.id}:${projectId}`,
             )
-            const communicationState = communicationPathState(route)
+            const communicationState = communicationPathState(
+              route,
+              projectStatusReports[projectId],
+            )
             return {
               id: `coordination-attachment:${node.id}:${projectId}`,
               source: `coordination-node:${node.id}`,
@@ -2587,6 +3048,14 @@ export function RuntimeCanvas({
         const target = automationTargetNodeId(automation.scope)
         if (!nodeIds.has(target)) return []
         const latestStatus = automation.latest_run?.status ?? 'never'
+        const communicationState: CommunicationPathState =
+          latestStatus === 'failed' || latestStatus === 'ambiguous'
+            ? 'failed'
+            : automation.state === 'active' &&
+                (latestStatus === 'pending' ||
+                  latestStatus === 'submitted')
+              ? 'active'
+              : 'idle'
         return [
           {
             id: `automation-target:${automation.id}`,
@@ -2595,15 +3064,14 @@ export function RuntimeCanvas({
             target,
             targetHandle: 'automation-target',
             type: 'smoothstep',
-            animated:
-              automation.state === 'active' &&
-              latestStatus === 'submitted',
+            animated: communicationState === 'active',
             selectable: false,
             deletable: false,
             reconnectable: false,
             focusable: false,
             zIndex: 2,
             className: `automation-target-edge automation-target-edge--${automation.state} automation-target-edge--${latestStatus}`,
+            data: { communicationState },
             ariaLabel: `${automation.name} targets its orchestrator`,
           },
         ]
@@ -2630,6 +3098,301 @@ export function RuntimeCanvas({
       yardOrchestratorRoutes,
     ],
   )
+
+  /**
+   * The projected scene, derived from exactly the same node and edge model the
+   * flat mode renders. There is no second data source and no parallel state:
+   * territories, skylines, ground anchors, and routes are all read out of
+   * `nodes`/`edges` and expressed in world coordinates, then projected once at
+   * render time inside `ProjectedMap`.
+   */
+  const scene = useMemo<ProjectedScene>(() => {
+    if (visualMode !== 'depth') return EMPTY_SCENE
+    const absolute = absoluteNodePositions(nodes)
+    const territories: ProjectedTerritory[] = []
+    const anchors: ProjectedAnchor[] = []
+    const centreByNodeId = new Map<string, WorldPoint>()
+
+    for (const node of nodes) {
+      const world = absolute.get(node.id) ?? node.position
+      if (node.type === 'project') {
+        const data = node.data as ProjectNodeData
+        const { width, height } = nodeDimensions(
+          node,
+          Math.max(data.project.placement.geometry.width, data.minimumWidth),
+          Math.max(data.project.placement.geometry.height, data.minimumHeight),
+        )
+        const rect = { x: world.x, y: world.y, width, height }
+        centreByNodeId.set(node.id, {
+          x: rect.x + rect.width / 2,
+          y: rect.y + rect.height / 2,
+        })
+        territories.push({
+          accent: data.accent,
+          allocationTarget: data.isAllocationTarget,
+          buildings: territoryBuildings(
+            data.project.id,
+            data.buildingCount,
+            data.completedBuildingCount,
+            rect,
+          ),
+          kind: 'project',
+          label: data.project.name,
+          nodeId: node.id,
+          rect,
+          runtime: data.workspace
+            ? 'online'
+            : data.runtimePending
+              ? 'loading'
+              : 'offline',
+          selected: node.selected === true,
+          status: data.workspace?.status ?? 'unknown',
+          tokenTotal: data.projectTokenTotal,
+        })
+        continue
+      }
+      if (node.type === 'workspace') {
+        const data = node.data as WorkspaceNodeData
+        const { width, height } = nodeDimensions(node, 350, projectHeight(1))
+        const rect = { x: world.x, y: world.y, width, height }
+        centreByNodeId.set(node.id, {
+          x: rect.x + rect.width / 2,
+          y: rect.y + rect.height / 2,
+        })
+        territories.push({
+          accent: '#3178a8',
+          allocationTarget: false,
+          buildings: [],
+          kind: 'workspace',
+          label: data.workspace.label,
+          nodeId: node.id,
+          rect,
+          runtime: 'online',
+          selected: node.selected === true,
+          status: data.workspace.status,
+        })
+        continue
+      }
+      const kind = ANCHOR_KINDS[node.type]
+      if (!kind) continue
+      const measured = nodeDimensions(
+        node,
+        WORKER_NODE_WIDTH,
+        WORKER_NODE_HEIGHT,
+      )
+      // Coordination nodes are scaled inside a correspondingly smaller
+      // ReactFlow wrapper in depth mode. During a mode switch ReactFlow may
+      // briefly retain the old flat-mode measurement, so derive their visible
+      // footprint from the persisted dimensions instead of letting the ground
+      // pad jump after a later measurement pass.
+      const width =
+        node.type === 'coordination-node'
+          ? numericDimension(node.style?.width, measured.width) *
+            BILLBOARD_SCALE
+          : measured.width
+      const height =
+        node.type === 'coordination-node'
+          ? numericDimension(node.style?.height, measured.height) *
+            BILLBOARD_SCALE
+          : measured.height
+      // Billboards deliberately stay upright: only their anchor corner (the
+      // node's own world position) is projected, then the rest of the box
+      // extends as a flat, unskewed CSS offset from there — that's what
+      // "billboard" means, as opposed to a building's fully projected faces.
+      // Projecting a world-space offset point here, the way this used to
+      // read, applies the axonometric skew to that offset too, which lands
+      // nowhere near where the billboard actually renders. unprojectDelta is
+      // the correct inverse: it finds the world-space delta that *produces*
+      // the desired flat screen offset once projected, so this anchor point
+      // reprojects back to the billboard's true visual bottom-center.
+      const screenOffset = unprojectDelta({ x: width / 2, y: height })
+      const centre = {
+        x: world.x + screenOffset.x,
+        y: world.y + screenOffset.y,
+      }
+      centreByNodeId.set(node.id, centre)
+      anchors.push({
+        accent:
+          node.type === 'child-agent'
+            ? (node.data as ChildAgentNodeData).accent
+            : node.type === 'coordination-node'
+              ? (node.data as CoordinationNodeData).node.kind ===
+                'knowledge_store'
+                ? '#347f78'
+                : '#d99832'
+              : '#c64b3c',
+        kind,
+        nodeId: node.id,
+        point: centre,
+        selected: node.selected === true,
+        status: String(
+          (node.data as { agent?: { status?: string } }).agent?.status ??
+            'unknown',
+        ),
+      })
+    }
+
+    const routes: ProjectedRoute[] = edges.flatMap((edge): ProjectedRoute[] => {
+      const from = centreByNodeId.get(edge.source)
+      const to = centreByNodeId.get(edge.target)
+      if (!from || !to) return []
+      return [
+        {
+          from,
+          id: edge.id,
+          kind: routeKind(edge.id),
+          state: routeState(edge),
+          to,
+        },
+      ]
+    })
+
+    return { anchors, routes, territories }
+  }, [edges, nodes, visualMode])
+
+  /**
+   * Projected dragging for territories.
+   *
+   * Pointer capture keeps the gesture on the polygon the user grabbed. The
+   * screen delta is divided by the live ReactFlow zoom and then inverse
+   * projected, so pushing the pointer sideways slides the territory along both
+   * ground axes and the stored world placement changes accordingly. Persistence
+   * reuses `commitNodePosition`, the same call the flat drag path ends in.
+   */
+  const beginTerritoryDrag = useCallback(
+    (nodeId: string, event: ReactPointerEvent<SVGElement>) => {
+      if (visualMode !== 'depth' || event.button !== 0) return
+      const flowInstance = instance.current
+      const node = flowInstance?.getNode(nodeId)
+      if (!flowInstance || !node || node.draggable === false) return
+      event.stopPropagation()
+
+      const surface = event.currentTarget
+      const pointerId = event.pointerId
+      const zoom = flowInstance.getViewport().zoom || 1
+      const start = { x: event.clientX, y: event.clientY }
+      const origin = { x: node.position.x, y: node.position.y }
+      let latest = origin
+      let moved = false
+      const positionUpdates = createLatestFrameQueue<CanvasPoint>((position) => {
+        setNodes((current) =>
+          current.map((candidate) =>
+            candidate.id === nodeId
+              ? { ...candidate, position }
+              : candidate,
+          ),
+        )
+      })
+
+      setNodes((current) =>
+        current.map((candidate) => ({
+          ...candidate,
+          selected: candidate.id === nodeId,
+        })),
+      )
+      onSelectionChange(selectionFromNodes([node]))
+
+      const move = (moveEvent: PointerEvent) => {
+        const worldDelta = unprojectDelta({
+          x: (moveEvent.clientX - start.x) / zoom,
+          y: (moveEvent.clientY - start.y) / zoom,
+        })
+        latest = {
+          x: origin.x + worldDelta.x,
+          y: origin.y + worldDelta.y,
+        }
+        if (
+          Math.abs(moveEvent.clientX - start.x) > 2 ||
+          Math.abs(moveEvent.clientY - start.y) > 2
+        ) {
+          moved = true
+        }
+        positionUpdates.schedule(latest)
+      }
+
+      const finish = () => {
+        surface.removeEventListener('pointermove', move)
+        surface.removeEventListener('pointerup', finish)
+        surface.removeEventListener('pointercancel', finish)
+        if (surface.hasPointerCapture?.(pointerId)) {
+          surface.releasePointerCapture(pointerId)
+        }
+        positionUpdates.flush()
+        if (!moved) return
+        const settled = instance.current?.getNode(nodeId)
+        if (settled) commitNodePosition(settled, latest)
+      }
+
+      surface.setPointerCapture?.(pointerId)
+      surface.addEventListener('pointermove', move)
+      surface.addEventListener('pointerup', finish)
+      surface.addEventListener('pointercancel', finish)
+    },
+    [commitNodePosition, onSelectionChange, setNodes, visualMode],
+  )
+
+  /**
+   * Frame the projected world once per switch into 2.5D.
+   *
+   * The flat mode's fixed default viewport assumes world coordinates land near
+   * the screen origin. Projected coordinates do not: the world y axis runs left
+   * across the screen, so a scene that was comfortably framed flat can sit
+   * entirely off the left edge once projected. Framing the projected envelope
+   * with `fitBounds` — not `fitView`, which frames ReactFlow's flat node boxes —
+   * is what puts the map where the user is looking.
+   */
+  useEffect(() => {
+    if (visualMode !== 'depth') {
+      framedProjection.current = false
+      return
+    }
+    if (framedProjection.current || nodes.length === 0) return
+    const flowInstance = instance.current
+    if (!flowInstance) return
+    const absolute = absoluteNodePositions(nodes)
+    const bounds = mergeBounds(
+      nodes.map((node) => {
+        const world = absolute.get(node.id) ?? node.position
+        const { width, height } = nodeDimensions(
+          node,
+          WORKER_NODE_WIDTH,
+          WORKER_NODE_HEIGHT,
+        )
+        return projectBounds({
+          x: world.x,
+          y: world.y,
+          width,
+          height,
+        })
+      }),
+    )
+    if (!(bounds.width > 0) || !(bounds.height > 0)) return
+    framedProjection.current = true
+    const compact = window.matchMedia('(max-width: 680px)').matches
+    const base = compact ? { x: 18, y: 34, zoom: 0.72 } : { x: 44, y: 42, zoom: 0.88 }
+    const frame = {
+      x: bounds.x,
+      // Headroom for the tallest structures, which rise above their ground.
+      y: bounds.y - BUILDING_HEADROOM,
+      width: bounds.width,
+      height: bounds.height + BUILDING_HEADROOM,
+    }
+    // Frame the projected envelope, then refuse to zoom in past the mode's own
+    // default. The projected world is wider than the flat one — world y runs
+    // left across the screen — so on a narrow viewport it has to be zoomed out
+    // to stay reachable, but on a roomy one it should be reframed, not
+    // magnified.
+    void flowInstance
+      .fitBounds(frame, { duration: 0, padding: 0.06 })
+      .then(() => {
+        if (flowInstance.getViewport().zoom <= base.zoom) return
+        void flowInstance.setViewport({
+          x: base.x - frame.x * base.zoom,
+          y: base.y - frame.y * base.zoom,
+          zoom: base.zoom,
+        })
+      })
+  }, [nodes, visualMode])
 
   const handleConnect = useCallback(
     (connection: Connection) => {
@@ -2724,7 +3487,9 @@ export function RuntimeCanvas({
   return (
     <ReactFlow
       aria-label="Yard project canvas"
+      className="runtime-canvas"
       colorMode={theme}
+      data-visual-mode={visualMode}
       defaultViewport={{ x: 44, y: 42, zoom: 0.88 }}
       deleteKeyCode={null}
       maxZoom={1.6}
@@ -2735,7 +3500,7 @@ export function RuntimeCanvas({
       elevateNodesOnSelect={false}
       multiSelectionKeyCode="Shift"
       nodeTypes={NODE_TYPES}
-      nodes={nodes}
+      nodes={projectedNodes}
       nodesConnectable
       onConnect={handleConnect}
       onPaneClick={() => setContextMenu(null)}
@@ -2831,6 +3596,7 @@ export function RuntimeCanvas({
         const target = projectAtPoint(
           instance.current?.getNodes() ?? [],
           point,
+          visualMode,
         )
         setAllocationTargetId(target?.id ?? null)
       }}
@@ -2842,7 +3608,11 @@ export function RuntimeCanvas({
           y: event.clientY,
         })
         const projectId = point
-          ? projectAtPoint(instance.current?.getNodes() ?? [], point)?.id
+          ? projectAtPoint(
+              instance.current?.getNodes() ?? [],
+              point,
+              visualMode,
+            )?.id
           : allocationTargetId
         setAllocationTargetId(null)
         if (payload && projectId) onAllocationDrop(payload, projectId)
@@ -2858,6 +3628,15 @@ export function RuntimeCanvas({
       }}
       proOptions={{ hideAttribution: true }}
     >
+      {visualMode === 'depth' ? (
+        <ViewportPortal>
+          <ProjectedMap
+            onGroundContextMenu={(event) => showContextMenu(event)}
+            onTerritoryPointerDown={beginTerritoryDrag}
+            scene={scene}
+          />
+        </ViewportPortal>
+      ) : null}
       <Panel className="canvas-tools-panel" position="top-left">
         <button
           aria-label="Project pulse"

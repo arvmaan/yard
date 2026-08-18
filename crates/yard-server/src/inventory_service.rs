@@ -242,6 +242,21 @@ impl RuntimeControl for HerdrInventorySource {
         }
     }
 
+    async fn prepare_replacement_worker(
+        &self,
+        request: RuntimeProvisionRequest,
+    ) -> Result<yard_domain::WorkerRuntimeBinding, RuntimeProvisionError> {
+        self.prepare_worker(request).await
+    }
+
+    async fn start_prepared_replacement_worker(
+        &self,
+        request: RuntimeProvisionRequest,
+        prepared: yard_domain::WorkerRuntimeBinding,
+    ) -> Result<yard_domain::WorkerRuntimeBinding, RuntimeProvisionError> {
+        self.start_prepared_worker(request, prepared).await
+    }
+
     async fn retire_runtime(
         &self,
         request: RuntimeRetirementRequest,
@@ -254,8 +269,16 @@ impl RuntimeControl for HerdrInventorySource {
             .inventory(&request.session)
             .await
             .map_err(|error| RuntimeRetirementError::Runtime(error.to_string()))?;
-        let Some(target) = retirement_target(&inventory, &request) else {
-            return Ok(());
+        let target = match retirement_resolution(&inventory, &request) {
+            RetirementResolution::Target(target) => target,
+            RetirementResolution::Absent => return Ok(()),
+            RetirementResolution::Conflict => {
+                return if request.require_identity_match {
+                    Err(RuntimeRetirementError::IdentityNotObserved)
+                } else {
+                    Ok(())
+                };
+            }
         };
         self.adapter
             .retire_runtime(HerdrRetireRuntimeRequest {
@@ -276,61 +299,145 @@ struct RetirementTarget {
     owns_tab: bool,
 }
 
-fn retirement_target(
+struct RetirementIdentity {
+    workspace: String,
+    tab: String,
+    pane: String,
+}
+
+enum RetirementResolution {
+    Target(RetirementTarget),
+    Absent,
+    Conflict,
+}
+
+fn retirement_resolution(
     inventory: &RuntimeInventory,
     request: &RuntimeRetirementRequest,
-) -> Option<RetirementTarget> {
-    let worker = inventory
+) -> RetirementResolution {
+    let identity = if let Some(expected) = request.provider_session.as_ref() {
+        retirement_by_provider(inventory, &request.terminal_id, expected)
+    } else {
+        retirement_by_topology(inventory, request)
+    };
+    let identity = match identity {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return RetirementResolution::Absent,
+        Err(()) => return RetirementResolution::Conflict,
+    };
+    if identity.workspace != request.workspace_id {
+        return RetirementResolution::Conflict;
+    }
+    let owns_tab = request.owns_tab
+        && request.tab_id.as_deref() == Some(identity.tab.as_str())
+        && inventory.tabs.iter().any(|tab| {
+            tab.runtime_id == identity.tab
+                && tab.workspace_id == identity.workspace
+                && tab.pane_count == 1
+        });
+    RetirementResolution::Target(RetirementTarget {
+        tab_id: identity.tab,
+        pane_id: identity.pane,
+        owns_tab,
+    })
+}
+
+fn retirement_by_provider(
+    inventory: &RuntimeInventory,
+    captured_terminal_id: &str,
+    expected: &yard_domain::ProviderSessionRef,
+) -> Result<Option<RetirementIdentity>, ()> {
+    let matching_workers = inventory
         .workers
         .iter()
-        .find(|worker| worker.terminal_id == request.terminal_id);
-    let (workspace_id, tab_id, pane_id) = if let Some(worker) = worker {
-        if let Some(expected) = request.provider_session.as_ref() {
-            if worker.provider_session.as_ref() != Some(expected) {
-                return None;
-            }
-        } else if worker.provider_session.is_some()
+        .filter(|worker| worker.provider_session.as_ref() == Some(expected))
+        .collect::<Vec<_>>();
+    if matching_workers.len() > 1 {
+        return Err(());
+    }
+    if let Some(worker) = matching_workers.first() {
+        if inventory.panes.iter().any(|pane| {
+            pane.provider_session.as_ref() == Some(expected)
+                && pane.terminal_id != worker.terminal_id
+        }) {
+            return Err(());
+        }
+        return Ok(Some(RetirementIdentity {
+            workspace: worker.workspace_id.clone(),
+            tab: worker.tab_id.clone(),
+            pane: worker.pane_id.clone(),
+        }));
+    }
+
+    let matching_panes = inventory
+        .panes
+        .iter()
+        .filter(|pane| pane.provider_session.as_ref() == Some(expected))
+        .collect::<Vec<_>>();
+    if matching_panes.len() > 1 {
+        return Err(());
+    }
+    if let Some(pane) = matching_panes.first() {
+        return Ok(Some(RetirementIdentity {
+            workspace: pane.workspace_id.clone(),
+            tab: pane.tab_id.clone(),
+            pane: pane.runtime_id.clone(),
+        }));
+    }
+    let captured_terminal_reused = inventory
+        .workers
+        .iter()
+        .any(|worker| worker.terminal_id == captured_terminal_id)
+        || inventory
+            .panes
+            .iter()
+            .any(|pane| pane.terminal_id == captured_terminal_id);
+    if captured_terminal_reused {
+        Err(())
+    } else {
+        Ok(None)
+    }
+}
+
+fn retirement_by_topology(
+    inventory: &RuntimeInventory,
+    request: &RuntimeRetirementRequest,
+) -> Result<Option<RetirementIdentity>, ()> {
+    if let Some(worker) = inventory
+        .workers
+        .iter()
+        .find(|worker| worker.terminal_id == request.terminal_id)
+    {
+        if worker.provider_session.is_some()
             || request.tab_id.as_deref() != Some(worker.tab_id.as_str())
             || request.pane_id != worker.pane_id
         {
-            return None;
+            return Err(());
         }
-        (
-            worker.workspace_id.as_str(),
-            worker.tab_id.as_str(),
-            worker.pane_id.as_str(),
-        )
-    } else {
-        if request.provider_session.is_some() {
-            return None;
-        }
-        let pane = inventory
-            .panes
-            .iter()
-            .find(|pane| pane.terminal_id == request.terminal_id)?;
-        if request.tab_id.as_deref() != Some(pane.tab_id.as_str())
-            || request.pane_id != pane.runtime_id
-        {
-            return None;
-        }
-        (
-            pane.workspace_id.as_str(),
-            pane.tab_id.as_str(),
-            pane.runtime_id.as_str(),
-        )
-    };
-    if workspace_id != request.workspace_id {
-        return None;
+        return Ok(Some(RetirementIdentity {
+            workspace: worker.workspace_id.clone(),
+            tab: worker.tab_id.clone(),
+            pane: worker.pane_id.clone(),
+        }));
     }
-    let owns_tab = request.owns_tab
-        && inventory.tabs.iter().any(|tab| {
-            tab.runtime_id == tab_id && tab.workspace_id == workspace_id && tab.pane_count == 1
-        });
-    Some(RetirementTarget {
-        tab_id: tab_id.to_owned(),
-        pane_id: pane_id.to_owned(),
-        owns_tab,
-    })
+    let Some(pane) = inventory
+        .panes
+        .iter()
+        .find(|pane| pane.terminal_id == request.terminal_id)
+    else {
+        return Ok(None);
+    };
+    if pane.provider_session.is_some()
+        || request.tab_id.as_deref() != Some(pane.tab_id.as_str())
+        || request.pane_id != pane.runtime_id
+    {
+        return Err(());
+    }
+    Ok(Some(RetirementIdentity {
+        workspace: pane.workspace_id.clone(),
+        tab: pane.tab_id.clone(),
+        pane: pane.runtime_id.clone(),
+    }))
 }
 
 #[async_trait]
@@ -575,7 +682,7 @@ mod tests {
         TabObservation,
     };
 
-    use super::retirement_target;
+    use super::{RetirementResolution, retirement_resolution};
     use crate::allocation_service::RuntimeRetirementRequest;
 
     fn provider(value: &str) -> ProviderSessionRef {
@@ -637,20 +744,22 @@ mod tests {
             session: "default".to_owned(),
             workspace_id: "workspace-1".to_owned(),
             terminal_id: "terminal-1".to_owned(),
-            tab_id: Some("tab-stale".to_owned()),
+            tab_id: Some("tab-current".to_owned()),
             pane_id: "pane-stale".to_owned(),
             provider_session: Some(provider_session),
             owns_tab: true,
+            require_identity_match: false,
         }
     }
 
     #[test]
     fn retirement_follows_the_matching_runtime_identity() {
-        let target = retirement_target(
+        let RetirementResolution::Target(target) = retirement_resolution(
             &inventory(provider("session-1"), 1),
             &request(provider("session-1")),
-        )
-        .unwrap();
+        ) else {
+            panic!("expected matching retirement target");
+        };
 
         assert_eq!(target.tab_id, "tab-current");
         assert_eq!(target.pane_id, "pane-current");
@@ -658,22 +767,77 @@ mod tests {
     }
 
     #[test]
+    fn retirement_follows_a_provider_session_that_moved_terminals() {
+        let mut inventory = inventory(provider("session-1"), 1);
+        inventory.workers[0].runtime_id = "terminal-moved".to_owned();
+        inventory.workers[0].terminal_id = "terminal-moved".to_owned();
+        inventory.workers[0].tab_id = "tab-moved".to_owned();
+        inventory.workers[0].pane_id = "pane-moved".to_owned();
+        inventory.tabs[0].runtime_id = "tab-moved".to_owned();
+        let mut replacement = inventory.workers[0].clone();
+        replacement.runtime_id = "terminal-1".to_owned();
+        replacement.terminal_id = "terminal-1".to_owned();
+        replacement.tab_id = "tab-reused".to_owned();
+        replacement.pane_id = "pane-reused".to_owned();
+        replacement.provider_session = Some(provider("replacement-session"));
+        inventory.workers.push(replacement);
+
+        let RetirementResolution::Target(target) =
+            retirement_resolution(&inventory, &request(provider("session-1")))
+        else {
+            panic!("expected moved retirement target");
+        };
+
+        assert_eq!(target.tab_id, "tab-moved");
+        assert_eq!(target.pane_id, "pane-moved");
+        assert!(!target.owns_tab);
+    }
+
+    #[test]
+    fn retirement_rejects_a_provider_session_that_moved_workspaces() {
+        let mut inventory = inventory(provider("session-1"), 1);
+        inventory.workers[0].terminal_id = "terminal-moved".to_owned();
+        inventory.workers[0].workspace_id = "workspace-other".to_owned();
+
+        assert!(matches!(
+            retirement_resolution(&inventory, &request(provider("session-1"))),
+            RetirementResolution::Conflict
+        ));
+    }
+
+    #[test]
+    fn retirement_does_not_transfer_captured_tab_ownership() {
+        let mut request = request(provider("session-1"));
+        request.tab_id = Some("tab-captured".to_owned());
+        let RetirementResolution::Target(target) =
+            retirement_resolution(&inventory(provider("session-1"), 1), &request)
+        else {
+            panic!("expected matching retirement target");
+        };
+
+        assert_eq!(target.tab_id, "tab-current");
+        assert_eq!(target.pane_id, "pane-current");
+        assert!(!target.owns_tab);
+    }
+
+    #[test]
     fn retirement_converges_without_closing_a_reused_terminal_identity() {
-        let target = retirement_target(
+        let resolution = retirement_resolution(
             &inventory(provider("replacement-session"), 1),
             &request(provider("original-session")),
         );
 
-        assert!(target.is_none());
+        assert!(matches!(resolution, RetirementResolution::Conflict));
     }
 
     #[test]
     fn retirement_closes_only_the_pane_when_the_tab_is_shared() {
-        let target = retirement_target(
+        let RetirementResolution::Target(target) = retirement_resolution(
             &inventory(provider("session-1"), 2),
             &request(provider("session-1")),
-        )
-        .unwrap();
+        ) else {
+            panic!("expected matching retirement target");
+        };
 
         assert!(!target.owns_tab);
         assert_eq!(target.pane_id, "pane-current");
@@ -686,11 +850,17 @@ mod tests {
         let mut request = request(provider("session-1"));
         request.provider_session = None;
 
-        assert!(retirement_target(&inventory, &request).is_none());
+        assert!(matches!(
+            retirement_resolution(&inventory, &request),
+            RetirementResolution::Conflict
+        ));
 
         request.tab_id = Some("tab-current".to_owned());
         request.pane_id = "pane-current".to_owned();
-        assert!(retirement_target(&inventory, &request).is_some());
+        assert!(matches!(
+            retirement_resolution(&inventory, &request),
+            RetirementResolution::Target(_)
+        ));
     }
 
     #[test]
@@ -700,8 +870,20 @@ mod tests {
         request.tab_id = Some("tab-current".to_owned());
         request.pane_id = "pane-current".to_owned();
 
-        assert!(
-            retirement_target(&inventory(provider("replacement-session"), 1), &request).is_none()
-        );
+        assert!(matches!(
+            retirement_resolution(&inventory(provider("replacement-session"), 1), &request),
+            RetirementResolution::Conflict
+        ));
+    }
+
+    #[test]
+    fn retirement_treats_a_fully_absent_captured_terminal_as_converged() {
+        let mut inventory = inventory(provider("session-1"), 1);
+        inventory.workers.clear();
+
+        assert!(matches!(
+            retirement_resolution(&inventory, &request(provider("session-1"))),
+            RetirementResolution::Absent
+        ));
     }
 }

@@ -1,3 +1,4 @@
+mod agent_profile;
 mod artifact;
 mod assignment;
 mod automation;
@@ -5,13 +6,26 @@ mod coordination;
 mod coordination_node;
 mod intervention;
 mod inventory;
+mod orchestrator_replacement;
+mod orchestrator_workflow_profile;
 mod profile;
 mod project;
 mod serde_u64;
 mod status_report;
+mod token_spend;
 mod worker;
 mod yard_orchestrator;
 
+pub use agent_profile::{
+    AGENT_PROFILE_API_VERSION, AGENT_PROFILE_KIND, AdapterCapability, AdapterDescriptor,
+    AgentProfile, AgentProfileArtifact, AgentProfileCapabilities, AgentProfileComponent,
+    AgentProfileComponents, AgentProfileInstruction, AgentProfileManifest, AgentProfileMetadata,
+    AgentProfilePolicies, AgentProfileRole, AgentProfileSource, AgentProfileSpec,
+    AgentProfileValidationError, AgentProfiles, CapabilityNegotiation, CapabilityNegotiationReport,
+    CapabilityRequest, CapabilityRequirement, CapabilitySupportStatus, CreateAgentProfile,
+    CredentialSlot, CredentialSlotKind, HERDR_EXTENSION_KEY, PreparedAgentProfile,
+    UpdateAgentProfile, WORKER_PROFILE_EXTENSION_KEY,
+};
 pub use artifact::{
     Artifact, ArtifactContent, ArtifactKind, ArtifactRegistration, ArtifactSource,
     ArtifactValidationError, MAX_ARTIFACT_CONTENT_BYTES, UploadArtifact,
@@ -56,6 +70,16 @@ pub use inventory::{
     ProviderSessionRef, RuntimeInventory, RuntimeReconciliation, RuntimeSession, RuntimeSessions,
     TabObservation, WorkspaceObservation, WorktreeObservation,
 };
+pub use orchestrator_replacement::{
+    OldSessionDisposition, OrchestratorReplacementValidationError, ReplaceProjectOrchestrator,
+    ReplacedProjectOrchestrator,
+};
+pub use orchestrator_workflow_profile::{
+    FACTORY_ORCHESTRATOR_WORKFLOW_INSTRUCTIONS, FACTORY_ORCHESTRATOR_WORKFLOW_MONITOR_INTERVAL_MS,
+    OrchestratorWorkflowProfile, OrchestratorWorkflowProfileSource,
+    OrchestratorWorkflowProfileValidationError, ResetOrchestratorWorkflowProfile,
+    UpdateOrchestratorWorkflowProfile,
+};
 pub use profile::{
     CreateWorkerProfile, ProfileValidationError, UpdateWorkerProfile, WorkerProfile,
     WorkerProfileSpec, WorkerProfiles,
@@ -70,6 +94,10 @@ pub use status_report::{
     MAX_STATUS_BLOCKER_BYTES, MAX_STATUS_BLOCKERS, MAX_STATUS_COMMAND_ID_BYTES,
     MAX_STATUS_REPORT_LINE_BYTES, MAX_STATUS_TEXT_BYTES, ORCHESTRATOR_STATUS_REPORT_VERSION,
     OrchestratorStatusReport, OrchestratorStatusReportError, OrchestratorStatusState,
+};
+pub use token_spend::{
+    AutomaticSummaryRequestKind, TokenSpendSettings, TokenSpendSettingsValidationError,
+    UpdateTokenSpendSettings,
 };
 pub use worker::{
     EndWorkerSession, EndedWorkerSession, WorkerAvailability, WorkerCandidate, WorkerCandidates,

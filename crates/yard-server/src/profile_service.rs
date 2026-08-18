@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use thiserror::Error;
-use yard_domain::{CreateWorkerProfile, UpdateWorkerProfile, WorkerProfile, WorkerProfiles};
+use yard_domain::{
+    AgentProfile, AgentProfiles, CreateAgentProfile, CreateWorkerProfile, UpdateAgentProfile,
+    UpdateWorkerProfile, WorkerProfile, WorkerProfiles,
+};
 use yard_store::{ProjectStoreError, YardStore};
 
 #[derive(Clone)]
@@ -70,12 +73,97 @@ impl ProfileService {
             .await
             .map_err(Into::into)
     }
+
+    /// List current portable agent-profile revisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentProfileServiceError`] when storage cannot be read.
+    pub async fn list_agents(&self) -> Result<AgentProfiles, AgentProfileServiceError> {
+        self.store.list_agent_profiles().await.map_err(Into::into)
+    }
+
+    /// Get the current portable revision for one profile identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentProfileServiceError`] when the profile is missing or
+    /// storage cannot be read.
+    pub async fn get_agent(
+        &self,
+        profile_id: &str,
+    ) -> Result<AgentProfile, AgentProfileServiceError> {
+        self.store
+            .get_agent_profile(profile_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Export one exact immutable portable profile revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentProfileServiceError`] when the revision is missing or
+    /// storage cannot be read.
+    pub async fn get_agent_revision(
+        &self,
+        profile_id: &str,
+        profile_version: u64,
+    ) -> Result<AgentProfile, AgentProfileServiceError> {
+        self.store
+            .get_agent_profile_revision(profile_id, profile_version)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Import a portable profile and create its `WorkerProfile` compatibility row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentProfileServiceError`] when validation, negotiation, or
+    /// persistence fails.
+    pub async fn create_agent(
+        &self,
+        profile: CreateAgentProfile,
+    ) -> Result<AgentProfile, AgentProfileServiceError> {
+        profile.clone().prepare()?;
+        self.store
+            .create_agent_profile(profile)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Import a replacement manifest as the next immutable profile revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentProfileServiceError`] for invalid input, unsupported
+    /// required capabilities, stale revisions, or persistence failures.
+    pub async fn update_agent(
+        &self,
+        profile_id: &str,
+        update: UpdateAgentProfile,
+    ) -> Result<AgentProfile, AgentProfileServiceError> {
+        update.clone().prepare()?;
+        self.store
+            .update_agent_profile(profile_id, update)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum ProfileServiceError {
     #[error(transparent)]
     InvalidProfile(#[from] yard_domain::ProfileValidationError),
+    #[error(transparent)]
+    Store(#[from] ProjectStoreError),
+}
+
+#[derive(Debug, Error)]
+pub enum AgentProfileServiceError {
+    #[error(transparent)]
+    InvalidProfile(#[from] yard_domain::AgentProfileValidationError),
     #[error(transparent)]
     Store(#[from] ProjectStoreError),
 }

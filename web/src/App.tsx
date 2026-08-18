@@ -25,17 +25,12 @@ import {
   GitBranch,
   GripVertical,
   LoaderCircle,
-  Map as MapIcon,
-  MessageSquareText,
-  Moon,
   Network,
   Pause,
   Pencil,
   Plus,
   RefreshCw,
   Server,
-  Sun,
-  SquareTerminal,
   Unlink,
   Wifi,
   WifiOff,
@@ -60,17 +55,20 @@ import {
   fetchCoordinationNodeRoutes,
   fetchCoordinationNodes,
   fetchCoordinationSnapshots,
+  fetchOrchestratorWorkflowProfile,
   fetchOrchestratorStatusOutput,
   fetchProjectAssignments,
   fetchProjectRelationships,
   fetchProjects,
   fetchSessions,
+  fetchTokenSpendSettings,
   fetchYardOrchestrator,
   fetchYardOrchestratorRoutes,
   fetchWorkerProfiles,
   fetchWorkers,
   provisionYardOrchestrator,
   recoverYardOrchestrator,
+  resetOrchestratorWorkflowProfile,
   provisionCoordinationNode,
   recordCompletionReceipt,
   requestCoordinationSnapshot,
@@ -80,14 +78,20 @@ import {
   updateAutomationPlacement,
   updateAutomationState,
   updateProjectPlacement,
+  updateTokenSpendSettings,
   updateCoordinationNode,
   updateCoordinationNodePlacement,
+  updateOrchestratorWorkflowProfile,
   updateWorkerProfile,
 } from './api'
 import {
   RuntimeCanvas,
   type CanvasSelection,
 } from './RuntimeCanvas'
+import {
+  GlobalCommandBar,
+  SettingsDialog,
+} from './AppChrome'
 import {
   AgentGroupChat,
   type AgentGroupTarget,
@@ -104,8 +108,11 @@ import {
 import { WorkerInterventions } from './WorkerInterventions'
 import {
   AgentWorkspaceContext,
-  type AgentWorkspaceMode,
+  DEFAULT_TERMINAL_PRESENTATION,
+  terminalLeaseKey,
   type AgentWorkspaceTarget,
+  type AgentWorkspaceView,
+  type TerminalPresentation,
 } from './AgentWorkspaceContext'
 import { AgentWorkspaceShell } from './AgentWorkspaceShell'
 import { ProjectPulseWorkspace } from './ProjectPulseWorkspace'
@@ -119,6 +126,8 @@ import {
   type AutomationDetails,
 } from './AutomationDialog'
 import { AutomationInspector } from './AutomationInspector'
+import { TokenSpendSettingsDialog } from './TokenSpendSettingsDialog'
+import { OrchestratorWorkflowProfileDialog } from './OrchestratorWorkflowProfileDialog'
 import {
   parseStatusReport,
   statusReportMatchesLatestRoute,
@@ -146,6 +155,15 @@ import {
   readTheme,
   type YardTheme,
 } from './theme'
+import {
+  reconcileInventorySnapshot,
+  reconcileRuntimeProjectionSnapshot,
+} from './inventoryState'
+import {
+  readMapVisualMode,
+  writeMapVisualMode,
+  type MapVisualMode,
+} from './mapVisualMode'
 import type {
   Artifact,
   Assignment,
@@ -161,6 +179,7 @@ import type {
   ObservedChildAgent,
   ObservedStatus,
   ObservedWorker,
+  OrchestratorWorkflowProfile,
   Project,
   ProjectRelationship,
   RuntimeInventory,
@@ -168,6 +187,7 @@ import type {
   RuntimeProcessState,
   RuntimeSession,
   StatusReport,
+  TokenSpendSettings,
   WorkerAvailability,
   WorkerCandidate,
   WorkerProfile,
@@ -180,6 +200,7 @@ import type {
 import './App.css'
 
 const INVENTORY_REFRESH_INTERVAL_MS = 1_000
+const ASSIGNMENT_REFRESH_INTERVAL_MS = 5_000
 const PROJECT_STATUS_REFRESH_INTERVAL_MS = 15_000
 
 const ArtifactInspector = lazy(() =>
@@ -346,6 +367,23 @@ function findObservedWorker(
   const matches = inventory.workers.filter(
     (worker) => worker.terminal_id === runtime.terminal_id,
   )
+  return matches.length === 1 ? matches[0] : undefined
+}
+
+function findCandidateForObservedWorker(
+  candidates: WorkerCandidate[],
+  inventory: RuntimeInventory | null,
+  observed: ObservedWorker,
+) {
+  if (!inventory) return undefined
+  const matches = candidates.filter((candidate) => {
+    const runtime = candidate.worker.runtime
+    return (
+      runtime?.adapter === inventory.adapter &&
+      runtime.session === inventory.session &&
+      runtime.terminal_id === observed.terminal_id
+    )
+  })
   return matches.length === 1 ? matches[0] : undefined
 }
 
@@ -1864,6 +1902,9 @@ function WorkspaceInspector({
 
 function App() {
   const [theme, setTheme] = useState<YardTheme>(readTheme)
+  const [mapVisualMode, setMapVisualMode] =
+    useState<MapVisualMode>(readMapVisualMode)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const [sessions, setSessions] = useState<RuntimeSession[]>([])
   const [selectedSession, setSelectedSession] = useState('')
   const [inventory, setInventory] = useState<RuntimeInventory | null>(null)
@@ -1886,6 +1927,22 @@ function App() {
     Record<string, CoordinationSnapshot[]>
   >({})
   const [automations, setAutomations] = useState<Automation[]>([])
+  const [tokenSpendSettings, setTokenSpendSettings] =
+    useState<TokenSpendSettings | null>(null)
+  const [tokenSpendSettingsOpen, setTokenSpendSettingsOpen] = useState(false)
+  const [tokenSpendSettingsBusy, setTokenSpendSettingsBusy] = useState(false)
+  const [tokenSpendSettingsError, setTokenSpendSettingsError] = useState<
+    string | null
+  >(null)
+  const [orchestratorWorkflowProfile, setOrchestratorWorkflowProfile] =
+    useState<OrchestratorWorkflowProfile | null>(null)
+  const [orchestratorWorkflowOpen, setOrchestratorWorkflowOpen] =
+    useState(false)
+  const [orchestratorWorkflowBusy, setOrchestratorWorkflowBusy] =
+    useState(false)
+  const [orchestratorWorkflowError, setOrchestratorWorkflowError] = useState<
+    string | null
+  >(null)
   const [automationRuns, setAutomationRuns] = useState<
     Record<string, AutomationRun[]>
   >({})
@@ -1901,9 +1958,10 @@ function App() {
   const [railView, setRailView] = useState<RailView>('profiles')
   const [resourceShelfOpen, setResourceShelfOpen] = useState(true)
   const [selection, setSelection] = useState<CanvasSelection>(null)
-  const [agentWorkspaceMode, setAgentWorkspaceMode] = useState<
-    AgentWorkspaceMode | 'map'
-  >('map')
+  const [agentWorkspaceMode, setAgentWorkspaceMode] =
+    useState<AgentWorkspaceView>('map')
+  const [terminalPresentation, setTerminalPresentation] =
+    useState<TerminalPresentation>(DEFAULT_TERMINAL_PRESENTATION)
   const [agentWorkspaceTarget, setAgentWorkspaceTarget] =
     useState<AgentWorkspaceTarget | null>(null)
   const [projectAccents, setProjectAccents] = useState<
@@ -1981,10 +2039,15 @@ function App() {
     new Map<string, CanvasPlacement>(),
   )
   const projectPulseTrigger = useRef<HTMLButtonElement | null>(null)
+  const settingsTrigger = useRef<HTMLButtonElement | null>(null)
 
   useEffect(() => {
     applyTheme(theme)
   }, [theme])
+
+  useEffect(() => {
+    writeMapVisualMode(mapVisualMode)
+  }, [mapVisualMode])
 
   useEffect(() => {
     projectsRef.current = projects
@@ -2021,25 +2084,42 @@ function App() {
     return result.sessions
   }, [])
 
-  const loadProjects = useCallback(async (signal?: AbortSignal) => {
-    const result = await fetchProjects(signal)
-    setProjects(result.projects)
-    const assignmentResults = await Promise.all(
-      result.projects.map((project) =>
-        fetchProjectAssignments(project.id, signal),
-      ),
-    )
-    const loadedAssignments = assignmentResults.flatMap(
-      (result) => result.assignments,
-    )
-    setAssignments(loadedAssignments)
-    return loadedAssignments
-  }, [])
+  const loadAssignments = useCallback(
+    async (projectIds: string[], signal?: AbortSignal) => {
+      const assignmentResults = await Promise.all(
+        projectIds.map((projectId) =>
+          fetchProjectAssignments(projectId, signal),
+        ),
+      )
+      const loadedAssignments = assignmentResults.flatMap(
+        (result) => result.assignments,
+      )
+      setAssignments((current) =>
+        reconcileRuntimeProjectionSnapshot(current, loadedAssignments),
+      )
+      return loadedAssignments
+    },
+    [],
+  )
+
+  const loadProjects = useCallback(
+    async (signal?: AbortSignal) => {
+      const result = await fetchProjects(signal)
+      setProjects(result.projects)
+      return loadAssignments(
+        result.projects.map((project) => project.id),
+        signal,
+      )
+    },
+    [loadAssignments],
+  )
 
   const loadYardOrchestrator = useCallback(
     async (signal?: AbortSignal) => {
       const result = await fetchYardOrchestrator(signal)
-      setYardOrchestrator(result)
+      setYardOrchestrator((current) =>
+        reconcileRuntimeProjectionSnapshot(current, result),
+      )
       return result
     },
     [],
@@ -2050,6 +2130,21 @@ function App() {
     setAutomations(result.automations)
     return result.automations
   }, [])
+
+  const loadTokenSpendSettings = useCallback(async (signal?: AbortSignal) => {
+    const result = await fetchTokenSpendSettings(signal)
+    setTokenSpendSettings(result)
+    return result
+  }, [])
+
+  const loadOrchestratorWorkflowProfile = useCallback(
+    async (signal?: AbortSignal) => {
+      const result = await fetchOrchestratorWorkflowProfile(signal)
+      setOrchestratorWorkflowProfile(result)
+      return result
+    },
+    [],
+  )
 
   const loadAutomationRuns = useCallback(
     async (automationId: string, signal?: AbortSignal) => {
@@ -2108,7 +2203,9 @@ function App() {
 
   const loadWorkers = useCallback(async (signal?: AbortSignal) => {
     const result = await fetchWorkers(signal)
-    setWorkerCandidates(result.workers)
+    setWorkerCandidates((current) =>
+      reconcileRuntimeProjectionSnapshot(current, result.workers),
+    )
     return result.workers
   }, [])
 
@@ -2143,11 +2240,8 @@ function App() {
       }
       try {
         const result = await fetchInventory(session, signal)
-        setInventory(result)
-        await Promise.all([
-          loadWorkers(signal),
-          loadYardOrchestrator(signal),
-        ])
+        setInventory((current) => reconcileInventorySnapshot(current, result))
+        await Promise.all([loadWorkers(signal), loadYardOrchestrator(signal)])
         setRuntimeError(null)
       } catch (caught) {
         if (caught instanceof DOMException && caught.name === 'AbortError') {
@@ -2205,6 +2299,8 @@ function App() {
       loadYardOrchestrator(controller.signal),
       loadCoordination(controller.signal),
       loadAutomations(controller.signal),
+      loadTokenSpendSettings(controller.signal),
+      loadOrchestratorWorkflowProfile(controller.signal),
       loadProfiles(controller.signal),
       loadWorkers(controller.signal),
     ])
@@ -2223,6 +2319,8 @@ function App() {
   }, [
     loadCoordination,
     loadAutomations,
+    loadOrchestratorWorkflowProfile,
+    loadTokenSpendSettings,
     loadProfiles,
     loadProjects,
     loadWorkers,
@@ -2261,6 +2359,46 @@ function App() {
       controller.abort()
     }
   }, [loadInventory, selectedSession])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    let inFlight = false
+
+    const refreshAssignments = async () => {
+      if (inFlight || projectsRef.current.length === 0) return
+      inFlight = true
+      try {
+        await loadAssignments(
+          projectsRef.current.map((project) => project.id),
+          controller.signal,
+        )
+      } catch (caught) {
+        if (!(caught instanceof DOMException && caught.name === 'AbortError')) {
+          // Assignment refresh is independent from runtime health. Keep the
+          // last durable projection and retry on the next bounded interval.
+        }
+      } finally {
+        inFlight = false
+      }
+    }
+
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshAssignments()
+      }
+    }
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void refreshAssignments()
+      }
+    }, ASSIGNMENT_REFRESH_INTERVAL_MS)
+    document.addEventListener('visibilitychange', refreshWhenVisible)
+    return () => {
+      window.clearInterval(interval)
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
+      controller.abort()
+    }
+  }, [loadAssignments])
 
   const projectStatusTargets = useMemo(
     () =>
@@ -2362,14 +2500,23 @@ function App() {
   const allocationPayloadByRuntimeId = useMemo(
     () =>
       Object.fromEntries(
-        workerCandidates.flatMap((candidate) => {
-          const runtimeId = candidate.worker.runtime?.terminal_id
-          return runtimeId && canAllocateCandidate(candidate)
-            ? [[runtimeId, { kind: 'worker' as const, id: candidate.worker.id }]]
+        (inventory?.workers ?? []).flatMap((worker) => {
+          const candidate = findCandidateForObservedWorker(
+            workerCandidates,
+            inventory,
+            worker,
+          )
+          return candidate && canAllocateCandidate(candidate)
+            ? [
+                [
+                  worker.runtime_id,
+                  { kind: 'worker' as const, id: candidate.worker.id },
+                ],
+              ]
             : []
         }),
       ),
-    [workerCandidates],
+    [inventory, workerCandidates],
   )
   const boundWorkspaceIds = useMemo(
     () =>
@@ -2410,10 +2557,10 @@ function App() {
           (candidate) => candidate.worker.id === selection.id,
         )
       : selectedObservedWorker
-        ? workerCandidates.find(
-            (candidate) =>
-              candidate.worker.runtime?.terminal_id ===
-              selectedObservedWorker.terminal_id,
+        ? findCandidateForObservedWorker(
+            workerCandidates,
+            inventory,
+            selectedObservedWorker,
           )
         : undefined
   const selectedCandidateObservation = findObservedWorker(
@@ -2649,13 +2796,6 @@ function App() {
         (worker) => worker.workspace_id === selectedWorkspace.runtime_id,
       ) ?? [])
     : []
-  const attentionCount =
-    inventory?.workers.filter(
-      (worker) =>
-        worker.status === 'blocked' ||
-        worker.status === 'done' ||
-        worker.status === 'unknown',
-    ).length ?? 0
   const agentWorkspaceTargets = useMemo<AgentWorkspaceTarget[]>(() => {
     const targets: AgentWorkspaceTarget[] = []
     const yardWorker = yardOrchestrator?.worker
@@ -2671,6 +2811,10 @@ function App() {
           yardRuntime.status,
         target: { kind: 'yard-orchestrator', orchestrator: yardOrchestrator },
         terminalId: yardRuntime.terminal_id,
+        terminalLeaseKey: terminalLeaseKey(
+          { kind: 'yard-orchestrator', orchestrator: yardOrchestrator },
+          yardRuntime,
+        ),
         terminalTarget: {
           kind: 'yard-orchestrator',
           workerId: yardWorker.id,
@@ -2692,6 +2836,10 @@ function App() {
           findObservedWorker(inventory, runtime)?.status ?? runtime.status,
         target: { kind: 'coordination-node', node },
         terminalId: runtime.terminal_id,
+        terminalLeaseKey: terminalLeaseKey(
+          { kind: 'coordination-node', node },
+          runtime,
+        ),
         terminalTarget: {
           kind: 'coordination-node',
           nodeId: node.id,
@@ -2713,6 +2861,10 @@ function App() {
           findObservedWorker(inventory, runtime)?.status ?? runtime.status,
         target: { kind: 'orchestrator', project },
         terminalId: runtime.terminal_id,
+        terminalLeaseKey: terminalLeaseKey(
+          { kind: 'orchestrator', project },
+          runtime,
+        ),
         terminalTarget: {
           kind: 'orchestrator',
           projectId: project.id,
@@ -2737,6 +2889,10 @@ function App() {
           findObservedWorker(inventory, runtime)?.status ?? runtime.status,
         target: { kind: 'assignment', assignment },
         terminalId: runtime.terminal_id,
+        terminalLeaseKey: terminalLeaseKey(
+          { kind: 'assignment', assignment },
+          runtime,
+        ),
         terminalTarget: {
           kind: 'assignment',
           assignmentId: assignment.id,
@@ -2771,6 +2927,7 @@ function App() {
   const openAgentTerminal = useCallback(
     (target: AgentWorkspaceTarget) => {
       setAgentWorkspaceTarget(target)
+      setTerminalPresentation(DEFAULT_TERMINAL_PRESENTATION)
       setAgentWorkspaceMode('terminal')
     },
     [],
@@ -2791,6 +2948,8 @@ function App() {
         loadProjects(),
         loadCoordination(),
         loadAutomations(),
+        loadTokenSpendSettings(),
+        loadOrchestratorWorkflowProfile(),
         loadProfiles(),
         loadWorkers(),
         loadYardOrchestrator(),
@@ -2816,13 +2975,109 @@ function App() {
     loadInventory,
     loadAutomations,
     loadCoordination,
+    loadOrchestratorWorkflowProfile,
     loadProfiles,
     loadProjects,
     loadSessions,
     loadWorkers,
     loadYardOrchestrator,
+    loadTokenSpendSettings,
     selectedSession,
   ])
+
+  const saveTokenSpendSettings = useCallback(
+    async ({
+      projectOrchestrators,
+      scheduled,
+      superintendent,
+    }: {
+      projectOrchestrators: boolean
+      scheduled: boolean
+      superintendent: boolean
+    }) => {
+      if (!tokenSpendSettings) return
+      setTokenSpendSettingsBusy(true)
+      setTokenSpendSettingsError(null)
+      try {
+        const updated = await updateTokenSpendSettings({
+          actor: 'local-user',
+          expected_version: tokenSpendSettings.version,
+          superintendent_auto_requests_project_summaries: superintendent,
+          project_orchestrators_auto_request_worker_summaries:
+            projectOrchestrators,
+          scheduled_automatic_summaries: scheduled,
+        })
+        setTokenSpendSettings(updated)
+        setTokenSpendSettingsOpen(false)
+      } catch (caught) {
+        setTokenSpendSettingsError(
+          caught instanceof Error
+            ? caught.message
+            : 'Automatic settings update failed',
+        )
+        await loadTokenSpendSettings().catch(() => undefined)
+      } finally {
+        setTokenSpendSettingsBusy(false)
+      }
+    },
+    [loadTokenSpendSettings, tokenSpendSettings],
+  )
+
+  const saveOrchestratorWorkflow = useCallback(
+    async ({
+      instructionsMarkdown,
+      monitorIntervalMs,
+    }: {
+      instructionsMarkdown: string
+      monitorIntervalMs: number
+    }) => {
+      if (!orchestratorWorkflowProfile) return
+      setOrchestratorWorkflowBusy(true)
+      setOrchestratorWorkflowError(null)
+      try {
+        const updated = await updateOrchestratorWorkflowProfile({
+          actor: 'local-user',
+          expected_version: orchestratorWorkflowProfile.version,
+          instructions_markdown: instructionsMarkdown,
+          monitor_interval_ms: String(monitorIntervalMs),
+        })
+        setOrchestratorWorkflowProfile(updated)
+        setOrchestratorWorkflowOpen(false)
+      } catch (caught) {
+        setOrchestratorWorkflowError(
+          caught instanceof Error
+            ? caught.message
+            : 'Orchestrator workflow update failed',
+        )
+        await loadOrchestratorWorkflowProfile().catch(() => undefined)
+      } finally {
+        setOrchestratorWorkflowBusy(false)
+      }
+    },
+    [loadOrchestratorWorkflowProfile, orchestratorWorkflowProfile],
+  )
+
+  const resetOrchestratorWorkflow = useCallback(async () => {
+    if (!orchestratorWorkflowProfile) return
+    setOrchestratorWorkflowBusy(true)
+    setOrchestratorWorkflowError(null)
+    try {
+      const reset = await resetOrchestratorWorkflowProfile({
+        actor: 'local-user',
+        expected_version: orchestratorWorkflowProfile.version,
+      })
+      setOrchestratorWorkflowProfile(reset)
+    } catch (caught) {
+      setOrchestratorWorkflowError(
+        caught instanceof Error
+          ? caught.message
+          : 'Orchestrator workflow reset failed',
+      )
+      await loadOrchestratorWorkflowProfile().catch(() => undefined)
+    } finally {
+      setOrchestratorWorkflowBusy(false)
+    }
+  }, [loadOrchestratorWorkflowProfile, orchestratorWorkflowProfile])
 
   const proposeEndSession = useCallback((candidate: WorkerCandidate) => {
     if (!canEndCandidate(candidate)) return
@@ -4119,195 +4374,45 @@ function App() {
   const displayedError = actionError ?? runtimeError
   const runtimeUnavailable =
     !runtimeLoading && inventory === null
+  const runtimeHealth = runtimeLoading
+    ? 'loading'
+    : runtimeUnavailable
+      ? 'unavailable'
+      : runtimeError
+        ? 'degraded'
+        : 'observed'
 
   return (
     <AgentWorkspaceContext.Provider value={agentWorkspaceContext}>
       <div className="app-shell" data-shelf-open={resourceShelfOpen}>
-        <header className="command-bar">
-          <div className="brand">
-            <span className="brand__mark" aria-hidden="true">
-              Y
-            </span>
-            <div>
-              <strong>Yard</strong>
-              <span>Operations atlas</span>
-            </div>
-          </div>
-
-          <div
-            aria-label="Application mode"
-            className="workspace-mode-switcher command-bar__modes"
-            role="tablist"
-          >
-            <button
-              aria-selected={agentWorkspaceMode === 'map'}
-              onClick={() => setAgentWorkspaceMode('map')}
-              role="tab"
-              type="button"
-            >
-              <MapIcon aria-hidden="true" size={14} />
-              <span>Map</span>
-            </button>
-            <button
-              aria-selected={agentWorkspaceMode === 'chat'}
-              disabled={!activeAgentWorkspaceTarget}
-              onClick={() => setAgentWorkspaceMode('chat')}
-              role="tab"
-              type="button"
-            >
-              <MessageSquareText aria-hidden="true" size={14} />
-              <span>Chat</span>
-            </button>
-            <button
-              aria-selected={agentWorkspaceMode === 'terminal'}
-              disabled={!activeAgentWorkspaceTarget}
-              onClick={() => setAgentWorkspaceMode('terminal')}
-              role="tab"
-              type="button"
-            >
-              <SquareTerminal aria-hidden="true" size={14} />
-              <span>Terminal</span>
-            </button>
-          </div>
-
-          <button
-            aria-label="Create project"
-            className="top-command"
-            onClick={() => {
-              setSelection(null)
-              setWorkspaceProjectOpen(true)
-            }}
-            type="button"
-          >
-            <FolderPlus aria-hidden="true" size={16} />
-            <span>Create project</span>
-          </button>
-
-          <div
-            aria-label="Observed resources"
-            className="command-bar__resources"
-            role="tablist"
-          >
-            {(['profiles', 'workers', 'workspaces'] as const).map((view) => (
-              <button
-                aria-controls="resource-shelf"
-                aria-selected={resourceShelfOpen && railView === view}
-                key={view}
-                onClick={() => toggleResourceShelf(view)}
-                role="tab"
-                type="button"
-              >
-                {view === 'profiles'
-                  ? 'Profiles'
-                  : view === 'workers'
-                    ? 'Workers'
-                    : 'Workspaces'}
-              </button>
-            ))}
-          </div>
-
-          <div
-            className="command-bar__metrics"
-            aria-label="Control plane totals"
-          >
-            <span title={`${projects.length} projects`}>
-              <BriefcaseBusiness aria-hidden="true" size={15} />
-              {projects.length} projects
-            </span>
-            <span title={`${inventory?.workers.length ?? 0} workers`}>
-              <Bot aria-hidden="true" size={15} />
-              {runtimeLoading && inventory === null
-                ? '...'
-                : (inventory?.workers.length ?? 0)}{' '}
-              workers
-            </span>
-            <span
-              data-attention={attentionCount > 0}
-              title={`${attentionCount} requiring attention`}
-            >
-              <CircleAlert aria-hidden="true" size={15} />
-              {runtimeLoading && inventory === null ? '...' : attentionCount}
-              {' attention'}
-            </span>
-          </div>
-
-          <label className="session-command" htmlFor="session-select">
-            <Server aria-hidden="true" size={15} />
-            <select
-              aria-label="Herdr session"
-              id="session-select"
-              onChange={(event) => setSelectedSession(event.target.value)}
-              value={selectedSession}
-            >
-              {sessions.map((session) => (
-                <option
-                  disabled={!session.running}
-                  key={session.name}
-                  value={session.name}
-                >
-                  {session.name}
-                  {session.running ? '' : ' (stopped)'}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <button
-            aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
-            aria-pressed={theme === 'dark'}
-            className="icon-button theme-toggle"
-            onClick={() =>
-              setTheme((current) =>
-                current === 'light' ? 'dark' : 'light',
-              )
+        <GlobalCommandBar
+          activeAgentWorkspaceTarget={Boolean(activeAgentWorkspaceTarget)}
+          agentWorkspaceMode={agentWorkspaceMode}
+          busy={runtimeLoading || projectLoading}
+          health={runtimeHealth}
+          onAgentWorkspaceModeChange={(mode) => {
+            if (mode === 'terminal') {
+              setTerminalPresentation(DEFAULT_TERMINAL_PRESENTATION)
             }
-            title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
-            type="button"
-          >
-            {theme === 'light' ? (
-              <Moon aria-hidden="true" size={17} />
-            ) : (
-              <Sun aria-hidden="true" size={17} />
-            )}
-          </button>
-
-          <div className="connection-state">
-            {runtimeLoading ? (
-              <LoaderCircle
-                aria-hidden="true"
-                className="status-spin"
-                size={16}
-              />
-            ) : runtimeUnavailable ? (
-              <WifiOff aria-hidden="true" size={16} />
-            ) : (
-              <Wifi aria-hidden="true" size={16} />
-            )}
-            <span>
-              {runtimeLoading
-                ? 'Observing Herdr'
-                : runtimeUnavailable
-                  ? 'Herdr unavailable'
-                  : 'Herdr observed'}
-            </span>
-            <button
-              aria-label="Refresh Yard and runtime state"
-              className="icon-button"
-              disabled={runtimeLoading || projectLoading}
-              onClick={() => void refresh()}
-              title="Refresh state"
-              type="button"
-            >
-              <RefreshCw
-                aria-hidden="true"
-                className={
-                  runtimeLoading || projectLoading ? 'status-spin' : ''
-                }
-                size={17}
-              />
-            </button>
-          </div>
-        </header>
+            setAgentWorkspaceMode(mode)
+          }}
+          onCreateProject={() => {
+            setSelection(null)
+            setWorkspaceProjectOpen(true)
+          }}
+          onOpenSettings={() => setSettingsOpen(true)}
+          onRefresh={() => void refresh()}
+          onResourceViewChange={toggleResourceShelf}
+          onSessionChange={setSelectedSession}
+          railView={railView}
+          resourceShelfOpen={resourceShelfOpen}
+          selectedSession={selectedSession}
+          sessions={sessions}
+          settingsLabel={`Settings, ${theme} theme, ${
+            mapVisualMode === 'depth' ? '2.5D' : '2D'
+          } map`}
+          settingsTriggerRef={settingsTrigger}
+        />
 
         {resourceShelfOpen ? (
           <section
@@ -4553,12 +4658,6 @@ function App() {
         ) : null}
 
         <main className="canvas-stage">
-        <div className="canvas-stage__label">
-          <span>Yard projects</span>
-          <strong>{projects.length}</strong>
-          <small>{selectedSession || 'No Herdr session'}</small>
-        </div>
-
         <RuntimeCanvas
           allocationPayloadByRuntimeId={allocationPayloadByRuntimeId}
           assignments={assignments}
@@ -4597,6 +4696,7 @@ function App() {
           runtimeLoading={runtimeLoading}
           selectedSession={selectedSession}
           theme={theme}
+          visualMode={mapVisualMode}
           visibleWorkers={visibleWorkers}
           yardOrchestrator={yardOrchestrator}
           yardOrchestratorRoutes={yardOrchestratorRoutes}
@@ -4819,6 +4919,45 @@ function App() {
         ) : null}
         </main>
       </div>
+      {settingsOpen ? (
+        <SettingsDialog
+          automaticCoordinationEnabledCount={
+            tokenSpendSettings
+              ? Number(
+                  tokenSpendSettings.superintendent_auto_requests_project_summaries,
+                ) +
+                Number(
+                  tokenSpendSettings.project_orchestrators_auto_request_worker_summaries,
+                ) +
+                Number(tokenSpendSettings.scheduled_automatic_summaries)
+              : null
+          }
+          mapVisualMode={mapVisualMode}
+          onClose={() => setSettingsOpen(false)}
+          onMapVisualModeChange={setMapVisualMode}
+          onOpenAutomaticCoordination={() => {
+            setSettingsOpen(false)
+            setTokenSpendSettingsError(null)
+            setTokenSpendSettingsOpen(true)
+          }}
+          onOpenOrchestratorWorkflow={() => {
+            setSettingsOpen(false)
+            setOrchestratorWorkflowError(null)
+            setOrchestratorWorkflowOpen(true)
+          }}
+          onThemeChange={setTheme}
+          returnFocus={settingsTrigger.current}
+          theme={theme}
+          workflowProfileSummary={
+            orchestratorWorkflowProfile
+              ? `Revision ${orchestratorWorkflowProfile.version} · ${
+                  Number(orchestratorWorkflowProfile.monitor_interval_ms) /
+                  60_000
+                } minute cadence`
+              : null
+          }
+        />
+      ) : null}
       {activeAgentWorkspaceTarget ? (
         <AgentWorkspaceShell
           activeTarget={activeAgentWorkspaceTarget}
@@ -4827,12 +4966,16 @@ function App() {
           onCoordinationChange={recordYardRoute}
           onCoordinationNodeChange={recordCoordinationNodeRoute}
           onModeChange={setAgentWorkspaceMode}
-          onTargetChange={(target) =>
+          onPresentationChange={setTerminalPresentation}
+          onTargetChange={(target) => {
             setAgentWorkspaceTarget({
               ...target,
               returnFocus: activeAgentWorkspaceTarget.returnFocus,
             })
-          }
+            setTerminalPresentation(DEFAULT_TERMINAL_PRESENTATION)
+            setAgentWorkspaceMode('terminal')
+          }}
+          presentation={terminalPresentation}
           projects={projects}
           sessions={sessions}
           targets={agentWorkspaceTargets}
@@ -4893,6 +5036,37 @@ function App() {
           onCreate={(details) => void createScheduledAutomation(details)}
           placement={automationCreation.placement}
           projects={projects}
+        />
+      ) : null}
+      {tokenSpendSettingsOpen && tokenSpendSettings ? (
+        <TokenSpendSettingsDialog
+          busy={tokenSpendSettingsBusy}
+          error={tokenSpendSettingsError}
+          key={tokenSpendSettings.version}
+          onClose={() => {
+            if (tokenSpendSettingsBusy) return
+            setTokenSpendSettingsError(null)
+            setTokenSpendSettingsOpen(false)
+          }}
+          onSave={(selection) => void saveTokenSpendSettings(selection)}
+          returnFocus={settingsTrigger.current}
+          settings={tokenSpendSettings}
+        />
+      ) : null}
+      {orchestratorWorkflowOpen && orchestratorWorkflowProfile ? (
+        <OrchestratorWorkflowProfileDialog
+          busy={orchestratorWorkflowBusy}
+          error={orchestratorWorkflowError}
+          key={orchestratorWorkflowProfile.version}
+          onClose={() => {
+            if (orchestratorWorkflowBusy) return
+            setOrchestratorWorkflowError(null)
+            setOrchestratorWorkflowOpen(false)
+          }}
+          onReset={() => void resetOrchestratorWorkflow()}
+          onSave={(input) => void saveOrchestratorWorkflow(input)}
+          profile={orchestratorWorkflowProfile}
+          returnFocus={settingsTrigger.current}
         />
       ) : null}
       {profileEditor !== undefined ? (

@@ -5,21 +5,24 @@ use tokio::{
     sync::Mutex,
     time::{Instant, sleep},
 };
+use tracing::warn;
 use yard_domain::{
     ConfigureYardOrchestrator, ConfiguredYardOrchestrator, ObservedWorker,
-    ProvisionYardOrchestrator, RecoverYardOrchestrator, RecoveredYardOrchestrator,
-    RuntimeInventory, RuntimeObservationState, RuntimeProcessState, WorkerAvailability,
+    OrchestratorWorkflowProfile, ProvisionYardOrchestrator, RecoverYardOrchestrator,
+    RecoveredYardOrchestrator, RuntimeInventory, RuntimeObservationState, RuntimeProcessState,
+    WorkerAvailability, WorkerRuntimeBinding,
 };
 use yard_store::{ProjectStoreError, YardStore};
 
 use crate::{
     allocation_service::{
-        AllocationServiceError, RuntimeControl, RuntimeProvisionError, RuntimeSessionRequest,
-        RuntimeWorkspaceProvisionRequest, assignment_prompt, provider_args,
+        AllocationServiceError, RuntimeControl, RuntimeProvisionError, RuntimeRetirementRequest,
+        RuntimeSessionRequest, RuntimeWorkspaceProvisionRequest, assignment_prompt, provider_args,
         validate_supported_profile,
     },
+    intervention_service::{RuntimeIntervention, RuntimePromptRequest},
     reconciliation_service::{ReconciliationService, ReconciliationServiceError},
-    status_protocol::with_orchestrator_status_contract,
+    status_protocol::{with_orchestrator_status_contract, with_orchestrator_workflow},
 };
 
 pub const YARD_ORCHESTRATOR_SESSION: &str = "yard-orchestrator";
@@ -34,6 +37,7 @@ const CENTRAL_COORDINATION_OBJECTIVE: &str = "Coordinate all Yard projects from 
 #[derive(Clone)]
 pub struct YardOrchestratorService {
     runtime: Arc<dyn RuntimeControl>,
+    intervention: Arc<dyn RuntimeIntervention>,
     store: Arc<dyn YardStore>,
     reconciliation: ReconciliationService,
     operation: Arc<Mutex<()>>,
@@ -46,12 +50,14 @@ impl YardOrchestratorService {
     #[must_use]
     pub fn new(
         runtime: Arc<dyn RuntimeControl>,
+        intervention: Arc<dyn RuntimeIntervention>,
         store: Arc<dyn YardStore>,
         reconciliation: ReconciliationService,
         cwd: String,
     ) -> Self {
         Self {
             runtime,
+            intervention,
             store,
             reconciliation,
             operation: Arc::default(),
@@ -77,6 +83,10 @@ impl YardOrchestratorService {
         let command = command.normalize()?;
         let _operation = self.operation.lock().await;
 
+        if let Some(configured) = self.replay_provision(&command).await? {
+            return Ok(configured);
+        }
+
         let profile = self.store.get_worker_profile(&command.profile_id).await?;
         if profile.version != command.expected_profile_version {
             return Err(ProjectStoreError::ProfileVersionConflict {
@@ -84,14 +94,8 @@ impl YardOrchestratorService {
             }
             .into());
         }
-        validate_supported_profile(&profile)
-            .map_err(YardOrchestratorServiceError::UnsupportedProfile)?;
-        let args = provider_args(&profile).map_err(|error| match error {
-            AllocationServiceError::UnsupportedProfile(message) => {
-                YardOrchestratorServiceError::UnsupportedProfile(message)
-            }
-            other => YardOrchestratorServiceError::UnsupportedProfile(other.to_string()),
-        })?;
+        let args = validated_provider_args(&profile)?;
+        let active_workflow = self.store.get_orchestrator_workflow_profile().await?;
 
         self.runtime
             .ensure_session(RuntimeSessionRequest {
@@ -107,31 +111,11 @@ impl YardOrchestratorService {
             .refresh(YARD_ORCHESTRATOR_SESSION)
             .await?;
         let mut observed = dedicated_worker(&inventory, current.worker.as_ref());
+        let bootstrapped = observed.is_none();
 
-        if observed.is_none() {
-            let runtime = self
-                .runtime
-                .bootstrap_worker(RuntimeWorkspaceProvisionRequest {
-                    command_id: command.command_id.clone(),
-                    session: YARD_ORCHESTRATOR_SESSION.to_owned(),
-                    workspace_label: YARD_ORCHESTRATOR_WORKSPACE_LABEL.to_owned(),
-                    cwd: self.cwd.clone(),
-                    agent_name: YARD_ORCHESTRATOR_AGENT_NAME.to_owned(),
-                    kind: profile.spec.provider.clone(),
-                    args,
-                    prompt: with_orchestrator_status_contract(
-                        &assignment_prompt(
-                            CENTRAL_COORDINATION_OBJECTIVE,
-                            "central orchestrator",
-                            &profile,
-                        ),
-                        &command.command_id,
-                    ),
-                })
-                .await
-                .map_err(runtime_error)?;
+        if bootstrapped {
             observed = Some(
-                self.reconcile_provisioned_worker(&runtime.terminal_id)
+                self.bootstrap_dedicated_worker(&command, &profile, args, &active_workflow)
                     .await?,
             );
         }
@@ -166,17 +150,140 @@ impl YardOrchestratorService {
                 command.expected_profile_version,
             )
             .await?;
-
-        self.store
+        let workflow_profile_version =
+            current
+                .worker
+                .as_ref()
+                .map_or(active_workflow.version, |current_worker| {
+                    if current_worker.id == worker.id {
+                        current.workflow_profile_version
+                    } else {
+                        active_workflow.version
+                    }
+                });
+        let configured = self
+            .store
             .configure_yard_orchestrator(ConfigureYardOrchestrator {
-                command_id: command.command_id,
-                actor: command.actor,
+                command_id: command.command_id.clone(),
+                actor: command.actor.clone(),
                 worker_id: worker.id,
                 expected_worker_version: worker.version,
                 expected_orchestrator_version: command.expected_orchestrator_version,
+                workflow_profile_version: Some(workflow_profile_version),
+            })
+            .await?;
+        let workflow = self
+            .store
+            .get_orchestrator_workflow_profile_revision(
+                configured.orchestrator.workflow_profile_version,
+            )
+            .await?;
+        self.deliver_provision_adoption_workflow(&command, &configured, &workflow, bootstrapped)
+            .await?;
+        Ok(configured)
+    }
+
+    async fn replay_provision(
+        &self,
+        command: &ProvisionYardOrchestrator,
+    ) -> Result<Option<ConfiguredYardOrchestrator>, YardOrchestratorServiceError> {
+        if self
+            .store
+            .replay_yard_orchestrator_provision(command.clone())
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.runtime
+            .ensure_session(RuntimeSessionRequest {
+                session: YARD_ORCHESTRATOR_SESSION.to_owned(),
+                startup_cwd: self.cwd.clone(),
             })
             .await
-            .map_err(Into::into)
+            .map_err(runtime_error)?;
+        self.reconciliation
+            .refresh(YARD_ORCHESTRATOR_SESSION)
+            .await?;
+        let configured = self
+            .store
+            .replay_yard_orchestrator_provision(command.clone())
+            .await?
+            .ok_or(ProjectStoreError::CommandNotFound)?;
+        let current = self.store.get_yard_orchestrator().await?;
+        if current.version != configured.orchestrator.version
+            || current.worker.as_ref().map(|worker| &worker.id)
+                != configured
+                    .orchestrator
+                    .worker
+                    .as_ref()
+                    .map(|worker| &worker.id)
+        {
+            return Ok(Some(configured));
+        }
+        let workflow = self
+            .store
+            .get_orchestrator_workflow_profile_revision(
+                configured.orchestrator.workflow_profile_version,
+            )
+            .await?;
+        self.deliver_provision_adoption_workflow(command, &configured, &workflow, false)
+            .await?;
+        Ok(Some(configured))
+    }
+
+    /// Configure or replace the Yard orchestrator and deliver its pinned workflow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`YardOrchestratorServiceError`] when ownership is stale or
+    /// the configured runtime cannot receive its workflow.
+    pub async fn configure(
+        &self,
+        mut command: ConfigureYardOrchestrator,
+    ) -> Result<ConfiguredYardOrchestrator, YardOrchestratorServiceError> {
+        command = command.normalize()?;
+        let _operation = self.operation.lock().await;
+        let current = self.store.get_yard_orchestrator().await?;
+        let active_workflow = self.store.get_orchestrator_workflow_profile().await?;
+        let replacing = current
+            .worker
+            .as_ref()
+            .is_none_or(|worker| worker.id != command.worker_id);
+        command.workflow_profile_version = Some(if replacing {
+            active_workflow.version
+        } else {
+            current.workflow_profile_version
+        });
+        let configured = self
+            .store
+            .configure_yard_orchestrator(command.clone())
+            .await?;
+        // Ownership commits before external delivery. A changed result must
+        // retry delivery on replay with the same command identity.
+        if configured.orchestrator.version != command.expected_orchestrator_version {
+            let workflow = self
+                .store
+                .get_orchestrator_workflow_profile_revision(
+                    configured.orchestrator.workflow_profile_version,
+                )
+                .await?;
+            let runtime = configured
+                .orchestrator
+                .worker
+                .as_ref()
+                .and_then(|worker| worker.runtime.as_ref())
+                .ok_or(YardOrchestratorServiceError::RuntimeBindingUnverified)?;
+            self.deliver_lifecycle_prompt(
+                &command.command_id,
+                runtime,
+                &workflow,
+                "Assume ownership of central Yard orchestration. Apply the pinned workflow to \
+                 every subsequent Yard command.",
+            )
+            .await?;
+        }
+        Ok(configured)
     }
 
     /// Restart the dedicated Herdr session and restore the existing Yard
@@ -252,11 +359,135 @@ impl YardOrchestratorService {
         {
             return Err(YardOrchestratorServiceError::RecoveryBindingAmbiguous);
         }
+        let workflow = self
+            .store
+            .get_orchestrator_workflow_profile_revision(orchestrator.workflow_profile_version)
+            .await?;
+        self.deliver_lifecycle_prompt(
+            &command.command_id,
+            runtime,
+            &workflow,
+            "Resume central Yard orchestration after runtime recovery. Reconcile the current \
+             fleet before advancing work.",
+        )
+        .await?;
 
         Ok(RecoveredYardOrchestrator {
             command_id: command.command_id,
             orchestrator,
         })
+    }
+
+    /// Start a fresh worker under the reserved `yard-orchestrator` name and
+    /// wait for it to reconcile.
+    ///
+    /// A successful bootstrap (or one that fails only after the agent
+    /// claimed the reserved name, i.e. `PromptDelivery`) leaves a live
+    /// Herdr worker holding that globally-unique name. If it cannot be
+    /// durably adopted here, it is explicitly retired before returning the
+    /// error — otherwise it becomes a permanent orphan that blocks every
+    /// future provisioning attempt with `agent_name_taken` until a human
+    /// manually finds and stops it in Herdr.
+    async fn bootstrap_dedicated_worker(
+        &self,
+        command: &ProvisionYardOrchestrator,
+        profile: &yard_domain::WorkerProfile,
+        args: Vec<String>,
+        workflow: &OrchestratorWorkflowProfile,
+    ) -> Result<ObservedWorker, YardOrchestratorServiceError> {
+        let bootstrapped = self
+            .runtime
+            .bootstrap_worker(RuntimeWorkspaceProvisionRequest {
+                command_id: command.command_id.clone(),
+                session: YARD_ORCHESTRATOR_SESSION.to_owned(),
+                workspace_label: YARD_ORCHESTRATOR_WORKSPACE_LABEL.to_owned(),
+                cwd: self.cwd.clone(),
+                agent_name: YARD_ORCHESTRATOR_AGENT_NAME.to_owned(),
+                kind: profile.spec.provider.clone(),
+                args,
+                prompt: with_orchestrator_status_contract(
+                    &with_orchestrator_workflow(
+                        &assignment_prompt(
+                            CENTRAL_COORDINATION_OBJECTIVE,
+                            "central orchestrator",
+                            profile,
+                        ),
+                        workflow,
+                    ),
+                    &command.command_id,
+                ),
+            })
+            .await;
+        let runtime = match bootstrapped {
+            Ok(runtime) => runtime,
+            Err(RuntimeProvisionError::PromptDelivery { runtime, message }) => {
+                self.retire_orphaned_runtime(*runtime).await;
+                return Err(YardOrchestratorServiceError::ObjectiveDeliveryFailed(
+                    message,
+                ));
+            }
+            Err(error) => return Err(runtime_error(error)),
+        };
+        match self
+            .reconcile_provisioned_worker(&runtime.terminal_id)
+            .await
+        {
+            Ok(worker) => Ok(worker),
+            Err(error) => {
+                self.retire_orphaned_runtime(runtime).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn deliver_lifecycle_prompt(
+        &self,
+        command_id: &str,
+        runtime: &WorkerRuntimeBinding,
+        workflow: &OrchestratorWorkflowProfile,
+        prompt: &str,
+    ) -> Result<(), YardOrchestratorServiceError> {
+        let prompt = with_orchestrator_workflow(prompt, workflow);
+        self.intervention
+            .prompt(RuntimePromptRequest {
+                command_id: command_id.to_owned(),
+                session: runtime.session.clone(),
+                pane_id: runtime.pane_id.clone(),
+                text: with_orchestrator_status_contract(&prompt, command_id),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                YardOrchestratorServiceError::ObjectiveDeliveryFailed(error.to_string())
+            })
+    }
+
+    async fn deliver_provision_adoption_workflow(
+        &self,
+        command: &ProvisionYardOrchestrator,
+        configured: &ConfiguredYardOrchestrator,
+        workflow: &OrchestratorWorkflowProfile,
+        bootstrapped: bool,
+    ) -> Result<(), YardOrchestratorServiceError> {
+        // A replay can be recovering a rejected post-commit adoption prompt.
+        if bootstrapped || configured.orchestrator.version == command.expected_orchestrator_version
+        {
+            return Ok(());
+        }
+        let runtime = configured
+            .orchestrator
+            .worker
+            .as_ref()
+            .and_then(|worker| worker.runtime.as_ref())
+            .ok_or(YardOrchestratorServiceError::RuntimeBindingUnverified)?;
+        self.deliver_lifecycle_prompt(
+            &command.command_id,
+            runtime,
+            workflow,
+            "Assume ownership of central Yard orchestration. Apply the pinned workflow to every \
+             subsequent Yard command.",
+        )
+        .await
     }
 
     async fn reconcile_provisioned_worker(
@@ -280,6 +511,49 @@ impl YardOrchestratorService {
                 return Err(YardOrchestratorServiceError::RuntimeBindingUnverified);
             }
             sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Best-effort retirement of a Herdr runtime that claimed the reserved
+    /// `yard-orchestrator` agent name but that Yard could not durably adopt
+    /// (initial prompt delivery failed, or the runtime never reconciled
+    /// within [`RUNTIME_IDENTITY_TIMEOUT`]). Without this, the runtime keeps
+    /// holding the name and every subsequent provisioning attempt fails with
+    /// Herdr's `agent_name_taken` until a human manually finds and stops it.
+    ///
+    /// Retirement failures are only logged: the caller already has a
+    /// provisioning error to return, and retirement can be retried by hand
+    /// (or by a future provisioning attempt) if this best-effort call fails.
+    async fn retire_orphaned_runtime(&self, runtime: WorkerRuntimeBinding) {
+        let request = RuntimeRetirementRequest {
+            cleanup_id: format!("yard-orchestrator-orphan-{}", runtime.terminal_id),
+            adapter: runtime.adapter,
+            session: runtime.session,
+            workspace_id: runtime.workspace_id,
+            terminal_id: runtime.terminal_id,
+            tab_id: runtime.tab_id,
+            pane_id: runtime.pane_id,
+            provider_session: runtime.provider_session,
+            owns_tab: runtime.owns_tab,
+            require_identity_match: true,
+        };
+        let deadline = Instant::now() + RUNTIME_IDENTITY_TIMEOUT;
+        loop {
+            match self.runtime.retire_runtime(request.clone()).await {
+                Ok(()) => break,
+                Err(_) if Instant::now() < deadline => {
+                    sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "Failed to retire an orphaned Yard orchestrator runtime; the \
+                         reserved yard-orchestrator agent name may remain blocked \
+                         until it is retired manually"
+                    );
+                    break;
+                }
+            }
         }
     }
 }
@@ -317,6 +591,19 @@ fn dedicated_worker(
         )
     });
     workers.into_iter().next()
+}
+
+fn validated_provider_args(
+    profile: &yard_domain::WorkerProfile,
+) -> Result<Vec<String>, YardOrchestratorServiceError> {
+    validate_supported_profile(profile)
+        .map_err(YardOrchestratorServiceError::UnsupportedProfile)?;
+    provider_args(profile).map_err(|error| match error {
+        AllocationServiceError::UnsupportedProfile(message) => {
+            YardOrchestratorServiceError::UnsupportedProfile(message)
+        }
+        other => YardOrchestratorServiceError::UnsupportedProfile(other.to_string()),
+    })
 }
 
 fn runtime_error(error: RuntimeProvisionError) -> YardOrchestratorServiceError {
@@ -382,8 +669,8 @@ mod tests {
 
     use crate::{
         allocation_service::{
-            RuntimeControl, RuntimeProvisionError, RuntimeProvisionRequest, RuntimeSessionRequest,
-            RuntimeWorkspaceProvisionRequest,
+            RuntimeControl, RuntimeProvisionError, RuntimeProvisionRequest, RuntimeRetirementError,
+            RuntimeRetirementRequest, RuntimeSessionRequest, RuntimeWorkspaceProvisionRequest,
         },
         inventory_service::{InventoryServiceError, InventorySource},
         reconciliation_service::ReconciliationService,
@@ -401,8 +688,22 @@ mod tests {
         ensure_calls: AtomicUsize,
         bootstrap_calls: AtomicUsize,
         restore_on_ensure: AtomicBool,
+        /// When set, `bootstrap_worker` reports the same failure Herdr
+        /// returns when an agent is successfully created and claims the
+        /// reserved name, but the initial prompt cannot be delivered.
+        fail_prompt_delivery: AtomicBool,
+        lifecycle_prompt_failures: AtomicUsize,
+        /// When set, the bootstrapped worker never reports as
+        /// `interactive_ready` with a provider session, so
+        /// `reconcile_provisioned_worker` runs out its identity-verification
+        /// deadline.
+        never_ready: AtomicBool,
+        retirement_identity_misses: AtomicUsize,
+        retirement_runtime_failures: AtomicUsize,
         session_requests: Mutex<Vec<RuntimeSessionRequest>>,
         bootstrap_requests: Mutex<Vec<RuntimeWorkspaceProvisionRequest>>,
+        prompt_requests: Mutex<Vec<crate::intervention_service::RuntimePromptRequest>>,
+        retirement_calls: Mutex<Vec<RuntimeRetirementRequest>>,
     }
 
     impl DedicatedRuntime {
@@ -491,12 +792,13 @@ mod tests {
                         status: ObservedStatus::Idle,
                         focused: false,
                         launch_pending: false,
-                        interactive_ready: true,
+                        interactive_ready: !self.never_ready.load(Ordering::SeqCst),
                         state_change_sequence: 1,
                         cwd: Some("/tmp/yard-backend".to_owned()),
                         foreground_cwd: Some("/tmp/yard-backend".to_owned()),
                         tokens: BTreeMap::new(),
-                        provider_session: Some(provider_session()),
+                        provider_session: (!self.never_ready.load(Ordering::SeqCst))
+                            .then(provider_session),
                         revision: 1,
                     })
                     .into_iter()
@@ -526,6 +828,15 @@ mod tests {
         ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
             self.bootstrap_calls.fetch_add(1, Ordering::SeqCst);
             self.bootstrap_requests.lock().unwrap().push(request);
+            if self.fail_prompt_delivery.load(Ordering::SeqCst) {
+                // Mirrors Herdr: the agent was created and claimed the
+                // reserved name, but the initial prompt could not be
+                // delivered.
+                return Err(RuntimeProvisionError::PromptDelivery {
+                    runtime: Box::new(Self::binding()),
+                    message: "Herdr agent is not ready to receive input".to_owned(),
+                });
+            }
             self.live.store(true, Ordering::SeqCst);
             Ok(Self::binding())
         }
@@ -535,6 +846,73 @@ mod tests {
             _request: RuntimeProvisionRequest,
         ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
             unreachable!("the Yard singleton always bootstraps a new workspace")
+        }
+
+        async fn retire_runtime(
+            &self,
+            request: RuntimeRetirementRequest,
+        ) -> Result<(), RuntimeRetirementError> {
+            self.retirement_calls.lock().unwrap().push(request);
+            if self
+                .retirement_runtime_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(RuntimeRetirementError::Runtime(
+                    "transient Herdr socket failure".to_owned(),
+                ));
+            }
+            if self
+                .retirement_identity_misses
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(RuntimeRetirementError::IdentityNotObserved);
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl crate::intervention_service::RuntimeIntervention for DedicatedRuntime {
+        async fn prompt(
+            &self,
+            request: crate::intervention_service::RuntimePromptRequest,
+        ) -> Result<
+            crate::intervention_service::RuntimePromptResult,
+            crate::intervention_service::RuntimeInterventionError,
+        > {
+            self.prompt_requests.lock().unwrap().push(request);
+            if self
+                .lifecycle_prompt_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(
+                    crate::intervention_service::RuntimeInterventionError::Rejected(
+                        "Herdr rejected the lifecycle prompt".to_owned(),
+                    ),
+                );
+            }
+            Ok(crate::intervention_service::RuntimePromptResult {
+                status: "submitted".to_owned(),
+            })
+        }
+
+        async fn read_output(
+            &self,
+            _request: crate::intervention_service::RuntimeOutputRequest,
+        ) -> Result<
+            crate::intervention_service::RuntimeOutputResult,
+            crate::intervention_service::RuntimeInterventionError,
+        > {
+            unreachable!("Yard orchestrator service tests do not read terminal output")
         }
     }
 
@@ -584,10 +962,12 @@ mod tests {
         let profile = store.create_worker_profile(profile()).await.unwrap();
         let source: Arc<dyn InventorySource> = runtime.clone();
         let reconciliation = ReconciliationService::new(source, store.clone());
-        let control: Arc<dyn RuntimeControl> = runtime;
+        let control: Arc<dyn RuntimeControl> = runtime.clone();
+        let intervention: Arc<dyn crate::intervention_service::RuntimeIntervention> = runtime;
         (
             YardOrchestratorService::new(
                 control,
+                intervention,
                 store.clone(),
                 reconciliation,
                 "/tmp/yard-backend".to_owned(),
@@ -639,6 +1019,7 @@ mod tests {
             first.orchestrator.worker.as_ref().unwrap().profile_version,
             Some(1)
         );
+        assert_eq!(first.orchestrator.workflow_profile_version, 1);
 
         let sessions = runtime.session_requests.lock().unwrap();
         assert!(sessions.iter().all(|request| {
@@ -655,6 +1036,10 @@ mod tests {
         assert_eq!(request.args, ["--yolo", "-m", "gpt-5.4"]);
         assert!(request.prompt.contains("Coordinate all Yard projects"));
         assert!(request.prompt.contains("Role: central orchestrator"));
+        assert!(request.prompt.contains("one Yard/Herdr worker per lane"));
+        assert!(request.prompt.contains("every 10 minutes"));
+        assert!(request.prompt.contains("concrete push-forward prompt"));
+        assert!(request.prompt.contains("commit SHA"));
         assert!(
             request
                 .prompt
@@ -664,6 +1049,37 @@ mod tests {
         assert!(
             yard_domain::OrchestratorStatusReport::scan_terminal_output(&request.prompt).is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn fresh_provision_uses_and_pins_the_active_workflow_revision() {
+        let runtime = Arc::new(DedicatedRuntime::default());
+        let (service, store, _temp, profile_id) = service(runtime.clone()).await;
+        let factory = store.get_orchestrator_workflow_profile().await.unwrap();
+        let edited = store
+            .update_orchestrator_workflow_profile(yard_domain::UpdateOrchestratorWorkflowProfile {
+                actor: "local-user".to_owned(),
+                expected_version: factory.version,
+                instructions_markdown: "# Current workflow\n\nUse current lanes.".to_owned(),
+                monitor_interval_ms: 900_000,
+            })
+            .await
+            .unwrap();
+
+        let configured = service.provision(command(&profile_id)).await.unwrap();
+
+        assert_eq!(
+            configured.orchestrator.workflow_profile_version,
+            edited.version
+        );
+        let request = &runtime.bootstrap_requests.lock().unwrap()[0];
+        assert!(
+            request
+                .prompt
+                .contains("Yard orchestrator workflow profile revision 2")
+        );
+        assert!(request.prompt.contains("# Current workflow"));
+        assert!(request.prompt.contains("monitor interval: 900000 ms"));
     }
 
     #[tokio::test]
@@ -679,6 +1095,89 @@ mod tests {
             worker.runtime.unwrap().terminal_id,
             "terminal-yard-orchestrator"
         );
+        let prompts = runtime.prompt_requests.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].command_id, "provision-yard-orchestrator");
+        assert!(
+            prompts[0]
+                .text
+                .contains("Assume ownership of central Yard orchestration")
+        );
+        assert!(prompts[0].text.contains("one Yard/Herdr worker per lane"));
+    }
+
+    #[tokio::test]
+    async fn retries_rejected_adoption_workflow_with_the_same_command_identity() {
+        let runtime = Arc::new(DedicatedRuntime::live());
+        runtime.lifecycle_prompt_failures.store(1, Ordering::SeqCst);
+        let (service, store, _temp, profile_id) = service(runtime.clone()).await;
+        let command = command(&profile_id);
+
+        let error = service.provision(command.clone()).await.unwrap_err();
+        assert!(matches!(
+            error,
+            super::YardOrchestratorServiceError::ObjectiveDeliveryFailed(_)
+        ));
+        assert!(
+            store
+                .get_yard_orchestrator()
+                .await
+                .unwrap()
+                .worker
+                .is_some()
+        );
+
+        let profile = store.get_worker_profile(&profile_id).await.unwrap();
+        let mut updated_spec = profile.spec;
+        updated_spec.model = Some("gpt-5.5".to_owned());
+        store
+            .update_worker_profile(
+                &profile_id,
+                yard_domain::UpdateWorkerProfile {
+                    spec: updated_spec,
+                    expected_version: profile.version,
+                },
+            )
+            .await
+            .unwrap();
+        let active_workflow = store.get_orchestrator_workflow_profile().await.unwrap();
+        store
+            .update_orchestrator_workflow_profile(yard_domain::UpdateOrchestratorWorkflowProfile {
+                actor: "local-user".to_owned(),
+                expected_version: active_workflow.version,
+                instructions_markdown: "# Replacement workflow\n\nDo not use this for the replay."
+                    .to_owned(),
+                monitor_interval_ms: 300_000,
+            })
+            .await
+            .unwrap();
+
+        let replay = service.provision(command).await.unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.orchestrator.workflow_profile_version, 1);
+        assert_eq!(runtime.bootstrap_calls.load(Ordering::SeqCst), 0);
+        let prompts = runtime.prompt_requests.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            prompts
+                .iter()
+                .all(|prompt| prompt.command_id == "provision-yard-orchestrator")
+        );
+        assert!(
+            prompts
+                .iter()
+                .all(|prompt| prompt.text.contains("one Yard/Herdr worker per lane"))
+        );
+        assert!(prompts.iter().all(|prompt| {
+            prompt
+                .text
+                .contains("Yard orchestrator workflow profile revision 1")
+        }));
+        assert!(
+            prompts
+                .iter()
+                .all(|prompt| !prompt.text.contains("# Replacement workflow"))
+        );
     }
 
     #[tokio::test]
@@ -687,6 +1186,7 @@ mod tests {
         let (service, store, _temp, profile_id) = service(runtime.clone()).await;
         let configured = service.provision(command(&profile_id)).await.unwrap();
         let worker_id = configured.orchestrator.worker.unwrap().id;
+        runtime.prompt_requests.lock().unwrap().clear();
 
         runtime.live.store(false, Ordering::SeqCst);
         runtime.restore_on_ensure.store(true, Ordering::SeqCst);
@@ -705,6 +1205,14 @@ mod tests {
             worker_id
         );
         assert_eq!(runtime.bootstrap_calls.load(Ordering::SeqCst), 0);
+        let (prompt_command_id, prompt_text) = {
+            let prompts = runtime.prompt_requests.lock().unwrap();
+            assert_eq!(prompts.len(), 1);
+            (prompts[0].command_id.clone(), prompts[0].text.clone())
+        };
+        assert_eq!(prompt_command_id, "recover-yard-orchestrator");
+        assert!(prompt_text.contains("one Yard/Herdr worker per lane"));
+        assert!(prompt_text.contains("Resume central Yard orchestration after runtime recovery"));
         assert_eq!(
             store
                 .get_yard_orchestrator()
@@ -740,5 +1248,66 @@ mod tests {
             super::YardOrchestratorServiceError::RecoveryBindingMissing
         ));
         assert_eq!(runtime.bootstrap_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // Regression coverage for the recurring "Herdr agent start failed:
+    // agent_name_taken" bug: Herdr enforces the `yard-orchestrator` agent
+    // name uniquely, so any runtime that claims it but that Yard fails to
+    // durably adopt must be retired immediately. Otherwise it becomes a
+    // permanent orphan and every later `provision` call fails the same way
+    // until a human runs `herdr session list`/`stop`/`delete` by hand.
+
+    #[tokio::test]
+    async fn retires_the_orphaned_runtime_when_the_initial_prompt_cannot_be_delivered() {
+        let runtime = Arc::new(DedicatedRuntime::default());
+        runtime.fail_prompt_delivery.store(true, Ordering::SeqCst);
+        runtime
+            .retirement_identity_misses
+            .store(2, Ordering::SeqCst);
+        runtime
+            .retirement_runtime_failures
+            .store(1, Ordering::SeqCst);
+        let (service, _store, _temp, profile_id) = service(runtime.clone()).await;
+
+        let error = service.provision(command(&profile_id)).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::YardOrchestratorServiceError::ObjectiveDeliveryFailed(_)
+        ));
+        assert_eq!(runtime.bootstrap_calls.load(Ordering::SeqCst), 1);
+
+        let retirements = runtime.retirement_calls.lock().unwrap();
+        assert_eq!(retirements.len(), 4);
+        let retirement = retirements.last().unwrap();
+        assert_eq!(retirement.adapter, "herdr");
+        assert_eq!(retirement.session, YARD_ORCHESTRATOR_SESSION);
+        assert_eq!(retirement.workspace_id, "workspace-yard-orchestrator");
+        assert_eq!(retirement.terminal_id, "terminal-yard-orchestrator");
+        assert_eq!(retirement.tab_id.as_deref(), Some("tab-yard-orchestrator"));
+        assert_eq!(retirement.pane_id, "pane-yard-orchestrator");
+        assert!(retirement.provider_session.is_some());
+        assert!(retirement.owns_tab);
+        assert!(retirement.require_identity_match);
+    }
+
+    #[tokio::test]
+    async fn retires_the_orphaned_runtime_when_the_bootstrapped_worker_never_reconciles() {
+        let runtime = Arc::new(DedicatedRuntime::default());
+        runtime.never_ready.store(true, Ordering::SeqCst);
+        let (service, _store, _temp, profile_id) = service(runtime.clone()).await;
+
+        let error = service.provision(command(&profile_id)).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::YardOrchestratorServiceError::RuntimeBindingUnverified
+        ));
+        assert_eq!(runtime.bootstrap_calls.load(Ordering::SeqCst), 1);
+
+        let retirements = runtime.retirement_calls.lock().unwrap();
+        assert_eq!(retirements.len(), 1);
+        assert_eq!(retirements[0].terminal_id, "terminal-yard-orchestrator");
+        assert!(retirements[0].require_identity_match);
     }
 }

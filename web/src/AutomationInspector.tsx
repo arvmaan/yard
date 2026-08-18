@@ -306,6 +306,7 @@ export function AutomationInspector({
       ) : null}
 
       <section className="inspector-actions automation-actions">
+        <p className="eyebrow">Automatic schedule</p>
         <button
           className="secondary-button"
           disabled={busy}
@@ -319,6 +320,7 @@ export function AutomationInspector({
           )}
           {automation.state === 'active' ? 'Pause schedule' : 'Resume schedule'}
         </button>
+        <p className="eyebrow automation-actions__manual">Manual dispatch</p>
         <button
           className="command-button"
           disabled={busy}

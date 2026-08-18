@@ -4,6 +4,7 @@ import {
   useRef,
   useState,
 } from 'react'
+import { createPortal } from 'react-dom'
 import DOMPurify from 'dompurify'
 import {
   Code2,
@@ -73,7 +74,7 @@ export function ArtifactInspector({
     [artifact.kind, content],
   )
 
-  return (
+  return createPortal(
     <div className="modal-backdrop artifact-backdrop" role="presentation">
       <section
         aria-labelledby="artifact-inspector-title"
@@ -191,7 +192,8 @@ export function ArtifactInspector({
           ) : null}
         </div>
       </section>
-    </div>
+    </div>,
+    document.body,
   )
 }
 

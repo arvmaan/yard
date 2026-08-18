@@ -54,8 +54,6 @@ import type {
 
 const OUTPUT_LINES = 160
 const MAX_ACTIVITY_CHARACTERS = 8000
-const MAX_ACTIVITY_SEGMENT_CHARACTERS = 4000
-const MAX_ACTIVITY_SEGMENTS = 24
 
 export type AgentChatTarget =
   | { kind: 'assignment'; assignment: Assignment }
@@ -128,61 +126,9 @@ function activityExcerpt(text: string) {
   return `...${trimmed.slice(-MAX_ACTIVITY_CHARACTERS)}`
 }
 
-function chunkActivitySegment(text: string) {
-  const chunks: string[] = []
-  let remaining = text.trim()
-
-  while (remaining.length > MAX_ACTIVITY_SEGMENT_CHARACTERS) {
-    const newline = remaining.lastIndexOf(
-      '\n',
-      MAX_ACTIVITY_SEGMENT_CHARACTERS,
-    )
-    const splitAt =
-      newline >= MAX_ACTIVITY_SEGMENT_CHARACTERS / 2
-        ? newline
-        : MAX_ACTIVITY_SEGMENT_CHARACTERS
-    chunks.push(remaining.slice(0, splitAt).trimEnd())
-    remaining = remaining.slice(splitAt).trimStart()
-  }
-
-  if (remaining) chunks.push(remaining)
-  return chunks
-}
-
 function activitySegments(text: string) {
   const excerpt = activityExcerpt(text).replace(/\r\n?/g, '\n')
-  if (!excerpt) return []
-
-  const blocks: string[] = []
-  let lines: string[] = []
-  let fenceMarker: '`' | '~' | null = null
-
-  const commitBlock = () => {
-    const block = lines.join('\n').trim()
-    if (block) blocks.push(...chunkActivitySegment(block))
-    lines = []
-  }
-
-  for (const line of excerpt.split('\n')) {
-    const fence = line.match(/^\s{0,3}(`{3,}|~{3,})/)
-    if (fence) {
-      const marker = fence[1][0] as '`' | '~'
-      if (fenceMarker === null) fenceMarker = marker
-      else if (fenceMarker === marker) fenceMarker = null
-    }
-
-    if (!line.trim() && fenceMarker === null) {
-      commitBlock()
-      continue
-    }
-    lines.push(line)
-  }
-  commitBlock()
-
-  if (blocks.length <= MAX_ACTIVITY_SEGMENTS) return blocks
-  const visible = blocks.slice(-MAX_ACTIVITY_SEGMENTS)
-  visible[0] = `...${visible[0]}`
-  return visible
+  return excerpt ? [excerpt] : []
 }
 
 export function AgentChatWorkspace({
@@ -268,6 +214,7 @@ export function AgentChatWorkspace({
   const returnFocusRef = useRef(returnFocus)
   const dialogRef = useRef<HTMLElement>(null)
   const messagesRef = useRef<HTMLDivElement>(null)
+  const followMessagesRef = useRef(true)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const refreshTimer = useRef<number | null>(null)
   const dispatchProject =
@@ -402,11 +349,13 @@ export function AgentChatWorkspace({
     setPromptFeedback(null)
     setPromptBusy(false)
     setDispatchProjectId('')
+    followMessagesRef.current = true
     return () => outputController.current?.abort()
   }, [targetKey])
 
   useEffect(() => {
     if (!open) return
+    followMessagesRef.current = true
     void loadActivity()
     window.requestAnimationFrame(() => textareaRef.current?.focus())
 
@@ -432,10 +381,20 @@ export function AgentChatWorkspace({
   useEffect(() => {
     if (!open) return
     const messagesElement = messagesRef.current
-    if (messagesElement) {
+    if (messagesElement && followMessagesRef.current) {
       messagesElement.scrollTop = messagesElement.scrollHeight
     }
   }, [messages, open])
+
+  const handleMessagesScroll = () => {
+    const messagesElement = messagesRef.current
+    if (!messagesElement) return
+    followMessagesRef.current =
+      messagesElement.scrollHeight -
+        messagesElement.scrollTop -
+        messagesElement.clientHeight <=
+      48
+  }
 
   const sendPrompt = async (forceNewCommand: boolean) => {
     const text = promptText.trim()
@@ -825,6 +784,7 @@ export function AgentChatWorkspace({
             <div
               aria-live="polite"
               className="chat-thread__messages"
+              onScroll={handleMessagesScroll}
               ref={messagesRef}
             >
               {activityLoading && messages.length === 0 ? (

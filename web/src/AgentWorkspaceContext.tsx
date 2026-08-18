@@ -3,9 +3,18 @@ import type {
   AgentChatTarget,
 } from './AgentChatWorkspace'
 import type { TerminalTarget } from './TerminalSession'
-import type { ObservedStatus } from './types'
+import type { ObservedStatus, WorkerRuntimeBinding } from './types'
 
+export type TerminalPresentation = 'focus' | 'terminal'
+export const DEFAULT_TERMINAL_PRESENTATION: TerminalPresentation = 'terminal'
 export type AgentWorkspaceMode = 'chat' | 'terminal'
+export type AgentWorkspaceView = AgentWorkspaceMode | 'map'
+
+export function isTerminalWorkspaceMode(
+  mode: AgentWorkspaceView,
+): mode is 'terminal' {
+  return mode === 'terminal'
+}
 
 export interface AgentWorkspaceTarget {
   key: string
@@ -16,6 +25,7 @@ export interface AgentWorkspaceTarget {
   status: ObservedStatus
   target: AgentChatTarget
   terminalId: string
+  terminalLeaseKey: string
   terminalTarget: TerminalTarget
   workspaceId: string
 }
@@ -49,4 +59,43 @@ export function agentWorkspaceKey(target: AgentChatTarget) {
     return `coordination-node:${target.node.id}`
   }
   return 'yard-orchestrator'
+}
+
+export function terminalLeaseKey(
+  target: AgentChatTarget,
+  runtime: WorkerRuntimeBinding,
+) {
+  const targetIdentity =
+    target.kind === 'assignment'
+      ? [
+          target.kind,
+          target.assignment.project_id,
+          target.assignment.id,
+          target.assignment.attempt.id,
+          target.assignment.worker.id,
+        ]
+      : target.kind === 'orchestrator'
+        ? [
+            target.kind,
+            target.project.id,
+            target.project.orchestrator.id,
+          ]
+        : target.kind === 'coordination-node'
+          ? [
+              target.kind,
+              target.node.id,
+              target.node.version,
+              target.node.worker?.id,
+            ]
+          : [target.kind, target.orchestrator.worker?.id]
+  return JSON.stringify([
+    ...targetIdentity,
+    runtime.adapter,
+    runtime.session,
+    runtime.workspace_id,
+    runtime.terminal_id,
+    runtime.tab_id,
+    runtime.pane_id,
+    runtime.provider_session,
+  ])
 }

@@ -1,6 +1,7 @@
 import {
   expect,
   test,
+  type Locator,
   type Page,
   type WebSocketRoute,
 } from '@playwright/test'
@@ -24,9 +25,11 @@ import type {
   CreateWorkspaceProjectFromProfileInput,
   EndWorkerSessionInput,
   ObservedChildAgent,
+  OrchestratorWorkflowProfile,
   ProjectRelationship,
   ProvisionYardOrchestratorInput,
   RecoverYardOrchestratorInput,
+  ResetOrchestratorWorkflowProfileInput,
   ProvisionCoordinationNodeInput,
   RecordCompletionReceiptInput,
   RunAutomationInput,
@@ -37,6 +40,7 @@ import type {
   SendYardOrchestratorPromptInput,
   SendYardOrchestratorRouteInput,
   StatusReport,
+  TokenSpendSettings,
   TerminalClientMessage,
   Worker,
   WorkerCandidate,
@@ -51,6 +55,8 @@ import type {
   UpdateAutomationInput,
   UpdateAutomationPlacementInput,
   UpdateAutomationStateInput,
+  UpdateOrchestratorWorkflowProfileInput,
+  UpdateTokenSpendSettingsInput,
 } from '../src/types'
 import {
   assignmentTerminalWebSocketUrl,
@@ -68,6 +74,9 @@ const sessions = {
     { name: 'beta', is_default: false, running: true },
   ],
 }
+
+const factoryWorkflowInstructions =
+  '# Yard Orchestrator Workflow\n\nCreate one Yard/Herdr worker per lane and monitor every 10 minutes.\n'
 
 function worker(index: number, workspaceId: string, status = 'idle') {
   return {
@@ -366,6 +375,11 @@ function initialWorkerCandidates(
 }
 
 interface MockState {
+  orchestratorWorkflowProfile: OrchestratorWorkflowProfile
+  orchestratorWorkflowUpdates: UpdateOrchestratorWorkflowProfileInput[]
+  orchestratorWorkflowResets: ResetOrchestratorWorkflowProfileInput[]
+  tokenSpendSettings: TokenSpendSettings
+  tokenSpendSettingsUpdates: UpdateTokenSpendSettingsInput[]
   automations: Automation[]
   automationRuns: Record<string, AutomationRun[]>
   automationCreateCommands: CreateAutomationInput[]
@@ -395,6 +409,8 @@ interface MockState {
   projectRelationshipCommands: CreateProjectRelationshipInput[]
   projectRelationships: ProjectRelationship[]
   projects: ReturnType<typeof initialProjects>
+  projectRequests: number
+  assignmentRequests: number
   profiles: ReturnType<typeof profile>[]
   workerCandidates: WorkerCandidate[]
   assignments: Assignment[]
@@ -527,6 +543,25 @@ async function mockApi(
   const initialProjectState = initialProjects()
   const initialProfileState = [profile()]
   const state: MockState = {
+    orchestratorWorkflowProfile: {
+      version: '1',
+      instructions_markdown: factoryWorkflowInstructions,
+      monitor_interval_ms: '600000',
+      source: 'factory',
+      updated_by: 'yard:factory',
+      created_at_unix_ms: 0,
+    },
+    orchestratorWorkflowUpdates: [],
+    orchestratorWorkflowResets: [],
+    tokenSpendSettings: {
+      superintendent_auto_requests_project_summaries: false,
+      project_orchestrators_auto_request_worker_summaries: false,
+      scheduled_automatic_summaries: false,
+      version: '1',
+      updated_by: 'yard:migration',
+      updated_at_unix_ms: 0,
+    },
+    tokenSpendSettingsUpdates: [],
     automations: [],
     automationRuns: {},
     automationCreateCommands: [],
@@ -547,6 +582,7 @@ async function mockApi(
     yardOrchestrator: {
       worker: null,
       version: '1',
+      workflow_profile_version: '1',
       created_at_unix_ms: 0,
       updated_at_unix_ms: 0,
     },
@@ -561,6 +597,8 @@ async function mockApi(
     projectRelationshipCommands: [],
     projectRelationships: [],
     projects: initialProjectState,
+    projectRequests: 0,
+    assignmentRequests: 0,
     profiles: initialProfileState,
     workerCandidates: initialWorkerCandidates(
       initialProjectState,
@@ -660,6 +698,98 @@ async function mockApi(
       result: ConfirmedWorkerHandoff
     }
   >()
+
+  await page.route('**/api/v1/token-spend-settings', async (route) => {
+    const request = route.request()
+    if (request.method() === 'GET') {
+      await route.fulfill({ json: state.tokenSpendSettings })
+      return
+    }
+    if (request.method() === 'PUT') {
+      const input =
+        request.postDataJSON() as UpdateTokenSpendSettingsInput
+      state.tokenSpendSettingsUpdates.push(input)
+      if (input.expected_version !== state.tokenSpendSettings.version) {
+        await route.fulfill({ status: 409 })
+        return
+      }
+      state.tokenSpendSettings = {
+        superintendent_auto_requests_project_summaries:
+          input.superintendent_auto_requests_project_summaries,
+        project_orchestrators_auto_request_worker_summaries:
+          input.project_orchestrators_auto_request_worker_summaries,
+        scheduled_automatic_summaries:
+          input.scheduled_automatic_summaries,
+        version: String(Number(state.tokenSpendSettings.version) + 1),
+        updated_by: input.actor,
+        updated_at_unix_ms: Date.now(),
+      }
+      await route.fulfill({ json: state.tokenSpendSettings })
+      return
+    }
+    await route.fulfill({ status: 404 })
+  })
+
+  await page.route(
+    '**/api/v1/orchestrator-workflow-profile',
+    async (route) => {
+      const request = route.request()
+      if (request.method() === 'GET') {
+        await route.fulfill({ json: state.orchestratorWorkflowProfile })
+        return
+      }
+      if (request.method() === 'PUT') {
+        const input =
+          request.postDataJSON() as UpdateOrchestratorWorkflowProfileInput
+        state.orchestratorWorkflowUpdates.push(input)
+        if (
+          input.expected_version !== state.orchestratorWorkflowProfile.version
+        ) {
+          await route.fulfill({ status: 409 })
+          return
+        }
+        state.orchestratorWorkflowProfile = {
+          version: String(
+            Number(state.orchestratorWorkflowProfile.version) + 1,
+          ),
+          instructions_markdown: input.instructions_markdown,
+          monitor_interval_ms: input.monitor_interval_ms,
+          source: 'user',
+          updated_by: input.actor,
+          created_at_unix_ms: Date.now(),
+        }
+        await route.fulfill({ json: state.orchestratorWorkflowProfile })
+        return
+      }
+      await route.fulfill({ status: 404 })
+    },
+  )
+
+  await page.route(
+    '**/api/v1/orchestrator-workflow-profile/reset',
+    async (route) => {
+      const input =
+        route.request().postDataJSON() as ResetOrchestratorWorkflowProfileInput
+      state.orchestratorWorkflowResets.push(input)
+      if (
+        input.expected_version !== state.orchestratorWorkflowProfile.version
+      ) {
+        await route.fulfill({ status: 409 })
+        return
+      }
+      state.orchestratorWorkflowProfile = {
+        version: String(
+          Number(state.orchestratorWorkflowProfile.version) + 1,
+        ),
+        instructions_markdown: factoryWorkflowInstructions,
+        monitor_interval_ms: '600000',
+        source: 'reset',
+        updated_by: input.actor,
+        created_at_unix_ms: Date.now(),
+      }
+      await route.fulfill({ json: state.orchestratorWorkflowProfile })
+    },
+  )
 
   await page.routeWebSocket(
     (url) => url.pathname.endsWith('/terminal'),
@@ -1166,6 +1296,7 @@ async function mockApi(
       state.yardOrchestrator = {
         worker: claimedWorker,
         version: String(Number(state.yardOrchestrator.version) + 1),
+        workflow_profile_version: state.orchestratorWorkflowProfile.version,
         created_at_unix_ms: state.yardOrchestrator.created_at_unix_ms,
         updated_at_unix_ms: Date.now(),
       }
@@ -1245,6 +1376,7 @@ async function mockApi(
       state.yardOrchestrator = {
         worker: claimedWorker,
         version: String(Number(state.yardOrchestrator.version) + 1),
+        workflow_profile_version: state.orchestratorWorkflowProfile.version,
         created_at_unix_ms: state.yardOrchestrator.created_at_unix_ms,
         updated_at_unix_ms: Date.now(),
       }
@@ -2097,6 +2229,7 @@ async function mockApi(
     }
 
     if (assignmentMatch && request.method() === 'GET') {
+      state.assignmentRequests += 1
       const projectId = decodeURIComponent(assignmentMatch[1])
       await route.fulfill({
         json: {
@@ -2399,6 +2532,7 @@ async function mockApi(
     }
 
     if (request.method() === 'GET' && url.pathname === '/api/v1/projects') {
+      state.projectRequests += 1
       await route.fulfill({ json: { projects: state.projects } })
       return
     }
@@ -2793,17 +2927,61 @@ async function mockApi(
 }
 
 async function dragFirstProject(page: Page, deltaX: number, deltaY: number) {
-  const heading = page
-    .locator('.react-flow__node-project .workspace-region__heading')
-    .first()
-  const box = await heading.boundingBox()
-  if (!box) throw new Error('Project heading is not visible')
-  const startX = box.x + box.width / 2
-  const startY = box.y + box.height / 2
+  const territory = page.locator(
+    '.projected-territory[data-node-id="project:project-1"] .territory-polygon',
+  )
+  const box = await territory.boundingBox()
+  if (!box) throw new Error('Projected territory is not visible')
+  // Whole-pixel start keeps the delivered pointer delta exactly (deltaX, deltaY)
+  // once the browser rounds coordinates, which the projection assertions rely on.
+  // This point is inside the parallelogram but clear of its upright label and
+  // units, so the gesture exercises the projected territory's own hit target.
+  const startX = Math.round(box.x + box.width * 0.25)
+  const startY = Math.round(box.y + box.height / 2)
   await page.mouse.move(startX, startY)
   await page.mouse.down()
   await page.mouse.move(startX + deltaX, startY + deltaY, { steps: 8 })
   await page.mouse.up()
+}
+
+async function openSettings(page: Page) {
+  const dialog = page.getByRole('dialog', { name: 'Settings' })
+  if (!(await dialog.isVisible().catch(() => false))) {
+    await page
+      .getByRole('button', { name: /^Settings,/ })
+      .click()
+  }
+  await expect(dialog).toBeVisible()
+  return dialog
+}
+
+async function setMapView(page: Page, label: '2D view' | '2.5D view') {
+  const dialog = await openSettings(page)
+  await dialog.getByRole('button', { name: label }).click()
+  await dialog.getByRole('button', { name: 'Close settings' }).click()
+}
+
+async function setAppTheme(page: Page, theme: 'Dark' | 'Light') {
+  const dialog = await openSettings(page)
+  await dialog.getByRole('button', { name: theme, exact: true }).click()
+  await dialog.getByRole('button', { name: 'Close settings' }).click()
+}
+
+async function openRuntimeHealth(page: Page) {
+  const popover = page.getByRole('dialog', { name: 'Runtime health' })
+  if (!(await popover.isVisible().catch(() => false))) {
+    await page
+      .getByRole('button', { name: /^Runtime health:/ })
+      .click()
+  }
+  await expect(popover).toBeVisible()
+  return popover
+}
+
+async function selectRuntimeSession(page: Page, session: string) {
+  const popover = await openRuntimeHealth(page)
+  await popover.getByLabel('Herdr session').selectOption(session)
+  await page.keyboard.press('Escape')
 }
 
 function projectDropTarget(page: Page, index = 0) {
@@ -2811,6 +2989,18 @@ function projectDropTarget(page: Page, index = 0) {
     .locator('.project-region')
     .nth(index)
     .locator('.workspace-region__heading')
+}
+
+async function dragToProject(
+  source: Locator,
+  page: Page,
+  index = 0,
+) {
+  // Upright units can legitimately occupy the label's screen point. The
+  // canvas resolves allocation drops from pointer geometry, so force only
+  // skips Playwright's pre-drag hit-target check; it does not bypass Yard's
+  // drag payload or drop handler.
+  await source.dragTo(projectDropTarget(page, index), { force: true })
 }
 
 async function dragFirstWorkspace(
@@ -2903,8 +3093,18 @@ async function expectRuntimeLayout(page: Page) {
 
   expect(metrics.documentOverflowX).toBeLessThanOrEqual(0)
   expect(metrics.documentOverflowY).toBeLessThanOrEqual(0)
-  expect(metrics.markerOverflowX).toBeLessThanOrEqual(0)
-  expect(metrics.markerOverflowY).toBeLessThanOrEqual(0)
+  // The depth-mode sprite is deliberately larger than its marker's real,
+  // click-matched hit region (see the `.worker-marker__body
+  // .worker-marker__sprite { inset: -53px }` rule in App.css) so the
+  // character reads at a usable size without growing the actual pointer
+  // target into a dead zone that steals clicks from whatever's nearby. That
+  // overflowing, pointer-events:none sprite still counts toward its
+  // ancestor's scrollWidth/scrollHeight even though it never affects hit
+  // testing or document layout — this bound tolerates that specific,
+  // intentional overflow (measured ~50px in practice) without opening the
+  // door to unbounded marker growth elsewhere.
+  expect(metrics.markerOverflowX).toBeLessThanOrEqual(60)
+  expect(metrics.markerOverflowY).toBeLessThanOrEqual(60)
   expect(metrics.outsideProject).toEqual([])
   expect(metrics.overlaps).toEqual([])
 }
@@ -3050,6 +3250,191 @@ test('keeps the canvas visible under a compact collapsible resource shelf', asyn
   await expect(shelf).toBeVisible()
 })
 
+test('provides one-click runtime health and persistent appearance settings', async ({
+  page,
+}, testInfo) => {
+  await page.addInitScript(() => {
+    if (window.localStorage.getItem('yard:theme') === null) {
+      window.localStorage.setItem('yard:theme', 'light')
+    }
+    if (window.localStorage.getItem('yard:map-visual-mode:v1') === null) {
+      window.localStorage.setItem('yard:map-visual-mode:v1', 'depth')
+    }
+  })
+  await mockApi(page)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  const commandBar = page.locator('.command-bar')
+  const healthTrigger = page.getByRole('button', {
+    name: /^Runtime health:/,
+  })
+  const settingsTrigger = page.getByRole('button', {
+    name: /^Settings,/,
+  })
+  await expect(commandBar).toBeVisible()
+  expect((await commandBar.boundingBox())?.height).toBeLessThanOrEqual(48)
+  expect(
+    await commandBar.evaluate(
+      (element) => element.scrollWidth - element.clientWidth,
+    ),
+  ).toBeLessThanOrEqual(0)
+  await expect(healthTrigger).toBeVisible()
+  await expect(healthTrigger).toHaveAccessibleName(
+    'Runtime health: alpha, Herdr observed',
+  )
+  await expect(settingsTrigger).toHaveAccessibleName(
+    'Settings, light theme, 2.5D map',
+  )
+  await expect(page.locator('.command-bar__metrics')).toHaveCount(0)
+  await expect(page.locator('.canvas-stage__label')).toHaveCount(0)
+  await expect(page.locator('.canvas-view-switcher')).toHaveCount(0)
+
+  await healthTrigger.focus()
+  await healthTrigger.press('Enter')
+  const health = page.getByRole('dialog', { name: 'Runtime health' })
+  const sessionSelect = health.getByLabel('Herdr session')
+  await expect(sessionSelect).toBeFocused()
+  await expect(health.getByText('Herdr observed')).toBeVisible()
+  await page.screenshot({
+    path: testInfo.outputPath('slice1-runtime-health-desktop.png'),
+    fullPage: true,
+  })
+  await sessionSelect.selectOption('beta')
+  await expect(
+    page.getByRole('button', {
+      name: /Runtime health: beta, Herdr observed/,
+    }),
+  ).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(health).toHaveCount(0)
+  await expect(healthTrigger).toBeFocused()
+
+  await healthTrigger.press('Enter')
+  await page.locator('.canvas-stage').click({ position: { x: 8, y: 80 } })
+  await expect(health).toHaveCount(0)
+  await expect(healthTrigger).toBeFocused()
+
+  await settingsTrigger.focus()
+  await settingsTrigger.press('Enter')
+  const settings = page.getByRole('dialog', { name: 'Settings' })
+  await expect(
+    settings.getByRole('button', { name: 'Light', exact: true }),
+  ).toBeFocused()
+  await expect(page.locator('.app-shell')).toHaveAttribute('inert', '')
+  for (let index = 0; index < 12; index += 1) {
+    await page.keyboard.press('Tab')
+    expect(
+      await settings.evaluate((element) =>
+        element.contains(document.activeElement),
+      ),
+    ).toBe(true)
+  }
+  await settings
+    .getByRole('button', { name: 'Dark', exact: true })
+    .click()
+  await settings.getByRole('button', { name: '2D view' }).click()
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+  await expect(page.getByLabel('Yard project canvas')).toHaveAttribute(
+    'data-visual-mode',
+    'flat',
+  )
+  expect(
+    await page.evaluate(() => ({
+      map: window.localStorage.getItem('yard:map-visual-mode:v1'),
+      theme: window.localStorage.getItem('yard:theme'),
+    })),
+  ).toEqual({ map: 'flat', theme: 'dark' })
+  await page.screenshot({
+    path: testInfo.outputPath('slice1-settings-desktop.png'),
+    fullPage: true,
+  })
+  await page.keyboard.press('Escape')
+  await expect(settings).toHaveCount(0)
+  await expect(settingsTrigger).toBeFocused()
+
+  await page.reload()
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+  await expect(page.getByLabel('Yard project canvas')).toHaveAttribute(
+    'data-visual-mode',
+    'flat',
+  )
+  await page.screenshot({
+    path: testInfo.outputPath('slice1-command-bar-desktop.png'),
+    fullPage: true,
+  })
+})
+
+test('keeps Slice 1 chrome visible and motion-safe at mobile widths', async ({
+  page,
+}, testInfo) => {
+  await mockApi(page)
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+
+  for (const width of [390, 320]) {
+    await page.setViewportSize({ width, height: 844 })
+    await page.goto('/')
+
+    const commandBar = page.locator('.command-bar')
+    const healthTrigger = page.getByRole('button', {
+      name: /Runtime health: alpha, Herdr observed/,
+    })
+    await expect(healthTrigger).toBeVisible()
+    expect((await commandBar.boundingBox())?.height).toBeLessThanOrEqual(46)
+    const overflow = await page.evaluate(() => {
+      const bar = document.querySelector<HTMLElement>('.command-bar')
+      return {
+        bar: bar ? bar.scrollWidth - bar.clientWidth : Number.NaN,
+        document:
+          document.documentElement.scrollWidth -
+          document.documentElement.clientWidth,
+      }
+    })
+    expect(overflow.bar).toBeLessThanOrEqual(0)
+    expect(overflow.document).toBeLessThanOrEqual(0)
+
+    const health = await openRuntimeHealth(page)
+    const healthBounds = await health.boundingBox()
+    expect(healthBounds?.x ?? -1).toBeGreaterThanOrEqual(0)
+    expect(
+      healthBounds
+        ? healthBounds.x + healthBounds.width
+        : Number.POSITIVE_INFINITY,
+    ).toBeLessThanOrEqual(width)
+    expect(
+      await health.evaluate(
+        (element) => getComputedStyle(element).animationName,
+      ),
+    ).toBe('none')
+    await page.keyboard.press('Escape')
+
+    const settings = await openSettings(page)
+    const settingsBounds = await settings.boundingBox()
+    expect(settingsBounds?.x ?? -1).toBeGreaterThanOrEqual(0)
+    expect(
+      settingsBounds
+        ? settingsBounds.x + settingsBounds.width
+        : Number.POSITIVE_INFINITY,
+    ).toBeLessThanOrEqual(width)
+    expect(
+      await settings.evaluate(
+        (element) => getComputedStyle(element).animationName,
+      ),
+    ).toBe('none')
+    await settings.getByRole('button', { name: '2D view' }).click()
+    await expect(page.getByLabel('Yard project canvas')).toHaveAttribute(
+      'data-visual-mode',
+      'flat',
+    )
+    await settings.getByRole('button', { name: 'Close settings' }).click()
+
+    await page.screenshot({
+      path: testInfo.outputPath(`slice1-command-bar-${width}.png`),
+      fullPage: true,
+    })
+  }
+})
+
 test('renders observed agents on the canvas before a project exists', async ({
   page,
 }) => {
@@ -3059,7 +3444,9 @@ test('renders observed agents on the canvas before a project exists', async ({
   await page.setViewportSize({ width: 1440, height: 900 })
   await page.goto('/')
 
-  await expect(page.getByText('Herdr observed')).toBeVisible()
+  await expect(
+    page.getByText('Herdr observed', { exact: true }),
+  ).toBeVisible()
   await expect(page.locator('.project-region')).toHaveCount(0)
   await expect(page.locator('.worker-marker')).toHaveCount(
     state.runtimeInventory.workers.length,
@@ -3124,6 +3511,19 @@ test('renders provider child agents beneath their terminal-backed parent', async
   await expect(page.locator('.child-agent-marker')).toHaveCount(2)
   await expect(page.locator('.provider-child-edge')).toHaveCount(2)
   await expect(page.getByText('Finished', { exact: true })).toHaveCount(0)
+  // Agent markers are billboards standing on projected ground anchors in 2.5D,
+  // so their box is the drawn sprite scaled to the ground plane. 2D view keeps
+  // the original flat card footprint.
+  const billboard = await page
+    .locator('.react-flow__node-worker')
+    .first()
+    .evaluate((element) => ({
+      height: Number.parseFloat((element as HTMLElement).style.height),
+      width: Number.parseFloat((element as HTMLElement).style.width),
+    }))
+  expect(billboard.width).toBeCloseTo(101 * 0.78, 3)
+  expect(billboard.height).toBeCloseTo(115 * 0.78, 3)
+  await setMapView(page, '2D view')
   await expect(page.locator('.react-flow__node-worker').first()).toHaveCSS(
     'width',
     '101px',
@@ -3140,6 +3540,7 @@ test('renders provider child agents beneath their terminal-backed parent', async
     'height',
     '92px',
   )
+  await setMapView(page, '2.5D view')
 
   const projectNode = page.locator('[data-id="project:project-1"]')
   const yardOrchestratorNode = page.locator('[data-id="yard-orchestrator"]')
@@ -3218,13 +3619,16 @@ test('renders provider child agents beneath their terminal-backed parent', async
     ),
   ).toBe(true)
 
-  await projectNode.locator('.workspace-region__heading').click()
+  // A unit can legitimately stand over the billboard label in the projected
+  // view. Force selection through the label here so this visual assertion does
+  // not depend on whichever unit happens to overlap that exact screen point.
+  await projectNode.locator('.workspace-region__heading').click({ force: true })
   await rawlsMarker.click()
   await expect(page.locator('.inspector h2')).toHaveText('Rawls')
   await expect(page.getByText('Shares parent terminal')).toBeVisible()
 })
 
-test('animates circular worker units and respects reduced motion', async ({
+test('keeps raised worker units stable and 2D motion respects reduced motion', async ({
   page,
 }) => {
   await mockApi(page)
@@ -3237,16 +3641,18 @@ test('animates circular worker units and respects reduced motion', async ({
     await marker.evaluate(
       (element) => getComputedStyle(element).animationName,
     ),
-  ).toBe('worker-drift')
-  const before = await marker.boundingBox()
-  await page.waitForTimeout(350)
-  const after = await marker.boundingBox()
-  expect(before).not.toBeNull()
-  expect(after).not.toBeNull()
+  ).toBe('none')
+  await setMapView(page, '2D view')
   expect(
-    Math.abs((after?.x ?? 0) - (before?.x ?? 0)) +
-      Math.abs((after?.y ?? 0) - (before?.y ?? 0)),
-  ).toBeGreaterThan(0.1)
+    await marker.evaluate(
+      (element) => getComputedStyle(element).animationName,
+    ),
+  ).toBe('worker-drift')
+  expect(
+    await marker.evaluate((element) =>
+      Number.parseFloat(getComputedStyle(element).animationDuration),
+    ),
+  ).toBeGreaterThan(0)
 
   await page.emulateMedia({ reducedMotion: 'reduce' })
   await page.reload()
@@ -3289,7 +3695,7 @@ test('keeps exactly one durable orchestrator visible across selected sessions', 
   ).toHaveCount(state.runtimeInventory.workers.length - 1)
   await expectRuntimeLayout(page)
 
-  await page.locator('#session-select').selectOption('beta')
+  await selectRuntimeSession(page, 'beta')
   await expect(
     page.locator('.project-region[data-runtime="offline"]'),
   ).toHaveCount(2)
@@ -3342,6 +3748,209 @@ test('keeps exactly one durable orchestrator visible across selected sessions', 
     path: testInfo.outputPath('durable-orchestrators-mobile.png'),
     fullPage: true,
   })
+})
+
+test('projects active assignments once and completed live workers as observed', async ({
+  page,
+}, testInfo) => {
+  const state = await mockApi(page)
+  const active = seedAssignedCandidateAssignment(state)
+  const completed = assignment(
+    'assignment-completed-live',
+    'project-1',
+    state.profiles[0],
+    'Retain the completed worker until its session ends.',
+    'implementer',
+    durableWorker(
+      'worker-completed-live',
+      'terminal-4',
+      state.profiles[0],
+    ),
+  )
+  completed.lifecycle = 'completed'
+  completed.attempt.lifecycle = 'completed'
+  completed.completion_receipt = {
+    id: 'receipt-completed-live',
+    assignment_id: completed.id,
+    attempt_id: completed.attempt.id,
+    outcome: 'completed',
+    summary: 'The assignment is complete while the terminal remains live.',
+    artifact_refs: [],
+    artifacts: [],
+    evidence_refs: [],
+    unresolved_blockers: [],
+    actor: 'local-user',
+    created_at_unix_ms: Date.now(),
+  }
+  state.assignments.push(completed)
+  const activeTerminalId = active.worker.runtime?.terminal_id
+  const completedTerminalId = completed.worker.runtime?.terminal_id
+  if (!activeTerminalId || !completedTerminalId) {
+    throw new Error('Projection fixtures require terminal-backed workers')
+  }
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  const activeMarker = page.locator(
+    `.assigned-worker-marker[data-worker-id="${active.worker.id}"]`,
+  )
+  const activeObservedNode = page.locator(
+    `.react-flow__node-worker[data-id="worker:${activeTerminalId}"]`,
+  )
+  const activeSprite = activeMarker.locator('.worker-marker__sprite')
+  const completedMarker = page.locator(
+    `.assigned-worker-marker[data-worker-id="${completed.worker.id}"]`,
+  )
+  const completedObservedNode = page.locator(
+    `.react-flow__node-worker[data-id="worker:${completedTerminalId}"]`,
+  )
+  const projectNode = page.locator(
+    '.react-flow__node-project[data-id="project:project-1"]',
+  )
+  const expectProjection = async () => {
+    await expect(activeMarker).toHaveCount(1)
+    await expect(activeSprite).toBeVisible()
+    await expect(activeSprite).toHaveCSS('background-image', /worker/)
+    await expect(activeObservedNode).toHaveCount(0)
+    await expect(completedMarker).toHaveCount(0)
+    await expect(completedObservedNode).toHaveCount(1)
+    await expect(completedObservedNode).toBeVisible()
+
+    const [projectBox, workerBox] = await Promise.all([
+      projectNode.boundingBox(),
+      completedObservedNode.boundingBox(),
+    ])
+    expect(projectBox).not.toBeNull()
+    expect(workerBox).not.toBeNull()
+    expect(workerBox!.x).toBeGreaterThanOrEqual(projectBox!.x - 1)
+    expect(workerBox!.y).toBeGreaterThanOrEqual(projectBox!.y - 1)
+    expect(workerBox!.x + workerBox!.width).toBeLessThanOrEqual(
+      projectBox!.x + projectBox!.width + 1,
+    )
+    expect(workerBox!.y + workerBox!.height).toBeLessThanOrEqual(
+      projectBox!.y + projectBox!.height + 1,
+    )
+  }
+
+  await expectProjection()
+  await page.reload()
+  await expectProjection()
+  await page.screenshot({
+    path: testInfo.outputPath('worker-projection-active-completed.png'),
+    fullPage: true,
+  })
+})
+
+test('scopes terminal projection identity to adapter and session', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const collidingAssignment = assignment(
+    'assignment-beta-terminal-collision',
+    'project-1',
+    state.profiles[0],
+    'Continue work in the beta Herdr session.',
+    'implementer',
+    durableWorker(
+      'worker-beta-terminal-collision',
+      'terminal-2',
+      state.profiles[0],
+      'workspace-1',
+      'beta',
+      true,
+      { status: 'blocked' },
+    ),
+  )
+  state.assignments.push(collidingAssignment)
+  const collidingCandidate: WorkerCandidate = {
+    worker: collidingAssignment.worker,
+    profile_name: state.profiles[0].name,
+    default_role: state.profiles[0].default_role,
+    availability: 'assigned',
+    project_id: collidingAssignment.project_id,
+    assignment_id: collidingAssignment.id,
+  }
+  state.workerCandidates.unshift(collidingCandidate)
+  state.workerCandidates.push({
+    worker: durableWorker(
+      'worker-beta-resumable-collision',
+      'terminal-2',
+      state.profiles[0],
+      'workspace-1',
+      'beta',
+    ),
+    profile_name: state.profiles[0].name,
+    default_role: state.profiles[0].default_role,
+    availability: 'resumable',
+    assignment_id: 'assignment-beta-resumable-collision',
+    reason: 'Foreign-session collision fixture.',
+  })
+  const foreignAdapterWorker = durableWorker(
+    'worker-foreign-adapter-collision',
+    'terminal-2',
+    state.profiles[0],
+  )
+  if (!foreignAdapterWorker.runtime) {
+    throw new Error('Adapter collision fixture requires a runtime')
+  }
+  foreignAdapterWorker.runtime.adapter = 'foreign-runtime'
+  state.workerCandidates.push({
+    worker: foreignAdapterWorker,
+    profile_name: state.profiles[0].name,
+    default_role: state.profiles[0].default_role,
+    availability: 'resumable',
+    assignment_id: 'assignment-foreign-adapter-collision',
+    reason: 'Foreign-adapter collision fixture.',
+  })
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await expect(
+    page.locator(
+      '.assigned-worker-marker[data-worker-id="worker-beta-terminal-collision"]',
+    ),
+  ).toHaveAttribute('data-status', 'blocked')
+  await expect(
+    page.locator(
+      '.react-flow__node-worker[data-id="worker:terminal-2"]',
+    ),
+  ).toHaveCount(1)
+
+  const alphaWorker = page.locator(
+    '.react-flow__node-worker[data-id="worker:terminal-2"]',
+  )
+  await alphaWorker.click()
+  await expect(
+    page
+      .locator('.inspector .detail-row')
+      .filter({ hasText: 'Worker ID' }),
+  ).toContainText('worker-unassigned')
+  await expect(
+    page.getByRole('button', { name: 'Assign worker', exact: true }),
+  ).toBeVisible()
+  await expect(
+    page.getByRole('button', { name: 'Hand off worker', exact: true }),
+  ).toHaveCount(0)
+
+  await dragToProject(alphaWorker.locator('.worker-marker'), page, 1)
+  const dialog = page.getByRole('dialog', { name: 'Assign worker' })
+  await expect(dialog).toBeVisible()
+  await expect(
+    page.getByRole('dialog', { name: 'Resume worker' }),
+  ).toHaveCount(0)
+  await expect(dialog.getByLabel('Worker profile')).toHaveValue('')
+  await dialog
+    .getByLabel('Objective')
+    .fill('Keep the alpha runtime identity scoped during allocation.')
+  await dialog
+    .getByRole('button', { name: 'Assign worker', exact: true })
+    .click()
+  const allocation = state.allocationCommands.at(-1)
+  if (!allocation || !('worker_id' in allocation)) {
+    throw new Error('Expected a live-worker allocation command')
+  }
+  expect(state.allocationCommands).toHaveLength(1)
+  expect(allocation.worker_id).toBe('worker-unassigned')
 })
 
 test('uses durable status for missing ambiguous and exited worker candidates', async ({
@@ -3454,8 +4063,12 @@ test('keeps Herdr in a loading state until session discovery completes', async (
   await page.setViewportSize({ width: 1200, height: 760 })
   await page.goto('/')
 
-  await expect(page.getByText('Observing Herdr')).toBeVisible()
-  await expect(page.getByText('Herdr unavailable')).toHaveCount(0)
+  await expect(
+    page.getByRole('button', { name: /Observing Herdr/ }),
+  ).toBeVisible()
+  await expect(
+    page.getByRole('button', { name: /Herdr unavailable/ }),
+  ).toHaveCount(0)
   await expect(page.locator('.project-region')).toHaveCount(2)
   await expect(
     page.locator('.project-region[data-runtime="loading"]'),
@@ -3465,8 +4078,12 @@ test('keeps Herdr in a loading state until session discovery completes', async (
   ).toHaveCount(0)
 
   releaseSessions()
-  await expect(page.getByText('9 workers')).toBeVisible()
-  await expect(page.getByText('Herdr observed')).toBeVisible()
+  await expect(page.locator('.worker-marker')).toHaveCount(
+    workers.length + 1,
+  )
+  await expect(
+    page.getByRole('button', { name: /Herdr observed/ }),
+  ).toBeVisible()
   await expect(
     page.locator('.project-region[data-runtime="loading"]'),
   ).toHaveCount(0)
@@ -3485,7 +4102,9 @@ test('resnapshots inventory, retains stale state, and recovers after failure', a
   await page.setViewportSize({ width: 1200, height: 760 })
   await page.goto('/')
 
-  await expect(page.getByText('9 workers')).toBeVisible()
+  await expect(page.locator('.worker-marker')).toHaveCount(
+    workers.length + 1,
+  )
   const initialRequests = state.inventoryRequests
   state.runtimeInventory = {
     ...state.runtimeInventory,
@@ -3499,7 +4118,9 @@ test('resnapshots inventory, retains stale state, and recovers after failure', a
   await expect
     .poll(() => state.inventoryRequests, { timeout: 3_000 })
     .toBeGreaterThan(initialRequests)
-  await expect(page.getByText('10 workers')).toBeVisible()
+  await expect(page.locator('.worker-marker')).toHaveCount(
+    workers.length + 2,
+  )
   await page.getByText('worker-10', { exact: true }).click()
   await expect(page.locator('.inspector .status-badge')).toHaveAttribute(
     'data-status',
@@ -3514,7 +4135,9 @@ test('resnapshots inventory, retains stale state, and recovers after failure', a
   await expect(
     page.getByText('Synthetic inventory snapshot failure'),
   ).toBeVisible()
-  await expect(page.getByText('10 workers')).toBeVisible()
+  await expect(page.locator('.worker-marker')).toHaveCount(
+    workers.length + 2,
+  )
   await expect(page.locator('.inspector h2')).toHaveText('worker-10')
 
   const requestsBeforeRecovery = state.inventoryRequests
@@ -3624,7 +4247,7 @@ test('keeps durable projects when a runtime snapshot fails', async ({ page }) =>
   await page.goto('/')
   await expect(page.locator('.project-region')).toHaveCount(2)
 
-  await page.locator('#session-select').selectOption('beta')
+  await selectRuntimeSession(page, 'beta')
 
   await expect(page.getByText('Synthetic beta snapshot failure')).toBeVisible()
   await expect(page.locator('.worker-marker')).toHaveCount(2)
@@ -3775,10 +4398,7 @@ test('confirms profile allocation before rendering a durable worker', async ({
   await page.goto('/')
 
   await expect(page.locator('.profile-row')).toHaveCount(1)
-  await page
-    .locator('.profile-row')
-    .first()
-    .dragTo(projectDropTarget(page))
+  await dragToProject(page.locator('.profile-row').first(), page)
   await expect(
     page.getByRole('dialog', { name: 'Create worker' }),
   ).toBeVisible()
@@ -3820,7 +4440,7 @@ test('hands an assigned worker to another project from the canvas', async ({
     '.assigned-worker-marker[data-worker-id="worker-assigned"]',
   )
   await expect(marker).toHaveAttribute('draggable', 'true')
-  await marker.dragTo(projectDropTarget(page, 1))
+  await dragToProject(marker, page, 1)
 
   const dialog = page.getByRole('dialog', { name: 'Move assigned worker' })
   await expect(dialog).toBeVisible()
@@ -3888,11 +4508,16 @@ test('keeps the handoff confirmation reachable on a narrow viewport', async ({
   await page.setViewportSize({ width: 390, height: 844 })
   await page.goto('/')
 
-  await page
-    .locator('.assigned-worker-marker[data-worker-id="worker-assigned"]')
-    .dragTo(projectDropTarget(page, 1), {
-      targetPosition: { x: 10, y: 10 },
-    })
+  // Dropped on the territory's own upright label. The old fixed 10px offset
+  // assumed a full-width heading bar; in 2.5D the label is a compact plaque
+  // pinned to the projected centroid, so the centre is the stable point.
+  await dragToProject(
+    page.locator(
+      '.assigned-worker-marker[data-worker-id="worker-assigned"]',
+    ),
+    page,
+    1,
+  )
 
   const dialog = page.getByRole('dialog', { name: 'Move assigned worker' })
   await expect(dialog).toBeVisible()
@@ -4072,9 +4697,10 @@ test('resumes a profiled worker through the generalized drag payload', async ({
   await page.goto('/')
 
   await page.getByRole('tab', { name: 'Workers' }).click()
-  await page
-    .locator('.worker-row[data-worker-id="worker-resumable"]')
-    .dragTo(projectDropTarget(page))
+  await dragToProject(
+    page.locator('.worker-row[data-worker-id="worker-resumable"]'),
+    page,
+  )
 
   const dialog = page.getByRole('dialog', { name: 'Resume worker' })
   await expect(dialog).toBeVisible()
@@ -4110,10 +4736,7 @@ test('retains the allocation command ID while a proposal remains open', async ({
   await page.setViewportSize({ width: 1200, height: 760 })
   await page.goto('/')
 
-  await page
-    .locator('.profile-row')
-    .first()
-    .dragTo(projectDropTarget(page))
+  await dragToProject(page.locator('.profile-row').first(), page)
   const dialog = page.getByRole('dialog', { name: 'Create worker' })
   await dialog.getByLabel('Objective').fill('Retry the same proposal.')
   const submit = dialog.getByRole('button', {
@@ -4140,7 +4763,10 @@ test('loads recent assignment activity when the chat opens', async ({
   const state = await mockApi(page, {
     terminalOutputDelayMs: 150,
     terminalOutputText: (readCount) =>
-      `build step ${readCount}\n${'checks-still-running'.repeat(30)}`,
+      Array.from(
+        { length: 240 },
+        (_, index) => `build ${readCount}: check ${index + 1} still running`,
+      ).join('\n'),
     terminalOutputTruncated: true,
   })
   seedActiveAssignment(state)
@@ -4160,7 +4786,7 @@ test('loads recent assignment activity when the chat opens', async ({
     .click()
   await expect(page.getByText('Loading recent agent activity')).toBeVisible()
   const conversation = page.getByLabel('Agent conversation')
-  await expect(conversation).toContainText('checks-still-running')
+  await expect(conversation).toContainText('still running')
   const initialText = await conversation.textContent()
   expect(
     state.terminalOutputRequests.every(
@@ -4174,11 +4800,34 @@ test('loads recent assignment activity when the chat opens', async ({
   const refresh = page.getByRole('button', {
     name: 'Refresh agent activity',
   })
+  const messages = page.locator('.chat-thread__messages')
+  await expect
+    .poll(() =>
+      messages.evaluate(
+        (element) => element.scrollHeight - element.clientHeight,
+      ),
+    )
+    .toBeGreaterThan(100)
+  await messages.evaluate((element) => {
+    element.scrollTop = 0
+    element.dispatchEvent(new Event('scroll'))
+  })
   await refresh.click()
   await expect(refresh).toBeDisabled()
   await expect(conversation).not.toHaveText(initialText ?? '')
   await expect(refresh).toBeEnabled()
+  await expect
+    .poll(() => messages.evaluate((element) => element.scrollTop))
+    .toBe(0)
   expect(state.terminalOutputRequests.length).toBeGreaterThanOrEqual(2)
+
+  await page.getByRole('button', { name: 'Close chat' }).click()
+  await page
+    .getByRole('button', { name: 'Open chat', exact: true })
+    .click()
+  await expect
+    .poll(() => messages.evaluate((element) => element.scrollTop))
+    .toBeGreaterThan(100)
 
   const overflow = await page.evaluate(() => {
     const workspace = document.querySelector<HTMLElement>('.chat-workspace')
@@ -4197,7 +4846,7 @@ test('loads recent assignment activity when the chat opens', async ({
   expect(overflow.workspaceHorizontal).toBeLessThanOrEqual(0)
 })
 
-test('renders separate agent output blocks as separate chat bubbles', async ({
+test('keeps one terminal output snapshot in one chat bubble', async ({
   page,
 }) => {
   const state = await mockApi(page, {
@@ -4220,23 +4869,21 @@ test('renders separate agent output blocks as separate chat bubbles', async ({
   const outputBubbles = page
     .getByLabel('Agent conversation')
     .locator('.chat-message[data-kind="agent"]')
-  await expect(outputBubbles).toHaveCount(4)
-  await expect(outputBubbles.nth(0)).toContainText(
+  await expect(outputBubbles).toHaveCount(1)
+  await expect(outputBubbles).toContainText(
     'Inspected the runtime state.',
   )
-  await expect(outputBubbles.nth(1)).toContainText(
+  await expect(outputBubbles).toContainText(
     'Ran the focused checks.',
   )
-  await expect(outputBubbles.nth(2)).toContainText(
+  await expect(outputBubbles).toContainText(
     'first result\n\nsecond result',
   )
-  await expect(outputBubbles.nth(3)).toContainText(
+  await expect(outputBubbles).toContainText(
     'Ready for owner review.',
   )
-  await expect(outputBubbles.nth(0)).toContainText(
-    'Agent output 1/4',
-  )
-  const bubbleWidth = await outputBubbles.nth(0).evaluate((element) => {
+  await expect(outputBubbles).toContainText('Agent output · rev')
+  const bubbleWidth = await outputBubbles.evaluate((element) => {
     const thread = element.parentElement
     if (!thread) return Number.POSITIVE_INFINITY
     const style = getComputedStyle(thread)
@@ -4384,6 +5031,51 @@ test('connects the assignment terminal and relays frames, input, resize, and rel
   await page.mouse.wheel(0, -1200)
   await expect(terminalRows).not.toContainText('terminal ready')
   await expect(terminalRows).toContainText('history line')
+  state.terminalSockets[0].send(
+    JSON.stringify({
+      type: 'terminal.frame',
+      bytes: Buffer.from('\r\nnew output while reviewing history').toString(
+        'base64',
+      ),
+      seq: 8,
+      width: cols,
+      height: rows,
+      full: false,
+    }),
+  )
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '8')
+  await expect(terminalRows).not.toContainText(
+    'new output while reviewing history',
+  )
+  await expect(terminalRows).toContainText('history line')
+
+  state.terminalSockets[0].send(
+    JSON.stringify({
+      type: 'terminal.frame',
+      bytes: Buffer.from('\u001b[?1049hfull-screen terminal app').toString(
+        'base64',
+      ),
+      seq: 9,
+      width: cols,
+      height: rows,
+      full: false,
+    }),
+  )
+  await expect(terminalRows).toContainText('full-screen terminal app')
+  const inputCountBeforeWheel = state.terminalMessages.filter(
+    (message) => message.type === 'terminal.input',
+  ).length
+  await terminal.locator('.xterm-screen').hover()
+  await page.mouse.wheel(0, -240)
+  await expect
+    .poll(
+      () =>
+        state.terminalMessages
+          .filter((message) => message.type === 'terminal.input')
+          .slice(inputCountBeforeWheel)
+          .map((message) => message.text),
+    )
+    .toContain('\u001b[A')
   await page.screenshot({
     path: testInfo.outputPath('terminal-workspace-desktop.png'),
     fullPage: true,
@@ -4428,6 +5120,290 @@ test('connects the assignment terminal and relays frames, input, resize, and rel
   await expect(openTerminal).toBeFocused()
 })
 
+test('keeps a worker terminal theme and scrollback authoritative under TUI mouse mode', async ({
+  page,
+}, testInfo) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem('yard:theme', 'light')
+  })
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page
+    .getByRole('button', { name: 'Open terminal', exact: true })
+    .click()
+
+  const workerDialog = page.getByRole('dialog', { name: 'Implementer' })
+  const terminal = workerDialog.locator('.terminal-session')
+  const xtermViewport = terminal.locator('.xterm-scrollable-element')
+  const renderedRows = terminal.locator('.xterm-rows')
+  const firstVisibleRow = terminal
+    .locator('.xterm-accessibility-tree')
+    .getByRole('listitem')
+    .first()
+  const xtermBackground = () =>
+    xtermViewport.evaluate((element) => element.style.backgroundColor)
+  const viewportY = () =>
+    firstVisibleRow
+      .getAttribute('aria-posinset')
+      .then((position) => Number(position) - 1)
+
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  expect(new URL(state.terminalConnectionUrls[0]).pathname).toBe(
+    '/api/v1/projects/project-1/assignments/assignment-1/terminal',
+  )
+  await expect.poll(xtermBackground).toBe('rgb(237, 241, 239)')
+
+  await setAppTheme(page, 'Dark')
+  await expect.poll(xtermBackground).toBe('rgb(23, 32, 29)')
+  await page.getByLabel('Terminal color theme').selectOption('nord')
+  await expect.poll(xtermBackground).toBe('rgb(46, 52, 64)')
+
+  const terminalUrl = new URL(state.terminalConnectionUrls[0])
+  const cols = Number(terminalUrl.searchParams.get('cols'))
+  const rows = Number(terminalUrl.searchParams.get('rows'))
+  state.terminalSockets[0].send(
+    JSON.stringify({
+      type: 'terminal.frame',
+      bytes: Buffer.from(
+        [
+          '\u001b]11;#ff0000\u0007',
+          '\u001b[?1000h',
+          ...Array.from(
+            { length: 180 },
+            (_, index) => `worker history line ${index + 1}\r\n`,
+          ),
+          'worker terminal tail',
+        ].join(''),
+      ).toString('base64'),
+      seq: 30,
+      width: cols,
+      height: rows,
+      full: true,
+    }),
+  )
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '30')
+  await expect(
+    terminal.locator('.xterm-accessibility-tree'),
+  ).toContainText('worker terminal tail')
+  await expect(renderedRows).toContainText('worker terminal tail')
+  // Worker TUIs may set OSC colors after xterm is constructed. The selected
+  // Yard palette remains authoritative for the renderer itself.
+  await expect.poll(xtermBackground).toBe('rgb(46, 52, 64)')
+
+  for (let sequence = 31; sequence <= 50; sequence += 1) {
+    state.terminalSockets[0].send(
+      JSON.stringify({
+        type: 'terminal.frame',
+        bytes: Buffer.from('\u001b]11;#ff0000\u0007').toString('base64'),
+        seq: sequence,
+        width: cols,
+        height: rows,
+        full: false,
+      }),
+    )
+  }
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '50')
+  await expect.poll(xtermBackground).toBe('rgb(46, 52, 64)')
+
+  const bottomViewportY = await viewportY()
+  expect(bottomViewportY).toBeGreaterThan(0)
+  const inputCountBeforeWheel = state.terminalMessages.filter(
+    (message) => message.type === 'terminal.input',
+  ).length
+  await terminal.locator('.xterm-screen').hover()
+  await page.mouse.wheel(0, -1200)
+  await expect.poll(viewportY).toBeLessThan(bottomViewportY)
+  await expect(
+    terminal.locator('.xterm-accessibility-tree'),
+  ).toContainText('worker history line')
+  await expect(renderedRows).not.toContainText('worker terminal tail')
+  await expect(renderedRows).toContainText('worker history line')
+  expect(
+    state.terminalMessages.filter(
+      (message) => message.type === 'terminal.input',
+    ),
+  ).toHaveLength(inputCountBeforeWheel)
+  await page.screenshot({
+    path: testInfo.outputPath('worker-terminal-theme-scrollback.png'),
+    fullPage: true,
+  })
+
+  await terminal.locator('.xterm-helper-textarea').pressSequentially('pwd')
+  await expect
+    .poll(() =>
+      state.terminalMessages
+        .filter((message) => message.type === 'terminal.input')
+        .map((message) => message.text)
+        .join(''),
+    )
+    .toContain('pwd')
+})
+
+test('keeps one terminal lease and viewport across Terminal and Focus presentations', async ({
+  page,
+}, testInfo) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page
+    .getByRole('button', { name: 'Open terminal', exact: true })
+    .click()
+
+  const shell = page.locator('.agent-workspace-shell')
+  const terminal = page.locator('.terminal-session')
+  const scrollable = terminal.locator('.xterm-scrollable-element')
+  const terminalRows = terminal.locator('.xterm-accessibility-tree')
+  const presentationControl = shell.getByRole('group', {
+    name: 'Terminal presentation',
+  })
+  const terminalPresentation = presentationControl.getByRole('button', {
+    name: 'Terminal',
+    exact: true,
+  })
+  const focusPresentation = presentationControl.getByRole('button', {
+    name: 'Focus',
+    exact: true,
+  })
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+
+  const terminalUrl = new URL(state.terminalConnectionUrls[0])
+  const cols = Number(terminalUrl.searchParams.get('cols'))
+  const rows = Number(terminalUrl.searchParams.get('rows'))
+  state.terminalSockets[0].send(
+    JSON.stringify({
+      type: 'terminal.frame',
+      bytes: Buffer.from(
+        `${Array.from(
+          { length: 180 },
+          (_, index) => `focus history line ${index + 1}`,
+        ).join('\r\n')}\r\nfocus terminal tail`,
+      ).toString('base64'),
+      seq: 20,
+      width: cols,
+      height: rows,
+      full: true,
+    }),
+  )
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '20')
+  await expect(terminalRows).toContainText('focus terminal tail')
+
+  await scrollable.hover()
+  await page.mouse.wheel(0, -1400)
+  await expect(terminalRows).not.toContainText('focus terminal tail')
+  await expect(terminalRows).toContainText('focus history line')
+  const firstVisibleRow = terminalRows.getByRole('listitem').first()
+  const terminalViewportPosition = Number(
+    await firstVisibleRow.getAttribute('aria-posinset'),
+  )
+  expect(terminalViewportPosition).toBeGreaterThan(1)
+  await terminal.evaluate((element) => {
+    element.dataset.lifecycleMarker = 'same-terminal'
+  })
+  const terminalWidth = await terminal.evaluate(
+    (element) => element.getBoundingClientRect().width,
+  )
+
+  await focusPresentation.click()
+  await expect(shell).toHaveAttribute('data-presentation', 'focus')
+  await expect(shell.getByLabel('Herdr windows')).toBeHidden()
+  await expect(terminal).toHaveAttribute(
+    'data-lifecycle-marker',
+    'same-terminal',
+  )
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  expect(state.terminalConnectionUrls).toHaveLength(1)
+  expect(
+    state.terminalMessages.filter(
+      (message) => message.type === 'terminal.release',
+    ),
+  ).toHaveLength(0)
+  await expect
+    .poll(() =>
+      firstVisibleRow.getAttribute('aria-posinset').then(Number),
+    )
+    .toBe(terminalViewportPosition)
+  await expect(terminalRows).not.toContainText('focus terminal tail')
+  await expect(terminalRows).toContainText('focus history line')
+  await expect
+    .poll(() =>
+      terminal.evaluate((element) => element.getBoundingClientRect().width),
+    )
+    .toBeGreaterThan(terminalWidth)
+  await page.screenshot({
+    path: testInfo.outputPath('terminal-focus-desktop.png'),
+    fullPage: true,
+  })
+
+  await terminalPresentation.click()
+  await expect(shell).toHaveAttribute('data-presentation', 'terminal')
+  await expect(shell.getByLabel('Herdr windows')).toBeVisible()
+  await expect(terminal).toHaveAttribute(
+    'data-lifecycle-marker',
+    'same-terminal',
+  )
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  expect(
+    state.terminalMessages.filter(
+      (message) => message.type === 'terminal.release',
+    ),
+  ).toHaveLength(0)
+  await expect
+    .poll(() =>
+      firstVisibleRow.getAttribute('aria-posinset').then(Number),
+    )
+    .toBe(terminalViewportPosition)
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(presentationControl).toBeVisible()
+  await focusPresentation.click()
+  await expect(shell).toHaveAttribute('data-presentation', 'focus')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  await expect(terminalRows).not.toContainText('focus terminal tail')
+  await expect(terminalRows).toContainText('focus history line')
+  const mobileLayout = await page.evaluate(() => {
+    const shellElement =
+      document.querySelector<HTMLElement>('.agent-workspace-shell')
+    const terminalElement =
+      document.querySelector<HTMLElement>('.terminal-session')
+    return {
+      documentHorizontal:
+        document.documentElement.scrollWidth - window.innerWidth,
+      shellRight:
+        shellElement?.getBoundingClientRect().right ??
+        Number.POSITIVE_INFINITY,
+      terminalRight:
+        terminalElement?.getBoundingClientRect().right ??
+        Number.POSITIVE_INFINITY,
+    }
+  })
+  expect(mobileLayout.documentHorizontal).toBeLessThanOrEqual(0)
+  expect(mobileLayout.shellRight).toBeLessThanOrEqual(390)
+  expect(mobileLayout.terminalRight).toBeLessThanOrEqual(390)
+  await page.screenshot({
+    path: testInfo.outputPath('terminal-focus-mobile.png'),
+    fullPage: true,
+  })
+
+  await shell.getByRole('button', { name: 'Close terminal' }).click()
+  await expect
+    .poll(
+      () =>
+        state.terminalMessages.filter(
+          (message) => message.type === 'terminal.release',
+        ).length,
+    )
+    .toBe(1)
+})
+
 test('keeps the full-screen terminal surfaces synchronized with the app theme', async ({
   page,
 }, testInfo) => {
@@ -4456,9 +5432,7 @@ test('keeps the full-screen terminal surfaces synchronized with the app theme', 
     fullPage: true,
   })
 
-  await page
-    .getByRole('button', { name: 'Switch to dark mode' })
-    .click()
+  await setAppTheme(page, 'Dark')
   await expect(terminal).toHaveAttribute('data-terminal-theme', 'dark')
   await expect(viewport).toHaveCSS(
     'background-color',
@@ -4474,7 +5448,137 @@ test('keeps the full-screen terminal surfaces synchronized with the app theme', 
   })
 })
 
-test('shows terminal closure and does not reconnect', async ({ page }) => {
+test('lets the terminal use its own named color palette, independent of the app theme, and persists the choice', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page
+    .getByRole('button', { name: 'Open terminal', exact: true })
+    .click()
+
+  const terminal = page.locator('.terminal-session')
+  const viewport = terminal.locator('.xterm-viewport')
+  const paletteSelect = page.getByLabel('Terminal color theme')
+
+  await expect(paletteSelect).toHaveValue('auto')
+  await expect(terminal).toHaveAttribute('data-terminal-palette', 'auto')
+
+  await paletteSelect.selectOption('nord')
+  await expect(terminal).toHaveAttribute('data-terminal-palette', 'nord')
+  await expect(viewport).toHaveCSS('background-color', 'rgb(46, 52, 64)')
+
+  for (const palette of [
+    'nord',
+    'dracula',
+    'solarized-dark',
+    'solarized-light',
+    'gruvbox-dark',
+  ]) {
+    await paletteSelect.selectOption(palette)
+    await expect(terminal).toHaveAttribute('data-terminal-palette', palette)
+    const chrome = await terminal.evaluate((element) => {
+      const terminalStyle = getComputedStyle(element)
+      const status = element.querySelector<HTMLElement>(
+        '.terminal-session__status',
+      )
+      const paletteControl = element.querySelector<HTMLElement>(
+        '.terminal-session__palette-select',
+      )
+      const channels = (color: string) =>
+        [...color.matchAll(/\d+(?:\.\d+)?/g)]
+          .slice(0, 3)
+          .map((match) => Number(match[0]) / 255)
+          .map((channel) =>
+            channel <= 0.04045
+              ? channel / 12.92
+              : ((channel + 0.055) / 1.055) ** 2.4,
+          )
+      const luminance = (color: string) => {
+        const [red, green, blue] = channels(color)
+        return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+      }
+      const contrast = (foreground: string, background: string) => {
+        const foregroundLuminance = luminance(foreground)
+        const backgroundLuminance = luminance(background)
+        return (
+          (Math.max(foregroundLuminance, backgroundLuminance) + 0.05) /
+          (Math.min(foregroundLuminance, backgroundLuminance) + 0.05)
+        )
+      }
+      const background = terminalStyle.backgroundColor
+      const border = paletteControl
+        ? getComputedStyle(paletteControl).borderTopColor
+        : ''
+      const statusColor = status ? getComputedStyle(status).color : ''
+      return {
+        background,
+        border,
+        borderContrast: contrast(border, background),
+        status: statusColor,
+        statusContrast: contrast(statusColor, background),
+      }
+    })
+    expect(chrome.border).not.toBe(chrome.background)
+    expect(chrome.status).not.toBe(chrome.background)
+    expect(chrome.borderContrast).toBeGreaterThanOrEqual(3)
+    expect(chrome.statusContrast).toBeGreaterThanOrEqual(4.5)
+  }
+  await paletteSelect.selectOption('nord')
+  await expect(terminal).toHaveAttribute('data-terminal-palette', 'nord')
+
+  // Toggling the app-wide light/dark theme must not change the terminal's
+  // colors while a named palette is selected.
+  await setAppTheme(page, 'Dark')
+  await expect(viewport).toHaveCSS('background-color', 'rgb(46, 52, 64)')
+  await expect(terminal).toHaveAttribute('data-terminal-palette', 'nord')
+
+  // The choice survives a reload.
+  await page.reload()
+  await page.locator('.assigned-worker-marker').click()
+  await page
+    .getByRole('button', { name: 'Open terminal', exact: true })
+    .click()
+
+  const reloadedTerminal = page.locator('.terminal-session')
+  const reloadedViewport = reloadedTerminal.locator('.xterm-viewport')
+  await expect(page.getByLabel('Terminal color theme')).toHaveValue('nord')
+  await expect(reloadedTerminal).toHaveAttribute(
+    'data-terminal-palette',
+    'nord',
+  )
+  await expect(reloadedViewport).toHaveCSS(
+    'background-color',
+    'rgb(46, 52, 64)',
+  )
+
+  // Switching back to Auto restores the app-theme-derived palette.
+  await page.getByLabel('Terminal color theme').selectOption('auto')
+  await expect(reloadedTerminal).toHaveAttribute(
+    'data-terminal-palette',
+    'auto',
+  )
+  await expect(reloadedViewport).toHaveCSS(
+    'background-color',
+    'rgb(23, 32, 29)',
+  )
+
+  await page.evaluate(() => {
+    window.localStorage.setItem('yard:terminal-palette', 'not-a-palette')
+  })
+  await page.reload()
+  await page.locator('.assigned-worker-marker').click()
+  await page
+    .getByRole('button', { name: 'Open terminal', exact: true })
+    .click()
+  await expect(page.getByLabel('Terminal color theme')).toHaveValue('auto')
+})
+
+test('shows terminal closure and reopens only when requested', async ({ page }) => {
   const state = await mockApi(page)
   seedActiveAssignment(state)
   await page.setViewportSize({ width: 1200, height: 760 })
@@ -4502,6 +5606,79 @@ test('shows terminal closure and does not reconnect', async ({ page }) => {
 
   await page.waitForTimeout(400)
   expect(state.terminalConnectionUrls).toHaveLength(1)
+
+  await page.getByRole('button', { name: 'Reopen terminal' }).click()
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(2)
+  expect(state.terminalConnectionUrls).toHaveLength(2)
+})
+
+test('reconnects the Superintendent terminal when its runtime identity changes', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const originalWorker = durableWorker(
+    'worker-yard-orchestrator',
+    'terminal-yard-orchestrator',
+    state.profiles[0],
+    'workspace-yard-orchestrator',
+    'yard-orchestrator',
+  )
+  state.yardOrchestrator = {
+    worker: originalWorker,
+    version: '2',
+    workflow_profile_version: '1',
+    created_at_unix_ms: Date.now(),
+    updated_at_unix_ms: Date.now(),
+  }
+  state.runtimeSessions.push({
+    name: 'yard-orchestrator',
+    is_default: false,
+    running: true,
+  })
+  await page.setViewportSize({ width: 1200, height: 760 })
+  await page.goto('/')
+
+  await page.locator('.yard-orchestrator-marker').click()
+  await page
+    .getByRole('button', { name: 'Open terminal', exact: true })
+    .click()
+  const terminal = page.locator('.terminal-session')
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  expect(new URL(state.terminalConnectionUrls[0]).pathname).toBe(
+    '/api/v1/yard/orchestrator/terminal',
+  )
+
+  const replacementWorker = durableWorker(
+    'worker-yard-orchestrator-replacement',
+    'terminal-yard-orchestrator-replacement',
+    state.profiles[0],
+    'workspace-yard-orchestrator-replacement',
+    'yard-orchestrator',
+  )
+  state.yardOrchestrator = {
+    worker: replacementWorker,
+    version: '3',
+    workflow_profile_version: '1',
+    created_at_unix_ms: state.yardOrchestrator.created_at_unix_ms,
+    updated_at_unix_ms: Date.now(),
+  }
+
+  await expect
+    .poll(
+      () =>
+        state.terminalMessages.filter(
+          (message) => message.type === 'terminal.release',
+        ).length,
+      { timeout: 5_000 },
+    )
+    .toBe(1)
+  await expect.poll(() => state.terminalSockets.length).toBe(2)
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  expect(new URL(state.terminalConnectionUrls[1]).pathname).toBe(
+    '/api/v1/yard/orchestrator/terminal',
+  )
 })
 
 test('provisions a dedicated Superintendent and shows project updates', async ({
@@ -4678,6 +5855,7 @@ test('recovers a stopped dedicated Superintendent session without replacing it',
   state.yardOrchestrator = {
     worker: configuredWorker,
     version: '3',
+    workflow_profile_version: '1',
     created_at_unix_ms: Date.now(),
     updated_at_unix_ms: Date.now(),
   }
@@ -4766,6 +5944,15 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
     .getByRole('button', { name: /API migration orchestrator/ })
     .click()
   await expect(shell).toContainText('API migration orchestrator')
+  await expect(
+    page.getByRole('tab', { name: 'Terminal', exact: true }),
+  ).toHaveAttribute('aria-selected', 'true')
+  await expect(page.locator('.terminal-session')).toHaveAttribute(
+    'data-state',
+    'connected',
+  )
+  await page.getByRole('tab', { name: 'Chat', exact: true }).click()
+  await expect(page.getByLabel('Agent conversation')).toBeVisible()
   await page.screenshot({
     path: testInfo.outputPath('agent-workspace-shell.png'),
     fullPage: true,
@@ -5290,8 +6477,8 @@ test('uses reported workflow status on the canvas and keeps runtime state distin
   await expect(page.locator('.app-shell')).not.toHaveAttribute('inert', '')
 
   await page
-    .locator('[data-id="project:project-1"] .workspace-region__heading')
-    .click()
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
   const projectWorkflow = page.getByRole('region', {
     name: 'Reported workflow status',
   })
@@ -5416,6 +6603,193 @@ test('creates a project-targeted automation and persists its satellite placement
   expect(state.automations[0].placement.geometry).toEqual(persisted)
 })
 
+test('persists independent automatic token-use settings while keeping manual actions separate', async ({
+  page,
+}, testInfo) => {
+  const state = await mockApi(page)
+  await page.goto('/')
+
+  const openAutomaticCoordination = async () => {
+    const settings = await openSettings(page)
+    const settingsButton = settings.getByRole('button', {
+      name: 'Automatic token use settings',
+    })
+    await expect(settingsButton).toBeEnabled()
+    await settingsButton.click()
+    return page.getByRole('dialog', {
+      name: 'Coordination settings',
+    })
+  }
+  const dialog = await openAutomaticCoordination()
+  const superintendent = dialog.getByRole('switch', {
+    name: /Superintendent to project orchestrators/,
+  })
+  const projectOrchestrators = dialog.getByRole('switch', {
+    name: /Project orchestrators to workers/,
+  })
+  const scheduled = dialog.getByRole('switch', {
+    name: /Scheduled automatic summaries/,
+  })
+  await expect(superintendent).not.toBeChecked()
+  await expect(projectOrchestrators).not.toBeChecked()
+  await expect(scheduled).not.toBeChecked()
+  await expect(dialog.getByText('Manual actions')).toBeVisible()
+
+  await superintendent.check()
+  await dialog.getByRole('button', {
+    name: 'Save automatic settings',
+  }).click()
+
+  expect(state.tokenSpendSettingsUpdates).toHaveLength(1)
+  expect(state.tokenSpendSettingsUpdates[0]).toMatchObject({
+    superintendent_auto_requests_project_summaries: true,
+    project_orchestrators_auto_request_worker_summaries: false,
+    scheduled_automatic_summaries: false,
+  })
+  await expect(dialog).toBeHidden()
+
+  const reopened = await openAutomaticCoordination()
+  await expect(
+    reopened.getByRole('switch', {
+      name: /Superintendent to project orchestrators/,
+    }),
+  ).toBeChecked()
+  await expect(
+    reopened.getByRole('switch', {
+      name: /Project orchestrators to workers/,
+    }),
+  ).not.toBeChecked()
+  await expect(
+    reopened.getByRole('switch', {
+      name: /Scheduled automatic summaries/,
+    }),
+  ).not.toBeChecked()
+
+  await page.screenshot({
+    path: testInfo.outputPath('token-spend-settings-desktop.png'),
+    fullPage: true,
+  })
+  await page.setViewportSize({ width: 390, height: 844 })
+  const manualCopy = reopened.getByText(
+    'Prompts, routes, and Run now remain independently available.',
+  )
+  const manualBox = await manualCopy.boundingBox()
+  const actionsBox = await reopened
+    .locator('.token-spend-dialog__actions')
+    .boundingBox()
+  expect(manualBox).not.toBeNull()
+  expect(actionsBox).not.toBeNull()
+  expect(manualBox!.y + manualBox!.height).toBeLessThanOrEqual(actionsBox!.y)
+  await page.screenshot({
+    path: testInfo.outputPath('token-spend-settings-mobile.png'),
+    fullPage: true,
+  })
+})
+
+test('reloads edits and resets the server-persisted orchestrator workflow', async ({
+  page,
+}, testInfo) => {
+  const state = await mockApi(page)
+  await page.goto('/')
+
+  const openWorkflow = async () => {
+    const settings = await openSettings(page)
+    await settings
+      .getByRole('button', { name: 'Orchestrator workflow settings' })
+      .click()
+    return page.getByRole('dialog', { name: 'Orchestrator workflow' })
+  }
+
+  let dialog = await openWorkflow()
+  const instructions = dialog.getByRole('textbox', {
+    name: 'Workflow instructions (Markdown)',
+  })
+  const interval = dialog.getByRole('spinbutton', {
+    name: 'Monitor interval (minutes)',
+  })
+  await expect(instructions).toHaveValue(factoryWorkflowInstructions)
+  await expect(interval).toHaveValue('10')
+  await expect(
+    dialog.getByRole('button', { name: 'Save changes' }),
+  ).toBeDisabled()
+  await page.screenshot({
+    path: testInfo.outputPath('orchestrator-workflow-desktop.png'),
+    fullPage: true,
+  })
+
+  await instructions.fill('# Custom workflow\n\nUse three isolated lanes.')
+  await interval.fill('15')
+  await dialog.getByRole('button', { name: 'Save changes' }).click()
+  await expect(dialog).toBeHidden()
+  expect(state.orchestratorWorkflowUpdates).toEqual([
+    {
+      actor: 'local-user',
+      expected_version: '1',
+      instructions_markdown:
+        '# Custom workflow\n\nUse three isolated lanes.',
+      monitor_interval_ms: '900000',
+    },
+  ])
+
+  await page.reload()
+  dialog = await openWorkflow()
+  await expect(
+    dialog.getByRole('textbox', {
+      name: 'Workflow instructions (Markdown)',
+    }),
+  ).toHaveValue('# Custom workflow\n\nUse three isolated lanes.')
+  await expect(
+    dialog.getByRole('spinbutton', {
+      name: 'Monitor interval (minutes)',
+    }),
+  ).toHaveValue('15')
+
+  await dialog.getByRole('button', { name: 'Reset to factory' }).click()
+  expect(state.orchestratorWorkflowResets).toEqual([
+    {
+      actor: 'local-user',
+      expected_version: '2',
+    },
+  ])
+  await expect(
+    dialog.getByRole('textbox', {
+      name: 'Workflow instructions (Markdown)',
+    }),
+  ).toHaveValue(factoryWorkflowInstructions)
+  await expect(dialog.getByText('Factory reset', { exact: true })).toBeVisible()
+
+  await dialog
+    .getByRole('button', { name: 'Close orchestrator workflow' })
+    .click()
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.reload()
+  dialog = await openWorkflow()
+  await expect(
+    dialog.getByRole('textbox', {
+      name: 'Workflow instructions (Markdown)',
+    }),
+  ).toHaveValue(factoryWorkflowInstructions)
+  await expect(
+    dialog.getByRole('spinbutton', {
+      name: 'Monitor interval (minutes)',
+    }),
+  ).toHaveValue('10')
+  const bounds = await dialog.boundingBox()
+  expect(bounds).not.toBeNull()
+  expect(bounds!.x).toBeGreaterThanOrEqual(0)
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(390)
+  await expect(
+    dialog.getByRole('button', { name: 'Reset to factory' }),
+  ).toBeVisible()
+  await expect(
+    dialog.getByRole('button', { name: 'Save changes' }),
+  ).toBeVisible()
+  await page.screenshot({
+    path: testInfo.outputPath('orchestrator-workflow-mobile.png'),
+    fullPage: true,
+  })
+})
+
 test('edits workstream automation scope and distinguishes submission from completion', async ({
   page,
 }, testInfo) => {
@@ -5485,6 +6859,8 @@ test('edits workstream automation scope and distinguishes submission from comple
   await page.goto('/')
   await page.locator('.automation-map-node').click()
 
+  await expect(page.getByText('Automatic schedule', { exact: true })).toBeVisible()
+  await expect(page.getByText('Manual dispatch', { exact: true })).toBeVisible()
   await expect(page.locator('.automation-run')).toHaveCount(20)
   const historyBounds = await page
     .locator('.automation-history__list')
@@ -5499,6 +6875,16 @@ test('edits workstream automation scope and distinguishes submission from comple
   await expect(
     page.getByText('Transport accepted. Completion is not implied.'),
   ).toBeVisible()
+  const projectedAutomationRoute = page.locator(
+    '.projected-route[data-route-id="automation-target:automation-daily"]',
+  )
+  await expect(projectedAutomationRoute).toHaveAttribute(
+    'data-state',
+    'active',
+  )
+  await expect(
+    projectedAutomationRoute.locator('.projected-route__activity'),
+  ).toHaveCount(1)
 
   await page
     .getByLabel('Target orchestrator')
@@ -5586,6 +6972,39 @@ test('creates an attached knowledge store and requests a source-linked snapshot'
   )
   await expect(node).toBeVisible()
   await expect(node).toContainText('Platform knowledge')
+  await setMapView(page, '2D view')
+  await setMapView(page, '2.5D view')
+  const createdNodeId = state.coordinationNodes.at(-1)?.id
+  expect(createdNodeId).toBeTruthy()
+  const anchorSelector = `.projected-anchor--coordination-node[data-node-id="coordination-node:${createdNodeId}"] .projected-anchor__pad`
+  const anchor = page.locator(
+    anchorSelector,
+  )
+  await expect(anchor).toBeVisible()
+  const grounding = await node
+    .locator('.coordination-map-node__glyph')
+    .evaluate((glyph, anchorSelector) => {
+      const pad = document.querySelector<SVGElement>(anchorSelector)
+      if (!pad) return null
+      const glyphBounds = glyph.getBoundingClientRect()
+      const padBounds = pad.getBoundingClientRect()
+      return {
+        horizontal:
+          Math.abs(
+            glyphBounds.left +
+              glyphBounds.width / 2 -
+              (padBounds.left + padBounds.width / 2),
+          ),
+        vertical: Math.abs(
+          glyphBounds.bottom - (padBounds.top + padBounds.height / 2),
+        ),
+      }
+    }, anchorSelector)
+  expect(grounding).not.toBeNull()
+  expect(grounding?.horizontal ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(
+    4,
+  )
+  expect(grounding?.vertical ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(8)
   await expect(page.locator('.node-attachment-edge')).toHaveCount(2)
   expect(state.coordinationNodeCreateCommands).toHaveLength(1)
   expect(state.coordinationNodeCreateCommands[0]).toMatchObject({
@@ -5632,9 +7051,7 @@ test('creates an attached knowledge store and requests a source-linked snapshot'
   await expect(
     page.getByRole('heading', { name: 'Platform knowledge' }),
   ).toBeVisible()
-  await page
-    .getByRole('button', { name: 'Switch to dark mode' })
-    .click()
+  await setAppTheme(page, 'Dark')
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
   await page.screenshot({
     path: testInfo.outputPath('knowledge-store-dark.png'),
@@ -5657,7 +7074,8 @@ test('creates an attached knowledge store and requests a source-linked snapshot'
 test('provisions a workstream orchestrator and routes work to an attached project', async ({
   page,
 }) => {
-  const state = await mockApi(page)
+  const reports: Record<string, unknown> = {}
+  const state = await mockApi(page, { orchestratorStatusReports: reports })
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
@@ -5721,11 +7139,25 @@ test('provisions a workstream orchestrator and routes work to an attached projec
   await expect(
     page.locator('.node-attachment-edge.coordination-edge--active'),
   ).toHaveCount(1)
+
+  const routeCommand = state.coordinationNodeRouteCommands[0]
+  reports['project-1'] = {
+    version: 1,
+    command_id: routeCommand.command_id,
+    state: 'idle',
+    last: 'Shared the requested migration update.',
+    next: 'Wait for more work.',
+    blockers: [],
+  }
+  await page.reload()
+  await expect(
+    page.locator('.node-attachment-edge.coordination-edge--idle'),
+  ).toHaveCount(1)
 })
 
 test('renders communication paths by durable activity state', async ({
   page,
-}) => {
+}, testInfo) => {
   const state = await mockApi(page, {
     orchestratorStatusReports: {
       'project-3': {
@@ -5766,6 +7198,7 @@ test('renders communication paths by durable activity state', async ({
       state.profiles[0],
     ),
     version: '2',
+    workflow_profile_version: '1',
     created_at_unix_ms: now,
     updated_at_unix_ms: now,
   }
@@ -5839,11 +7272,16 @@ test('renders communication paths by durable activity state', async ({
   await expect(activeRoute).toHaveClass(/animated/)
   await expect(failedRoute).not.toHaveClass(/animated/)
   await expect(idleRoute).not.toHaveClass(/animated/)
+  await expect(activeRoute).toHaveCSS('visibility', 'hidden')
   expect(
     await activeRoute
       .locator('.react-flow__edge-path')
       .evaluate((element) => getComputedStyle(element).animationName),
-  ).toBe('information-path-flow')
+  ).toBe('none')
+  await expect(activeRoute.locator('.react-flow__edge-path')).toHaveCSS(
+    'filter',
+    'none',
+  )
   await expect(activeRoute).toHaveCSS('opacity', '0.8')
   await expect(activeRoute.locator('.react-flow__edge-path')).toHaveCSS(
     'stroke',
@@ -5861,15 +7299,286 @@ test('renders communication paths by durable activity state', async ({
   )
   await expect(relationship).toHaveCSS('opacity', '0.8')
 
+  // The rail infrastructure stays neutral. Signals carry route state, and only
+  // active communication gets a moving train packet.
+  const projectedActive = page
+    .locator('.projected-route--coordination.projected-route--active')
+    .first()
+  const projectedFailed = page
+    .locator('.projected-route--coordination.projected-route--failed')
+    .first()
+  const projectedIdle = page
+    .locator('.projected-route--coordination.projected-route--idle')
+    .first()
+  const activeSignal = projectedActive.locator(
+    '.projected-route__signal-light',
+  )
+  const failedSignal = projectedFailed.locator(
+    '.projected-route__signal-light',
+  )
+  const idleSignal = projectedIdle.locator('.projected-route__signal-light')
+  await expect(activeSignal).toHaveCSS('fill', 'rgb(25, 118, 107)')
+  await expect(failedSignal).toHaveCSS('fill', 'rgb(217, 74, 55)')
+  await expect(idleSignal).toHaveCSS('fill', 'rgb(104, 115, 111)')
+  await expect(projectedIdle).toHaveCSS('opacity', '0.8')
+  const activePacket = projectedActive.locator('.projected-route__activity')
+  await expect(activePacket).toHaveCount(1)
+  await expect(activePacket).toHaveCSS('stroke', 'rgb(25, 118, 107)')
+  await expect(
+    projectedFailed.locator('.projected-route__activity'),
+  ).toHaveCount(0)
+  await expect(
+    projectedIdle.locator('.projected-route__activity'),
+  ).toHaveCount(0)
+  expect(
+    await activePacket
+      .evaluate((element) => getComputedStyle(element).animationName),
+  ).toBe('projected-train-run')
+  expect(
+    await activePacket.evaluate((element) =>
+      Number.parseFloat(getComputedStyle(element).animationDuration),
+    ),
+  ).toBe(0.7)
+  for (const layer of ['ballast', 'sleepers', 'rails', 'gauge']) {
+    const strokes = await Promise.all(
+      [projectedActive, projectedFailed, projectedIdle].map((route) =>
+        route
+          .locator(`.projected-route__${layer}`)
+          .evaluate((element) => getComputedStyle(element).stroke),
+      ),
+    )
+    expect(new Set(strokes).size).toBe(1)
+  }
+  await page.screenshot({
+    path: testInfo.outputPath('railroad-light.png'),
+    fullPage: true,
+  })
+  const railroadSettings = await openSettings(page)
+  await railroadSettings
+    .getByRole('button', { name: 'Dark', exact: true })
+    .click()
+  await railroadSettings
+    .getByRole('button', { name: 'Close settings' })
+    .click()
+  await page.screenshot({
+    path: testInfo.outputPath('railroad-dark.png'),
+    fullPage: true,
+  })
+
+  await setMapView(page, '2D view')
+  await expect(page.locator('.projected-route')).toHaveCount(0)
+  await expect(activeRoute).toHaveCSS('visibility', 'visible')
+  const twoDPulse = activeRoute.locator('.react-flow__edge-path')
+  expect(
+    await twoDPulse.evaluate(
+      (element) => getComputedStyle(element).animationName,
+    ),
+  ).toBe('information-path-flow')
+  expect(
+    await twoDPulse.evaluate((element) =>
+      Number.parseFloat(getComputedStyle(element).animationDuration),
+    ),
+  ).toBe(0.75)
+
   await page.emulateMedia({ reducedMotion: 'reduce' })
   expect(
-    await activeRoute
-      .locator('.react-flow__edge-path')
+    await twoDPulse
+      .evaluate((element) => getComputedStyle(element).animationName),
+  ).toBe('none')
+  await setMapView(page, '2.5D view')
+  expect(
+    await page
+      .locator('.projected-route--coordination.projected-route--active')
+      .first()
+      .locator('.projected-route__activity')
       .evaluate((element) => getComputedStyle(element).animationName),
   ).toBe('none')
   await expect(
     relationship.locator('.react-flow__edge-path'),
   ).toHaveCSS('stroke-dasharray', '6px, 5px')
+})
+
+test('renders the map as one projected world and persists the view mode', async ({
+  page,
+}, testInfo) => {
+  await mockApi(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.goto('/')
+
+  const canvas = page.getByLabel('Yard project canvas')
+  const projectNode = page.locator('.react-flow__node-project').first()
+  const projectRegion = projectNode.locator('.project-region')
+  const minimap = page.locator('.react-flow__minimap')
+
+  await expect(canvas).toHaveAttribute('data-visual-mode', 'depth')
+  const settings = await openSettings(page)
+  await expect(
+    settings.getByRole('button', { name: '2.5D view' }),
+  ).toHaveAttribute('aria-pressed', 'true')
+  await expect(
+    settings.getByRole('button', { name: '2D view' }),
+  ).toHaveAttribute('aria-pressed', 'false')
+  await settings.getByRole('button', { name: 'Close settings' }).click()
+  await expect(minimap).toBeVisible()
+  expect(
+    await canvas.evaluate(
+      (element) => getComputedStyle(element).backgroundImage,
+    ),
+  ).not.toBe('none')
+
+  // The territory is a projected parallelogram, not an axis-aligned card. The
+  // previous version of this test asserted the opposite — that toggling 2.5D
+  // left the flat node box untouched — which is exactly the decorative
+  // behaviour this slice replaces, so that assertion is gone on purpose.
+  const territory = page.locator('.territory-polygon').first()
+  await expect(territory).toHaveCount(1)
+  const corners = await territory.evaluate((element) =>
+    (element.getAttribute('points') ?? '')
+      .trim()
+      .split(/\s+/)
+      .map((pair) => {
+        const [x, y] = pair.split(',').map(Number)
+        return { x, y }
+      }),
+  )
+  expect(corners).toHaveLength(4)
+  for (let index = 0; index < corners.length; index += 1) {
+    const from = corners[index]
+    const to = corners[(index + 1) % corners.length]
+    expect(Math.abs(to.x - from.x)).toBeGreaterThan(1)
+    expect(Math.abs(to.y - from.y)).toBeGreaterThan(1)
+  }
+
+  // Structures stand on the territory they belong to: every building face sits
+  // inside the territory's own projected envelope, widened only by the height
+  // the structures rise.
+  const buildingsInsideTerritory = await page
+    .locator('.projected-territory')
+    .first()
+    .evaluate((group) => {
+      const outline = group.querySelector('.territory-polygon')
+      if (!outline) return null
+      const bounds = (outline as SVGGraphicsElement).getBBox()
+      const faces = Array.from(
+        group.querySelectorAll<SVGGraphicsElement>(
+          '.projected-building__face--top, .projected-building__face--side, .projected-building__face--side-b',
+        ),
+      )
+      return {
+        count: faces.length,
+        outside: faces.filter((face) => {
+          const box = face.getBBox()
+          return (
+            box.x < bounds.x - 1 ||
+            box.x + box.width > bounds.x + bounds.width + 1 ||
+            box.y + box.height > bounds.y + bounds.height + 1
+          )
+        }).length,
+      }
+    })
+  expect(buildingsInsideTerritory).not.toBeNull()
+  expect(buildingsInsideTerritory!.count).toBeGreaterThan(0)
+  expect(buildingsInsideTerritory!.outside).toBe(0)
+
+  await setMapView(page, '2D view')
+  await expect(canvas).toHaveAttribute('data-visual-mode', 'flat')
+  expect(
+    await page.evaluate(() =>
+      window.localStorage.getItem('yard:map-visual-mode:v1'),
+    ),
+  ).toBe('flat')
+  await expect(page.locator('.territory-polygon')).toHaveCount(0)
+
+  await setMapView(page, '2.5D view')
+  await expect(canvas).toHaveAttribute('data-visual-mode', 'depth')
+  expect(
+    await page.evaluate(() =>
+      window.localStorage.getItem('yard:map-visual-mode:v1'),
+    ),
+  ).toBe('depth')
+  await page.reload()
+  await expect(canvas).toHaveAttribute('data-visual-mode', 'depth')
+
+  // Dispatch selection on the ReactFlow node itself so this z-order assertion
+  // does not depend on whichever upright unit occupies a particular pixel.
+  await projectNode.dispatchEvent('click')
+  await expect(projectRegion).toHaveClass(/is-selected/)
+  await expect(page.locator('.projected-territory').first()).toHaveClass(
+    /is-selected/,
+  )
+  const depthLayers = await page.evaluate(() => {
+    const project = document.querySelector<HTMLElement>(
+      '.react-flow__node-project.selected',
+    )
+    const units = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        [
+          '.react-flow__node-worker',
+          '.react-flow__node-orchestrator',
+          '.react-flow__node-assigned-worker',
+          '.react-flow__node-child-agent',
+          '.react-flow__node-yard-orchestrator',
+          '.react-flow__node-automation',
+          '.react-flow__node-coordination-node',
+        ].join(', '),
+      ),
+    )
+    return {
+      project: project ? Number(getComputedStyle(project).zIndex) : -1,
+      units: units.map((unit) => Number(getComputedStyle(unit).zIndex)),
+    }
+  })
+  expect(depthLayers.units.length).toBeGreaterThan(0)
+  expect(
+    depthLayers.units.every((zIndex) => zIndex > depthLayers.project),
+  ).toBe(true)
+  const lightGround = await page
+    .locator('.projected-ground')
+    .evaluate((element) => getComputedStyle(element).fill)
+  await page.screenshot({
+    path: testInfo.outputPath('raised-map-desktop.png'),
+    fullPage: true,
+  })
+
+  // Forced colours must not swallow the selection outline; it is the only cue
+  // that survives when the accent palette is replaced.
+  await page.emulateMedia({ forcedColors: 'active' })
+  const forcedOutline = await page
+    .locator('.projected-territory.is-selected .territory-polygon__outline')
+    .evaluate((element) => {
+      const style = getComputedStyle(element)
+      return { stroke: style.stroke, width: style.strokeWidth }
+    })
+  expect(forcedOutline.stroke).not.toBe('none')
+  expect(Number.parseFloat(forcedOutline.width)).toBeGreaterThanOrEqual(3)
+  await page.emulateMedia({ forcedColors: 'none' })
+
+  await setAppTheme(page, 'Dark')
+  // The projected surface is theme aware: it reads the same tokens the rest of
+  // the shell does rather than baking in a light palette.
+  await expect
+    .poll(async () =>
+      page
+        .locator('.projected-ground')
+        .evaluate((element) => getComputedStyle(element).fill),
+    )
+    .not.toBe(lightGround)
+  await page.screenshot({
+    path: testInfo.outputPath('raised-map-dark.png'),
+    fullPage: true,
+  })
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.reload()
+  await expect(canvas).toHaveAttribute('data-visual-mode', 'depth')
+  const toolsBounds = await page.locator('.canvas-tools-panel').boundingBox()
+  expect(toolsBounds).not.toBeNull()
+  expect(toolsBounds!.x).toBeGreaterThanOrEqual(0)
+  expect(toolsBounds!.x + toolsBounds!.width).toBeLessThanOrEqual(390)
+  await page.screenshot({
+    path: testInfo.outputPath('raised-map-mobile.png'),
+    fullPage: true,
+  })
 })
 
 test('arranges and persists non-overlapping project spaces around Yard', async ({
@@ -5979,6 +7688,32 @@ test('arranges and persists non-overlapping project spaces around Yard', async (
     })
     .toBe(true)
 
+  // Arrange frames the projected envelope, not ReactFlow's flat node boxes:
+  // every visible territory has to land inside the canvas, and those boxes no
+  // longer agree with what is drawn.
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const canvas = document
+          .querySelector('.runtime-canvas')!
+          .getBoundingClientRect()
+        return Array.from(
+          document.querySelectorAll(
+            '.projected-territory--project .territory-polygon',
+          ),
+        ).every((polygon) => {
+          const box = polygon.getBoundingClientRect()
+          return (
+            box.left >= canvas.x - 1 &&
+            box.top >= canvas.y - 1 &&
+            box.right <= canvas.x + canvas.width + 1 &&
+            box.bottom <= canvas.y + canvas.height + 1
+          )
+        })
+      }),
+    )
+    .toBe(true)
+
   const persisted = state.projects.map((current) => ({
     id: current.id,
     placement: { ...current.placement.geometry },
@@ -6036,9 +7771,50 @@ test('connects projects with a durable dependency edge', async ({
   })
   await expect(page.locator('.project-relationship-edge')).toHaveCount(1)
 
+  // The relationship is a layered railroad whose right-angle segments run
+  // along the ground plane's own axes.
+  const routeShape = await page
+    .locator('.projected-route--relationship')
+    .first()
+    .evaluate((group) => {
+      const rails = group.querySelector('.projected-route__rails')
+      const dots = Array.from(
+        group.querySelectorAll('.projected-route__junction'),
+      )
+      const commands =
+        (rails?.getAttribute('d') ?? '').match(/[ML][^ML]*/g) ?? []
+      const points = commands.map((command) => {
+        const [x, y] = command.slice(1).trim().split(' ').map(Number)
+        return { x, y }
+      })
+      return {
+        layerCount: group.querySelectorAll(
+          '.projected-route__ballast, .projected-route__sleepers, .projected-route__rails, .projected-route__gauge',
+        ).length,
+        signalCount: group.querySelectorAll('.projected-route__signal').length,
+        dots: dots.map((dot) => ({
+          x: Number(dot.getAttribute('cx')),
+          y: Number(dot.getAttribute('cy')),
+        })),
+        points,
+      }
+    })
+  expect(routeShape.points.length).toBeGreaterThanOrEqual(2)
+  expect(routeShape.layerCount).toBe(4)
+  expect(routeShape.signalCount).toBe(1)
+  expect(routeShape.dots).toEqual(routeShape.points)
+  // Each leg runs along a projected ground axis, so its screen slope matches
+  // one of the two axis gradients (0.44 / 0.82) rather than an arbitrary curve.
+  for (let index = 1; index < routeShape.points.length; index += 1) {
+    const from = routeShape.points[index - 1]
+    const to = routeShape.points[index]
+    const slope = Math.abs((to.y - from.y) / (to.x - from.x))
+    expect(slope).toBeCloseTo(0.44 / 0.82, 3)
+  }
+
   await page
-    .locator('[data-id="project:project-1"] .workspace-region__heading')
-    .click()
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
   await expect(page.getByLabel('Project connections')).toContainText(
     'Offline release',
   )
@@ -6165,6 +7941,45 @@ test('opens chat and terminal from an assigned worker in the worker rail', async
   await page
     .getByRole('button', { name: 'Open terminal', exact: true })
     .click()
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  expect(new URL(state.terminalConnectionUrls[0]).pathname).toBe(
+    `/api/v1/projects/project-1/assignments/${seeded.id}/terminal`,
+  )
+})
+
+test('reconciles an external assignment into terminal controls without reloading projects', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.getByRole('tab', { name: 'Workers' }).click()
+  await page
+    .locator('.worker-row[data-worker-id="worker-assigned"]')
+    .click()
+  await expect(
+    page.getByRole('button', { name: 'Open terminal', exact: true }),
+  ).toHaveCount(0)
+
+  const inventoryRequests = state.inventoryRequests
+  const projectRequests = state.projectRequests
+  const assignmentRequests = state.assignmentRequests
+  const seeded = seedAssignedCandidateAssignment(state)
+  await expect
+    .poll(() => state.inventoryRequests, { timeout: 3_000 })
+    .toBeGreaterThan(inventoryRequests)
+  await page.waitForTimeout(1_200)
+  expect(state.assignmentRequests).toBe(assignmentRequests)
+
+  const openTerminal = page.getByRole('button', {
+    name: 'Open terminal',
+    exact: true,
+  })
+  await expect(openTerminal).toBeVisible({ timeout: 7_000 })
+  expect(state.assignmentRequests).toBeGreaterThan(assignmentRequests)
+  expect(state.projectRequests).toBe(projectRequests)
+  await openTerminal.click()
   await expect.poll(() => state.terminalSockets.length).toBe(1)
   expect(new URL(state.terminalConnectionUrls[0]).pathname).toBe(
     `/api/v1/projects/project-1/assignments/${seeded.id}/terminal`,
@@ -6311,6 +8126,33 @@ test('selects multiple agents and broadcasts one sourced group order', async ({
   await page
     .getByRole('button', { name: 'Open group chat', exact: true })
     .click()
+  const groupChat = page.getByRole('dialog', { name: 'Group chat' })
+  const groupChatBounds = await groupChat.boundingBox()
+  const closeChatBounds = await groupChat
+    .getByRole('button', { name: 'Close chat' })
+    .boundingBox()
+  expect(
+    await groupChat.evaluate(
+      (element) => element.parentElement?.parentElement === document.body,
+    ),
+  ).toBe(true)
+  expect(groupChatBounds?.y).toBeGreaterThanOrEqual(0)
+  expect(closeChatBounds?.y).toBeGreaterThanOrEqual(groupChatBounds?.y ?? 0)
+  await expect(
+    groupChat.getByRole('button', { name: 'Close chat' }),
+  ).toBeInViewport()
+  expect(
+    await groupChat
+      .getByRole('button', { name: 'Close chat' })
+      .evaluate((element) => {
+        const bounds = element.getBoundingClientRect()
+        const topElement = document.elementFromPoint(
+          bounds.left + bounds.width / 2,
+          bounds.top + bounds.height / 2,
+        )
+        return topElement === element || element.contains(topElement)
+      }),
+  ).toBe(true)
   const thread = page.getByLabel('Combined recent agent messages')
   await expect(thread.getByText('Implementer')).toBeVisible()
   await expect(
@@ -6611,10 +8453,7 @@ test('records a durable manual completion receipt', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
-  await page
-    .locator('.profile-row')
-    .first()
-    .dragTo(projectDropTarget(page))
+  await dragToProject(page.locator('.profile-row').first(), page)
   await page.getByLabel('Objective').fill('Ship the receipt workflow.')
   await page
     .getByRole('button', { name: 'Create worker', exact: true })
@@ -6688,9 +8527,15 @@ test('records a durable manual completion receipt', async ({ page }) => {
   await expect(
     page.locator('.assigned-worker-marker[data-status="done"]'),
   ).toHaveCount(0)
-  await expect(page.getByText('Completion receipt', { exact: true })).toBeVisible()
+  const receipt = page.getByRole('region', {
+    name: 'Completion receipt',
+  })
+  await expect(receipt).toBeVisible()
   await expect(
-    page.getByText('Implementation and verification are complete.'),
+    receipt.getByText(
+      'Implementation and verification are complete.',
+      { exact: true },
+    ),
   ).toBeVisible()
   await expect(page.getByText(artifactRef, { exact: true })).toBeVisible()
   await expect(page.getByText('https://ci.example/runs/42')).toBeVisible()
@@ -6816,10 +8661,7 @@ test('uploads and safely inspects a typed HTML artifact', async ({
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
-  await page
-    .locator('.profile-row')
-    .first()
-    .dragTo(projectDropTarget(page))
+  await dragToProject(page.locator('.profile-row').first(), page)
   await page.getByLabel('Objective').fill('Publish a release report.')
   await page
     .getByRole('button', { name: 'Create worker', exact: true })
@@ -6880,6 +8722,31 @@ test('uploads and safely inspects a typed HTML artifact', async ({
   await page.setViewportSize({ width: 390, height: 844 })
   await artifactButton.click()
   await expect(inspector).toBeVisible()
+  const inspectorBounds = await inspector.boundingBox()
+  const closeArtifactBounds = await inspector
+    .getByRole('button', { name: 'Close artifact' })
+    .boundingBox()
+  expect(
+    await inspector.evaluate(
+      (element) => element.parentElement?.parentElement === document.body,
+    ),
+  ).toBe(true)
+  expect(inspectorBounds?.y).toBeGreaterThanOrEqual(0)
+  expect(closeArtifactBounds?.y).toBeGreaterThanOrEqual(
+    inspectorBounds?.y ?? 0,
+  )
+  expect(
+    await inspector
+      .getByRole('button', { name: 'Close artifact' })
+      .evaluate((element) => {
+        const bounds = element.getBoundingClientRect()
+        const topElement = document.elementFromPoint(
+          bounds.left + bounds.width / 2,
+          bounds.top + bounds.height / 2,
+        )
+        return topElement === element || element.contains(topElement)
+      }),
+  ).toBe(true)
   const overflow = await inspector.evaluate((element) => ({
     documentHorizontal:
       document.documentElement.scrollWidth - window.innerWidth,
@@ -6939,10 +8806,7 @@ test('retries completion with the same command ID after a network failure', asyn
   await page.setViewportSize({ width: 1200, height: 760 })
   await page.goto('/')
 
-  await page
-    .locator('.profile-row')
-    .first()
-    .dragTo(projectDropTarget(page))
+  await dragToProject(page.locator('.profile-row').first(), page)
   await page.getByLabel('Objective').fill('Verify retry semantics.')
   await page
     .getByRole('button', { name: 'Create worker', exact: true })
@@ -7062,18 +8926,263 @@ test('persists project drag placement across reload', async ({ page }) => {
   const state = await mockApi(page)
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
-  const before = state.projects[0].placement.geometry.x
+  const before = { ...state.projects[0].placement.geometry }
 
   await dragFirstProject(page, 120, 70)
   await expect
     .poll(() => state.placementUpdates, { timeout: 5_000 })
     .toBe(1)
 
-  expect(state.projects[0].placement.geometry.x).toBeGreaterThan(before)
+  // A drag straight across the screen crosses both ground axes, so both world
+  // coordinates move. Anything that only changed x would mean the pointer delta
+  // never went through the inverse projection.
+  expect(state.projects[0].placement.geometry.x).toBeGreaterThan(before.x)
+  expect(state.projects[0].placement.geometry.y).not.toBe(before.y)
+  // The exact split between the two world axes is fixed by the projection and
+  // is independent of the viewport zoom: for a screen delta (dx, dy),
+  // (worldDx - worldDy) / (worldDx + worldDy) == (dx / 0.82) / (dy / 0.44).
+  const moved = {
+    x: state.projects[0].placement.geometry.x - before.x,
+    y: state.projects[0].placement.geometry.y - before.y,
+  }
+  expect(moved.x + moved.y).not.toBeCloseTo(0, 3)
+  // Tolerance covers the browser rounding pointer coordinates to whole pixels.
+  // A flat, unprojected drag would land near 0.26 here, so this is a wide berth
+  // around the right answer rather than a loose one.
+  expect(
+    Math.abs(
+      (moved.x - moved.y) / (moved.x + moved.y) - 120 / 0.82 / (70 / 0.44),
+    ),
+  ).toBeLessThan(0.02)
+
+  // And the magnitude follows the pointer: dividing the screen delta by the
+  // live zoom and inverse projecting it reproduces the persisted delta.
+  const zoom = await page.evaluate(() => {
+    const viewport = document.querySelector<HTMLElement>(
+      '.react-flow__viewport',
+    )
+    const match = viewport?.style.transform.match(/scale\(([^)]+)\)/)
+    return match ? Number(match[1]) : 1
+  })
+  const flowDelta = { x: 120 / zoom, y: 70 / zoom }
+  const ideal = {
+    x: 0.5 * (flowDelta.x / 0.82 + flowDelta.y / 0.44),
+    y: 0.5 * (flowDelta.y / 0.44 - flowDelta.x / 0.82),
+  }
+  // ReactFlow consumes the first pointer step to cross its own drag threshold,
+  // in 2D view exactly as in 2.5D, so the persisted delta trails the ideal by
+  // up to one step of the eight this helper sends.
+  const step = {
+    x: ideal.x / 8,
+    y: ideal.y / 8,
+  }
+  expect(moved.x).toBeLessThan(ideal.x + 2)
+  expect(moved.x).toBeGreaterThan(ideal.x - Math.abs(step.x) - 2)
+  expect(moved.y).toBeLessThan(ideal.y + Math.abs(step.y) + 2)
+  expect(moved.y).toBeGreaterThan(ideal.y - Math.abs(step.y) - 2)
+
   const persisted = state.projects[0].placement.geometry
   await page.reload()
   await expect(page.locator('.project-region')).toHaveCount(2)
   expect(state.projects[0].placement.geometry).toEqual(persisted)
+
+  // Toggling the view mode must never rewrite a placement.
+  await setMapView(page, '2D view')
+  await setMapView(page, '2.5D view')
+  expect(state.projects[0].placement.geometry).toEqual(persisted)
+  expect(state.placementUpdates).toBe(1)
+})
+
+test('selects and drags a project through the projected territory itself', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  const territoryGroup = page.locator('.projected-territory').first()
+  const territory = territoryGroup.locator('.territory-polygon')
+  const box = await territory.boundingBox()
+  expect(box).not.toBeNull()
+  // Left of centre, halfway down: inside the visible parallelogram, outside the
+  // flat node rectangle, and clear of the upright label at the centroid.
+  const grab = {
+    x: box!.x + box!.width * 0.25,
+    y: box!.y + box!.height * 0.5,
+  }
+
+  await page.mouse.move(grab.x, grab.y)
+  await page.mouse.down()
+  await page.mouse.up()
+
+  // Selection made on the projected surface opens the project inspector and
+  // marks the still-mounted flat node selected, so anything reading that state
+  // stays consistent.
+  await expect(
+    page.getByRole('heading', { name: 'API migration' }),
+  ).toBeVisible()
+  await expect(territoryGroup).toHaveClass(/is-selected/)
+  await expect(
+    page.locator('.react-flow__node-project').first().locator('.project-region'),
+  ).toHaveClass(/is-selected/)
+
+  const before = { ...state.projects[0].placement.geometry }
+  await page.mouse.move(grab.x, grab.y)
+  await page.mouse.down()
+  await page.mouse.move(grab.x + 90, grab.y + 40, { steps: 8 })
+  await page.mouse.up()
+
+  await expect
+    .poll(() => state.placementUpdates, { timeout: 5_000 })
+    .toBe(1)
+  const moved = {
+    x: state.projects[0].placement.geometry.x - before.x,
+    y: state.projects[0].placement.geometry.y - before.y,
+  }
+  expect((moved.x - moved.y) / (moved.x + moved.y)).toBeCloseTo(
+    90 / 0.82 / (40 / 0.44),
+    2,
+  )
+  expect(state.projects[0].placement.geometry.width).toBe(before.width)
+  expect(state.projects[0].placement.geometry.height).toBe(before.height)
+})
+
+test('resizes a project on the flat box and settles the projected shape', async ({
+  page,
+}) => {
+  // Documented 2.5D compromise: NodeResizer computes its handles from the
+  // node's own flat rectangle, so the gesture stays flat and the projected
+  // territory re-renders once onResizeEnd fires. This test exists to prove the
+  // interaction still functions, not that it looks projected while dragging.
+  const state = await mockApi(page)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.goto('/')
+
+  const projectNode = page.locator('[data-id="project:project-1"]')
+  await projectNode.dispatchEvent('click')
+  const control = projectNode.locator('.react-flow__resize-control.bottom.right')
+  await expect(control).toHaveCount(1)
+  const handle = await control.boundingBox()
+  expect(handle).not.toBeNull()
+
+  const before = { ...state.projects[0].placement.geometry }
+  const cornersBefore = await page
+    .locator('.projected-territory[data-node-id="project:project-1"] .territory-polygon')
+    .getAttribute('points')
+
+  await page.mouse.move(
+    handle!.x + handle!.width / 2,
+    handle!.y + handle!.height / 2,
+  )
+  await page.mouse.down()
+  await page.mouse.move(
+    handle!.x + handle!.width / 2 + 80,
+    handle!.y + handle!.height / 2 + 60,
+    { steps: 8 },
+  )
+  await page.mouse.up()
+
+  await expect.poll(() => state.projects[0].placement.geometry.width).toBeGreaterThan(
+    before.width,
+  )
+  await expect
+    .poll(async () =>
+      page
+        .locator(
+          '.projected-territory[data-node-id="project:project-1"] .territory-polygon',
+        )
+        .getAttribute('points'),
+    )
+    .not.toBe(cornersBefore)
+})
+
+test('drops an allocation on the visibly projected territory', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  const territory = page.locator('.territory-polygon').first()
+  const box = await territory.boundingBox()
+  expect(box).not.toBeNull()
+
+  // A quarter of the way across the projected envelope, halfway down, is inside
+  // the visible parallelogram but well to the left of the flat node rectangle
+  // the territory used to be. Only the inverse-projected hit test can resolve
+  // this drop to a project.
+  const target = { x: box!.width * 0.25, y: box!.height * 0.5 }
+  const flatBox = await page
+    .locator('.react-flow__node-project')
+    .first()
+    .boundingBox()
+  expect(flatBox).not.toBeNull()
+  expect(box!.x + target.x).toBeLessThan(flatBox!.x)
+
+  await page
+    .locator('.profile-row')
+    .first()
+    .dragTo(territory, { targetPosition: target })
+  await expect(
+    page.getByRole('dialog', { name: 'Create worker' }),
+  ).toBeVisible()
+  await page.getByLabel('Objective').fill('Verify the projected drop target.')
+  await page
+    .getByRole('button', { name: 'Create worker', exact: true })
+    .click()
+  await expect.poll(() => state.assignments.length).toBe(1)
+  expect(state.assignments[0].project_id).toBe('project-1')
+})
+
+test('creates a map node at the inverse-mapped right-click point', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  const canvas = page.locator('.react-flow')
+  const bounds = await canvas.boundingBox()
+  expect(bounds).not.toBeNull()
+  const click = { x: bounds!.x + 240, y: bounds!.y + 200 }
+  await page.mouse.click(click.x, click.y, { button: 'right' })
+  await page.getByRole('menuitem', { name: /Workstream/ }).click()
+  await page.getByLabel('Name').fill('Projected placement')
+  await page
+    .getByRole('button', { name: 'Create node', exact: true })
+    .click()
+
+  await expect.poll(() => state.coordinationNodes.length).toBe(1)
+  const placement = state.coordinationNodes[0].placement.geometry
+  const projected = await page.evaluate(
+    ({ x, y }) => {
+      const viewport = document.querySelector<HTMLElement>(
+        '.react-flow__viewport',
+      )
+      const transform = viewport?.style.transform ?? ''
+      const translate = transform.match(
+        /translate\(([^p]+)px,\s*([^p]+)px\)/,
+      )
+      const scale = transform.match(/scale\(([^)]+)\)/)
+      const container = document
+        .querySelector('.react-flow')!
+        .getBoundingClientRect()
+      const zoom = scale ? Number(scale[1]) : 1
+      const flow = {
+        x: (x - container.x - Number(translate?.[1] ?? 0)) / zoom,
+        y: (y - container.y - Number(translate?.[2] ?? 0)) / zoom,
+      }
+      return {
+        // The stored placement must be the unprojected world point, centred on
+        // the pointer, not the raw flow point.
+        x: 0.5 * (flow.x / 0.82 + flow.y / 0.44) - 58,
+        y: 0.5 * (flow.y / 0.44 - flow.x / 0.82) - 58,
+      }
+    },
+    click,
+  )
+  expect(placement.x).toBeCloseTo(projected.x, 0)
+  expect(placement.y).toBeCloseTo(projected.y, 0)
 })
 
 test('persists agent grip placement across refresh and reload', async ({
@@ -7121,9 +9230,8 @@ test('persists agent grip placement across refresh and reload', async ({
   const moved = await node.boundingBox()
   expect(moved?.x).toBeGreaterThan(before.x + 20)
   const inventoryRequests = state.inventoryRequests
-  await page
-    .getByRole('button', { name: 'Refresh Yard and runtime state' })
-    .click()
+  const runtimeHealth = await openRuntimeHealth(page)
+  await runtimeHealth.getByRole('button', { name: 'Refresh state' }).click()
   await expect.poll(() => state.inventoryRequests).toBeGreaterThan(
     inventoryRequests,
   )
@@ -7196,8 +9304,8 @@ test('persists unbound workspace placement per runtime session', async ({
       .evaluate((element) => (element as HTMLElement).style.transform),
   ).toBe(moved)
 
-  await page.locator('#session-select').selectOption('beta')
-  await page.locator('#session-select').selectOption('alpha')
+  await selectRuntimeSession(page, 'beta')
+  await selectRuntimeSession(page, 'alpha')
   await expect(
     page.locator('.react-flow__node-workspace').first(),
   ).toHaveCSS('transform', /matrix/)

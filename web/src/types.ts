@@ -199,6 +199,7 @@ export interface Project {
 export interface YardOrchestrator {
   worker: Worker | null
   version: string
+  workflow_profile_version: string
   created_at_unix_ms: number
   updated_at_unix_ms: number
 }
@@ -209,6 +210,7 @@ export interface ConfigureYardOrchestratorInput {
   worker_id: string
   expected_worker_version: string
   expected_orchestrator_version: string
+  workflow_profile_version?: string
 }
 
 export interface ProvisionYardOrchestratorInput {
@@ -880,6 +882,46 @@ export interface Automation {
 
 export interface Automations {
   automations: Automation[]
+}
+
+export interface TokenSpendSettings {
+  superintendent_auto_requests_project_summaries: boolean
+  project_orchestrators_auto_request_worker_summaries: boolean
+  scheduled_automatic_summaries: boolean
+  version: string
+  updated_by: string
+  updated_at_unix_ms: number
+}
+
+export type OrchestratorWorkflowProfileSource = 'factory' | 'user' | 'reset'
+
+export interface OrchestratorWorkflowProfile {
+  version: string
+  instructions_markdown: string
+  monitor_interval_ms: string
+  source: OrchestratorWorkflowProfileSource
+  updated_by: string
+  created_at_unix_ms: number
+}
+
+export interface UpdateOrchestratorWorkflowProfileInput {
+  actor: string
+  expected_version: string
+  instructions_markdown: string
+  monitor_interval_ms: string
+}
+
+export interface ResetOrchestratorWorkflowProfileInput {
+  actor: string
+  expected_version: string
+}
+
+export interface UpdateTokenSpendSettingsInput {
+  actor: string
+  expected_version: string
+  superintendent_auto_requests_project_summaries: boolean
+  project_orchestrators_auto_request_worker_summaries: boolean
+  scheduled_automatic_summaries: boolean
 }
 
 export interface AutomationRuns {

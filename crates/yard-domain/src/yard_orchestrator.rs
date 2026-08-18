@@ -12,6 +12,8 @@ pub struct YardOrchestrator {
     pub worker: Option<Worker>,
     #[serde(with = "crate::serde_u64")]
     pub version: u64,
+    #[serde(with = "crate::serde_u64")]
+    pub workflow_profile_version: u64,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
 }
@@ -25,6 +27,8 @@ pub struct ConfigureYardOrchestrator {
     pub expected_worker_version: u64,
     #[serde(with = "crate::serde_u64")]
     pub expected_orchestrator_version: u64,
+    #[serde(default, with = "crate::serde_u64::option")]
+    pub workflow_profile_version: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +97,9 @@ impl ConfigureYardOrchestrator {
         self.actor = required("actor", &self.actor, MAX_ACTOR_BYTES)?;
         self.worker_id = required("worker_id", &self.worker_id, MAX_COMMAND_ID_BYTES)?;
         if self.expected_worker_version == 0 || self.expected_orchestrator_version == 0 {
+            return Err(YardOrchestratorValidationError::InvalidVersion);
+        }
+        if self.workflow_profile_version == Some(0) {
             return Err(YardOrchestratorValidationError::InvalidVersion);
         }
         Ok(self)
@@ -210,6 +217,7 @@ mod tests {
             worker_id: " worker-1 ".to_owned(),
             expected_worker_version: 2,
             expected_orchestrator_version: 3,
+            workflow_profile_version: Some(4),
         }
         .normalize()
         .unwrap();
@@ -257,6 +265,7 @@ mod tests {
             worker_id: "worker-1".to_owned(),
             expected_worker_version: 1,
             expected_orchestrator_version: 0,
+            workflow_profile_version: None,
         }
         .normalize()
         .unwrap_err();

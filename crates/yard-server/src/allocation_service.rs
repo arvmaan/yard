@@ -74,6 +74,7 @@ pub struct RuntimeRetirementRequest {
     pub pane_id: String,
     pub provider_session: Option<ProviderSessionRef>,
     pub owns_tab: bool,
+    pub require_identity_match: bool,
 }
 
 #[derive(Debug, Error)]
@@ -82,6 +83,8 @@ pub enum RuntimeRetirementError {
     UnsupportedAdapter(String),
     #[error("{0}")]
     Runtime(String),
+    #[error("the captured runtime identity is not currently observable")]
+    IdentityNotObserved,
 }
 
 #[async_trait]
@@ -122,6 +125,25 @@ pub trait RuntimeControl: Send + Sync {
         prepared: WorkerRuntimeBinding,
     ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
         Ok(prepared)
+    }
+
+    async fn prepare_replacement_worker(
+        &self,
+        _request: RuntimeProvisionRequest,
+    ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+        Err(RuntimeProvisionError::BeforeWorker(
+            "runtime does not support staged orchestrator replacement".to_owned(),
+        ))
+    }
+
+    async fn start_prepared_replacement_worker(
+        &self,
+        _request: RuntimeProvisionRequest,
+        _prepared: WorkerRuntimeBinding,
+    ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+        Err(RuntimeProvisionError::BeforeWorker(
+            "runtime does not support staged orchestrator replacement".to_owned(),
+        ))
     }
 
     async fn retire_runtime(

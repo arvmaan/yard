@@ -7,6 +7,7 @@ import {
 } from 'lucide-react'
 import {
   agentWorkspaceKey,
+  terminalLeaseKey,
   useAgentWorkspace,
 } from './AgentWorkspaceContext'
 import { openTerminalInGhostty } from './api'
@@ -66,16 +67,13 @@ export function WorkerInterventions({
     yardOrchestrator?.worker?.id ??
     coordinationNode?.worker?.id ??
     ''
-  const terminalId =
-    assignment?.worker.runtime?.terminal_id ??
-    project?.orchestrator.runtime?.terminal_id ??
-    yardOrchestrator?.worker?.runtime?.terminal_id ??
-    coordinationNode?.worker?.runtime?.terminal_id
-  const runtimeSession =
-    assignment?.worker.runtime?.session ??
-    project?.orchestrator.runtime?.session ??
-    yardOrchestrator?.worker?.runtime?.session ??
-    coordinationNode?.worker?.runtime?.session
+  const runtime =
+    assignment?.worker.runtime ??
+    project?.orchestrator.runtime ??
+    yardOrchestrator?.worker?.runtime ??
+    coordinationNode?.worker?.runtime
+  const terminalId = runtime?.terminal_id
+  const runtimeSession = runtime?.session
   const targetKey =
     agentWorkspaceKey(target)
   const interactive =
@@ -126,7 +124,9 @@ export function WorkerInterventions({
   } | null>(null)
   if (!interactive) return null
 
-  if (!terminalTarget || !terminalId || !runtimeSession) return null
+  if (!terminalTarget || !terminalId || !runtimeSession || !runtime) {
+    return null
+  }
 
   const workspaceTarget = {
     key: targetKey,
@@ -144,13 +144,9 @@ export function WorkerInterventions({
     status: status ?? 'unknown',
     target,
     terminalId,
+    terminalLeaseKey: terminalLeaseKey(target, runtime),
     terminalTarget,
-    workspaceId:
-      assignment?.worker.runtime?.workspace_id ??
-      project?.orchestrator.runtime?.workspace_id ??
-      yardOrchestrator?.worker?.runtime?.workspace_id ??
-      coordinationNode?.worker?.runtime?.workspace_id ??
-      'workspace unavailable',
+    workspaceId: runtime.workspace_id,
   }
 
   const attachCommand =

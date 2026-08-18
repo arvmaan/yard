@@ -3,14 +3,18 @@ import {
   Bot,
   BriefcaseBusiness,
   Network,
+  PanelLeftClose,
   Radio,
   Server,
+  SquareTerminal,
   X,
 } from 'lucide-react'
 import { AgentChatWorkspace } from './AgentChatWorkspace'
-import type {
-  AgentWorkspaceMode,
-  AgentWorkspaceTarget,
+import {
+  isTerminalWorkspaceMode,
+  type AgentWorkspaceTarget,
+  type AgentWorkspaceView,
+  type TerminalPresentation,
 } from './AgentWorkspaceContext'
 import type {
   CoordinationNodeRoute,
@@ -48,7 +52,9 @@ export function AgentWorkspaceShell({
   onCoordinationChange,
   onCoordinationNodeChange,
   onModeChange,
+  onPresentationChange,
   onTargetChange,
+  presentation,
   projects,
   sessions,
   targets,
@@ -57,11 +63,13 @@ export function AgentWorkspaceShell({
 }: {
   activeTarget: AgentWorkspaceTarget
   coordinationRoutes: CoordinationNodeRoute[]
-  mode: AgentWorkspaceMode | 'map'
+  mode: AgentWorkspaceView
   onCoordinationChange: (route: YardOrchestratorRoute) => void
   onCoordinationNodeChange: (route: CoordinationNodeRoute) => void
-  onModeChange: (mode: AgentWorkspaceMode | 'map') => void
+  onModeChange: (mode: AgentWorkspaceView) => void
+  onPresentationChange: (presentation: TerminalPresentation) => void
   onTargetChange: (target: AgentWorkspaceTarget) => void
+  presentation: TerminalPresentation
   projects: Project[]
   sessions: RuntimeSession[]
   targets: AgentWorkspaceTarget[]
@@ -92,11 +100,13 @@ export function AgentWorkspaceShell({
             (route) => route.node_id === coordinationNode.id,
           )
         : []
+  const terminalVisible = isTerminalWorkspaceMode(mode)
 
   return (
     <section
       aria-label={activeTarget.label}
       className="agent-workspace-shell"
+      data-presentation={terminalVisible ? presentation : undefined}
       hidden={mode === 'map'}
       role="dialog"
     >
@@ -172,6 +182,34 @@ export function AgentWorkspaceShell({
 
       {mode !== 'map' ? (
         <header className="agent-workspace-toolbar">
+          {terminalVisible ? (
+            <div
+              aria-label="Terminal presentation"
+              className="segmented-control terminal-presentation-control"
+              role="group"
+            >
+              <button
+                aria-label="Terminal"
+                aria-pressed={presentation === 'terminal'}
+                onClick={() => onPresentationChange('terminal')}
+                title="Terminal presentation"
+                type="button"
+              >
+                <SquareTerminal aria-hidden="true" size={14} />
+                <span>Terminal</span>
+              </button>
+              <button
+                aria-label="Focus"
+                aria-pressed={presentation === 'focus'}
+                onClick={() => onPresentationChange('focus')}
+                title="Focus presentation"
+                type="button"
+              >
+                <PanelLeftClose aria-hidden="true" size={14} />
+                <span>Focus</span>
+              </button>
+            </div>
+          ) : null}
           <div className="agent-workspace-toolbar__target">
             <span data-status={activeTarget.status} />
             <strong>{activeTarget.label}</strong>
@@ -203,7 +241,7 @@ export function AgentWorkspaceShell({
           target={activeTarget.target}
           variant="workspace"
         />
-        {mode === 'terminal' ? (
+        {terminalVisible ? (
           <Suspense
             fallback={
               <div className="terminal-mode-loading" role="status">
@@ -212,7 +250,7 @@ export function AgentWorkspaceShell({
             }
           >
             <TerminalSession
-              key={activeTarget.key}
+              key={activeTarget.terminalLeaseKey}
               target={activeTarget.terminalTarget}
             />
           </Suspense>

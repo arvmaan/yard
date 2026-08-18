@@ -23,7 +23,7 @@ use yard_domain::{
 };
 use yard_store::{
     BeginCoordinationNodePrompt, BeginCoordinationNodeRoute, ProjectStoreError,
-    SnapshotDeliveryResult, SnapshotProjectFolder, YardStore,
+    SnapshotDeliveryResult, SnapshotProjectFolder, TokenSpendCommandSource, YardStore,
 };
 
 use crate::{
@@ -292,9 +292,39 @@ impl CoordinationNodeService {
         node_id: &str,
         command: SendCoordinationNodePrompt,
     ) -> Result<CoordinationNodePromptAcknowledgement, CoordinationNodeServiceError> {
+        self.prompt_with_scheduled_policy(node_id, command, false)
+            .await
+    }
+
+    pub(crate) async fn prompt_scheduled_summary(
+        &self,
+        node_id: &str,
+        command: SendCoordinationNodePrompt,
+    ) -> Result<CoordinationNodePromptAcknowledgement, CoordinationNodeServiceError> {
+        self.prompt_with_scheduled_policy(node_id, command, true)
+            .await
+    }
+
+    async fn prompt_with_scheduled_policy(
+        &self,
+        node_id: &str,
+        command: SendCoordinationNodePrompt,
+        scheduled: bool,
+    ) -> Result<CoordinationNodePromptAcknowledgement, CoordinationNodeServiceError> {
+        if scheduled {
+            self.ensure_scheduled_summaries_enabled().await?;
+        }
         let (command, node) = match self
             .store
-            .begin_coordination_node_prompt(node_id, command)
+            .begin_coordination_node_prompt(
+                node_id,
+                command,
+                if scheduled {
+                    TokenSpendCommandSource::ScheduledSummary
+                } else {
+                    TokenSpendCommandSource::Manual
+                },
+            )
             .await?
         {
             BeginCoordinationNodePrompt::Replayed(acknowledgement) => return Ok(acknowledgement),
@@ -302,6 +332,12 @@ impl CoordinationNodeService {
         };
         let runtime = node_runtime(&node)?;
         if let Err(error) = self.validate_node_binding(&node).await {
+            self.store
+                .fail_coordination_node_prompt(&command.command_id, &error.to_string(), false)
+                .await?;
+            return Err(error);
+        }
+        if scheduled && let Err(error) = self.ensure_scheduled_summaries_enabled().await {
             self.store
                 .fail_coordination_node_prompt(&command.command_id, &error.to_string(), false)
                 .await?;
@@ -348,6 +384,19 @@ impl CoordinationNodeService {
                     .await?;
                 Err(error.into())
             }
+        }
+    }
+
+    async fn ensure_scheduled_summaries_enabled(&self) -> Result<(), CoordinationNodeServiceError> {
+        if self
+            .store
+            .get_token_spend_settings()
+            .await?
+            .scheduled_automatic_summaries
+        {
+            Ok(())
+        } else {
+            Err(CoordinationNodeServiceError::AutomaticTokenSpendDisabled)
         }
     }
 
@@ -1011,6 +1060,8 @@ pub enum CoordinationNodeServiceError {
     RuntimeBindingMissing,
     #[error("the Herdr runtime no longer matches the durable worker binding")]
     RuntimeBindingStale,
+    #[error("scheduled automatic summaries are disabled")]
+    AutomaticTokenSpendDisabled,
     #[error("lines must be between 1 and 1000")]
     InvalidLineCount,
     #[error("unsupported worker profile: {0}")]

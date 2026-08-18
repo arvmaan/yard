@@ -341,19 +341,19 @@ async fn start_agent_at_socket(
     let started = match started {
         Ok(started) => started,
         Err(start) => {
-            let rollback_result =
-                rollback_start(config, socket_path, &request.command_id, rollback).await;
-            let rollback_succeeded = rollback_result.is_ok();
-            let rollback =
-                rollback_result.map_or_else(|error| error.to_string(), |()| "succeeded".to_owned());
-            return Err(HerdrControlError::StartFailed {
-                start,
+            return Err(start_failure_after_rollback(
+                config,
+                socket_path,
+                &request.command_id,
                 rollback,
-                rollback_succeeded,
-            });
+                start,
+                true,
+            )
+            .await);
         }
     };
-    let runtime = runtime_binding(&request.prepared.session, started.agent);
+    let runtime =
+        validate_started_topology(config, socket_path, &request, rollback, started).await?;
 
     let prompt_result = prompt_when_ready(
         config,
@@ -393,6 +393,69 @@ async fn start_agent_at_socket(
             source,
         }),
     }
+}
+
+async fn validate_started_topology(
+    config: &HerdrConfig,
+    socket_path: &std::path::Path,
+    request: &StartPreparedAgentRequest,
+    rollback: StartRollback,
+    started: AgentStarted,
+) -> Result<WorkerRuntimeBinding, HerdrControlError> {
+    let runtime = runtime_binding(&request.prepared.session, started.agent);
+    if !retained_prepared_topology(&request.prepared, &runtime) {
+        let start = HerdrError::InvalidTopology(
+            "started agent did not retain the prepared workspace, tab, pane, and terminal"
+                .to_owned(),
+        );
+        return Err(start_failure_after_rollback(
+            config,
+            socket_path,
+            &request.command_id,
+            rollback,
+            start,
+            false,
+        )
+        .await);
+    }
+    Ok(runtime)
+}
+
+async fn start_failure_after_rollback(
+    config: &HerdrConfig,
+    socket_path: &std::path::Path,
+    command_id: &str,
+    rollback: StartRollback,
+    start: HerdrError,
+    rollback_covers_started_runtime: bool,
+) -> HerdrControlError {
+    let rollback_result = rollback_start(config, socket_path, command_id, rollback).await;
+    let rollback_succeeded = rollback_covers_started_runtime && rollback_result.is_ok();
+    let rollback = rollback_result.map_or_else(
+        |error| error.to_string(),
+        |()| {
+            if rollback_covers_started_runtime {
+                "succeeded".to_owned()
+            } else {
+                "prepared topology closed; mismatched started runtime remains unverified".to_owned()
+            }
+        },
+    );
+    HerdrControlError::StartFailed {
+        start,
+        rollback,
+        rollback_succeeded,
+    }
+}
+
+fn retained_prepared_topology(
+    prepared: &WorkerRuntimeBinding,
+    started: &WorkerRuntimeBinding,
+) -> bool {
+    started.workspace_id == prepared.workspace_id
+        && started.tab_id == prepared.tab_id
+        && started.pane_id == prepared.pane_id
+        && started.terminal_id == prepared.terminal_id
 }
 
 pub(crate) async fn prompt_agent(
@@ -795,10 +858,49 @@ mod tests {
         BootstrapAgentRequest, HerdrControlError, PrepareAgentRequest, PromptAgentRequest,
         ReadPaneRequest, RetireRuntimeRequest, StartPreparedAgentRequest,
         bootstrap_agent_at_socket, prepare_agent_at_socket, prompt_agent_at_socket,
-        read_pane_at_socket, retire_runtime, retire_runtime_at_socket,
+        read_pane_at_socket, retained_prepared_topology, retire_runtime, retire_runtime_at_socket,
         start_prepared_agent_at_socket, workspace_create_outcome_ambiguous,
     };
     use crate::{HerdrConfig, HerdrError};
+    use yard_domain::{
+        ObservedStatus, RuntimeObservationState, RuntimeProcessState, WorkerRuntimeBinding,
+    };
+
+    fn runtime_topology(
+        workspace_id: &str,
+        tab_id: &str,
+        pane_id: &str,
+        terminal_id: &str,
+    ) -> WorkerRuntimeBinding {
+        WorkerRuntimeBinding {
+            adapter: "herdr".to_owned(),
+            session: "default".to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            terminal_id: terminal_id.to_owned(),
+            tab_id: Some(tab_id.to_owned()),
+            pane_id: pane_id.to_owned(),
+            provider_session: None,
+            owns_tab: true,
+            observation_state: RuntimeObservationState::Observed,
+            process_state: RuntimeProcessState::Running,
+            status: ObservedStatus::Idle,
+            state_change_sequence: 1,
+            revision: 1,
+            version: 1,
+            last_observed_at_unix_ms: 1,
+        }
+    }
+
+    #[test]
+    fn started_agent_must_retain_the_prepared_topology() {
+        let prepared = runtime_topology("workspace-1", "tab-1", "pane-1", "terminal-1");
+
+        assert!(retained_prepared_topology(&prepared, &prepared));
+        assert!(!retained_prepared_topology(
+            &prepared,
+            &runtime_topology("workspace-2", "tab-1", "pane-1", "terminal-1"),
+        ));
+    }
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]

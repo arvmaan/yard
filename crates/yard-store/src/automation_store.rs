@@ -679,6 +679,11 @@ pub(super) async fn list_due_automations(
                    FROM automations a
                   WHERE a.state = 'active'
                     AND a.next_run_at_unix_ms <= ?1
+                    AND (
+                        SELECT scheduled_automatic_summaries
+                          FROM token_spend_settings
+                         WHERE id = 1
+                    ) = 1
                     AND NOT EXISTS (
                         SELECT 1
                           FROM automation_runs ar
@@ -742,6 +747,16 @@ pub(super) async fn claim_scheduled_automation_run(
                     return Err(ProjectStoreError::IdempotencyConflict);
                 }
                 return Ok(run);
+            }
+            let enabled = transaction.query_row(
+                "SELECT scheduled_automatic_summaries
+                   FROM token_spend_settings
+                  WHERE id = 1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !enabled {
+                return Err(ProjectStoreError::ScheduledAutomaticSummariesDisabled);
             }
             let automation = select_automation(&transaction, &automation_id)?;
             if automation.state != AutomationState::Active {
@@ -1706,11 +1721,11 @@ mod tests {
         CoordinationNodeKind, CreateAutomation, CreateCoordinationNode, CreateProject,
         DailySchedule, ObservedStatus, ProjectRuntimeBinding, RunAutomationNow,
         RuntimeObservationState, RuntimeProcessState, SetAutomationPaused, UpdateAutomation,
-        UpdateAutomationPlacement, WorkerRuntimeBinding,
+        UpdateAutomationPlacement, UpdateTokenSpendSettings, WorkerRuntimeBinding,
     };
 
     use super::{ProjectStoreError, SqliteProjectStore, to_i64};
-    use crate::YardStore;
+    use crate::{SCHEMA_VERSION, YardStore};
 
     fn project_draft(
         workspace_id: &str,
@@ -1942,6 +1957,39 @@ mod tests {
         assert_eq!(replayed_resume.automation.next_run_at_unix_ms, Some(100));
         assert_eq!(
             store
+                .list_due_automations(100, 10)
+                .await
+                .unwrap()
+                .automations
+                .len(),
+            0
+        );
+        assert!(matches!(
+            store
+                .claim_scheduled_automation_run(
+                    &automation_id,
+                    100,
+                    200,
+                    &Uuid::now_v7().to_string(),
+                    "disabled-scheduled-dispatch",
+                    "scheduler",
+                )
+                .await,
+            Err(ProjectStoreError::ScheduledAutomaticSummariesDisabled)
+        ));
+        let token_spend_settings = store.get_token_spend_settings().await.unwrap();
+        store
+            .update_token_spend_settings(UpdateTokenSpendSettings {
+                actor: "local-user".to_owned(),
+                expected_version: token_spend_settings.version,
+                superintendent_auto_requests_project_summaries: false,
+                project_orchestrators_auto_request_worker_summaries: false,
+                scheduled_automatic_summaries: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
                 .list_due_automations(99, 10)
                 .await
                 .unwrap()
@@ -2135,12 +2183,15 @@ mod tests {
             })
             .await
             .unwrap();
+        store.reconcile_automation_runs().await.unwrap();
         let submitted = store
-            .mark_automation_run_submitted(&submitted_run_id, "accepted", submitted_at_unix_ms)
+            .get_automation_run(&automation_id, &submitted_run_id)
             .await
             .unwrap();
         assert_eq!(submitted.status, AutomationRunStatus::Submitted);
         assert_eq!(submitted.version, 2);
+        assert_eq!(submitted.runtime_status.as_deref(), Some("submitted"));
+        assert_eq!(submitted.submitted_at_unix_ms, Some(submitted_at_unix_ms));
 
         let ambiguous_run_id = Uuid::now_v7().to_string();
         let current_version = store.get_automation(&automation_id).await.unwrap().version;
@@ -2269,6 +2320,6 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 18);
+        assert_eq!(version, SCHEMA_VERSION);
     }
 }

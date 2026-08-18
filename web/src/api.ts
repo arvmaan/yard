@@ -36,11 +36,13 @@ import type {
   ExternalTerminalLaunch,
   OrchestratorPromptAcknowledgement,
   OrchestratorTerminalOutput,
+  OrchestratorWorkflowProfile,
   Project,
   Projects,
   ProvisionYardOrchestratorInput,
   RecoverYardOrchestratorInput,
   RecoveredYardOrchestrator,
+  ResetOrchestratorWorkflowProfileInput,
   ProvisionCoordinationNodeInput,
   PromptAcknowledgement,
   RecordedCompletionReceipt,
@@ -55,12 +57,15 @@ import type {
   SendYardOrchestratorPromptInput,
   SendYardOrchestratorRouteInput,
   TerminalOutput,
+  TokenSpendSettings,
   UpdateCoordinationNodeInput,
   UpdateCoordinationNodePlacementInput,
   UpdateAutomationInput,
   UpdateAutomationPlacementInput,
   UpdateAutomationStateInput,
+  UpdateOrchestratorWorkflowProfileInput,
   UpdateProjectPlacementInput,
+  UpdateTokenSpendSettingsInput,
   UpdateWorkerProfileInput,
   UploadArtifactInput,
   RequestCoordinationSnapshotInput,
@@ -163,6 +168,54 @@ function unwrapAutomationRun(result: AutomationRunEnvelope): AutomationRun {
 
 export function fetchAutomations(signal?: AbortSignal): Promise<Automations> {
   return requestJson('/api/v1/automations', { signal })
+}
+
+export function fetchTokenSpendSettings(
+  signal?: AbortSignal,
+): Promise<TokenSpendSettings> {
+  return requestJson('/api/v1/token-spend-settings', { signal })
+}
+
+export function fetchOrchestratorWorkflowProfile(
+  signal?: AbortSignal,
+): Promise<OrchestratorWorkflowProfile> {
+  return requestJson('/api/v1/orchestrator-workflow-profile', { signal })
+}
+
+export function updateOrchestratorWorkflowProfile(
+  command: UpdateOrchestratorWorkflowProfileInput,
+  signal?: AbortSignal,
+): Promise<OrchestratorWorkflowProfile> {
+  return requestJson('/api/v1/orchestrator-workflow-profile', {
+    body: JSON.stringify(command),
+    headers: { 'Content-Type': 'application/json' },
+    method: 'PUT',
+    signal,
+  })
+}
+
+export function resetOrchestratorWorkflowProfile(
+  command: ResetOrchestratorWorkflowProfileInput,
+  signal?: AbortSignal,
+): Promise<OrchestratorWorkflowProfile> {
+  return requestJson('/api/v1/orchestrator-workflow-profile/reset', {
+    body: JSON.stringify(command),
+    headers: { 'Content-Type': 'application/json' },
+    method: 'POST',
+    signal,
+  })
+}
+
+export function updateTokenSpendSettings(
+  command: UpdateTokenSpendSettingsInput,
+  signal?: AbortSignal,
+): Promise<TokenSpendSettings> {
+  return requestJson('/api/v1/token-spend-settings', {
+    body: JSON.stringify(command),
+    headers: { 'Content-Type': 'application/json' },
+    method: 'PUT',
+    signal,
+  })
 }
 
 export function createAutomation(
