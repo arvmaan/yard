@@ -3810,7 +3810,7 @@ test('projects active assignments once and completed live workers as observed', 
   const expectProjection = async () => {
     await expect(activeMarker).toHaveCount(1)
     await expect(activeSprite).toBeVisible()
-    await expect(activeSprite).toHaveCSS('background-image', /worker/)
+    await expect(activeSprite.locator('svg[data-crew-role="worker"]')).toBeVisible()
     await expect(activeObservedNode).toHaveCount(0)
     await expect(completedMarker).toHaveCount(0)
     await expect(completedObservedNode).toHaveCount(1)

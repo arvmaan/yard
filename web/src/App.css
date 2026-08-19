@@ -31,6 +31,10 @@
   --terminal-ink: var(--ink);
   --terminal-muted: var(--muted);
   --terminal-selection: #bfd7d1;
+  --crew-body: var(--muted);
+  --crew-body-soft: color-mix(in srgb, var(--ink) 12%, var(--muted));
+  --crew-window: color-mix(in srgb, var(--blue) 20%, var(--surface-raised));
+  --crew-shadow: rgba(23, 32, 30, 0.2);
 }
 
 :root[data-theme="dark"] {
@@ -66,6 +70,10 @@
   --terminal-ink: var(--ink);
   --terminal-muted: var(--muted);
   --terminal-selection: #305c56;
+  --crew-body: var(--muted);
+  --crew-body-soft: color-mix(in srgb, var(--ink) 10%, var(--muted));
+  --crew-window: color-mix(in srgb, var(--blue) 24%, var(--surface-raised));
+  --crew-shadow: rgba(0, 0, 0, 0.42);
 }
 
 * {
@@ -7167,38 +7175,62 @@ html[data-yard-allocation-dragging="true"]
   inset: 0;
   z-index: 1;
   display: block;
-  background-image: var(--sprite-src);
-  background-repeat: no-repeat;
-  background-position: 50% 50%;
-  background-size: contain;
   pointer-events: none;
-  animation:
-    sprite-hover 2.6s ease-in-out infinite,
-    sprite-wander 10s ease-in-out infinite,
-    sprite-turn 10s steps(1) infinite;
-  /* Reuses --drift-delay, the same per-worker hash-derived value 2D mode's
-     own drift animation already sets (motionProperties in RuntimeCanvas.tsx)
-     — inherited straight through from .worker-marker's inline style, so
-     several workers standing near each other don't wander in lockstep. */
-  animation-delay: var(--drift-delay, 0s);
 }
 
-.runtime-canvas[data-visual-mode="depth"]
-  .worker-marker[data-status="working"]
-  .worker-marker__sprite,
-.runtime-canvas[data-visual-mode="depth"]
-  .yard-orchestrator-marker[data-status="working"]
-  .worker-marker__sprite {
-  animation:
-    sprite-hover 2.6s ease-in-out infinite,
-    sprite-wander 10s ease-in-out infinite,
-    sprite-turn 10s steps(1) infinite,
-    sprite-working-glow 1.3s ease-in-out infinite;
-  animation-delay:
-    var(--drift-delay, 0s),
-    var(--drift-delay, 0s),
-    var(--drift-delay, 0s),
-    0s;
+/* Crew art renders as real inline SVG (see crewArt.tsx), not a
+   background-image, specifically so its fills can read the app's own
+   --ink/--muted/--blue/etc. tokens and follow light/dark — an externally
+   referenced image (background-image, <img>) can't see page CSS variables
+   at all, which is why the static-PNG/SVG-file version of this never
+   re-themed. `preserveAspectRatio` on the SVG itself reproduces the old
+   `background-size: contain` fit within the same overflowed box. */
+.runtime-canvas[data-visual-mode="depth"] .worker-marker__sprite svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* Truthful state motion: pose plus one signal, driven by the same
+   [data-status] the rest of the app already reads --status-color from — no
+   free-roaming loop implying activity Yard hasn't observed. Idle gets a
+   small anchored breathing float; working and blocked get a status-colored
+   pulse traced around the character's own silhouette (drop-shadow follows
+   whatever alpha shape is actually showing, so it reads correctly across
+   different character art and poses without a hardcoded coordinate). Done
+   and unknown stay still, matching their "quiet"/"neutral" rows in the
+   visual-language proposal. */
+@media (prefers-reduced-motion: no-preference) {
+  .runtime-canvas[data-visual-mode="depth"]
+    [data-status="idle"]
+    .worker-marker__sprite {
+    animation: sprite-breathe 3.6s ease-in-out infinite;
+    animation-delay: var(--drift-delay, 0s);
+  }
+
+  .runtime-canvas[data-visual-mode="depth"]
+    [data-status="working"]
+    .worker-marker__sprite,
+  .runtime-canvas[data-visual-mode="depth"]
+    [data-status="blocked"]
+    .worker-marker__sprite {
+    animation: sprite-signal-pulse 1.4s ease-in-out infinite;
+  }
+}
+
+/* "Reduced" isn't "zero": the breathing float (translate, purely decorative)
+   drops out, but the working/blocked signal keeps a slow opacity-only pulse
+   since that part carries real status, not decoration. */
+@media (prefers-reduced-motion: reduce) {
+  .runtime-canvas[data-visual-mode="depth"]
+    [data-status="working"]
+    .worker-marker__sprite,
+  .runtime-canvas[data-visual-mode="depth"]
+    [data-status="blocked"]
+    .worker-marker__sprite {
+    animation: sprite-signal-pulse-opacity 2.6s ease-in-out infinite;
+  }
 }
 
 /* Worker/orchestrator specifically: overflow the unchanged 71px body by
@@ -7220,11 +7252,9 @@ html[data-yard-allocation-dragging="true"]
   inset: -36px;
 }
 
-/* Barely off the ground: a couple of pixels of hover, not the original 4 —
-   this is deliberately subtler now that the character sits low in the
-   marker box (see the order rules above) rather than compounding with that
-   change to still read as floating. */
-@keyframes sprite-hover {
+/* Anchored breathing: idle only, 2px of float, nothing that reads as
+   locomotion or a route-facing loop. */
+@keyframes sprite-breathe {
   0%,
   100% {
     transform: translateY(0);
@@ -7234,73 +7264,33 @@ html[data-yard-allocation-dragging="true"]
   }
 }
 
-/* Idle wandering within a small bounded footprint — purely a local visual
-   loop around the worker's real, persisted position, not a change to it;
-   node.position (and the projected anchor derived from it) never moves.
-   Applied to the sprite, which is pointer-events: none, not to __motion —
-   the real interactive hit target stays exactly at its anchored position
-   throughout the loop, so this can't drift into a neighboring territory's
-   drop target the way animating __motion itself would. */
-@keyframes sprite-wander {
+/* Working/blocked signal: traced around the character's own silhouette via
+   drop-shadow rather than a dot guessed at a fixed percentage position (a
+   fixed coordinate only ever lines up with one specific character's build
+   by luck). Two stacked shadows — a tight core and a wider halo — so the
+   signal stays legible at zoomed-out map scale, and it now reads
+   var(--status-color) instead of a hardcoded hue: blocked shows the same
+   vermilion as its badge, working the same blue, so the character-level
+   signal never disagrees with the status badge sitting right next to it. */
+@keyframes sprite-signal-pulse {
   0%,
   100% {
-    translate: 0 0;
-  }
-  22% {
-    translate: 13px -2px;
-  }
-  48% {
-    translate: 5px -4px;
-  }
-  70% {
-    translate: -13px -2px;
-  }
-  88% {
-    translate: -5px 0;
-  }
-}
-
-/* A flat sprite can't actually turn in 3D, so "turning" is simulated the
-   way 2D game sprites always have: mirror horizontally to face whichever
-   way the wander loop is currently heading. `steps(1)` makes each keyframe
-   a hard cut rather than an interpolated flip-through-zero, which would
-   squash the character sideways for a frame. Kept on its own property
-   (scale, not transform) so it composes independently of the hover/hue
-   animations already running on translate/filter. */
-@keyframes sprite-turn {
-  0%,
-  21% {
-    scale: 1 1;
-  }
-  22%,
-  69% {
-    scale: -1 1;
-  }
-  70%,
-  100% {
-    scale: 1 1;
-  }
-}
-
-/* Working status: a soft pulsing glow traced around the character's own
-   silhouette, not a dot guessed at a fixed percentage position. A fixed
-   coordinate ("58%, 40%") only ever lined up with one specific sprite's
-   visor by luck and looked wrong on the other two designs — drop-shadow
-   traces whatever the sprite's actual alpha shape is, so it reads correctly
-   regardless of which character or pose is showing. */
-@keyframes sprite-working-glow {
-  0%,
-  100% {
-    filter: drop-shadow(0 0 0 transparent);
+    filter: drop-shadow(0 0 0 transparent) drop-shadow(0 0 0 transparent);
   }
   50% {
-    filter: drop-shadow(0 0 14px var(--teal));
+    filter:
+      drop-shadow(0 0 3px var(--status-color))
+      drop-shadow(0 0 15px var(--status-color));
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .runtime-canvas[data-visual-mode="depth"] .worker-marker__sprite {
-    animation: none !important;
+@keyframes sprite-signal-pulse-opacity {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.6;
   }
 }
 

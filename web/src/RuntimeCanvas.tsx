@@ -44,9 +44,12 @@ import {
   Pause,
   Radio,
 } from 'lucide-react'
-import orchestratorSpriteUrl from './assets/sprites/orchestrator.png'
-import superintendentSpriteUrl from './assets/sprites/superintendent.png'
-import workerSpriteUrl from './assets/sprites/worker.png'
+import {
+  OrchestratorSprite,
+  SubagentSprite,
+  SuperintendentSprite,
+  WorkerSprite,
+} from './crewArt'
 import type {
   Assignment,
   Automation,
@@ -836,15 +839,9 @@ function WorkerMarker({ data, selected }: NodeProps<ObservedWorkerNode>) {
           <span className="worker-marker__body">
             <span className="worker-marker__glyph">
               <Bot aria-hidden="true" size={25} strokeWidth={1.8} />
-              <span
-                aria-hidden="true"
-                className="worker-marker__sprite"
-                style={
-                  {
-                    '--sprite-src': `url(${workerSpriteUrl})`,
-                  } as CSSProperties
-                }
-              />
+              <span aria-hidden="true" className="worker-marker__sprite">
+                <WorkerSprite />
+              </span>
             </span>
             <StatusIcon
               aria-label={`Observed status: ${worker.status}`}
@@ -906,12 +903,9 @@ function ChildAgentMarker({
         <span
           aria-hidden="true"
           className="worker-marker__sprite worker-marker__sprite--child"
-          style={
-            {
-              '--sprite-src': `url(${workerSpriteUrl})`,
-            } as CSSProperties
-          }
-        />
+        >
+          <SubagentSprite />
+        </span>
         <StatusIcon
           aria-label={`Observed status: ${agent.status}`}
           className={agent.status === 'working' ? 'status-spin' : ''}
@@ -996,15 +990,9 @@ function YardOrchestratorMarker({
         />
         <span className="yard-orchestrator-marker__glyph">
           <Network aria-hidden="true" size={35} strokeWidth={1.7} />
-          <span
-            aria-hidden="true"
-            className="worker-marker__sprite"
-            style={
-              {
-                '--sprite-src': `url(${superintendentSpriteUrl})`,
-              } as CSSProperties
-            }
-          />
+          <span aria-hidden="true" className="worker-marker__sprite">
+            <SuperintendentSprite />
+          </span>
           <StatusIcon
             aria-label={`Observed status: ${runtimeState.status}`}
             className={runtimeState.status === 'working' ? 'status-spin' : ''}
@@ -1139,15 +1127,9 @@ function OrchestratorMarker({
           <span className="worker-marker__body">
             <span className="worker-marker__glyph">
               <Crown aria-hidden="true" size={24} strokeWidth={1.8} />
-              <span
-                aria-hidden="true"
-                className="worker-marker__sprite"
-                style={
-                  {
-                    '--sprite-src': `url(${orchestratorSpriteUrl})`,
-                  } as CSSProperties
-                }
-              />
+              <span aria-hidden="true" className="worker-marker__sprite">
+                <OrchestratorSprite />
+              </span>
             </span>
             <StatusIcon
               aria-label={`Observed status: ${runtimeState.status}`}
@@ -1229,15 +1211,9 @@ function AssignedWorkerMarker({
           <span className="worker-marker__body">
             <span className="worker-marker__glyph">
               <Bot aria-hidden="true" size={25} strokeWidth={1.8} />
-              <span
-                aria-hidden="true"
-                className="worker-marker__sprite"
-                style={
-                  {
-                    '--sprite-src': `url(${workerSpriteUrl})`,
-                  } as CSSProperties
-                }
-              />
+              <span aria-hidden="true" className="worker-marker__sprite">
+                <WorkerSprite />
+              </span>
             </span>
             <StatusIcon
               aria-label={`Observed status: ${runtimeState.status}`}

@@ -161,6 +161,7 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
     let socket: WebSocket | null = null
     let released = false
     let fitAnimationFrame = 0
+    let settleFitTimer = 0
     let connectAnimationFrame = 0
     let frameAnimationFrame = 0
     let pendingFrame: FrameMetadata | null = null
@@ -219,18 +220,44 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       }
     }
 
+    let hasFitOnce = false
+
     const fit = () => {
       fitAnimationFrame = 0
       if (disposed || !host.isConnected) return
       const dimensions = fitAddon.proposeDimensions()
+      // Skipping fitAddon.fit() when the proposed cols/rows already match
+      // is correct for every later resize, but not the first one: xterm's
+      // renderer-level setup (including the scrollbar) only initializes
+      // inside fit(), so if the very first proposal happens to already
+      // match xterm's default size, fit() would never run at all. Force
+      // it unconditionally the first time regardless of what's proposed.
       if (
         dimensions &&
-        (dimensions.cols !== terminal.cols ||
+        (!hasFitOnce ||
+          dimensions.cols !== terminal.cols ||
           dimensions.rows !== terminal.rows)
       ) {
         fitAddon.fit()
+        hasFitOnce = true
       }
       sendResize()
+    }
+
+    // xterm.js only recomputes its renderer-level pixel dimensions (the
+    // scrollbar included) when terminal.resize() is called with a value
+    // that actually differs from the current one — calling fit()/resize()
+    // again with the same already-correct cols/rows is a no-op. Resizing
+    // away by one column and back forces that recomputation deliberately,
+    // the same way an incidental browser-window resize does.
+    const nudgeRendererResync = () => {
+      const cols = terminal.cols
+      const rows = terminal.rows
+      terminal.resize(Math.max(2, cols - 1), rows)
+      window.requestAnimationFrame(() => {
+        if (disposed) return
+        terminal.resize(cols, rows)
+      })
     }
 
     const scheduleFit = () => {
@@ -269,120 +296,134 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
     })
 
     connectAnimationFrame = window.requestAnimationFrame(() => {
-      connectAnimationFrame = 0
-      if (disposed) return
-
-      fitAddon.fit()
-      const url = targetKind === 'yard-orchestrator'
-        ? yardOrchestratorTerminalWebSocketUrl(
-            terminal.cols,
-            terminal.rows,
-          )
-        : targetKind === 'coordination-node' && nodeId
-          ? coordinationNodeTerminalWebSocketUrl(
-              nodeId,
-              terminal.cols,
-              terminal.rows,
-            )
-        : targetKind === 'assignment' && assignmentId && projectId
-          ? assignmentTerminalWebSocketUrl(
-              projectId,
-              assignmentId,
-              terminal.cols,
-              terminal.rows,
-            )
-          : orchestratorTerminalWebSocketUrl(
-              projectId ?? '',
-              terminal.cols,
-              terminal.rows,
-            )
-      socket = new WebSocket(url)
-
-      socket.onopen = () => {
+      // A single animation frame after this effect runs can still land in
+      // the same layout pass that just made the (previously hidden or
+      // unmounted) dialog visible, before its flexed size has settled —
+      // a second frame guarantees layout has actually completed first.
+      connectAnimationFrame = window.requestAnimationFrame(() => {
+        connectAnimationFrame = 0
         if (disposed) return
-        setConnection({ kind: 'connected', detail: 'Connected' })
-        sendResize(true)
-      }
 
-      socket.onmessage = (event) => {
-        if (disposed || typeof event.data !== 'string') return
+        fitAddon.fit()
+        // Capture the settled size before nudging — nudgeRendererResync()
+        // leaves terminal.cols/rows sitting at a temporary value until its
+        // own next-frame callback restores them.
+        const cols = terminal.cols
+        const rows = terminal.rows
+        nudgeRendererResync()
+        // xterm's character-cell measurement (which the renderer's pixel
+        // dimensions derive from) isn't guaranteed to be ready this soon
+        // after the container becomes visible. Re-fit once more after a
+        // real amount of clock time as a backstop, since animation frames
+        // alone haven't been reliably long enough.
+        settleFitTimer = window.setTimeout(() => {
+          settleFitTimer = 0
+          if (disposed) return
+          fitAddon.fit()
+          nudgeRendererResync()
+          sendResize(true)
+        }, 500)
 
-        let message: TerminalServerMessage
-        try {
-          message = JSON.parse(event.data) as TerminalServerMessage
-        } catch {
-          setConnection({
-            kind: 'error',
-            detail: 'Terminal protocol error',
-          })
-          socket?.close(1000, 'Protocol error')
-          return
+        const url = targetKind === 'yard-orchestrator'
+          ? yardOrchestratorTerminalWebSocketUrl(cols, rows)
+          : targetKind === 'coordination-node' && nodeId
+            ? coordinationNodeTerminalWebSocketUrl(nodeId, cols, rows)
+          : targetKind === 'assignment' && assignmentId && projectId
+            ? assignmentTerminalWebSocketUrl(
+                projectId,
+                assignmentId,
+                cols,
+                rows,
+              )
+            : orchestratorTerminalWebSocketUrl(projectId ?? '', cols, rows)
+        socket = new WebSocket(url)
+
+        socket.onopen = () => {
+          if (disposed) return
+          setConnection({ kind: 'connected', detail: 'Connected' })
+          sendResize(true)
         }
 
-        if (isTerminalFrameMessage(message)) {
-          if (message.seq <= lastSequence) return
-          lastSequence = message.seq
+        socket.onmessage = (event) => {
+          if (disposed || typeof event.data !== 'string') return
+
+          let message: TerminalServerMessage
           try {
-            // Reset only for the first authoritative snapshot. Later full
-            // frames may follow resize/reconnect state and must not erase
-            // bytes already accepted for this lease.
-            if (message.full && !receivedInitialFrame) terminal.reset()
-            terminal.write(decodeBase64(message.bytes))
-            receivedInitialFrame = true
-            pendingFrame = {
-              seq: message.seq,
-              width: message.width,
-              height: message.height,
-              full: message.full,
-            }
-            if (!frameAnimationFrame) {
-              frameAnimationFrame = window.requestAnimationFrame(() => {
-                frameAnimationFrame = 0
-                if (!disposed && pendingFrame) setFrame(pendingFrame)
-                pendingFrame = null
-              })
-            }
+            message = JSON.parse(event.data) as TerminalServerMessage
           } catch {
             setConnection({
               kind: 'error',
-              detail: 'Terminal frame could not be decoded',
+              detail: 'Terminal protocol error',
             })
-            socket?.close(1000, 'Invalid terminal frame')
+            socket?.close(1000, 'Protocol error')
+            return
           }
-          return
+
+          if (isTerminalFrameMessage(message)) {
+            if (message.seq <= lastSequence) return
+            lastSequence = message.seq
+            try {
+              // Reset only for the first authoritative snapshot. Later full
+              // frames may follow resize/reconnect state and must not erase
+              // bytes already accepted for this lease.
+              if (message.full && !receivedInitialFrame) terminal.reset()
+              terminal.write(decodeBase64(message.bytes))
+              receivedInitialFrame = true
+              pendingFrame = {
+                seq: message.seq,
+                width: message.width,
+                height: message.height,
+                full: message.full,
+              }
+              if (!frameAnimationFrame) {
+                frameAnimationFrame = window.requestAnimationFrame(() => {
+                  frameAnimationFrame = 0
+                  if (!disposed && pendingFrame) setFrame(pendingFrame)
+                  pendingFrame = null
+                })
+              }
+            } catch {
+              setConnection({
+                kind: 'error',
+                detail: 'Terminal frame could not be decoded',
+              })
+              socket?.close(1000, 'Invalid terminal frame')
+            }
+            return
+          }
+
+          if (message.type === 'terminal.closed') {
+            released = true
+            setConnection({
+              kind: 'closed',
+              detail: message.reason ?? message.code ?? 'Session closed',
+            })
+            socket?.close(1000)
+          }
         }
 
-        if (message.type === 'terminal.closed') {
-          released = true
-          setConnection({
-            kind: 'closed',
-            detail: message.reason ?? message.code ?? 'Session closed',
+        socket.onerror = () => {
+          if (!disposed) {
+            setConnection({
+              kind: 'error',
+              detail: 'Terminal connection unavailable',
+            })
+          }
+        }
+
+        socket.onclose = (event) => {
+          if (disposed) return
+          setConnection((current) => {
+            if (current.kind === 'closed' || current.kind === 'error') {
+              return current
+            }
+            return {
+              kind: 'closed',
+              detail: event.reason || 'Terminal connection closed',
+            }
           })
-          socket?.close(1000)
         }
-      }
-
-      socket.onerror = () => {
-        if (!disposed) {
-          setConnection({
-            kind: 'error',
-            detail: 'Terminal connection unavailable',
-          })
-        }
-      }
-
-      socket.onclose = (event) => {
-        if (disposed) return
-        setConnection((current) => {
-          if (current.kind === 'closed' || current.kind === 'error') {
-            return current
-          }
-          return {
-            kind: 'closed',
-            detail: event.reason || 'Terminal connection closed',
-          }
-        })
-      }
+      })
     })
 
     return () => {
@@ -398,6 +439,9 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       host.removeEventListener('wheel', handleWheel, true)
       if (fitAnimationFrame) {
         window.cancelAnimationFrame(fitAnimationFrame)
+      }
+      if (settleFitTimer) {
+        window.clearTimeout(settleFitTimer)
       }
       if (connectAnimationFrame) {
         window.cancelAnimationFrame(connectAnimationFrame)
