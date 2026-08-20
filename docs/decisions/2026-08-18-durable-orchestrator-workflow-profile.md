@@ -58,11 +58,18 @@ and backend-enforced.
 The factory Markdown requires the central orchestrator to:
 
 - decompose every request into bounded independent Yard/Herdr worker lanes;
+- capture once the workspace ID that owns the central orchestrator pane without
+  inferring it from repository identity, focus, or a workspace naming pattern;
+- create every worker as a separate tab in that captured workspace, using an
+  isolated git worktree for write lanes and a plain tab for read-only lanes;
 - provide each worker complete zero-context briefs and explicit exclusions;
 - inspect the fleet every ten minutes while actively running;
 - send concrete push-forward prompts for stalls and unresolved decisions;
 - collect named artifacts and committed write-lane SHAs;
-- reconcile all lane output and integration order;
+- require separate explicit grants for automatic token spend and
+  permission-bypass settings;
+- review all lane output, choose an integration order, and integrate accepted
+  commits;
 - run final tests, formatting, linting, and review; and
 - close completed worker lifecycles without incidental branch, worktree, or
   transcript deletion.

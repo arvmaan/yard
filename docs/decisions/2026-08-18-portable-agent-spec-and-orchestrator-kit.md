@@ -303,54 +303,49 @@ plugin discovery mechanism. The source kit is embedded or installed relative
 to the Yard executable; it never references a developer home directory.
 
 The wrapper discovers the repository root, `herdr`, `jq`, supported agent
-kinds, and current flags at runtime. It captures Herdr JSON IDs, uses plain
-workspaces for read-only lanes, creates isolated worktrees only for write
-lanes, polls status, and requires a structured lane result. Internal paths are
-relative to the kit or resolved from `git rev-parse`; transient state uses
-`$YARD_RUN_DIR` or an XDG-derived directory.
+kinds, and current flags at runtime. Before delegation it captures once the
+workspace ID that owns the orchestrator pane. It uses plain tabs in that
+workspace for read-only lanes, isolated git worktrees attached as tabs for
+write lanes, polls status, and requires a structured lane result. Internal
+paths are relative to the kit or resolved from `git rev-parse`; transient state
+uses `$YARD_RUN_DIR` or an XDG-derived directory.
 
-Creating a Herdr worktree or starting an agent does not make that runtime a
-Yard project worker. Herdr may create the worktree in a new top-level
-workspace, while Yard binds the project to a different workspace. Accepted
-ADR-0008 rejects allocating a live worker across that boundary. The embedded
-kit must therefore adopt each new runtime into the project-bound workspace
-before Yard confirmed allocation:
+Creating a git worktree or starting an agent does not make that runtime a Yard
+project worker. Accepted ADR-0008 rejects allocating a live worker across the
+project workspace boundary, so the embedded kit must create every child
+runtime directly as a tab in the captured orchestrator workspace:
 
-1. Read fresh Herdr and Yard inventory and resolve the project's currently
-   owned Herdr workspace.
-2. Create the isolated worktree and start the agent, but do not allocate it.
-3. Capture the terminal ID, provider session, process identity and state,
-   isolated worktree CWD, source workspace, and current pane/tab topology.
-4. If the source differs from the project workspace, run:
+1. Capture the orchestrator pane once and retain its exact workspace ID for the
+   entire fleet. Never infer it from project or repository identity, current
+   focus, or a workspace naming convention.
+2. For a write lane, create the isolated checkout from the explicit repository
+   root with `git worktree add`. For a read-only lane, retain the source
+   checkout.
+3. Create a Herdr tab with the captured workspace ID and lane checkout as its
+   CWD. Herdr 0.8.0 treats `worktree create --workspace` and `--cwd` as
+   alternative selectors, so the kit must not combine them.
+4. Verify the returned tab and pane carry the captured workspace ID before
+   starting the agent or allocating it.
+5. Capture the terminal ID, provider session, process identity and state,
+   isolated worktree CWD, workspace, and current pane/tab topology.
+6. Read both inventories again and require Yard reconciliation to represent
+   the worker in the captured workspace. Only then may normal confirmed
+   allocation create an active Yard assignment.
 
-   ```sh
-   herdr pane move <pane> --workspace <project-workspace> --new-tab \
-     --label <label>
-   ```
-
-5. Read both inventories again. Require one unique runtime in the project
-   workspace with the same terminal ID, provider session, process, and CWD.
-   Pane and tab IDs may change during movement and must be recaptured.
-6. Require Yard inventory reconciliation to represent that worker in the
-   project-bound workspace. Only then may the normal confirmed allocation
-   create an active Yard assignment.
-
-Movement and reconciliation fail closed. A failed or ambiguous move triggers
-fresh inventory and lookup by the captured stable identity; allocation may
-continue only when one unique match is in the target workspace. A match still
-in the source workspace requires a deliberate retry, while an absent or
-ambiguous match stops the operation. Failure to reconcile stops allocation
-without blind recreation or movement. If allocation fails after successful
-adoption, retain the observed unassigned worker, reload command versions, and
-retry according to allocation idempotency; do not recreate or move it again.
-All retained resources remain available for inspection, and any later cleanup
-must revalidate captured identity and owned-workspace constraints.
+Tab creation, workspace verification, and reconciliation fail closed. A
+mismatched, absent, or ambiguous runtime stops allocation without blind
+recreation or movement. If allocation fails after successful reconciliation,
+retain the observed unassigned worker, reload command versions, and retry
+according to allocation idempotency; do not recreate it. All retained
+resources remain available for inspection, and any later cleanup must
+revalidate captured identity and owned-workspace constraints.
 
 Starting or prompting additional agents requires an explicit, non-persisted
 `--approve-agent-spend` grant plus bounded agent and depth limits. Planning
-and dry run are the default. The kit does not add dangerous autonomy flags by
-default. Cleanup is a separate explicit action and never automatically
-deletes transcripts, branches, or useful worktrees.
+and dry run are the default. Permission-bypass settings require a separate
+explicit grant and are never inferred from spend approval, workflow cadence,
+or runtime settings. Cleanup is a separate explicit action and never
+automatically deletes transcripts, branches, or useful worktrees.
 
 This policy is instruction- and wrapper-enforced in this lane. Strong runtime
 budget enforcement belongs to the separate token-coordination design and is
@@ -366,10 +361,9 @@ not changed by this ADR.
   and security work before the UI can advertise portability.
 - Provider changes can produce explicit degradation warnings rather than
   silently changing behavior.
-- The embedded kit can create real isolated Herdr lanes from a new project
-  orchestrator, adopt them into the Yard-owned project workspace without
-  replacing their stable runtime identity, and allocate them without local
-  absolute paths or implicit token spend.
+- The embedded kit can create real isolated Herdr lanes as child tabs of the
+  new project orchestrator's captured workspace and allocate them without
+  local absolute paths or implicit token spend.
 
 ## Non-Goals
 

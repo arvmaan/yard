@@ -1151,6 +1151,7 @@ mod tests {
                 let result = match step {
                     0 => {
                         assert_eq!(request["method"], "tab.create");
+                        assert_eq!(request["params"]["workspace_id"], "workspace-2");
                         serde_json::json!({
                             "type": "tab_created",
                             "tab": {

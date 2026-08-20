@@ -16,12 +16,12 @@ version.
 
 Embed a relocatable `herdr-orchestration` Agent Skill and `herdr-cli`
 companion in Yard-created project orchestrators. Materialize it relative to
-the owned project workspace and discover runtime tools dynamically. Treat
-worktree creation and project adoption as separate phases: preserve runtime
-identity while moving the pane into the project-bound workspace, refresh
-inventory, let Yard reconcile it, and only then confirm allocation. Default to
-a dry run and require a non-persisted token-spend approval before starting or
-prompting additional agents.
+the owned project workspace and discover runtime tools dynamically. Capture
+the workspace that owns the orchestrator pane once, create isolated write
+checkouts with Git, and attach every lane as a tab in that captured workspace
+before starting or allocating its agent. Default to a dry run and require
+non-persisted token-spend approval before model use. Require a separate
+explicit grant only when permission-bypass settings are requested.
 
 Do not add replacement UI in this lane. The project handoff path has an
 atomic durable cutover, but displaced-orchestrator cleanup loses the captured
@@ -208,12 +208,11 @@ files were last committed on 2026-08-17, with the Skills source updated on
 ## Embedded Herdr Orchestrator Kit
 
 The current `herdr-orchestration` skill has the correct baseline operating
-shape: classify before creating durable lanes, use plain workspaces for
-read-only research, isolate write lanes in worktrees, capture Herdr IDs,
-prompt with bounded deliverables, poll rather than treating timeout as
-failure, and make cleanup explicit. It does not yet define Yard's required
-project-workspace adoption phase; the embedded contract below adds it.
-Evidence is in:
+shape: classify before creating durable lanes, capture the orchestrator pane's
+workspace once, use plain tabs there for read-only research, attach isolated
+write-lane worktrees as tabs there, prompt with bounded deliverables, poll
+rather than treating timeout as failure, and make cleanup explicit. Evidence
+is in:
 
 - `/local/home/arvinmaa/.codex/skills/herdr-orchestration/SKILL.md:13`
 - `/local/home/arvinmaa/.codex/skills/herdr-orchestration/SKILL.md:35`
@@ -243,69 +242,62 @@ installed kit.
 6. Put transient manifests under `$YARD_RUN_DIR` or an XDG-derived path and
    record workspace, worktree, terminal, pane, tab, provider session, process,
    agent, branch, checkout, and isolated worktree CWD identities.
-7. Default to a dry-run plan. Use plain workspaces for declared read-only
-   lanes and worktrees only for declared write lanes.
+7. Default to a dry-run plan. Capture once the workspace ID that owns the
+   orchestrator pane, use plain tabs there for declared read-only lanes, and
+   attach isolated git worktrees there as tabs for declared write lanes. Never
+   infer the ID from project or repository identity, current focus, or a
+   workspace naming convention.
 8. Require explicit, non-persisted `--approve-agent-spend` plus maximum agent
    and depth bounds before any `herdr agent start` or prompt that incurs model
-   usage. Never add full-autonomy flags by default.
+   usage. Require a separate explicit grant for permission-bypass settings;
+   never infer one from spend approval or runtime settings.
 9. Require structured lane output with conclusions, evidence, files changed,
    checks, risks, and next action.
 10. Keep close/remove operations separate. Never infer completion from agent
     status and never automatically delete a transcript, branch, or worktree.
 
-### Project-Workspace Adoption Contract
+### Captured Parent-Workspace Contract
 
 A 2026-08-18 live run exposed a required boundary that the initial packaging
-contract did not state. `herdr worktree create` produced top-level workspaces
-`w1V` through `w1Z`, while the Yard project `Yard` was bound to `wN`.
-Accepted ADR-0008 rejects live cross-workspace allocation. A newly created
-Herdr worktree is therefore isolated runtime infrastructure, not yet a Yard
-project worker, and it must not be passed to confirmed allocation in its
-source workspace.
+contract did not state. The old `herdr worktree create` flow produced
+top-level workspaces observed as `w1V` through `w1Z`, while the orchestrator's
+workspace was observed as `wN`. Those IDs are historical observations, not a
+discovery convention. Moving the resulting panes recovered that run, but
+post-creation movement is not the normal provisioning contract.
 
-The successful sequence was:
+Accepted ADR-0008 rejects live cross-workspace allocation. The supported
+sequence prevents that topology:
 
-1. Fetch fresh Herdr and Yard inventory and capture the project's currently
-   owned workspace (`wN` in this run).
-2. Create the isolated Herdr worktree, start its agent, and leave it
-   unallocated.
-3. Before movement, capture the terminal ID, Codex provider session, process
-   identity and state, isolated worktree CWD, source workspace, and pane/tab
-   topology.
-4. Move the live pane into the project-bound workspace before any Yard
-   confirmed allocation:
-
-   ```sh
-   herdr pane move <pane> --workspace wN --new-tab --label <label>
-   ```
-
-5. Fetch fresh Herdr and Yard inventory. Locate exactly one runtime by the
-   captured terminal/provider identity and verify the same terminal ID, Codex
-   provider session, process, and isolated worktree CWD. Require its workspace
-   to be `wN`; because pane and tab IDs may change, recapture both rather than
-   treating them as stable identity.
-6. Let fresh Yard inventory reconcile the observed worker topology to `wN`.
-   Verify the worker is observed and unassigned in the project workspace.
-7. Invoke the normal Yard confirmed allocation only after movement,
-   post-move identity checks, and reconciliation. That allocation, not
-   `herdr worktree create`, creates the active Yard assignment.
+1. Capture the orchestrator pane once before delegation and retain its exact
+   workspace ID for the fleet.
+2. Resolve the explicit repository root. For each write lane, create an
+   isolated checkout with `git worktree add`; read-only lanes retain the source
+   checkout.
+3. Create each lane with `herdr tab create`, passing `--workspace <captured>`
+   and `--cwd <checkout>`. Herdr 0.8.0 treats the `worktree create` selectors
+   `--workspace` and `--cwd` as alternatives, so never combine them.
+4. Verify the returned tab and pane carry the captured workspace ID, then
+   start the agent and capture terminal, provider session, process, checkout,
+   pane, and tab identity.
+5. Fetch fresh Herdr and Yard inventory. Require exactly one matching runtime
+   in the captured workspace and let Yard reconcile it as observed and
+   unassigned.
+6. Invoke normal Yard confirmed allocation only after workspace verification
+   and reconciliation. Allocation creates the active Yard assignment.
 
 The wrapper must fail closed:
 
-- If worktree or agent creation fails, do not allocate.
-- If pane movement fails or its result is ambiguous, do not allocate. Refresh
-  both inventories and locate the runtime by captured terminal/provider
-  identity. Continue only if exactly one matching worker is in the target
-  workspace with the same process and CWD.
-- If the unique match remains in the source workspace, resolve the failure and
-  retry movement deliberately. If no match or multiple matches exist, stop
-  and retain the resources for inspection.
+- If worktree, tab, or agent creation fails, do not allocate.
+- If the tab reports a different workspace, do not allocate or blindly move
+  it. Refresh both inventories and retain the resources for inspection.
+- If no unique runtime matches the captured terminal/provider identity,
+  process, and CWD in the captured workspace, stop.
 - If Yard reconciliation does not converge, do not allocate, recreate, or
-  blindly move the pane again. Preserve the live runtime for inspection.
-- If confirmed allocation fails after successful movement and reconciliation,
+  blindly move the pane. Preserve the live runtime for inspection.
+- If confirmed allocation fails after workspace verification and reconciliation,
   keep the worker observed and unassigned in the target workspace. Do not
-  recreate or re-move it; reload current versions and retry under the
-  allocation command's idempotency semantics.
+  recreate it; reload current versions and retry under the allocation
+  command's idempotency semantics.
 - Cleanup remains a separate explicit operation. Before any destructive close
   or worktree removal, freshly revalidate the captured runtime identity,
   project-owned workspace, and owned topology. Never remove a worktree,

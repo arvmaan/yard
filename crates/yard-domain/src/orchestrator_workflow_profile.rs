@@ -9,9 +9,10 @@ Apply this workflow to every prompt delivered to the Yard orchestrator.
 ## Delegate through independent workers
 
 1. Decompose the request into bounded lanes that can run independently.
-2. Create one Yard/Herdr worker per lane. Use isolated worktrees for write lanes and plain workspaces only for read-only investigation.
-3. Give every worker complete context. Include the lane boundary, relevant facts and source paths, explicit exclusions, the expected artifact or commit, required checks, and the stopping condition. Workers start with no conversation context.
-4. Require each worker to return conclusions, evidence, files changed, tests run with observed results, unresolved risks, and the recommended next action.
+2. Before creating workers, capture once the workspace ID that owns the central orchestrator pane. Reuse that exact ID for the entire fleet; never infer it from repository identity, current focus, or a `wN` naming convention.
+3. Create one Yard/Herdr worker per lane as a separate tab in that captured workspace, and verify its observed workspace ID. Use an isolated git worktree for every write lane and a plain tab for read-only investigation. When the exact source checkout matters, create the worktree with Git and then create the Herdr tab with the captured workspace ID and worktree checkout as its CWD.
+4. Give every worker complete context. Include the lane boundary, relevant facts and source paths, explicit exclusions, the expected artifact or commit, required checks, and the stopping condition. Workers start with no conversation context.
+5. Require each worker to return conclusions, evidence, files changed, tests run with observed results, unresolved risks, and the recommended next action.
 
 Do not perform the delegated implementation in the central orchestrator. Use the central session to classify, brief, monitor, intervene, collect, and reconcile the worker fleet.
 
@@ -26,7 +27,7 @@ On each monitoring pass:
 - send a concrete push-forward prompt that states the observed condition, the decision or next action, and the required artifact;
 - avoid generic prompts such as "continue" or "give an update."
 
-Automatic token-spending behavior remains opt-in and backend-enforced. Never infer permission to send automatic prompts from this workflow or its cadence.
+Automatic token-spending behavior remains opt-in and backend-enforced. Permission-bypass settings require a separate explicit grant. Never infer token-spend approval, permission to send automatic prompts, or permission-bypass settings from this workflow, its cadence, or the orchestrator's runtime settings.
 
 ## Collect deterministic output
 
@@ -34,9 +35,9 @@ Require write lanes to commit coherent changes and report the commit SHA. Requir
 
 After all lanes stop:
 
-1. collect every artifact and commit;
-2. reconcile overlaps, contradictions, and integration order;
-3. inspect the combined diff and preserve unrelated user changes;
+1. collect and review every artifact and commit;
+2. reconcile overlaps and contradictions and choose the integration order;
+3. integrate accepted commits in that order, inspect the combined diff, and preserve unrelated user changes;
 4. run the final focused and repository-level tests, formatting, linting, and review appropriate to the change;
 5. resolve failures or return an exact residual gap;
 6. close completed worker lifecycles while retaining branches, worktrees, transcripts, and artifacts unless deletion was explicitly requested.
@@ -184,6 +185,14 @@ mod tests {
         let instructions = FACTORY_ORCHESTRATOR_WORKFLOW_INSTRUCTIONS;
 
         assert!(instructions.contains("one Yard/Herdr worker per lane"));
+        assert!(instructions.contains("workspace ID that owns the central orchestrator pane"));
+        assert!(instructions.contains("separate tab in that captured workspace"));
+        assert!(instructions.contains("isolated git worktree for every write lane"));
+        assert!(instructions.contains("plain tab for read-only investigation"));
+        assert!(
+            instructions
+                .contains("repository identity, current focus, or a `wN` naming convention")
+        );
         assert!(instructions.contains("complete context"));
         assert!(instructions.contains("every 10 minutes"));
         assert!(instructions.contains("concrete push-forward prompt"));
@@ -193,6 +202,11 @@ mod tests {
         assert!(instructions.contains("close completed worker lifecycles"));
         assert!(instructions.contains("does not create backend wakeups"));
         assert!(instructions.contains("Automatic token-spending behavior remains opt-in"));
+        assert!(
+            instructions.contains("Permission-bypass settings require a separate explicit grant")
+        );
+        assert!(instructions.contains("Never infer token-spend approval"));
+        assert!(instructions.contains("integrate accepted commits"));
         assert_eq!(FACTORY_ORCHESTRATOR_WORKFLOW_MONITOR_INTERVAL_MS, 600_000);
     }
 
