@@ -1,8 +1,18 @@
-use std::{future::IntoFuture, sync::Arc, time::Duration};
+use std::{
+    fs::File,
+    future::IntoFuture,
+    io::{self, Seek, SeekFrom, Write},
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
 
 use thiserror::Error;
-use tokio::{sync::watch, task::JoinHandle, time::timeout};
-use tracing_subscriber::EnvFilter;
+use tokio::{
+    sync::watch,
+    task::{JoinHandle, JoinSet},
+    time::timeout,
+};
+use tracing_subscriber::{EnvFilter, fmt::MakeWriter};
 use yard_herdr::{HerdrAdapter, HerdrConfig};
 use yard_server::{
     app_with_reconciliation_and_paths_and_automation_and_shutdown,
@@ -17,6 +27,7 @@ use crate::lifecycle::{self, LifecycleError};
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 const CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
+const MAX_MANAGED_LOG_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub(crate) enum ServerError {
@@ -28,6 +39,10 @@ pub(crate) enum ServerError {
     Lifecycle(#[from] LifecycleError),
     #[error("server I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("lifecycle control failed: {0}")]
+    Control(String),
+    #[error("background service failed: {0}")]
+    Background(String),
 }
 
 impl ServerError {
@@ -35,7 +50,7 @@ impl ServerError {
         match self {
             Self::Config(_) => 2,
             Self::Lifecycle(error) => error.exit_code(),
-            Self::Store(_) | Self::Io(_) => 1,
+            Self::Store(_) | Self::Io(_) | Self::Control(_) | Self::Background(_) => 1,
         }
     }
 }
@@ -49,16 +64,26 @@ enum ServerEvent {
     Http(std::io::Result<()>),
     Shutdown,
     Control(Result<(), tokio::task::JoinError>),
+    Background(Option<Result<&'static str, tokio::task::JoinError>>),
 }
 
 pub(crate) fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_ansi(false)
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("yard_server=info")),
-        )
+        .with_env_filter(tracing_filter())
         .try_init();
+}
+
+fn init_managed_tracing(file: File) {
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(tracing_filter())
+        .with_writer(BoundedLogWriter::new(file, MAX_MANAGED_LOG_BYTES))
+        .try_init();
+}
+
+fn tracing_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("yard_server=info"))
 }
 
 pub(crate) async fn run_foreground() -> Result<(), ServerError> {
@@ -78,6 +103,9 @@ async fn run(mode: RunMode<'_>) -> Result<(), ServerError> {
         RunMode::Managed { .. } => lifecycle::InstanceMode::Managed,
     };
     let mut runtime_claim = lifecycle::claim_runtime(&config.database_path, lifecycle_mode).await?;
+    if lifecycle_mode == lifecycle::InstanceMode::Managed {
+        init_managed_tracing(runtime_claim.paths().open_log()?);
+    }
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     let address = listener.local_addr()?;
     let ui_url = format!("http://{address}/");
@@ -124,9 +152,19 @@ async fn run(mode: RunMode<'_>) -> Result<(), ServerError> {
     let mut control_task = lifecycle::spawn_control(control, metadata, shutdown.clone());
     runtime_claim.published();
 
-    let reconciliation_task = tokio::spawn(reconciliation.run());
-    let cleanup_task = tokio::spawn(cleanup.run());
-    let automation_task = tokio::spawn(automations.run());
+    let mut background_tasks = JoinSet::new();
+    background_tasks.spawn(async move {
+        reconciliation.run().await;
+        "reconciliation"
+    });
+    background_tasks.spawn(async move {
+        cleanup.run().await;
+        "runtime cleanup"
+    });
+    background_tasks.spawn(async move {
+        automations.run().await;
+        "automation scheduler"
+    });
 
     tracing::info!(
         target: "yard_server",
@@ -156,30 +194,33 @@ async fn run(mode: RunMode<'_>) -> Result<(), ServerError> {
             result = &mut server => ServerEvent::Http(result),
             _ = shutdown_observer.wait_for(|requested| *requested) => ServerEvent::Shutdown,
             result = &mut control_task => ServerEvent::Control(result),
+            result = background_tasks.join_next() => ServerEvent::Background(result),
         };
-        let (http_result, control_finished) = match event {
-            ServerEvent::Http(result) => (Some(result), false),
-            ServerEvent::Shutdown => (None, false),
+        let (http_result, control_finished, event_failure) = match event {
+            ServerEvent::Http(result) => (Some(result), false, None),
+            ServerEvent::Shutdown => (None, false, None),
             ServerEvent::Control(result) => {
-                match result {
-                    Ok(()) => tracing::error!(
-                        target: "yard_server",
-                        "lifecycle control listener stopped unexpectedly"
-                    ),
-                    Err(error) => tracing::error!(
-                        target: "yard_server",
-                        %error,
-                        "lifecycle control listener task failed"
-                    ),
-                }
-                let _ = shutdown.send(true);
-                (None, true)
+                let message = match result {
+                    Ok(()) => "listener stopped unexpectedly".to_owned(),
+                    Err(error) => format!("listener task failed: {error}"),
+                };
+                tracing::error!(target: "yard_server", error = %message, "lifecycle control failed");
+                (None, true, Some(ServerError::Control(message)))
+            }
+            ServerEvent::Background(result) => {
+                let message = match result {
+                    Some(Ok(name)) => format!("{name} stopped unexpectedly"),
+                    Some(Err(error)) => format!("task failed: {error}"),
+                    None => "supervisor became empty".to_owned(),
+                };
+                tracing::error!(target: "yard_server", error = %message, "background service failed");
+                (None, false, Some(ServerError::Background(message)))
             }
         };
-        if http_result.is_none() {
-            connections.close();
-        }
-        let result = if let Some(result) = http_result {
+        let _ = shutdown.send(true);
+        connections.close();
+        abort_background_tasks(&mut background_tasks).await;
+        let server_result = if let Some(result) = http_result {
             result.map_err(ServerError::Io)
         } else if let Ok(result) = timeout(GRACEFUL_SHUTDOWN_TIMEOUT, &mut server).await {
             result.map_err(ServerError::Io)
@@ -191,18 +232,16 @@ async fn run(mode: RunMode<'_>) -> Result<(), ServerError> {
             );
             Ok(())
         };
+        let result = match (server_result, event_failure) {
+            (Err(error), _) | (Ok(()), Some(error)) => Err(error),
+            (Ok(()), None) => Ok(()),
+        };
         (result, control_finished)
     };
 
     let _ = shutdown.send(true);
     connections.close();
     signal_task.abort();
-    reconciliation_task.abort();
-    cleanup_task.abort();
-    automation_task.abort();
-    let _ = reconciliation_task.await;
-    let _ = cleanup_task.await;
-    let _ = automation_task.await;
     if !control_finished {
         control_task.abort();
         let _ = control_task.await;
@@ -220,6 +259,71 @@ async fn run(mode: RunMode<'_>) -> Result<(), ServerError> {
     drop(owner_guard);
     runtime_claim.retain_instance_lock_until_process_exit();
     result
+}
+
+async fn abort_background_tasks(tasks: &mut JoinSet<&'static str>) {
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
+#[derive(Clone)]
+struct BoundedLogWriter {
+    file: Arc<Mutex<File>>,
+    maximum: u64,
+}
+
+impl BoundedLogWriter {
+    fn new(file: File, maximum: u64) -> Self {
+        Self {
+            file: Arc::new(Mutex::new(file)),
+            maximum,
+        }
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for BoundedLogWriter {
+    type Writer = BoundedLogGuard<'writer>;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        BoundedLogGuard {
+            file: self
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            maximum: self.maximum,
+        }
+    }
+}
+
+struct BoundedLogGuard<'writer> {
+    file: MutexGuard<'writer, File>,
+    maximum: u64,
+}
+
+impl Write for BoundedLogGuard<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let maximum = usize::try_from(self.maximum).unwrap_or(usize::MAX);
+        let retained = if buffer.len() > maximum {
+            &buffer[buffer.len() - maximum..]
+        } else {
+            buffer
+        };
+        let length = self.file.metadata()?.len();
+        if length.saturating_add(retained.len() as u64) > self.maximum {
+            self.file.set_len(0)?;
+            self.file.seek(SeekFrom::Start(0))?;
+        }
+        if retained.len() == buffer.len() {
+            self.file.write(retained)
+        } else {
+            self.file.write_all(retained)?;
+            Ok(buffer.len())
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
 }
 
 fn spawn_signal_handler(shutdown: watch::Sender<bool>) -> JoinHandle<()> {
@@ -249,5 +353,47 @@ async fn wait_for_os_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future::pending, io::Write};
+
+    use tempfile::tempfile;
+    use tokio::task::JoinSet;
+
+    use super::{BoundedLogWriter, abort_background_tasks};
+
+    #[tokio::test]
+    async fn background_task_exit_is_observed_and_remaining_tasks_are_aborted() {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async { "exited service" });
+        tasks.spawn(async {
+            pending::<()>().await;
+            "pending service"
+        });
+
+        let exited = tasks
+            .join_next()
+            .await
+            .expect("supervised task")
+            .expect("task result");
+        assert_eq!(exited, "exited service");
+        abort_background_tasks(&mut tasks).await;
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn managed_log_writer_discards_old_records_at_the_size_limit() {
+        let file = tempfile().expect("temporary log");
+        let writer = BoundedLogWriter::new(file.try_clone().expect("clone log"), 32);
+        {
+            let mut output = tracing_subscriber::fmt::MakeWriter::make_writer(&writer);
+            output.write_all(&[b'a'; 24]).expect("first record");
+            output.write_all(&[b'b'; 24]).expect("second record");
+            output.flush().expect("flush");
+        }
+        assert!(file.metadata().expect("metadata").len() <= 32);
     }
 }

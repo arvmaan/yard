@@ -21,7 +21,7 @@ use crate::{
     },
 };
 
-const TERMINAL_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+const TERMINAL_OPERATION_TIMEOUT: Duration = Duration::from_secs(6);
 const TERMINAL_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Deserialize)]
@@ -136,23 +136,16 @@ async fn relay(
                 break;
             }
             _ = lease_check.tick() => {
-                if !matches!(
-                    timeout(TERMINAL_OPERATION_TIMEOUT, terminals.validate_lease(&lease)).await,
-                    Ok(Ok(()))
-                ) {
-                    send_closed(&mut socket, lease.revoked_reason()).await;
+                if let Err(reason) = validate_lease(&terminals, &lease).await {
+                    send_closed(&mut socket, reason).await;
                     break;
                 }
             }
             runtime_message = session.next_message() => {
                 match runtime_message {
                     Ok(Some(message)) => {
-                        if !matches!(
-                            timeout(TERMINAL_OPERATION_TIMEOUT, terminals.validate_lease(&lease))
-                                .await,
-                            Ok(Ok(()))
-                        ) {
-                            send_closed(&mut socket, lease.revoked_reason()).await;
+                        if let Err(reason) = validate_lease(&terminals, &lease).await {
+                            send_closed(&mut socket, reason).await;
                             break;
                         }
                         if let Some((sequence, full)) = message.sequence() {
@@ -201,17 +194,21 @@ async fn relay(
                             break;
                         }
                         if matches!(command, TerminalClientMessage::Release) {
-                            let _ =
-                                timeout(TERMINAL_OPERATION_TIMEOUT, session.release()).await;
-                            send_closed(&mut socket, "released").await;
+                            match timeout(TERMINAL_OPERATION_TIMEOUT, session.release()).await {
+                                Ok(Ok(())) => send_closed(&mut socket, "released").await,
+                                Ok(Err(error)) => {
+                                    tracing::warn!(%error, "interactive terminal release failed");
+                                    send_closed(&mut socket, "runtime_error").await;
+                                }
+                                Err(_) => {
+                                    tracing::warn!("interactive terminal release timed out");
+                                    send_closed(&mut socket, "runtime_timeout").await;
+                                }
+                            }
                             break;
                         }
-                        if !matches!(
-                            timeout(TERMINAL_OPERATION_TIMEOUT, terminals.validate_lease(&lease))
-                                .await,
-                            Ok(Ok(()))
-                        ) {
-                            send_closed(&mut socket, lease.revoked_reason()).await;
+                        if let Err(reason) = validate_lease(&terminals, &lease).await {
+                            send_closed(&mut socket, reason).await;
                             break;
                         }
                         match timeout(TERMINAL_OPERATION_TIMEOUT, session.send(command)).await {
@@ -223,7 +220,7 @@ async fn relay(
                             }
                             Err(_) => {
                                 tracing::warn!("interactive terminal command timed out");
-                                send_closed(&mut socket, "runtime_error").await;
+                                send_closed(&mut socket, "runtime_timeout").await;
                                 break;
                             }
                         }
@@ -244,6 +241,28 @@ async fn relay(
         socket.send(Message::Close(None)),
     )
     .await;
+}
+
+async fn validate_lease(
+    terminals: &crate::terminal_service::TerminalService,
+    lease: &crate::terminal_service::TerminalLease,
+) -> Result<(), &'static str> {
+    match timeout(TERMINAL_OPERATION_TIMEOUT, terminals.validate_lease(lease)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            if error.is_lease_revocation() {
+                tracing::debug!(%error, "interactive terminal lease was revoked");
+                Err(lease.revoked_reason())
+            } else {
+                tracing::warn!(%error, "interactive terminal lease validation failed");
+                Err("runtime_error")
+            }
+        }
+        Err(_) => {
+            tracing::warn!("interactive terminal lease validation timed out");
+            Err("runtime_timeout")
+        }
+    }
 }
 
 async fn send_message(socket: &mut WebSocket, message: &TerminalServerMessage) -> Result<(), ()> {

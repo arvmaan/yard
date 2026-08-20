@@ -34,7 +34,7 @@ use yard_server::config::{ServerConfig, database_path_from_env};
 // signal; only a retained Child handle may be terminated during failed startup.
 const CONTROL_PROTOCOL: u32 = 1;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
-const LAUNCH_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
+const LAUNCH_LOCK_TIMEOUT: Duration = Duration::from_secs(40);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -212,9 +212,12 @@ impl RuntimePaths {
         }
     }
 
-    fn open_log(&self) -> Result<File, LifecycleError> {
-        open_private_file(&self.log, true, true)?
-            .ok_or_else(|| Self::path_error("open managed log", &self.log, not_found()))
+    pub(crate) fn open_log(&self) -> Result<File, LifecycleError> {
+        let file = open_private_file(&self.log, true, true)?
+            .ok_or_else(|| Self::path_error("open managed log", &self.log, not_found()))?;
+        file.set_len(0)
+            .map_err(|source| Self::path_error("truncate managed log", &self.log, source))?;
+        Ok(file)
     }
 
     fn validate_socket_length(&self) -> Result<(), LifecycleError> {
@@ -456,7 +459,7 @@ pub(crate) async fn start(no_open: bool) -> Result<ExitCode, LifecycleError> {
         .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
     let paths = RuntimePaths::discover(&config.database_path)?;
     paths.prepare()?;
-    let _launch_lock = paths
+    let launch_lock = paths
         .lock_launch(true)
         .await?
         .expect("create=true returns a launch lock");
@@ -484,6 +487,7 @@ pub(crate) async fn start(no_open: bool) -> Result<ExitCode, LifecycleError> {
                     config.bind, metadata.address
                 );
             }
+            drop(launch_lock);
             maybe_open_browser(no_open, &metadata.url).await;
             return Ok(ExitCode::SUCCESS);
         }
@@ -523,6 +527,7 @@ pub(crate) async fn start(no_open: bool) -> Result<ExitCode, LifecycleError> {
                 && health_ready(metadata.address).await =>
             {
                 print_instance("Yard started", &metadata, &paths.log);
+                drop(launch_lock);
                 maybe_open_browser(no_open, &metadata.url).await;
                 return Ok(ExitCode::SUCCESS);
             }
@@ -572,7 +577,9 @@ pub(crate) async fn start(no_open: bool) -> Result<ExitCode, LifecycleError> {
 }
 
 pub(crate) async fn status() -> Result<ExitCode, LifecycleError> {
-    let paths = RuntimePaths::discover(&database_path_from_env())?;
+    let database_path = database_path_from_env()
+        .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+    let paths = RuntimePaths::discover(&database_path)?;
     if !paths.validate_existing()? {
         println!("Yard is not running");
         return Ok(ExitCode::from(STOPPED_EXIT_CODE));
@@ -601,7 +608,9 @@ pub(crate) async fn status() -> Result<ExitCode, LifecycleError> {
 }
 
 pub(crate) async fn stop() -> Result<ExitCode, LifecycleError> {
-    let paths = RuntimePaths::discover(&database_path_from_env())?;
+    let database_path = database_path_from_env()
+        .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+    let paths = RuntimePaths::discover(&database_path)?;
     if !paths.validate_existing()? {
         println!("Yard is already stopped");
         return Ok(ExitCode::SUCCESS);
@@ -799,11 +808,21 @@ async fn open_browser(url: &str) -> Result<(), String> {
         let status = if let Ok(result) = timeout(BROWSER_TIMEOUT, child.wait()).await {
             result.map_err(|error| format!("could not wait for {launcher}: {error}"))?
         } else {
-            let _ = timeout(CHILD_TERMINATION_TIMEOUT, child.kill()).await;
-            return Err(format!(
-                "{launcher} did not exit within {} seconds and was terminated",
-                BROWSER_TIMEOUT.as_secs()
-            ));
+            return match timeout(CHILD_TERMINATION_TIMEOUT, child.kill()).await {
+                Ok(Ok(())) => Err(format!(
+                    "{launcher} did not exit within {} seconds and was terminated",
+                    BROWSER_TIMEOUT.as_secs()
+                )),
+                Ok(Err(error)) => Err(format!(
+                    "{launcher} did not exit within {} seconds and termination failed: {error}",
+                    BROWSER_TIMEOUT.as_secs()
+                )),
+                Err(_) => Err(format!(
+                    "{launcher} did not exit within {} seconds; termination could not be confirmed within {} seconds",
+                    BROWSER_TIMEOUT.as_secs(),
+                    CHILD_TERMINATION_TIMEOUT.as_secs()
+                )),
+            };
         };
         if status.success() {
             Ok(())
@@ -1005,40 +1024,102 @@ fn remove_stale_state(paths: &RuntimePaths) -> Result<(), LifecycleError> {
 }
 
 fn remove_owned_regular_file(path: &Path) -> Result<(), LifecycleError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            validate_private_metadata(path, &metadata, PrivatePathKind::RegularFile)?;
-            fs::remove_file(path).map_err(|source| LifecycleError::Io {
-                operation: "remove stale lifecycle metadata",
-                path: path.to_path_buf(),
-                source,
-            })
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(LifecycleError::Io {
-            operation: "inspect stale lifecycle metadata",
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
+    let Some(quarantined) = quarantine_owned_path(path, PrivatePathKind::RegularFile)? else {
+        return Ok(());
+    };
+    remove_quarantined_path(path, &quarantined, "remove stale lifecycle metadata")
 }
 
 fn remove_owned_socket(path: &Path) -> Result<(), LifecycleError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            validate_private_metadata(path, &metadata, PrivatePathKind::Socket)?;
-            fs::remove_file(path).map_err(|source| LifecycleError::Io {
-                operation: "remove stale lifecycle socket",
+    let Some(quarantined) = quarantine_owned_path(path, PrivatePathKind::Socket)? else {
+        return Ok(());
+    };
+    remove_quarantined_path(path, &quarantined, "remove stale lifecycle socket")
+}
+
+fn quarantine_owned_path(
+    path: &Path,
+    kind: PrivatePathKind,
+) -> Result<Option<PathBuf>, LifecycleError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| LifecycleError::UnsafeRuntimePath {
+            path: path.to_path_buf(),
+            reason: "lifecycle path has no parent directory".to_owned(),
+        })?;
+    let quarantined = parent.join(format!(".cleanup-{}", Uuid::now_v7()));
+    match fs::rename(path, &quarantined) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(LifecycleError::Io {
+                operation: "quarantine lifecycle path before cleanup",
                 path: path.to_path_buf(),
                 source,
-            })
+            });
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(LifecycleError::Io {
-            operation: "inspect stale lifecycle socket",
-            path: path.to_path_buf(),
+    }
+
+    let validation = fs::symlink_metadata(&quarantined)
+        .map_err(|source| LifecycleError::Io {
+            operation: "inspect quarantined lifecycle path",
+            path: quarantined.clone(),
             source,
-        }),
+        })
+        .and_then(|metadata| validate_private_metadata(path, &metadata, kind));
+    if let Err(error) = validation {
+        restore_quarantined_path(path, &quarantined)?;
+        return Err(error);
+    }
+    Ok(Some(quarantined))
+}
+
+fn restore_quarantined_path(path: &Path, quarantined: &Path) -> Result<(), LifecycleError> {
+    fs::rename(quarantined, path).map_err(|source| LifecycleError::Io {
+        operation: "restore rejected lifecycle path",
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn remove_quarantined_path(
+    original: &Path,
+    quarantined: &Path,
+    operation: &'static str,
+) -> Result<(), LifecycleError> {
+    fs::remove_file(quarantined).map_err(|source| LifecycleError::Io {
+        operation,
+        path: original.to_path_buf(),
+        source,
+    })
+}
+
+fn remove_metadata_for_instance(path: &Path, instance_id: &str) -> Result<bool, LifecycleError> {
+    let Some(quarantined) = quarantine_owned_path(path, PrivatePathKind::RegularFile)? else {
+        return Ok(false);
+    };
+    let ownership = read_private_file(&quarantined, MAX_METADATA_SIZE)
+        .and_then(|bytes| {
+            bytes.ok_or_else(|| RuntimePaths::path_error("read owned metadata", path, not_found()))
+        })
+        .and_then(|bytes| {
+            serde_json::from_slice::<InstanceMetadata>(&bytes).map_err(LifecycleError::from)
+        })
+        .map(|metadata| metadata.instance_id == instance_id);
+
+    match ownership {
+        Ok(true) => {
+            remove_quarantined_path(path, &quarantined, "remove owned lifecycle metadata")?;
+            Ok(true)
+        }
+        Ok(false) => {
+            restore_quarantined_path(path, &quarantined)?;
+            Ok(false)
+        }
+        Err(error) => {
+            restore_quarantined_path(path, &quarantined)?;
+            Err(error)
+        }
     }
 }
 
@@ -1233,13 +1314,7 @@ impl RuntimeOwnerGuard {
 
 impl Drop for RuntimeOwnerGuard {
     fn drop(&mut self) {
-        let owns_metadata = read_private_file(&self.paths.metadata, MAX_METADATA_SIZE)
-            .ok()
-            .flatten()
-            .and_then(|bytes| serde_json::from_slice::<InstanceMetadata>(&bytes).ok())
-            .is_some_and(|metadata| metadata.instance_id == self.instance_id);
-        if owns_metadata {
-            let _ = remove_owned_regular_file(&self.paths.metadata);
+        if remove_metadata_for_instance(&self.paths.metadata, &self.instance_id).unwrap_or(false) {
             let _ = remove_owned_socket(&self.paths.control);
         }
     }
@@ -1748,6 +1823,26 @@ mod tests {
     }
 
     #[test]
+    fn stale_cleanup_does_not_follow_or_remove_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_root(temporary.path().join("run"));
+        paths.prepare().expect("prepare");
+        let target = temporary.path().join("foreign");
+        std::fs::write(&target, b"keep").expect("target");
+        symlink(&target, &paths.metadata).expect("symlink");
+
+        assert!(matches!(
+            super::remove_owned_regular_file(&paths.metadata)
+                .expect_err("symlink must fail closed"),
+            LifecycleError::UnsafeRuntimePath { .. }
+        ));
+        assert!(paths.metadata.is_symlink());
+        assert_eq!(std::fs::read(&target).expect("target remains"), b"keep");
+    }
+
+    #[test]
     fn database_identity_is_stable_and_path_scoped() {
         let first = database_identity(Path::new("/tmp/yard-a.sqlite3")).expect("first");
         let equivalent =
@@ -1801,6 +1896,27 @@ mod tests {
         let tail = super::read_log_tail(&paths.log).expect("read tail");
         assert_eq!(tail, "final startup error");
         assert!(tail.len() < usize::try_from(super::MAX_LOG_TAIL_BYTES).expect("tail size"));
+    }
+
+    #[test]
+    fn managed_log_is_truncated_for_each_launch() {
+        use std::io::Write as _;
+
+        let temporary = tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_root(temporary.path().join("run"));
+        paths.prepare().expect("prepare");
+        let mut first = paths.open_log().expect("first log");
+        first.write_all(b"previous launch\n").expect("write log");
+        drop(first);
+
+        let second = paths.open_log().expect("second log");
+        assert_eq!(second.metadata().expect("log metadata").len(), 0);
+    }
+
+    #[test]
+    fn launch_lock_wait_covers_startup_and_shutdown_budgets() {
+        assert!(super::LAUNCH_LOCK_TIMEOUT > super::STARTUP_TIMEOUT);
+        assert!(super::LAUNCH_LOCK_TIMEOUT > super::STOP_TIMEOUT);
     }
 
     use std::path::Path;

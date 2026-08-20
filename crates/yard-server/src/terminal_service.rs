@@ -566,6 +566,23 @@ pub enum TerminalServiceError {
     RuntimeBindingChanged,
 }
 
+impl TerminalServiceError {
+    #[must_use]
+    pub fn is_lease_revocation(&self) -> bool {
+        matches!(
+            self,
+            Self::AssignmentNotActive
+                | Self::OrchestratorChanged
+                | Self::YardOrchestratorNotConfigured
+                | Self::YardOrchestratorChanged
+                | Self::CoordinationNodeNotProvisioned
+                | Self::CoordinationNodeChanged
+                | Self::RuntimeBindingMissing
+                | Self::RuntimeBindingChanged
+        )
+    }
+}
+
 #[must_use]
 pub fn sequence_continues(previous: Option<u64>, current: u64, full: bool) -> bool {
     full || previous.is_some_and(|previous| current == previous.saturating_add(1))
@@ -609,5 +626,18 @@ mod tests {
         assert!(sequence_continues(Some(10), 11, false));
         assert!(!sequence_continues(Some(10), 12, false));
         assert!(sequence_continues(Some(10), 20, true));
+    }
+
+    #[test]
+    fn distinguishes_lease_revocation_from_infrastructure_failure() {
+        assert!(TerminalServiceError::AssignmentNotActive.is_lease_revocation());
+        assert!(TerminalServiceError::RuntimeBindingChanged.is_lease_revocation());
+        assert!(!TerminalServiceError::InvalidDimensions.is_lease_revocation());
+        assert!(
+            !TerminalServiceError::Runtime(super::RuntimeTerminalError::Protocol(
+                "socket unavailable".to_owned()
+            ))
+            .is_lease_revocation()
+        );
     }
 }

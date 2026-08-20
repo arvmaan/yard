@@ -30,6 +30,12 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    #[error("YARD_DATABASE_PATH '{path}' could not be normalized: {source}")]
+    InvalidDatabasePath {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl ServerConfig {
@@ -48,7 +54,13 @@ impl ServerConfig {
             return Err(ConfigError::NonLoopbackBind);
         }
         let herdr_binary = env::var_os("YARD_HERDR_BIN").unwrap_or_else(|| OsString::from("herdr"));
-        let database_path = database_path_from_env();
+        let database_path = database_path_from_env()?;
+        yard_store::validate_database_file_identity(&database_path).map_err(|source| {
+            ConfigError::InvalidDatabasePath {
+                path: database_path.clone(),
+                source,
+            }
+        })?;
         let artifact_path = env::var_os("YARD_ARTIFACT_PATH")
             .map_or_else(|| default_artifact_path(&database_path), PathBuf::from);
         let coordination_path = managed_path_from_env(
@@ -122,10 +134,16 @@ fn default_knowledge_path(database_path: &Path) -> PathBuf {
     )
 }
 
-/// Resolve the configured database path without loading unrelated server settings.
-#[must_use]
-pub fn database_path_from_env() -> PathBuf {
-    env::var_os("YARD_DATABASE_PATH").map_or_else(default_database_path, PathBuf::from)
+/// Resolve and normalize the configured database path without loading unrelated settings.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] when the current directory or an existing path
+/// ancestor cannot be resolved.
+pub fn database_path_from_env() -> Result<PathBuf, ConfigError> {
+    let path = env::var_os("YARD_DATABASE_PATH").map_or_else(default_database_path, PathBuf::from);
+    yard_store::normalize_database_path(&path)
+        .map_err(|source| ConfigError::InvalidDatabasePath { path, source })
 }
 
 fn default_database_path() -> PathBuf {

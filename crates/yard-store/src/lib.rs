@@ -1,9 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
+    env,
     ffi::OsString,
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
+    io,
     num::TryFromIntError,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
     time::{SystemTime, SystemTimeError, UNIX_EPOCH},
 };
@@ -783,8 +785,111 @@ pub enum SnapshotDeliveryResult {
 
 #[derive(Debug, Clone)]
 pub struct SqliteProjectStore {
-    database_lock: Arc<File>,
+    database_lock: Arc<DatabaseLock>,
     connection: Arc<std::sync::Mutex<Connection>>,
+}
+
+#[derive(Debug)]
+struct DatabaseLock {
+    _sidecar: File,
+    _database: File,
+}
+
+/// Resolve a database path through every existing ancestor.
+///
+/// This keeps lifecycle and sidecar-lock identity stable when callers address
+/// the same database through relative paths or symbolic-link aliases.
+///
+/// # Errors
+///
+/// Returns an I/O error when the current directory or an existing path
+/// ancestor cannot be resolved.
+pub fn normalize_database_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let path = path.as_ref();
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    match absolute.canonicalize() {
+        Ok(resolved) => return Ok(resolved),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                validate_database_path_ancestor(&resolved)?;
+                resolved.pop();
+            }
+            Component::RootDir | Component::Normal(_) | Component::Prefix(_) => {
+                if matches!(component, Component::Normal(_)) {
+                    validate_database_path_ancestor(&resolved)?;
+                }
+                let candidate = resolved.join(component.as_os_str());
+                match fs::symlink_metadata(&candidate) {
+                    Ok(_) => resolved = candidate.canonicalize()?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        resolved.push(component.as_os_str());
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn validate_database_path_ancestor(path: &Path) -> io::Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!(
+                "database path ancestor '{}' is not a directory",
+                path.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+/// Reject an existing database file with multiple hard-link names.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] for a hard-linked regular file and
+/// forwards metadata errors other than a missing path.
+pub fn validate_database_file_identity(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() && metadata.nlink() > 1 => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "database file '{}' has {} hard links; remove aliases before starting Yard",
+                path.display(),
+                metadata.nlink()
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+/// Validate database file identity on platforms without Unix link metadata.
+///
+/// # Errors
+///
+/// This implementation does not currently return an error.
+pub fn validate_database_file_identity(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 impl SqliteProjectStore {
@@ -797,7 +902,8 @@ impl SqliteProjectStore {
     /// created, another Yard process owns the database, `SQLite` cannot be
     /// opened, or the schema is newer than this version of Yard.
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self, ProjectStoreError> {
-        let path = path.into();
+        let path = normalize_database_path(path.into())?;
+        validate_database_file_identity(&path)?;
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -7673,23 +7779,37 @@ fn open_connection(path: &Path) -> Result<Connection, ProjectStoreError> {
     Ok(connection)
 }
 
-fn acquire_database_lock(path: &Path) -> Result<File, ProjectStoreError> {
+fn acquire_database_lock(path: &Path) -> Result<DatabaseLock, ProjectStoreError> {
     let mut lock_path = OsString::from(path.as_os_str());
     lock_path.push(".lock");
-    let lock = OpenOptions::new()
+    let sidecar = OpenOptions::new()
         .create(true)
         .read(true)
         .truncate(false)
         .write(true)
         .open(PathBuf::from(lock_path))?;
-    lock.try_lock_exclusive().map_err(|error| {
+    try_lock_database_file(&sidecar)?;
+    let database = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    try_lock_database_file(&database)?;
+    Ok(DatabaseLock {
+        _sidecar: sidecar,
+        _database: database,
+    })
+}
+
+fn try_lock_database_file(file: &File) -> Result<(), ProjectStoreError> {
+    file.try_lock_exclusive().map_err(|error| {
         if error.kind() == std::io::ErrorKind::WouldBlock {
             ProjectStoreError::DatabaseAlreadyOpen
         } else {
             ProjectStoreError::Io(error)
         }
-    })?;
-    Ok(lock)
+    })
 }
 
 fn recover_interrupted_commands(connection: &mut Connection) -> Result<(), ProjectStoreError> {
@@ -12642,6 +12762,95 @@ mod tests {
 
         drop(store);
         SqliteProjectStore::open(path).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn database_symlink_alias_cannot_create_a_second_store_owner() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let alias = temp.path().join("yard-alias.sqlite3");
+        let store = SqliteProjectStore::open(&path).await.unwrap();
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+
+        let error = SqliteProjectStore::open(&alias).await.unwrap_err();
+        assert!(matches!(error, ProjectStoreError::DatabaseAlreadyOpen));
+
+        drop(store);
+        SqliteProjectStore::open(alias).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_parent_symlink_alias_normalizes_before_file_creation() {
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join("database");
+        let alias = temp.path().join("database-alias");
+        std::fs::create_dir(&directory).unwrap();
+        std::os::unix::fs::symlink(&directory, &alias).unwrap();
+
+        let direct = super::normalize_database_path(directory.join("yard.sqlite3")).unwrap();
+        let through_alias = super::normalize_database_path(alias.join("yard.sqlite3")).unwrap();
+        assert_eq!(direct, through_alias);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_normalization_preserves_parent_semantics_after_symlinks() {
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join("database");
+        let nested = directory.join("nested");
+        let alias = temp.path().join("database-alias");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::os::unix::fs::symlink(&nested, &alias).unwrap();
+
+        let normalized = super::normalize_database_path(alias.join("../yard.sqlite3")).unwrap();
+        assert_eq!(normalized, directory.join("yard.sqlite3"));
+    }
+
+    #[test]
+    fn database_normalization_rejects_traversal_through_a_regular_file() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("not-a-directory");
+        std::fs::write(&file, b"content").unwrap();
+
+        for path in [file.join("../yard.sqlite3"), file.join(".")] {
+            let error = super::normalize_database_path(path).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn database_inode_lock_blocks_hard_link_created_after_open() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let alias = temp.path().join("yard-hard-link.sqlite3");
+        let store = SqliteProjectStore::open(&path).await.unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+
+        let error = super::acquire_database_lock(&alias).unwrap_err();
+        assert!(matches!(error, ProjectStoreError::DatabaseAlreadyOpen));
+        drop(store);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hard_linked_database_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let alias = temp.path().join("yard-hard-link.sqlite3");
+        let store = SqliteProjectStore::open(&path).await.unwrap();
+        drop(store);
+        std::fs::hard_link(&path, &alias).unwrap();
+
+        let error = SqliteProjectStore::open(&path).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectStoreError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::InvalidInput
+                    && source.to_string().contains("hard links")
+        ));
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+CALLER_CWD=$PWD
 
 if (($# > 1)); then
   printf 'Usage: %s [BIN_DIR]\n' "$0" >&2
@@ -18,6 +19,9 @@ elif [[ -n "${HOME:-}" ]]; then
 else
   printf 'HOME is not set; pass an install directory or set YARD_INSTALL_DIR\n' >&2
   exit 2
+fi
+if [[ "$BIN_DIR" != /* ]]; then
+  BIN_DIR=$CALLER_CWD/$BIN_DIR
 fi
 
 cd "$REPO_ROOT"

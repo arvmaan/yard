@@ -154,15 +154,16 @@ yard start
 
 The installer runs the locked frontend and Rust builds, then atomically
 installs `yard` to `~/.local/bin`. Pass another bin directory as its first
-argument or set `YARD_INSTALL_DIR` to change the destination. Add that
-directory to `PATH` in your shell profile if needed.
+argument or set `YARD_INSTALL_DIR` to change the destination. Relative
+destinations are resolved from the directory where the installer was invoked.
+Add that directory to `PATH` in your shell profile if needed.
 
 `yard start` starts one managed background instance and opens its UI. The
 other lifecycle commands are:
 
 ```sh
 yard start --no-open  # start without launching a browser
-yard status           # print mode, URL, PID, and managed log path
+yard status           # print mode, URL, PID, and log destination
 yard stop             # gracefully stop only a managed instance
 yard run              # foreground mode for logs, development, or containers
 ```
@@ -183,9 +184,13 @@ tree; Node.js, npm, Vite, `node_modules`, and `web/` are build-time only.
 Each database gets a private lifecycle directory below
 `$YARD_RUNTIME_DIR`, `$XDG_RUNTIME_DIR/yard`, or a UID-qualified temporary
 directory. The directory name is derived from the normalized database path.
+Existing symbolic-link aliases resolve to the same database and lifecycle
+owner. Hard-linked database files are rejected because SQLite cannot safely
+coordinate separate lock paths for them.
 It contains retained `yard.log`, persistent `launch.lock` and `instance.lock`
 files, and the live instance's `instance.json` and `control.sock`. Directories
-are mode `0700`; files and the socket are mode `0600`.
+are mode `0700`; files and the socket are mode `0600`. The managed log is reset
+for each launch, and tracing output retains at most 8 MiB.
 
 The instance lock is held for the process lifetime. `status` and `stop`
 authenticate the same-UID process through the private Unix socket using a

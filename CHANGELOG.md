@@ -3,6 +3,18 @@
 All notable Yard changes are recorded here. Yard uses semantic versioning once
 a release is tagged.
 
+## [Unreleased]
+
+### Added
+
+- Installed `yard` CLI with managed `start`, `status`, and `stop` commands,
+  explicit foreground `run`, and a user-local source installer.
+
+### Hardened
+
+- Same-UID, secret-authenticated Unix-socket lifecycle control, lifetime and
+  launch locks, stale-state recovery, and bounded SIGINT/SIGTERM shutdown.
+
 ## [0.1.0] - 2026-08-15
 
 ### Added
@@ -15,8 +27,6 @@ a release is tagged.
 - Full-screen chat and terminal workspaces, group orders, Ghostty launch,
   child-agent trees, themes, and map auto-layout.
 - Workstream orchestrators and revisioned knowledge-store snapshots.
-- Installed `yard` CLI with managed `start`, `status`, and `stop` commands,
-  explicit foreground `run`, and a user-local source installer.
 
 ### Hardened
 
@@ -27,8 +37,6 @@ a release is tagged.
   focus restoration.
 - Strict TypeScript checking for application and Playwright sources.
 - Isolated smoke-test ports and a declared WebSocket harness dependency.
-- Same-UID, secret-authenticated Unix-socket lifecycle control, lifetime and
-  launch locks, stale-state recovery, and bounded SIGINT/SIGTERM shutdown.
 
 ### Known Limitations
 

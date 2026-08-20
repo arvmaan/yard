@@ -117,7 +117,7 @@ printf '%s\n' "$1" >>"$YARD_BROWSER_MARKER"
 printf '%s\n' "$#" >>"$YARD_BROWSER_ARGC_MARKER"
 if [[ -n "${YARD_BROWSER_SLEEP:-}" ]]; then
   printf '%s\n' "$$" >"$YARD_BROWSER_PID"
-  sleep "$YARD_BROWSER_SLEEP"
+  exec sleep "$YARD_BROWSER_SLEEP"
 fi
 exit "${YARD_BROWSER_EXIT:-0}"
 EOF
@@ -175,6 +175,29 @@ fi
 SECOND_PID=$(status_value PID "$ROOT/start-again.out")
 [[ "$SECOND_PID" == "$FIRST_PID" ]] ||
   fail "second start launched a different managed process"
+ln -s "$XDG_DATA_HOME/yard/yard.sqlite3" "$ROOT/database-alias.sqlite3"
+YARD_DATABASE_PATH="$ROOT/database-alias.sqlite3" \
+  "$BINARY" start --no-open >"$ROOT/alias-start.out"
+[[ "$(status_value PID "$ROOT/alias-start.out")" == "$FIRST_PID" ]] ||
+  fail "database symlink alias launched a second managed process"
+YARD_DATABASE_PATH="$ROOT/database-alias.sqlite3" \
+  "$BINARY" status >"$ROOT/alias-status.out"
+[[ "$(status_value URL "$ROOT/alias-status.out")" == "$FIRST_URL" ]] ||
+  fail "database symlink alias did not resolve to the active lifecycle owner"
+ln "$XDG_DATA_HOME/yard/yard.sqlite3" "$ROOT/database-hard-link.sqlite3"
+set +e
+YARD_DATABASE_PATH="$ROOT/database-hard-link.sqlite3" \
+  "$BINARY" start --no-open \
+  >"$ROOT/hard-link.out" 2>"$ROOT/hard-link.err"
+HARD_LINK_EXIT=$?
+set -e
+[[ "$HARD_LINK_EXIT" == 2 ]] ||
+  fail "hard-linked database returned $HARD_LINK_EXIT instead of configuration failure 2"
+grep -q 'hard links' "$ROOT/hard-link.err" ||
+  fail "hard-linked database failure was not actionable"
+unlink "$ROOT/database-hard-link.sqlite3"
+kill -0 "$FIRST_PID" >/dev/null 2>&1 ||
+  fail "hard-linked database attempt affected the active owner"
 YARD_BIND=127.0.0.1:1 \
   "$BINARY" start --no-open \
   >"$ROOT/different-bind.out" 2>"$ROOT/different-bind.err"
@@ -349,17 +372,42 @@ kill "$UNRELATED_PID"
 wait "$UNRELATED_PID" 2>/dev/null || true
 UNRELATED_PID=''
 
-"$BINARY" start --no-open >"$ROOT/concurrent-a.out" &
-START_A=$!
-"$BINARY" start --no-open >"$ROOT/concurrent-b.out" &
-START_B=$!
-wait "$START_A"
-wait "$START_B"
-CONCURRENT_A_PID=$(status_value PID "$ROOT/concurrent-a.out")
-CONCURRENT_B_PID=$(status_value PID "$ROOT/concurrent-b.out")
-[[ -n "$CONCURRENT_A_PID" && "$CONCURRENT_A_PID" == "$CONCURRENT_B_PID" ]] ||
-  fail "concurrent starts did not converge on one managed process"
+CONCURRENT_STARTS=()
+for index in {1..10}; do
+  "$BINARY" start --no-open >"$ROOT/concurrent-$index.out" &
+  CONCURRENT_STARTS+=("$!")
+done
+for pid in "${CONCURRENT_STARTS[@]}"; do
+  wait "$pid"
+done
+CONCURRENT_PID=$(status_value PID "$ROOT/concurrent-1.out")
+[[ -n "$CONCURRENT_PID" ]] ||
+  fail "concurrent starts omitted process identity"
+for index in {2..10}; do
+  [[ "$(status_value PID "$ROOT/concurrent-$index.out")" == "$CONCURRENT_PID" ]] ||
+    fail "ten concurrent starts did not converge on one managed process"
+done
 "$BINARY" stop >/dev/null
+
+"$BINARY" start --no-open >"$ROOT/race-initial.out"
+"$BINARY" stop >"$ROOT/race-stop.out" &
+RACE_STOP=$!
+"$BINARY" start --no-open >"$ROOT/race-start.out" &
+RACE_START=$!
+wait "$RACE_STOP"
+wait "$RACE_START"
+set +e
+"$BINARY" status >"$ROOT/race-status.out" 2>&1
+RACE_STATUS=$?
+set -e
+if [[ "$RACE_STATUS" == 0 ]]; then
+  RACE_URL=$(status_value URL "$ROOT/race-status.out")
+  curl -fsS "${RACE_URL}health" >/dev/null ||
+    fail "start-stop race left an unhealthy lifecycle owner"
+  "$BINARY" stop >/dev/null
+elif [[ "$RACE_STATUS" != 1 ]]; then
+  fail "start-stop race left an invalid lifecycle status: $RACE_STATUS"
+fi
 
 if node -e '
   const server = require("node:net").createServer();

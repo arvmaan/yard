@@ -61,13 +61,10 @@ pub(crate) async fn execute(cli: Cli) -> ExitCode {
                 .map(|()| ExitCode::SUCCESS)
                 .map_err(|error| CommandFailure::server(&error))
         }
-        Command::ManagedRun(args) => {
-            server::init_tracing();
-            server::run_managed(&args.instance_id)
-                .await
-                .map(|()| ExitCode::SUCCESS)
-                .map_err(|error| CommandFailure::server(&error))
-        }
+        Command::ManagedRun(args) => server::run_managed(&args.instance_id)
+            .await
+            .map(|()| ExitCode::SUCCESS)
+            .map_err(|error| CommandFailure::server(&error)),
     };
 
     match result {
