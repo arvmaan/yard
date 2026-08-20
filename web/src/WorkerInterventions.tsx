@@ -9,6 +9,7 @@ import {
   agentWorkspaceKey,
   terminalLeaseKey,
   useAgentWorkspace,
+  type AgentWorkspaceTarget,
 } from './AgentWorkspaceContext'
 import { openTerminalInGhostty } from './api'
 import type {
@@ -128,20 +129,61 @@ export function WorkerInterventions({
     return null
   }
 
-  const workspaceTarget = {
+  const contextLabel =
+    project?.name ??
+    (assignment
+      ? projects?.find(
+          (candidate) => candidate.id === assignment.project_id,
+        )?.name
+      : undefined) ??
+    (coordinationNode
+      ? coordinationNode.attached_project_ids
+          .map(
+            (projectId) =>
+              projects?.find((candidate) => candidate.id === projectId)
+                ?.name,
+          )
+          .filter((name): name is string => Boolean(name))
+          .join(', ') || undefined
+      : undefined) ??
+    (target.kind === 'yard-orchestrator'
+      ? 'Yard portfolio'
+      : 'Yard workstream')
+  const role =
+    target.kind === 'yard-orchestrator'
+      ? ('superintendent' as const)
+      : target.kind === 'coordination-node'
+        ? ('workstream' as const)
+        : target.kind === 'orchestrator'
+          ? ('orchestrator' as const)
+          : ('worker' as const)
+  const roleLabel =
+    target.kind === 'yard-orchestrator'
+      ? 'Superintendent'
+      : target.kind === 'coordination-node'
+        ? 'Workstream'
+        : target.kind === 'orchestrator'
+          ? 'Orchestrator'
+          : assignment?.role ?? 'Worker'
+  const workspaceTarget: Omit<AgentWorkspaceTarget, 'returnFocus'> = {
+    contextLabel,
+    cwd:
+      coordinationNode?.cwd ??
+      coordinationNode?.folder_path ??
+      null,
+    harness:
+      runtime.provider_session?.provider ??
+      runtime.adapter,
     key: targetKey,
     label,
-    projectName:
-      project?.name ??
-      (assignment
-        ? projects?.find(
-            (candidate) => candidate.id === assignment.project_id,
-          )?.name
-        : undefined) ??
-      coordinationNode?.name ??
-      'Yard portfolio',
+    observation: 'durable',
+    paneId: runtime.pane_id,
+    role,
+    roleLabel,
+    runtimeAdapter: runtime.adapter,
     session: runtimeSession,
     status: status ?? 'unknown',
+    tabId: runtime.tab_id,
     target,
     terminalId,
     terminalLeaseKey: terminalLeaseKey(target, runtime),

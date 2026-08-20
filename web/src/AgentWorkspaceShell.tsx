@@ -1,10 +1,12 @@
-import { lazy, Suspense } from 'react'
+import { lazy, Suspense, useMemo } from 'react'
 import {
   Bot,
+  Boxes,
   BriefcaseBusiness,
+  Folder,
+  GitBranch,
   Network,
   PanelLeftClose,
-  Radio,
   Server,
   SquareTerminal,
   X,
@@ -16,9 +18,11 @@ import {
   type AgentWorkspaceView,
   type TerminalPresentation,
 } from './AgentWorkspaceContext'
+import { groupAgentWindowTargets } from './agentWindowNavigator'
 import type {
   CoordinationNodeRoute,
   Project,
+  RuntimeInventory,
   RuntimeSession,
   YardOrchestratorRoute,
 } from './types'
@@ -34,20 +38,68 @@ function TargetIcon({
 }: {
   target: AgentWorkspaceTarget
 }) {
-  if (target.target.kind === 'yard-orchestrator') {
+  if (target.role === 'superintendent') {
     return <Network aria-hidden="true" size={15} />
   }
-  if (
-    target.target.kind === 'orchestrator' ||
-    target.target.kind === 'coordination-node'
-  ) {
+  if (target.role === 'orchestrator' || target.role === 'workstream') {
     return <BriefcaseBusiness aria-hidden="true" size={15} />
   }
   return <Bot aria-hidden="true" size={15} />
 }
 
+const runtimeStatusOrder = [
+  'blocked',
+  'working',
+  'idle',
+  'done',
+  'unknown',
+] as const
+
+function targetRuntimeSummary(targets: AgentWorkspaceTarget[]) {
+  const observedTargets = targets.filter(
+    (target) => target.observation === 'observed',
+  )
+  const durableCount = targets.length - observedTargets.length
+  const statuses = runtimeStatusOrder
+    .map((status) => ({
+      count: observedTargets.filter(
+        (target) => target.status === status,
+      ).length,
+      status,
+    }))
+    .filter(({ count }) => count > 0)
+    .map(({ count, status }) => `${count} ${status}`)
+  const parts = [`${targets.length} ${targets.length === 1 ? 'target' : 'targets'}`]
+  if (statuses.length > 0) parts.push(`runtime ${statuses.join(', ')}`)
+  if (durableCount > 0) parts.push(`${durableCount} durable-only`)
+  return parts.join(' · ')
+}
+
+function targetTitle(target: AgentWorkspaceTarget) {
+  const topology = [
+    `terminal ${target.terminalId}`,
+    target.tabId ? `tab ${target.tabId}` : null,
+    `pane ${target.paneId}`,
+  ]
+    .filter(Boolean)
+    .join(' · ')
+  return [
+    target.label,
+    `${target.roleLabel} · ${target.contextLabel}`,
+    `${target.harness} · ${target.runtimeAdapter} session ${target.session}`,
+    target.observation === 'observed'
+      ? `Observed runtime: ${target.status}`
+      : 'Durable binding; runtime not currently observed',
+    topology,
+    target.cwd,
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
 export function AgentWorkspaceShell({
   activeTarget,
+  inventory,
   mode,
   onCoordinationChange,
   onCoordinationNodeChange,
@@ -63,6 +115,7 @@ export function AgentWorkspaceShell({
 }: {
   activeTarget: AgentWorkspaceTarget
   coordinationRoutes: CoordinationNodeRoute[]
+  inventory: RuntimeInventory | null
   mode: AgentWorkspaceView
   onCoordinationChange: (route: YardOrchestratorRoute) => void
   onCoordinationNodeChange: (route: CoordinationNodeRoute) => void
@@ -101,6 +154,10 @@ export function AgentWorkspaceShell({
           )
         : []
   const terminalVisible = isTerminalWorkspaceMode(mode)
+  const workspaceGroups = useMemo(
+    () => groupAgentWindowTargets(targets, inventory, sessions),
+    [inventory, sessions, targets],
+  )
 
   return (
     <section
@@ -121,58 +178,165 @@ export function AgentWorkspaceShell({
           </span>
           <span>
             <strong>Herdr windows</strong>
-            <small>{targets.length} under Yard control</small>
+            <small>
+              {targets.length} controlled · runtime evidence
+            </small>
           </span>
         </header>
-        <div className="agent-window-navigator__sessions">
-          {sessions.map((session) => {
-            const sessionTargets = targets.filter(
-              (target) => target.session === session.name,
-            )
+        <div className="agent-window-navigator__workspaces">
+          {workspaceGroups.map((group, groupIndex) => {
+            const workspace = group.observation
+            const label = workspace?.label ?? 'Unobserved workspace'
+            const offline = group.sessionRunning === false
+            const workspaceTitle = [
+              `${label} · ${group.workspaceId}`,
+              `${group.runtimeAdapter} session ${group.session}`,
+              workspace
+                ? `Observed workspace runtime: ${workspace.status}`
+                : 'Durable target bindings; workspace not currently observed',
+              workspace?.focused ? 'Focused workspace' : null,
+              offline ? 'Session offline' : null,
+              workspace
+                ? `${workspace.tab_count} tabs · ${workspace.pane_count} panes`
+                : null,
+              workspace?.worktree
+                ? `${workspace.worktree.repository_name} · ${workspace.worktree.checkout_path}`
+                : null,
+              targetRuntimeSummary(group.targets),
+              'Runtime observations do not indicate workflow completion.',
+            ]
+              .filter(Boolean)
+              .join('\n')
             return (
               <section
-                className="agent-window-session"
-                data-running={session.running}
-                key={session.name}
+                aria-label={`${label} workspace ${group.workspaceId}`}
+                className="agent-window-workspace"
+                data-focused={workspace?.focused || undefined}
+                data-observed={Boolean(workspace)}
+                data-offline={offline || undefined}
+                data-session={group.session}
+                data-workspace-id={group.workspaceId}
+                key={group.key}
               >
-                <div className="agent-window-session__heading">
-                  <Radio aria-hidden="true" size={11} />
-                  <strong>{session.name}</strong>
-                  <small>
-                    {session.running
-                      ? sessionTargets.length
-                      : 'offline'}
-                  </small>
-                </div>
-                {sessionTargets.map((target) => (
-                  <button
-                    aria-current={
-                      target.key === activeTarget.key
-                        ? 'page'
-                        : undefined
-                    }
-                    className="agent-window-row"
-                    data-status={target.status}
-                    key={target.key}
-                    onClick={() => onTargetChange(target)}
-                    title={`${target.label} · ${target.projectName}`}
-                    type="button"
-                  >
-                    <span className="agent-window-row__icon">
-                      <TargetIcon target={target} />
-                      <i aria-hidden="true" />
-                    </span>
+                <header
+                  className="agent-window-workspace__heading"
+                  title={workspaceTitle}
+                >
+                  <div className="agent-window-workspace__identity">
+                    <Boxes aria-hidden="true" size={14} />
                     <span>
-                      <strong>{target.label}</strong>
-                      <small>
-                        {target.projectName} · {target.workspaceId}
-                      </small>
+                      <strong>{label}</strong>
+                      <code>{group.workspaceId}</code>
                     </span>
-                  </button>
-                ))}
-                {sessionTargets.length === 0 ? (
-                  <p>No controlled windows</p>
-                ) : null}
+                    <small>
+                      {group.targets.length}{' '}
+                      {group.targets.length === 1 ? 'target' : 'targets'}
+                    </small>
+                  </div>
+                  <div
+                    className="agent-window-workspace__state"
+                    data-status={offline ? 'offline' : workspace?.status}
+                  >
+                    <i aria-hidden="true" />
+                    <span>
+                      {offline
+                        ? 'Session offline'
+                        : workspace
+                          ? `Observed ${workspace.status}`
+                          : 'Durable bindings only'}
+                    </span>
+                    {workspace?.focused ? <b>Focused</b> : null}
+                  </div>
+                  <small className="agent-window-workspace__summary">
+                    {targetRuntimeSummary(group.targets)}
+                  </small>
+                  <div className="agent-window-workspace__topology">
+                    <span
+                      title={`${group.runtimeAdapter} session ${group.session}`}
+                    >
+                      {group.session}
+                    </span>
+                    {workspace ? (
+                      <span>
+                        {workspace.tab_count} tabs · {workspace.pane_count}{' '}
+                        panes
+                      </span>
+                    ) : (
+                      <span>Topology not observed</span>
+                    )}
+                  </div>
+                  {workspace?.worktree ? (
+                    <div className="agent-window-workspace__worktree">
+                      <GitBranch aria-hidden="true" size={10} />
+                      <span>{workspace.worktree.repository_name}</span>
+                      <code>{workspace.worktree.checkout_path}</code>
+                    </div>
+                  ) : null}
+                </header>
+                {group.targets.map((target, targetIndex) => {
+                  const descriptionId = `agent-window-target-${groupIndex}-${targetIndex}-description`
+                  return (
+                    <button
+                      aria-describedby={descriptionId}
+                      aria-label={`${target.label}, ${target.roleLabel}, ${target.contextLabel}`}
+                      aria-current={
+                        target.key === activeTarget.key
+                          ? 'page'
+                          : undefined
+                      }
+                      className="agent-window-row"
+                      data-observation={target.observation}
+                      data-status={target.status}
+                      data-target-key={target.key}
+                      key={target.key}
+                      onClick={() => onTargetChange(target)}
+                      title={targetTitle(target)}
+                      type="button"
+                    >
+                      <span
+                        className="visually-hidden"
+                        id={descriptionId}
+                      >
+                        {targetTitle(target)}
+                      </span>
+                      <span className="agent-window-row__icon">
+                        <TargetIcon target={target} />
+                        <i aria-hidden="true" />
+                      </span>
+                      <span className="agent-window-row__body">
+                        <span className="agent-window-row__identity">
+                          <strong>{target.label}</strong>
+                          <small>
+                            {target.observation === 'observed'
+                              ? `Runtime ${target.status}`
+                              : 'Not observed'}
+                          </small>
+                        </span>
+                        <small className="agent-window-row__context">
+                          {target.roleLabel} · {target.contextLabel}
+                        </small>
+                        <span className="agent-window-row__runtime">
+                          <small>
+                            {target.harness} · {target.session}
+                          </small>
+                          <code>{target.terminalId}</code>
+                        </span>
+                        <code className="agent-window-row__topology">
+                          {target.tabId
+                            ? `tab ${target.tabId} · `
+                            : ''}
+                          pane {target.paneId}
+                        </code>
+                        {target.cwd ? (
+                          <span className="agent-window-row__path">
+                            <Folder aria-hidden="true" size={9} />
+                            <code>{target.cwd}</code>
+                          </span>
+                        ) : null}
+                      </span>
+                    </button>
+                  )
+                })}
               </section>
             )
           })}

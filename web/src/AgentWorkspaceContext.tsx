@@ -4,6 +4,7 @@ import type {
 } from './AgentChatWorkspace'
 import type { TerminalTarget } from './TerminalSession'
 import type { ObservedStatus, WorkerRuntimeBinding } from './types'
+import type { AgentWindowRole } from './agentWindowNavigator'
 
 export type TerminalPresentation = 'focus' | 'terminal'
 export const DEFAULT_TERMINAL_PRESENTATION: TerminalPresentation = 'terminal'
@@ -17,12 +18,20 @@ export function isTerminalWorkspaceMode(
 }
 
 export interface AgentWorkspaceTarget {
+  contextLabel: string
+  cwd: string | null
+  harness: string
   key: string
   label: string
-  projectName: string
+  observation: 'observed' | 'durable'
+  paneId: string
   returnFocus?: HTMLElement | null
+  role: AgentWindowRole
+  roleLabel: string
+  runtimeAdapter: string
   session: string
   status: ObservedStatus
+  tabId: string | null
   target: AgentChatTarget
   terminalId: string
   terminalLeaseKey: string

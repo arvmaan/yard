@@ -373,6 +373,31 @@ function findObservedWorker(
   return matches.length === 1 ? matches[0] : undefined
 }
 
+function agentTargetRuntimeMetadata(
+  runtime: WorkerRuntimeBinding,
+  observed: ObservedWorker | undefined,
+  fallbackCwd: string | null = null,
+) {
+  return {
+    cwd:
+      observed?.foreground_cwd ??
+      observed?.cwd ??
+      fallbackCwd,
+    harness:
+      observed?.display_provider ??
+      observed?.provider ??
+      runtime.provider_session?.provider ??
+      runtime.adapter,
+    observation: observed
+      ? ('observed' as const)
+      : ('durable' as const),
+    paneId: observed?.pane_id ?? runtime.pane_id,
+    runtimeAdapter: runtime.adapter,
+    status: observed?.status ?? runtime.status,
+    tabId: observed?.tab_id ?? runtime.tab_id,
+  }
+}
+
 function eligibleProjectOrchestratorCandidates(
   inventory: RuntimeInventory | null,
   project: Project,
@@ -3040,17 +3065,35 @@ function App() {
     : []
   const agentWorkspaceTargets = useMemo<AgentWorkspaceTarget[]>(() => {
     const targets: AgentWorkspaceTarget[] = []
+    const observedWorkers = new Map<string, ObservedWorker | null>()
+    inventory?.workers.forEach((worker) => {
+      observedWorkers.set(
+        worker.terminal_id,
+        observedWorkers.has(worker.terminal_id) ? null : worker,
+      )
+    })
+    const observedForRuntime = (runtime: WorkerRuntimeBinding) =>
+      inventory?.adapter === runtime.adapter &&
+      inventory.session === runtime.session
+        ? observedWorkers.get(runtime.terminal_id) ?? undefined
+        : undefined
+    const projectNames = new Map(
+      projects.map((project) => [project.id, project.name]),
+    )
     const yardWorker = yardOrchestrator?.worker
     const yardRuntime = yardWorker?.runtime
     if (yardOrchestrator && yardWorker && yardRuntime) {
       targets.push({
+        ...agentTargetRuntimeMetadata(
+          yardRuntime,
+          observedForRuntime(yardRuntime),
+        ),
+        contextLabel: 'Yard portfolio',
         key: 'yard-orchestrator',
         label: 'Superintendent',
-        projectName: 'Yard portfolio',
+        role: 'superintendent',
+        roleLabel: 'Superintendent',
         session: yardRuntime.session,
-        status:
-          findObservedWorker(inventory, yardRuntime)?.status ??
-          yardRuntime.status,
         target: { kind: 'yard-orchestrator', orchestrator: yardOrchestrator },
         terminalId: yardRuntime.terminal_id,
         terminalLeaseKey: terminalLeaseKey(
@@ -3069,13 +3112,22 @@ function App() {
       const worker = node.worker
       const runtime = worker?.runtime
       if (!worker || !runtime || node.kind !== 'workstream') return
+      const attachedProjects = node.attached_project_ids
+        .map((projectId) => projectNames.get(projectId))
+        .filter((name): name is string => Boolean(name))
       targets.push({
+        ...agentTargetRuntimeMetadata(
+          runtime,
+          observedForRuntime(runtime),
+          node.cwd ?? node.folder_path,
+        ),
+        contextLabel:
+          attachedProjects.join(', ') || 'Yard workstream',
         key: `coordination-node:${node.id}`,
         label: node.name,
-        projectName: 'Workstream',
+        role: 'workstream',
+        roleLabel: 'Workstream',
         session: runtime.session,
-        status:
-          findObservedWorker(inventory, runtime)?.status ?? runtime.status,
         target: { kind: 'coordination-node', node },
         terminalId: runtime.terminal_id,
         terminalLeaseKey: terminalLeaseKey(
@@ -3095,12 +3147,16 @@ function App() {
       const runtime = project.orchestrator.runtime
       if (!runtime) return
       targets.push({
+        ...agentTargetRuntimeMetadata(
+          runtime,
+          observedForRuntime(runtime),
+        ),
+        contextLabel: project.name,
         key: `orchestrator:${project.id}`,
         label: `${project.name} orchestrator`,
-        projectName: project.name,
+        role: 'orchestrator',
+        roleLabel: 'Orchestrator',
         session: runtime.session,
-        status:
-          findObservedWorker(inventory, runtime)?.status ?? runtime.status,
         target: { kind: 'orchestrator', project },
         terminalId: runtime.terminal_id,
         terminalLeaseKey: terminalLeaseKey(
@@ -3119,16 +3175,18 @@ function App() {
     assignments.forEach((assignment) => {
       const runtime = assignment.worker.runtime
       if (!runtime || assignment.lifecycle !== 'active') return
-      const project = projects.find(
-        (candidate) => candidate.id === assignment.project_id,
-      )
       targets.push({
+        ...agentTargetRuntimeMetadata(
+          runtime,
+          observedForRuntime(runtime),
+        ),
+        contextLabel:
+          projectNames.get(assignment.project_id) ?? 'Yard project',
         key: `assignment:${assignment.id}`,
         label: assignment.profile_name,
-        projectName: project?.name ?? 'Yard project',
+        role: 'worker',
+        roleLabel: assignment.role,
         session: runtime.session,
-        status:
-          findObservedWorker(inventory, runtime)?.status ?? runtime.status,
         target: { kind: 'assignment', assignment },
         terminalId: runtime.terminal_id,
         terminalLeaseKey: terminalLeaseKey(
@@ -5367,6 +5425,7 @@ function App() {
             setAgentWorkspaceMode('terminal')
           }}
           presentation={terminalPresentation}
+          inventory={inventory}
           projects={projects}
           sessions={sessions}
           targets={agentWorkspaceTargets}

@@ -3442,7 +3442,7 @@ html[data-yard-allocation-dragging="true"]
   grid-template:
     "navigator toolbar" 46px
     "navigator content" minmax(0, 1fr)
-    / 252px minmax(0, 1fr);
+    / 300px minmax(0, 1fr);
   overflow: hidden;
   border-top: 1px solid var(--line-strong);
   background: var(--surface-muted);
@@ -3517,61 +3517,175 @@ html[data-yard-allocation-dragging="true"]
   white-space: nowrap;
 }
 
-.agent-window-navigator__sessions {
+.agent-window-navigator__workspaces {
   min-width: 0;
   min-height: 0;
-  padding: 5px;
   overflow-y: auto;
   scrollbar-color: var(--line-strong) transparent;
   scrollbar-width: thin;
 }
 
-.agent-window-session {
-  display: grid;
+.agent-window-workspace {
   min-width: 0;
-  gap: 2px;
-  margin-bottom: 8px;
+  border-bottom: 1px solid var(--line);
 }
 
-.agent-window-session__heading {
+.agent-window-workspace__heading {
   display: grid;
   min-width: 0;
-  grid-template-columns: 13px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 5px;
+  gap: 3px;
+  padding: 8px 9px 7px;
+  background: color-mix(in srgb, var(--paper) 44%, transparent);
   color: var(--muted);
 }
 
-.agent-window-session[data-running="true"]
-  .agent-window-session__heading
-  > svg {
+.agent-window-workspace[data-focused="true"]
+  .agent-window-workspace__heading {
+  box-shadow: inset 2px 0 0 var(--teal);
+}
+
+.agent-window-workspace__identity {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 15px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 5px;
+}
+
+.agent-window-workspace__identity > svg {
   color: var(--teal);
 }
 
-.agent-window-session__heading strong,
-.agent-window-session__heading small {
+.agent-window-workspace[data-observed="false"]
+  .agent-window-workspace__identity
+  > svg,
+.agent-window-workspace[data-offline="true"]
+  .agent-window-workspace__identity
+  > svg {
+  color: var(--muted);
+}
+
+.agent-window-workspace__identity > span {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.agent-window-workspace__identity strong,
+.agent-window-workspace__identity code,
+.agent-window-workspace__identity small,
+.agent-window-workspace__summary,
+.agent-window-workspace__topology span,
+.agent-window-workspace__worktree span,
+.agent-window-workspace__worktree code {
   overflow: hidden;
-  font: 8px/1.2 "IBM Plex Mono", monospace;
   text-overflow: ellipsis;
-  text-transform: uppercase;
   white-space: nowrap;
 }
 
-.agent-window-session > p {
-  margin: 1px 5px 4px 22px;
+.agent-window-workspace__identity strong {
+  color: var(--ink);
+  font-size: 10px;
+}
+
+.agent-window-workspace__identity code,
+.agent-window-workspace__identity small {
+  font: 8px/1.2 "IBM Plex Mono", monospace;
+}
+
+.agent-window-workspace__identity small {
   color: var(--muted);
-  font-size: 9px;
+}
+
+.agent-window-workspace__state {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  margin-left: 20px;
+  font: 8px/1.2 "IBM Plex Mono", monospace;
+}
+
+.agent-window-workspace__state i {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.agent-window-workspace__state span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-window-workspace__state b {
+  flex: 0 0 auto;
+  color: var(--teal);
+  font-size: 7px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.agent-window-workspace__state[data-status="working"] i {
+  background: var(--teal);
+}
+
+.agent-window-workspace__state[data-status="blocked"] i,
+.agent-window-workspace__state[data-status="unknown"] i,
+.agent-window-workspace__state[data-status="offline"] i {
+  background: var(--vermilion);
+}
+
+.agent-window-workspace__state[data-status="done"] i {
+  background: var(--yellow);
+}
+
+.agent-window-workspace__summary {
+  margin-left: 20px;
+  color: var(--ink);
+  font: 8px/1.25 "IBM Plex Mono", monospace;
+}
+
+.agent-window-workspace__topology {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-left: 20px;
+  font: 8px/1.25 "IBM Plex Mono", monospace;
+}
+
+.agent-window-workspace__topology span:first-child {
+  color: var(--blue);
+}
+
+.agent-window-workspace__worktree {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 11px auto minmax(0, 1fr);
+  align-items: center;
+  gap: 4px;
+  margin-left: 20px;
+  color: var(--muted);
+  font: 8px/1.25 "IBM Plex Mono", monospace;
+}
+
+.agent-window-workspace__worktree > svg {
+  color: var(--teal);
 }
 
 .agent-window-row {
   display: grid;
-  width: 100%;
+  width: calc(100% - 10px);
   min-width: 0;
-  grid-template-columns: 27px minmax(0, 1fr);
-  align-items: center;
-  gap: 7px;
-  padding: 7px;
+  grid-template-columns: 26px minmax(0, 1fr);
+  align-items: start;
+  gap: 6px;
+  margin: 3px 5px;
+  padding: 6px;
   border: 1px solid transparent;
   border-radius: 4px;
   background: transparent;
@@ -3588,14 +3702,20 @@ html[data-yard-allocation-dragging="true"]
 .agent-window-row[aria-current="page"] {
   border-color: var(--line-strong);
   background: var(--paper);
-  box-shadow: 0 1px 4px rgba(23, 32, 30, 0.08);
+  box-shadow: inset 2px 0 0 var(--teal);
+}
+
+.agent-window-row:focus-visible {
+  z-index: 1;
+  outline: 2px solid var(--blue);
+  outline-offset: -2px;
 }
 
 .agent-window-row__icon {
   position: relative;
   display: grid;
-  width: 26px;
-  height: 26px;
+  width: 25px;
+  height: 25px;
   place-items: center;
   border: 1px solid var(--line);
   border-radius: 4px;
@@ -3604,8 +3724,8 @@ html[data-yard-allocation-dragging="true"]
 
 .agent-window-row__icon i {
   position: absolute;
+  top: -3px;
   right: -3px;
-  bottom: -3px;
   width: 7px;
   height: 7px;
   border: 2px solid var(--paper);
@@ -3626,26 +3746,92 @@ html[data-yard-allocation-dragging="true"]
   background: var(--yellow);
 }
 
-.agent-window-row > span:last-child {
+.agent-window-row[data-observation="durable"]
+  .agent-window-row__icon
+  i {
+  border: 1px solid var(--muted);
+  background: var(--paper);
+}
+
+.agent-window-row__body {
   display: grid;
   min-width: 0;
-  gap: 2px;
+  gap: 1px;
+}
+
+.agent-window-row__identity {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
 }
 
 .agent-window-row strong,
-.agent-window-row small {
+.agent-window-row small,
+.agent-window-row code {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .agent-window-row strong {
+  min-width: 0;
   font-size: 10px;
 }
 
 .agent-window-row small {
   color: var(--muted);
   font: 8px/1.25 "IBM Plex Mono", monospace;
+}
+
+.agent-window-row__identity small {
+  flex: 0 0 auto;
+  color: var(--ink);
+}
+
+.agent-window-row__context {
+  display: block;
+}
+
+.agent-window-row__runtime {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+  gap: 6px;
+}
+
+.agent-window-row__runtime code,
+.agent-window-row__topology,
+.agent-window-row__path {
+  color: var(--muted);
+  font: 8px/1.25 "IBM Plex Mono", monospace;
+}
+
+.agent-window-row__runtime code {
+  max-width: 112px;
+}
+
+.agent-window-row__topology {
+  display: block;
+}
+
+.agent-window-row__path {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 10px minmax(0, 1fr);
+  align-items: center;
+  gap: 2px;
+}
+
+.agent-window-row__path > svg {
+  color: var(--teal);
+}
+
+.agent-window-row__path code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .agent-workspace-toolbar {
@@ -5106,7 +5292,7 @@ html[data-yard-allocation-dragging="true"]
     grid-template:
       "navigator toolbar" 44px
       "navigator content" minmax(0, 1fr)
-      / 58px minmax(0, 1fr);
+      / 132px minmax(0, 1fr);
   }
 
   .agent-window-navigator {
@@ -5114,30 +5300,113 @@ html[data-yard-allocation-dragging="true"]
   }
 
   .agent-window-navigator > header {
-    display: grid;
-    grid-template-columns: 1fr;
-    justify-items: center;
-    padding: 7px;
+    grid-template-columns: 24px minmax(0, 1fr);
+    gap: 5px;
+    padding: 6px;
   }
 
-  .agent-window-navigator > header > span:last-child,
-  .agent-window-session__heading strong,
-  .agent-window-session__heading small,
-  .agent-window-session > p,
-  .agent-window-row > span:last-child {
+  .agent-window-navigator__mark {
+    width: 24px;
+    height: 24px;
+  }
+
+  .agent-window-navigator > header strong {
+    font-size: 10px;
+  }
+
+  .agent-window-navigator > header small {
+    font-size: 7px;
+  }
+
+  .agent-window-workspace__heading {
+    gap: 2px;
+    padding: 6px;
+  }
+
+  .agent-window-workspace__identity {
+    grid-template-columns: 12px minmax(0, 1fr);
+    gap: 4px;
+  }
+
+  .agent-window-workspace__identity > svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  .agent-window-workspace__identity > small {
     display: none;
   }
 
-  .agent-window-session__heading {
-    grid-template-columns: 1fr;
-    justify-items: center;
-    padding: 5px;
+  .agent-window-workspace__identity strong {
+    font-size: 9px;
+  }
+
+  .agent-window-workspace__state,
+  .agent-window-workspace__summary,
+  .agent-window-workspace__topology,
+  .agent-window-workspace__worktree {
+    margin-left: 16px;
+    font-size: 8px;
+  }
+
+  .agent-window-workspace__state b {
+    display: none;
+  }
+
+  .agent-window-workspace__topology {
+    display: grid;
+    justify-content: stretch;
+    gap: 0;
+  }
+
+  .agent-window-workspace__worktree {
+    grid-template-columns: 10px minmax(0, 1fr);
+  }
+
+  .agent-window-workspace__worktree code {
+    display: none;
   }
 
   .agent-window-row {
-    grid-template-columns: 1fr;
-    justify-items: center;
-    padding: 7px 5px;
+    grid-template-columns: 20px minmax(0, 1fr);
+    gap: 4px;
+    padding: 5px 4px;
+  }
+
+  .agent-window-row__icon {
+    width: 20px;
+    height: 20px;
+  }
+
+  .agent-window-row__icon > svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  .agent-window-row__identity {
+    display: grid;
+    gap: 0;
+  }
+
+  .agent-window-row strong {
+    font-size: 9px;
+  }
+
+  .agent-window-row small,
+  .agent-window-row__runtime code,
+  .agent-window-row__topology,
+  .agent-window-row__path {
+    font-size: 8px;
+  }
+
+  .agent-window-row__runtime {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .agent-window-row__runtime code,
+  .agent-window-row__topology,
+  .agent-window-row__path {
+    display: none;
   }
 
   .agent-workspace-toolbar {

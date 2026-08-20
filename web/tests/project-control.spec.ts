@@ -6062,11 +6062,94 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   page,
 }, testInfo) => {
   const state = await mockApi(page)
-  seedActiveAssignment(state)
+  const implementer = seedActiveAssignment(state)
+  const reviewerProfile = profile('profile-reviewer', 'Reviewer')
+  const reviewer = assignment(
+    'assignment-reviewer',
+    'project-1',
+    reviewerProfile,
+    'Review release readiness.',
+    'reviewer',
+    durableWorker(
+      'worker-reviewer',
+      'terminal-reviewer',
+      reviewerProfile,
+      'workspace-2',
+    ),
+  )
+  state.profiles.push(reviewerProfile)
+  state.assignments.push(reviewer)
+  state.runtimeSessions.push({
+    name: 'gamma',
+    is_default: false,
+    running: false,
+  })
+
+  const apiWorkspace = state.runtimeInventory.workspaces.find(
+    (candidate) => candidate.runtime_id === 'workspace-1',
+  )
+  const releaseWorkspace = state.runtimeInventory.workspaces.find(
+    (candidate) => candidate.runtime_id === 'workspace-2',
+  )
+  if (!apiWorkspace || !releaseWorkspace) {
+    throw new Error('Workspace navigator fixture is incomplete')
+  }
+  apiWorkspace.order = 20
+  apiWorkspace.worktree = {
+    repository_key: 'yard',
+    repository_name: 'yard',
+    repository_root: '/tmp/sample/yard',
+    checkout_path: '/tmp/sample/yard-worktrees/api-migration',
+    is_linked: true,
+  }
+  releaseWorkspace.order = 10
+  releaseWorkspace.worktree = {
+    repository_key: 'release-tools',
+    repository_name: 'release-tools',
+    repository_root: '/tmp/sample/release-tools',
+    checkout_path: '/tmp/sample/release-tools/checks',
+    is_linked: true,
+  }
+
+  const implementerRuntime = implementer.worker.runtime
+  const reviewerRuntime = reviewer.worker.runtime
+  if (!implementerRuntime || !reviewerRuntime) {
+    throw new Error('Workspace navigator runtimes are missing')
+  }
+  state.runtimeInventory.workers.push(
+    {
+      ...worker(20, 'workspace-1', 'working'),
+      runtime_id: implementerRuntime.terminal_id,
+      terminal_id: implementerRuntime.terminal_id,
+      tab_id: implementerRuntime.tab_id ?? 'workspace-1:tab-implementer',
+      pane_id: implementerRuntime.pane_id,
+      name: 'implementer',
+      cwd: '/tmp/sample/yard-worktrees/api-migration/web',
+      foreground_cwd: '/tmp/sample/yard-worktrees/api-migration/web',
+    },
+    {
+      ...worker(21, 'workspace-2', 'blocked'),
+      runtime_id: reviewerRuntime.terminal_id,
+      terminal_id: reviewerRuntime.terminal_id,
+      tab_id: reviewerRuntime.tab_id ?? 'workspace-2:tab-reviewer',
+      pane_id: reviewerRuntime.pane_id,
+      name: 'reviewer',
+      cwd: '/tmp/sample/release-tools/checks',
+      foreground_cwd: '/tmp/sample/release-tools/checks',
+    },
+  )
+
+  await page.addInitScript(() => {
+    window.localStorage.setItem('yard:theme', 'light')
+  })
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
-  await page.locator('.assigned-worker-marker').click()
+  await page
+    .locator(
+      `.assigned-worker-marker[data-worker-id="${implementer.worker.id}"]`,
+    )
+    .click()
   const openChat = page.getByRole('button', {
     name: 'Open chat',
     exact: true,
@@ -6074,9 +6157,80 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   await openChat.click()
 
   const shell = page.locator('.agent-workspace-shell')
+  const navigator = shell.getByLabel('Herdr windows')
   await expect(shell).toBeVisible()
-  await expect(shell.getByLabel('Herdr windows')).toContainText(
-    'Implementer',
+  await expect(navigator).toContainText('Runtime working')
+  await expect(navigator).toContainText('durable-only')
+  await expect(navigator).toContainText('release-tools')
+  await expect(navigator).toContainText('Topology not observed')
+  const workspaceGroups = navigator.locator('.agent-window-workspace')
+  await expect(workspaceGroups).toHaveCount(3)
+  await expect(workspaceGroups.nth(0)).toHaveAttribute(
+    'data-workspace-id',
+    'workspace-2',
+  )
+  await expect(workspaceGroups.nth(1)).toHaveAttribute(
+    'data-workspace-id',
+    'workspace-1',
+  )
+  await expect(workspaceGroups.nth(2)).toHaveAttribute(
+    'data-workspace-id',
+    'workspace-offline',
+  )
+  await expect(workspaceGroups.nth(1)).toContainText('API migration')
+  await expect(workspaceGroups.nth(1)).toContainText('workspace-1')
+  await expect(workspaceGroups.nth(1)).toContainText('2 targets')
+  await expect(workspaceGroups.nth(1)).toContainText('6 tabs · 6 panes')
+  await expect(workspaceGroups.nth(1)).toContainText('Focused')
+  await expect(workspaceGroups.nth(1)).toContainText(
+    '/tmp/sample/yard-worktrees/api-migration',
+  )
+  await expect(workspaceGroups.nth(2)).toContainText('Session offline')
+  await expect(workspaceGroups.nth(2)).toContainText(
+    'workspace-offline',
+  )
+  const targetRows = navigator.locator('.agent-window-row')
+  await expect(targetRows).toHaveCount(4)
+  const targetKeys = await targetRows.evaluateAll((rows) =>
+    rows.map((row) => row.getAttribute('data-target-key')),
+  )
+  expect(new Set(targetKeys).size).toBe(4)
+  for (const key of targetKeys) {
+    await expect(
+      navigator.locator(`[data-target-key="${key}"]`),
+    ).toHaveCount(1)
+  }
+  await expect(workspaceGroups.nth(1).locator('.agent-window-row')).toHaveCount(
+    2,
+  )
+  const implementerRow = navigator.locator(
+    '[data-target-key="assignment:assignment-1"]',
+  )
+  await expect(implementerRow).toHaveAttribute('aria-current', 'page')
+  await expect(implementerRow).toContainText('Implementer')
+  await expect(implementerRow).toContainText('implementer · API migration')
+  await expect(implementerRow).toContainText('Claude · alpha')
+  await expect(implementerRow).toContainText(
+    'tab workspace-1:tab-assignment-1-terminal',
+  )
+  await expect(implementerRow).toContainText(
+    '/tmp/sample/yard-worktrees/api-migration/web',
+  )
+  const implementerDescriptionId = await implementerRow.getAttribute(
+    'aria-describedby',
+  )
+  expect(implementerDescriptionId).not.toBeNull()
+  const implementerDescription = page.locator(
+    `#${implementerDescriptionId}`,
+  )
+  await expect(implementerDescription).toContainText(
+    'Observed runtime: working',
+  )
+  await expect(implementerDescription).toContainText(
+    'herdr session alpha',
+  )
+  await expect(implementerDescription).toContainText(
+    'pane workspace-1:pane-assignment-1-terminal',
   )
   await expect(page.locator('.modal-backdrop.chat-backdrop')).toHaveCount(0)
   const shellBounds = await shell.boundingBox()
@@ -6084,6 +6238,23 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   expect(shellBounds?.x).toBe(0)
   expect(shellBounds ? shellBounds.x + shellBounds.width : 0).toBe(1280)
   expect(shellBounds ? shellBounds.y + shellBounds.height : 0).toBe(800)
+  const desktopLayout = await page.evaluate(() => {
+    const nav = document.querySelector<HTMLElement>(
+      '.agent-window-navigator',
+    )
+    const content = document.querySelector<HTMLElement>(
+      '.agent-workspace-content',
+    )
+    return {
+      contentWidth: content?.getBoundingClientRect().width ?? 0,
+      documentOverflow:
+        document.documentElement.scrollWidth - window.innerWidth,
+      navigatorOverflow: nav ? nav.scrollWidth - nav.clientWidth : 1,
+    }
+  })
+  expect(desktopLayout.contentWidth).toBeGreaterThanOrEqual(900)
+  expect(desktopLayout.documentOverflow).toBeLessThanOrEqual(0)
+  expect(desktopLayout.navigatorOverflow).toBeLessThanOrEqual(0)
 
   await page
     .getByRole('tab', { name: 'Terminal', exact: true })
@@ -6095,6 +6266,32 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   await expect(page.locator('.modal-backdrop.terminal-backdrop')).toHaveCount(
     0,
   )
+  const reviewerRow = navigator.locator(
+    '[data-target-key="assignment:assignment-reviewer"]',
+  )
+  const keyboardFocusRow = navigator.locator(
+    '[data-target-key="orchestrator:project-1"]',
+  )
+  await reviewerRow.focus()
+  await page.keyboard.press('Tab')
+  await expect(keyboardFocusRow).toBeFocused()
+  expect(
+    await keyboardFocusRow.evaluate((element) =>
+      element.matches(':focus-visible'),
+    ),
+  ).toBe(true)
+  await page.screenshot({
+    path: testInfo.outputPath('workspace-navigator-light-desktop.png'),
+    fullPage: true,
+  })
+  await setAppTheme(page, 'Dark')
+  await reviewerRow.focus()
+  await page.keyboard.press('Tab')
+  await expect(keyboardFocusRow).toBeFocused()
+  await page.screenshot({
+    path: testInfo.outputPath('workspace-navigator-dark-desktop.png'),
+    fullPage: true,
+  })
   await page.getByRole('tab', { name: 'Chat', exact: true }).click()
   await expect
     .poll(() =>
@@ -6104,10 +6301,13 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
     )
     .toBe(true)
 
-  await shell
-    .getByLabel('Herdr windows')
+  await navigator
     .getByRole('button', { name: /API migration orchestrator/ })
     .click()
+  await expect(implementerRow).not.toHaveAttribute('aria-current', 'page')
+  await expect(
+    navigator.locator('[data-target-key="orchestrator:project-1"]'),
+  ).toHaveAttribute('aria-current', 'page')
   await expect(shell).toContainText('API migration orchestrator')
   await expect(
     page.getByRole('tab', { name: 'Terminal', exact: true }),
@@ -6118,16 +6318,47 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   )
   await page.getByRole('tab', { name: 'Chat', exact: true }).click()
   await expect(page.getByLabel('Agent conversation')).toBeVisible()
-  await page.screenshot({
-    path: testInfo.outputPath('agent-workspace-shell.png'),
-    fullPage: true,
-  })
 
   await page.setViewportSize({ width: 390, height: 844 })
   const mobileBounds = await shell.boundingBox()
   expect(mobileBounds?.x).toBe(0)
   expect(mobileBounds ? mobileBounds.x + mobileBounds.width : 0).toBe(390)
   expect(mobileBounds ? mobileBounds.y + mobileBounds.height : 0).toBe(844)
+  const mobileLayout = await page.evaluate(() => {
+    const nav = document.querySelector<HTMLElement>(
+      '.agent-window-navigator',
+    )
+    const content = document.querySelector<HTMLElement>(
+      '.agent-workspace-content',
+    )
+    return {
+      contentWidth: content?.getBoundingClientRect().width ?? 0,
+      documentOverflow:
+        document.documentElement.scrollWidth - window.innerWidth,
+      navigatorOverflow: nav ? nav.scrollWidth - nav.clientWidth : 1,
+      shellOverflow:
+        document.querySelector<HTMLElement>('.agent-workspace-shell')
+          ?.scrollWidth ?? 1,
+      shellWidth:
+        document.querySelector<HTMLElement>('.agent-workspace-shell')
+          ?.clientWidth ?? 0,
+    }
+  })
+  expect(mobileLayout.contentWidth).toBeGreaterThanOrEqual(250)
+  expect(mobileLayout.documentOverflow).toBeLessThanOrEqual(0)
+  expect(mobileLayout.navigatorOverflow).toBeLessThanOrEqual(0)
+  expect(mobileLayout.shellOverflow).toBeLessThanOrEqual(
+    mobileLayout.shellWidth,
+  )
+  await page.screenshot({
+    path: testInfo.outputPath('workspace-navigator-dark-mobile.png'),
+    fullPage: true,
+  })
+  await setAppTheme(page, 'Light')
+  await page.screenshot({
+    path: testInfo.outputPath('workspace-navigator-light-mobile.png'),
+    fullPage: true,
+  })
   await shell.getByRole('button', { name: 'Close chat' }).click()
   await expect(shell).toBeHidden()
   await expect(openChat).toBeFocused()
