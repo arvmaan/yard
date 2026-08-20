@@ -45,7 +45,7 @@ tabs do not provide:
 | Interface | local browser app; light and dark themes |
 | Runtime | Herdr 0.8.0 |
 | Persistence | local SQLite database and managed files |
-| Distribution | source only; no packaged or signed release |
+| Distribution | source-built single executable; no published or signed release |
 
 ## Contents
 
@@ -123,11 +123,14 @@ outcome instead of guessing or retrying destructive work.
 
 ## Quick start
 
-Prerequisites:
+Source-build prerequisites:
 
 - Git and a native C build toolchain;
 - Rust 1.85 or newer;
 - Node.js `^20.19.0` or `>=22.12.0` and npm;
+
+Runtime prerequisites:
+
 - Herdr 0.8.0 available as `herdr`;
 - an authenticated agent provider supported by Herdr, such as Codex or Claude;
 - a running Herdr session containing the agents you want to operate.
@@ -149,23 +152,15 @@ cargo fetch
 cd web
 npm ci
 cd ..
+cargo build --release --locked -p yard-server
+./target/release/yard-server
 ```
 
-Start the control-plane service:
-
-```sh
-cargo run -p yard-server
-```
-
-In another terminal, from the repository root, start the web client:
-
-```sh
-cd web
-npm run dev
-```
-
-Open <http://127.0.0.1:5173>. The API listens on
-<http://127.0.0.1:4317>.
+Open the UI URL printed at startup, by default <http://127.0.0.1:4317/>.
+The React app, REST API, and terminal WebSockets use that one origin and one
+Yard process. The built executable can be copied and run outside the source
+tree; Node.js, npm, Vite, `node_modules`, and `web/` are not runtime
+dependencies.
 
 Yard will display the sessions reported by Herdr. If there are none, start one
 with Herdr before continuing.
@@ -240,30 +235,33 @@ and successful delivery means only that the prompt reached its target.
 
 ## Architecture
 
-Yard is a Rust workspace with a React client:
+Yard is a Rust workspace with a React client embedded in `yard-server`:
 
 ```text
 crates/
   yard-domain/    provider-neutral commands and durable entities
   yard-herdr/     Herdr discovery, lifecycle, output, and terminal adapter
   yard-store/     SQLite persistence and migrations
-  yard-server/    loopback REST and WebSocket control plane
+  yard-server/    embedded UI plus loopback REST and WebSocket control plane
 web/
-  src/            React map, inspectors, chat, and terminal workspaces
+  src/            React source for the embedded UI and Vite development
   tests/          Playwright acceptance coverage
 scripts/
+  embedded-binary-smoke.sh
   live-herdr-smoke.sh
   live-v1-acceptance.sh
 ```
 
-The server binds only to loopback while Yard has no authentication layer.
-SQLite runs in WAL mode, and one Yard process exclusively owns a database.
+The production web build is compiled into the Rust executable and served by
+the same Axum router as the API. The server binds only to loopback while Yard
+has no authentication layer. SQLite runs in WAL mode, and one Yard process
+exclusively owns a database.
 
 ## Configuration
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `YARD_BIND` | API socket; loopback addresses only | `127.0.0.1:4317` |
+| `YARD_BIND` | UI and API socket; loopback addresses only | `127.0.0.1:4317` |
 | `YARD_HERDR_BIN` | Herdr executable | `herdr` |
 | `YARD_GHOSTTY_BIN` | Ghostty executable | macOS app bundle, then `ghostty` |
 | `YARD_DATABASE_PATH` | SQLite control database | `$XDG_DATA_HOME/yard/yard.sqlite3` or `$HOME/.local/share/yard/yard.sqlite3` |
@@ -271,12 +269,61 @@ SQLite runs in WAL mode, and one Yard process exclusively owns a database.
 | `YARD_COORDINATION_PATH` | managed workstream directories | `coordination/` beside the database |
 | `YARD_KNOWLEDGE_PATH` | managed knowledge snapshots | `knowledge/` beside the database |
 | `YARD_ORCHESTRATOR_CWD` | working directory for the superintendent | process working directory |
-| `YARD_API_TARGET` | Vite proxy API target | `http://127.0.0.1:4317` |
+| `YARD_API_TARGET` | Vite development proxy target only | `http://127.0.0.1:4317` |
 
 Stop Yard before copying its database and managed directories for backup.
 Managed coordination and knowledge paths reject symlink traversal.
 
 ## Development and verification
+
+### Embedded production build
+
+`yard-server`'s Cargo build script runs the lockfile-pinned `npm run build` and
+writes the production assets under Cargo's `OUT_DIR`; `include_dir` then embeds
+those bytes in the executable. Cargo reruns that step after a clean target or
+when frontend source, public assets, package manifests, or build configuration
+changes. Unrelated incremental Rust builds reuse Cargo's result.
+
+Cargo's build script never installs frontend dependencies; it only runs the
+local build tools installed by an explicit `npm ci`. Run `npm ci` after cloning
+or changing `web/package-lock.json`. Missing Node.js, npm, or `node_modules`
+fails the Rust build with the command needed to fix it. A manual
+`npm run build` writes ignored `web/dist`; generated frontend output is not
+committed and the Cargo build embeds its own `OUT_DIR` copy.
+
+### Frontend development and HMR
+
+For React work, keep the two-process Vite workflow. Start the API from the
+repository root:
+
+```sh
+cargo run -p yard-server
+```
+
+Then start Vite in another terminal:
+
+```sh
+cd web
+npm run dev
+```
+
+Open <http://127.0.0.1:5173/> for HMR. Vite continues to proxy `/api` and
+`/health` (including API WebSockets) to `YARD_API_TARGET`. Production assets,
+API calls, and WebSockets use same-origin URLs and do not compile an API port
+into the client.
+
+### Verification
+
+Install frontend dependencies and run the web gates first:
+
+```sh
+cd web
+npm ci
+npm run lint
+npm run build
+npm run test:unit
+cd ..
+```
 
 Run the Rust gates from the repository root:
 
@@ -284,24 +331,22 @@ Run the Rust gates from the repository root:
 cargo fmt --all -- --check
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
+cargo build --release --locked -p yard-server
+bash scripts/embedded-binary-smoke.sh target/release/yard-server
 bash -n scripts/live-herdr-smoke.sh
 bash -n scripts/live-v1-acceptance.sh
 ```
 
-Run the web gates from `web/`:
-
-```sh
-npm ci
-npx playwright install chromium
-npm run lint
-npm run build
-npm run test:e2e
-```
+`scripts/embedded-binary-smoke.sh` copies the release executable to an
+isolated temporary directory, launches it with no Node/npm tools on its runtime
+`PATH`, and verifies health, UI, an embedded asset, SPA fallback, a real API
+route, and unknown-API behavior.
 
 `scripts/live-herdr-smoke.sh` creates real temporary Herdr resources. The
 historical `live-v1-acceptance.sh` harness also launches authenticated Codex
 workers with `--yolo`, can consume model quota, and defaults to a one-hour run.
-Read both scripts before running them.
+Read both scripts before running them. Browser acceptance additionally requires
+`npx playwright install chromium` followed by `npm run test:e2e` in `web/`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for change and review expectations and
 [SECURITY.md](SECURITY.md) for the local trust boundary.
@@ -312,7 +357,7 @@ Yard 0.1 is an early, single-user local tool:
 
 - there is no authentication, authorization, TLS, or remote deployment model;
 - Herdr 0.8.0 is the only runtime adapter;
-- there are no packaged or signed binaries;
+- there are no published installers or signed binaries;
 - interrupted project creation, allocation, or handoff can retain a safety
   reservation without a self-service cancel or resolve workflow;
 - knowledge collection and automation delivery are transport events, not

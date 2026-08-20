@@ -43,15 +43,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tokio::spawn(automations.run());
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    let address = listener.local_addr()?;
+    let ui_url = format!("http://{address}/");
 
     tracing::info!(
-        address = %config.bind,
+        address = %address,
+        ui_url = %ui_url,
         database = %config.database_path.display(),
         artifacts = %config.artifact_path.display(),
         orchestrator_cwd = %config.orchestrator_cwd.display(),
         coordination = %config.coordination_path.display(),
         knowledge = %config.knowledge_path.display(),
-        "Yard server listening"
+        "Yard UI available"
     );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

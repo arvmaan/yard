@@ -60,6 +60,7 @@ use crate::worker_session_service::{WorkerSessionService, WorkerSessionServiceEr
 use crate::yard_orchestrator_service::{YardOrchestratorService, YardOrchestratorServiceError};
 
 mod terminal;
+mod web;
 
 #[derive(Clone)]
 struct AppState {
@@ -384,6 +385,7 @@ pub(crate) fn router_with_reconciliation(
             "/api/v1/agent-profiles/{profile_id}/revisions/{profile_version}",
             get(get_agent_profile_revision),
         )
+        .fallback(web::serve)
         .with_state(AppState {
             store,
             source,
@@ -4001,6 +4003,88 @@ mod tests {
 
     async fn test_router() -> (Router, TempDir) {
         test_router_with_source(Arc::new(FakeInventory)).await
+    }
+
+    #[tokio::test]
+    async fn embedded_web_fallback_preserves_server_route_semantics() {
+        let (app, _temp) = test_router().await;
+
+        let root = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(root.status(), StatusCode::OK);
+        assert_eq!(
+            root.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert_eq!(health.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(response_json(health).await["status"], "ok");
+
+        let projects = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(projects.status(), StatusCode::OK);
+        assert_eq!(projects.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(projects.headers()[header::CACHE_CONTROL], "no-store");
+
+        let unknown_api = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/not-a-route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown_api.status(), StatusCode::NOT_FOUND);
+        assert!(unknown_api.headers().get(header::CONTENT_TYPE).is_none());
+
+        let health_post = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health_post.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let terminal_head = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/v1/yard/orchestrator/terminal?cols=80&rows=24")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal_head.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     async fn handoff_test_router() -> (Router, TempDir, Arc<ClaimCheckingRuntime>) {
