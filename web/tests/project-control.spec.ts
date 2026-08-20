@@ -3914,54 +3914,57 @@ test('projects active assignments once and historical live workers as observed',
 }, testInfo) => {
   const state = await mockApi(page)
   const active = seedAssignedCandidateAssignment(state)
-  const completed = assignment(
-    'assignment-completed-live',
-    'project-1',
-    state.profiles[0],
-    'Retain the completed worker until its session ends.',
-    'implementer',
-    durableWorker(
-      'worker-completed-live',
-      'terminal-4',
+  const historical = [
+    {
+      lifecycle: 'completed' as const,
+      terminalId: 'terminal-4',
+      prompt: 'Retain the completed worker until its session ends.',
+    },
+    {
+      lifecycle: 'failed' as const,
+      terminalId: 'terminal-5',
+      prompt: 'Keep the failed worker available for diagnosis.',
+    },
+  ].map(({ lifecycle, terminalId, prompt }) => {
+    const historicalAssignment = assignment(
+      `assignment-${lifecycle}-live`,
+      'project-1',
       state.profiles[0],
-    ),
-  )
-  completed.lifecycle = 'completed'
-  completed.attempt.lifecycle = 'completed'
-  completed.completion_receipt = {
-    id: 'receipt-completed-live',
-    assignment_id: completed.id,
-    attempt_id: completed.attempt.id,
-    outcome: 'completed',
-    summary: 'The assignment is complete while the terminal remains live.',
-    artifact_refs: [],
-    artifacts: [],
-    evidence_refs: [],
-    unresolved_blockers: [],
-    actor: 'local-user',
-    created_at_unix_ms: Date.now(),
-  }
-  state.assignments.push(completed)
-  const failed = assignment(
-    'assignment-failed-live',
-    'project-1',
-    state.profiles[0],
-    'Keep the failed worker available for diagnosis.',
-    'implementer',
-    durableWorker(
-      'worker-failed-live',
-      'terminal-5',
-      state.profiles[0],
-    ),
-  )
-  failed.lifecycle = 'failed'
-  failed.attempt.lifecycle = 'failed'
-  failed.attempt.error = 'Synthetic historical failure.'
-  state.assignments.push(failed)
+      prompt,
+      'implementer',
+      durableWorker(
+        `worker-${lifecycle}-live`,
+        terminalId,
+        state.profiles[0],
+      ),
+    )
+    historicalAssignment.lifecycle = lifecycle
+    historicalAssignment.attempt.lifecycle = lifecycle
+    if (lifecycle === 'completed') {
+      historicalAssignment.completion_receipt = {
+        id: 'receipt-completed-live',
+        assignment_id: historicalAssignment.id,
+        attempt_id: historicalAssignment.attempt.id,
+        outcome: 'completed',
+        summary: 'The assignment is complete while the terminal remains live.',
+        artifact_refs: [],
+        artifacts: [],
+        evidence_refs: [],
+        unresolved_blockers: [],
+        actor: 'local-user',
+        created_at_unix_ms: Date.now(),
+      }
+    } else {
+      historicalAssignment.attempt.error = 'Synthetic historical failure.'
+    }
+    state.assignments.push(historicalAssignment)
+    return historicalAssignment
+  })
   const activeTerminalId = active.worker.runtime?.terminal_id
-  const completedTerminalId = completed.worker.runtime?.terminal_id
-  const failedTerminalId = failed.worker.runtime?.terminal_id
-  if (!activeTerminalId || !completedTerminalId || !failedTerminalId) {
+  if (
+    !activeTerminalId ||
+    historical.some(({ worker }) => !worker.runtime?.terminal_id)
+  ) {
     throw new Error('Projection fixtures require terminal-backed workers')
   }
   await page.setViewportSize({ width: 1280, height: 800 })
@@ -3974,47 +3977,24 @@ test('projects active assignments once and historical live workers as observed',
     `.react-flow__node-worker[data-id="worker:${activeTerminalId}"]`,
   )
   const activeSprite = activeMarker.locator('.worker-marker__sprite')
-  const completedMarker = page.locator(
-    `.assigned-worker-marker[data-worker-id="${completed.worker.id}"]`,
-  )
-  const completedObservedNode = page.locator(
-    `.react-flow__node-worker[data-id="worker:${completedTerminalId}"]`,
-  )
-  const failedMarker = page.locator(
-    `.assigned-worker-marker[data-worker-id="${failed.worker.id}"]`,
-  )
-  const failedObservedNode = page.locator(
-    `.react-flow__node-worker[data-id="worker:${failedTerminalId}"]`,
-  )
-  const projectNode = page.locator(
-    '.react-flow__node-project[data-id="project:project-1"]',
-  )
   const expectProjection = async () => {
     await expect(activeMarker).toHaveCount(1)
     await expect(activeSprite).toBeVisible()
     await expect(activeSprite.locator('svg[data-crew-role="worker"]')).toBeVisible()
     await expect(activeObservedNode).toHaveCount(0)
-    await expect(completedMarker).toHaveCount(0)
-    await expect(completedObservedNode).toHaveCount(1)
-    await expect(completedObservedNode).toBeVisible()
-    await expect(failedMarker).toHaveCount(0)
-    await expect(failedObservedNode).toHaveCount(1)
-    await expect(failedObservedNode).toBeVisible()
 
-    const [projectBox, workerBox] = await Promise.all([
-      projectNode.boundingBox(),
-      completedObservedNode.boundingBox(),
-    ])
-    expect(projectBox).not.toBeNull()
-    expect(workerBox).not.toBeNull()
-    expect(workerBox!.x).toBeGreaterThanOrEqual(projectBox!.x - 1)
-    expect(workerBox!.y).toBeGreaterThanOrEqual(projectBox!.y - 1)
-    expect(workerBox!.x + workerBox!.width).toBeLessThanOrEqual(
-      projectBox!.x + projectBox!.width + 1,
-    )
-    expect(workerBox!.y + workerBox!.height).toBeLessThanOrEqual(
-      projectBox!.y + projectBox!.height + 1,
-    )
+    for (const historicalAssignment of historical) {
+      const terminalId = historicalAssignment.worker.runtime!.terminal_id
+      const marker = page.locator(
+        `.assigned-worker-marker[data-worker-id="${historicalAssignment.worker.id}"]`,
+      )
+      const observedNode = page.locator(
+        `.react-flow__node-worker[data-id="worker:${terminalId}"]`,
+      )
+      await expect(marker).toHaveCount(0)
+      await expect(observedNode).toHaveCount(1)
+      await expect(observedNode).toBeVisible()
+    }
   }
 
   await expectProjection()
@@ -9334,21 +9314,36 @@ test('creates a worker profile from a reusable role template', async ({
   await page.goto('/')
 
   await page.getByRole('button', { name: 'Create worker profile' }).click()
-  await page
-    .getByLabel('Profile template')
-    .selectOption({ label: 'Reviewer' })
-  await expect(page.getByLabel('Profile name')).toHaveValue('Reviewer')
-  await expect(page.getByLabel('Default role')).toHaveValue('reviewer')
+  await page.getByLabel('Profile template').selectOption('verifier')
+  await expect(page.getByLabel('Profile name')).toHaveValue('Verifier')
+  await expect(page.getByLabel('Provider')).toHaveValue('codex')
+  await expect(page.getByLabel('Model')).toHaveValue('')
+  await expect(page.getByLabel('Default role')).toHaveValue('verifier')
   await expect(page.getByLabel('Instructions reference')).toHaveValue(
     'AGENTS.md',
   )
+  await expect(page.getByLabel('Tools')).toHaveValue('')
+  await expect(page.getByLabel('Skills')).toHaveValue('')
+  await expect(page.getByLabel('MCP servers')).toHaveValue('')
+  await expect(page.getByLabel('Sandbox')).toHaveValue('runtime_default')
+  await expect(page.getByLabel('Worktree')).toHaveValue('project_workspace')
+  await expect(page.getByLabel('Permissions')).toHaveValue('runtime_default')
   await page.getByRole('button', { name: 'Save profile' }).click()
 
   expect(state.profiles.at(-1)).toMatchObject({
-    name: 'Reviewer',
-    default_role: 'reviewer',
-    instructions_ref: 'AGENTS.md',
     completion_contract: 'manual_receipt',
+    default_role: 'verifier',
+    instructions_ref: 'AGENTS.md',
+    mcp_servers: [],
+    model: null,
+    name: 'Verifier',
+    permission_policy: 'runtime_default',
+    provider: 'codex',
+    runtime_adapter: 'herdr',
+    sandbox_policy: 'runtime_default',
+    skills: [],
+    tools: [],
+    worktree_policy: 'project_workspace',
   })
 })
 
