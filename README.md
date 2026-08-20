@@ -278,18 +278,21 @@ Managed coordination and knowledge paths reject symlink traversal.
 
 ### Embedded production build
 
-`yard-server`'s Cargo build script runs the lockfile-pinned `npm run build` and
-writes the production assets under Cargo's `OUT_DIR`; `include_dir` then embeds
-those bytes in the executable. Cargo reruns that step after a clean target or
-when frontend source, public assets, package manifests, or build configuration
-changes. Unrelated incremental Rust builds reuse Cargo's result.
+`yard-server`'s Cargo build script runs the local `npm run build` with
+`NODE_ENV=production` and writes the production assets under Cargo's `OUT_DIR`;
+`include_dir` then embeds those bytes in the executable. Cargo reruns that step
+after a clean target or when frontend source, public assets, package manifests,
+or build configuration changes. Unrelated incremental Rust builds reuse
+Cargo's result.
 
 Cargo's build script never installs frontend dependencies; it only runs the
-local build tools installed by an explicit `npm ci`. Run `npm ci` after cloning
-or changing `web/package-lock.json`. Missing Node.js, npm, or `node_modules`
-fails the Rust build with the command needed to fix it. A manual
-`npm run build` writes ignored `web/dist`; generated frontend output is not
-committed and the Cargo build embeds its own `OUT_DIR` copy.
+local build tools installed by an explicit `npm ci`, which creates
+`node_modules` from `web/package-lock.json`. Cargo only checks that
+`node_modules` exists, so rerun `npm ci` after cloning, changing the lockfile, or
+switching from a branch with a different dependency tree. Missing Node.js, npm,
+or `node_modules` fails the Rust build with the command needed to fix it. A
+manual `npm run build` writes ignored `web/dist`; generated frontend output is
+not committed and the Cargo build embeds its own `OUT_DIR` copy.
 
 ### Frontend development and HMR
 

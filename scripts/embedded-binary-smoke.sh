@@ -108,7 +108,10 @@ grep -qi '^cache-control: no-cache' "$ROOT/ui.headers"
 grep -qi '^cache-control: no-cache' "$ROOT/spa.headers"
 grep -qi '^content-type: application/json' "$ROOT/api.headers"
 grep -q '"projects":\[\]' "$ROOT/api.body"
-! grep -qi '^content-type: text/html' "$ROOT/unknown-api.headers"
+if grep -qi '^content-type: text/html' "$ROOT/unknown-api.headers"; then
+  printf 'Unknown API route returned the embedded index\n' >&2
+  exit 1
+fi
 
 printf 'Yard embedded-binary smoke passed\n'
 printf '  UI: %s (%s)\n' "$BASE_URL" "$UI_CODE"

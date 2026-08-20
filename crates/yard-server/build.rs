@@ -5,6 +5,7 @@ use std::{
 };
 
 const WEB_INPUTS: &[&str] = &[
+    ".npmrc",
     "index.html",
     "package.json",
     "package-lock.json",
@@ -45,6 +46,7 @@ fn main() {
         .args(["run", "build", "--", "--outDir"])
         .arg(&output_dir)
         .arg("--emptyOutDir")
+        .env("NODE_ENV", "production")
         .current_dir(&web_dir)
         .status()
         .unwrap_or_else(|error| {

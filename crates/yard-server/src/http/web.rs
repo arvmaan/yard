@@ -45,6 +45,9 @@ pub(super) async fn serve(request: Request) -> Response {
 fn decode_path(raw_path: &str) -> Result<String, ()> {
     validate_percent_encoding(raw_path)?;
     let decoded = percent_decode_str(raw_path).decode_utf8().map_err(|_| ())?;
+    if contains_percent_encoding(&decoded) {
+        return Err(());
+    }
     let relative = decoded.strip_prefix('/').ok_or(())?;
     if relative.contains('\\') || relative.chars().any(char::is_control) {
         return Err(());
@@ -57,6 +60,12 @@ fn decode_path(raw_path: &str) -> Result<String, ()> {
         }
     }
     Ok(relative.to_owned())
+}
+
+fn contains_percent_encoding(path: &str) -> bool {
+    path.as_bytes()
+        .windows(3)
+        .any(|encoded| encoded[0] == b'%' && encoded[1..].iter().all(u8::is_ascii_hexdigit))
 }
 
 fn validate_percent_encoding(path: &str) -> Result<(), ()> {
@@ -83,7 +92,7 @@ fn is_server_namespace(path: &str) -> bool {
 }
 
 fn is_asset_path(path: &str) -> bool {
-    path.starts_with("assets/") || Path::new(path).extension().is_some()
+    path == "assets" || path.starts_with("assets/") || Path::new(path).extension().is_some()
 }
 
 fn file_response(path: &Path, bytes: &'static [u8], head_only: bool) -> Response {
@@ -270,6 +279,12 @@ mod tests {
             "/assets/%0A.js",
             "/assets/%FF.js",
             "/assets//index.js",
+            "/api%252fv1%252fmissing",
+            "/health%252fmissing",
+            "/%252e%252e/Cargo.toml",
+            "/%255cfoo",
+            "/%2500",
+            "/%25FF",
         ] {
             let response = request(Method::GET, uri).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
@@ -279,7 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_asset_paths_remain_not_found() {
-        for uri in ["/assets/missing.js", "/favicon.ico"] {
+        for uri in ["/assets", "/assets/missing.js", "/favicon.ico"] {
             let response = request(Method::GET, uri).await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
             assert!(response.headers().get(header::CONTENT_TYPE).is_none());
