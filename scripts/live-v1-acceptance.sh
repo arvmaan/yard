@@ -142,7 +142,7 @@ start_yard() {
   YARD_DATABASE_PATH="$ROOT/yard.sqlite3" \
   YARD_ARTIFACT_PATH="$ROOT/artifacts" \
   RUST_LOG=yard_server=debug \
-  "$REPO_ROOT/target/debug/yard-server" >>"$ROOT/yard.log" 2>&1 &
+  "$REPO_ROOT/target/debug/yard" run >>"$ROOT/yard.log" 2>&1 &
   YARD_PID=$!
   wait_for_yard
 }

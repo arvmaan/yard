@@ -8,6 +8,7 @@ use axum::{
     routing::{get, put},
 };
 use serde::Serialize;
+use tokio::sync::watch;
 use yard_domain::{
     AgentProfile, AgentProfiles, Artifact, ArtifactContent, Assignments, Automation,
     AutomationCommandResult, AutomationRun, AutomationRunCommandResult, AutomationRuns,
@@ -38,6 +39,7 @@ use yard_domain::{
 use yard_herdr::HerdrError;
 use yard_store::{ProjectStoreError, YardStore};
 
+use crate::ConnectionTracker;
 use crate::allocation_service::{AllocationService, AllocationServiceError, RuntimeControl};
 use crate::artifact_service::{ArtifactService, ArtifactServiceError, StoredArtifact};
 use crate::automation_service::{AutomationService, AutomationServiceError};
@@ -79,6 +81,8 @@ struct AppState {
     automations: AutomationService,
     yard_orchestrator: YardOrchestratorService,
     coordination_nodes: CoordinationNodeService,
+    shutdown: Option<watch::Receiver<bool>>,
+    connections: ConnectionTracker,
 }
 
 #[cfg(test)]
@@ -89,6 +93,30 @@ pub(crate) fn router(
     terminal: Arc<dyn RuntimeTerminal>,
     store: Arc<dyn YardStore>,
     artifacts: ArtifactService,
+) -> Router {
+    test_router_with_shutdown(
+        source,
+        runtime,
+        intervention,
+        terminal,
+        store,
+        artifacts,
+        None,
+        ConnectionTracker::default(),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn test_router_with_shutdown(
+    source: Arc<dyn InventorySource>,
+    runtime: Arc<dyn RuntimeControl>,
+    intervention: Arc<dyn RuntimeIntervention>,
+    terminal: Arc<dyn RuntimeTerminal>,
+    store: Arc<dyn YardStore>,
+    artifacts: ArtifactService,
+    shutdown: Option<watch::Receiver<bool>>,
+    connections: ConnectionTracker,
 ) -> Router {
     let reconciliation = ReconciliationService::new(Arc::clone(&source), Arc::clone(&store));
     let managed_root = env::temp_dir().join(format!("yard-http-{}", uuid::Uuid::now_v7()));
@@ -107,7 +135,7 @@ pub(crate) fn router(
         Arc::clone(&store),
     );
     let automations = AutomationService::new(Arc::clone(&store), interventions, coordination_nodes);
-    router_with_reconciliation(
+    router_with_reconciliation_and_shutdown(
         source,
         runtime,
         intervention,
@@ -119,11 +147,13 @@ pub(crate) fn router(
         managed_root.join("coordination"),
         managed_root.join("knowledge"),
         automations,
+        shutdown,
+        connections,
     )
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(crate) fn router_with_reconciliation(
+pub(crate) fn router_with_reconciliation_and_shutdown(
     source: Arc<dyn InventorySource>,
     runtime: Arc<dyn RuntimeControl>,
     intervention: Arc<dyn RuntimeIntervention>,
@@ -135,6 +165,8 @@ pub(crate) fn router_with_reconciliation(
     coordination_path: PathBuf,
     knowledge_path: PathBuf,
     automations: AutomationService,
+    shutdown: Option<watch::Receiver<bool>>,
+    connections: ConnectionTracker,
 ) -> Router {
     let projects = ProjectService::new(
         Arc::clone(&source),
@@ -402,6 +434,8 @@ pub(crate) fn router_with_reconciliation(
             automations,
             yard_orchestrator,
             coordination_nodes,
+            shutdown,
+            connections,
         })
 }
 
@@ -3046,7 +3080,7 @@ mod tests {
     use yard_herdr::HerdrError;
     use yard_store::{SqliteProjectStore, YardStore};
 
-    use super::router;
+    use super::{router, test_router_with_shutdown};
     use crate::allocation_service::{
         RuntimeControl, RuntimeProvisionError, RuntimeProvisionRequest, RuntimeRetirementError,
         RuntimeRetirementRequest, RuntimeWorkspaceProvisionRequest,
@@ -4003,6 +4037,35 @@ mod tests {
 
     async fn test_router() -> (Router, TempDir) {
         test_router_with_source(Arc::new(FakeInventory)).await
+    }
+
+    async fn shutdown_test_router() -> (
+        Router,
+        TempDir,
+        tokio::sync::watch::Sender<bool>,
+        crate::ConnectionTracker,
+    ) {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let connections = crate::ConnectionTracker::default();
+        let app = test_router_with_shutdown(
+            Arc::new(FakeInventory),
+            runtime.clone(),
+            runtime.clone(),
+            runtime,
+            store,
+            artifacts,
+            Some(receiver),
+            connections.clone(),
+        );
+        (app, temp, shutdown, connections)
     }
 
     #[tokio::test]
@@ -5271,6 +5334,58 @@ mod tests {
         assert_eq!(closed["reason"], "released");
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_active_terminal_websocket_and_drains_tracker() {
+        let (app, _temp, shutdown, connections) = shutdown_test_router().await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut shutdown_receiver = shutdown.subscribe();
+        let server = tokio::spawn(
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_receiver.wait_for(|requested| *requested).await;
+                })
+                .into_future(),
+        );
+        let url = format!(
+            "ws://{address}/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal?cols=80&rows=24"
+        );
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://127.0.0.1:5173"),
+        );
+        let (mut socket, response) = connect_async(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert!(matches!(
+            socket.next().await.unwrap().unwrap(),
+            TungsteniteMessage::Text(_)
+        ));
+
+        connections.close();
+        shutdown.send(true).unwrap();
+        let closed = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("terminal did not close during shutdown")
+            .unwrap()
+            .unwrap();
+        let TungsteniteMessage::Text(closed) = closed else {
+            panic!("expected terminal.closed");
+        };
+        let closed: serde_json::Value = serde_json::from_str(&closed).unwrap();
+        assert_eq!(closed["type"], "terminal.closed");
+        assert_eq!(closed["reason"], "server_shutdown");
+        timeout(Duration::from_secs(2), connections.wait_for_idle())
+            .await
+            .expect("connection tracker did not drain");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server did not stop")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

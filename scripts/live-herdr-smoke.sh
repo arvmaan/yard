@@ -8,6 +8,9 @@ SESSION="yard-e2e-$$"
 PORT=${YARD_HERDR_SMOKE_PORT:-}
 export XDG_CONFIG_HOME="$ROOT/config"
 export XDG_STATE_HOME="$ROOT/state"
+export XDG_DATA_HOME="$ROOT/data"
+export XDG_CACHE_HOME="$ROOT/cache"
+export XDG_RUNTIME_DIR="$ROOT/runtime"
 
 HERDR_PID=''
 YARD_PID=''
@@ -32,6 +35,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cd "$REPO_ROOT"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
 cargo build -p yard-server >/dev/null
 
 if [[ -z "$PORT" ]]; then
@@ -60,7 +65,7 @@ YARD_BIND="127.0.0.1:$PORT" \
 YARD_DATABASE_PATH="$ROOT/yard.sqlite3" \
 YARD_ARTIFACT_PATH="$ROOT/artifacts" \
 RUST_LOG=yard_server=debug \
-./target/debug/yard-server >"$ROOT/yard.log" 2>&1 &
+./target/debug/yard run >"$ROOT/yard.log" 2>&1 &
 YARD_PID=$!
 for _ in {1..200}; do
   if ! kill -0 "$YARD_PID" >/dev/null 2>&1; then

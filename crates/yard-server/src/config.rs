@@ -48,8 +48,7 @@ impl ServerConfig {
             return Err(ConfigError::NonLoopbackBind);
         }
         let herdr_binary = env::var_os("YARD_HERDR_BIN").unwrap_or_else(|| OsString::from("herdr"));
-        let database_path =
-            env::var_os("YARD_DATABASE_PATH").map_or_else(default_database_path, PathBuf::from);
+        let database_path = database_path_from_env();
         let artifact_path = env::var_os("YARD_ARTIFACT_PATH")
             .map_or_else(|| default_artifact_path(&database_path), PathBuf::from);
         let coordination_path = managed_path_from_env(
@@ -121,6 +120,12 @@ fn default_knowledge_path(database_path: &Path) -> PathBuf {
         || PathBuf::from(".yard/knowledge"),
         |parent| parent.join("knowledge"),
     )
+}
+
+/// Resolve the configured database path without loading unrelated server settings.
+#[must_use]
+pub fn database_path_from_env() -> PathBuf {
+    env::var_os("YARD_DATABASE_PATH").map_or_else(default_database_path, PathBuf::from)
 }
 
 fn default_database_path() -> PathBuf {

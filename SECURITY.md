@@ -22,6 +22,12 @@ Artifacts are size-limited and verified by digest. HTML previews are sanitized
 and sandboxed. Managed knowledge and coordination paths reject symlink
 traversal. These controls do not make untrusted local agents safe.
 
+The lifecycle CLI uses a database-scoped, owner-only Unix socket, same-UID peer
+credentials, and a random per-launch secret. The process holds a persistent
+instance lock for its lifetime. Stored PIDs are diagnostic: `yard stop`
+requests shutdown through the authenticated control channel and never signals
+a PID loaded from lifecycle metadata.
+
 ## Live Harness Warning
 
 `scripts/live-v1-acceptance.sh` starts authenticated Codex agents with

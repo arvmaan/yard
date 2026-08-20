@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-BINARY=${1:-"$REPO_ROOT/target/release/yard-server"}
+BINARY=${1:-"$REPO_ROOT/target/release/yard"}
 if [[ "$BINARY" != /* ]]; then
   BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 fi
@@ -30,12 +30,26 @@ curl_request() {
 }
 
 mkdir -p "$ROOT/run" "$ROOT/data" "$ROOT/empty-path"
-cp "$BINARY" "$ROOT/yard-server"
+mkdir -p \
+  "$ROOT/home" \
+  "$ROOT/xdg/config" \
+  "$ROOT/xdg/state" \
+  "$ROOT/xdg/data" \
+  "$ROOT/xdg/cache" \
+  "$ROOT/xdg/runtime"
+chmod 700 "$ROOT/xdg/runtime"
+cp "$BINARY" "$ROOT/yard"
 [[ ! -e "$ROOT/run/web" ]]
 
 (
   cd "$ROOT/run"
   PATH="$ROOT/empty-path" \
+  HOME="$ROOT/home" \
+  XDG_CONFIG_HOME="$ROOT/xdg/config" \
+  XDG_STATE_HOME="$ROOT/xdg/state" \
+  XDG_DATA_HOME="$ROOT/xdg/data" \
+  XDG_CACHE_HOME="$ROOT/xdg/cache" \
+  XDG_RUNTIME_DIR="$ROOT/xdg/runtime" \
   YARD_BIND=127.0.0.1:0 \
   YARD_DATABASE_PATH="$ROOT/data/yard.sqlite3" \
   YARD_ARTIFACT_PATH="$ROOT/data/artifacts" \
@@ -44,7 +58,7 @@ cp "$BINARY" "$ROOT/yard-server"
   YARD_ORCHESTRATOR_CWD="$ROOT/run" \
   YARD_HERDR_BIN="$ROOT/missing-herdr" \
   RUST_LOG=yard_server=info \
-    "$ROOT/yard-server" >"$ROOT/yard.log" 2>&1
+    "$ROOT/yard" run >"$ROOT/yard.log" 2>&1
 ) &
 YARD_PID=$!
 

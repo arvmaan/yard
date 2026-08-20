@@ -7,10 +7,12 @@ use axum::{
     response::Response,
 };
 use serde::Deserialize;
-use std::time::Duration;
+use std::{future::pending, time::Duration};
+use tokio::{sync::watch, time::timeout};
 
 use super::{ApiError, AppState};
 use crate::{
+    ConnectionGuard,
     coordination_node_service::CoordinationNodeServiceError,
     intervention_service::InterventionServiceError,
     terminal_service::{
@@ -18,6 +20,9 @@ use crate::{
         TerminalServerMessage, TerminalServiceError, sequence_continues,
     },
 };
+
+const TERMINAL_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+const TERMINAL_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Deserialize)]
 pub(super) struct TerminalQuery {
@@ -33,16 +38,18 @@ pub(super) async fn assignment_terminal(
     websocket: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     validate_origin(&headers)?;
+    let connection = state.connections.track().ok_or_else(server_shutting_down)?;
     let terminal = state
         .terminals
         .open(&project_id, &assignment_id, query.cols, query.rows)
         .await
         .map_err(|error| terminal_error(&error))?;
     let terminals = state.terminals.clone();
+    let shutdown = state.shutdown.clone();
     Ok(websocket
         .max_message_size(MAX_TERMINAL_MESSAGE_BYTES)
         .max_frame_size(MAX_TERMINAL_MESSAGE_BYTES)
-        .on_upgrade(move |socket| relay(socket, terminal, terminals)))
+        .on_upgrade(move |socket| relay(socket, terminal, terminals, shutdown, connection)))
 }
 
 pub(super) async fn orchestrator_terminal(
@@ -53,16 +60,18 @@ pub(super) async fn orchestrator_terminal(
     websocket: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     validate_origin(&headers)?;
+    let connection = state.connections.track().ok_or_else(server_shutting_down)?;
     let terminal = state
         .terminals
         .open_orchestrator(&project_id, query.cols, query.rows)
         .await
         .map_err(|error| terminal_error(&error))?;
     let terminals = state.terminals.clone();
+    let shutdown = state.shutdown.clone();
     Ok(websocket
         .max_message_size(MAX_TERMINAL_MESSAGE_BYTES)
         .max_frame_size(MAX_TERMINAL_MESSAGE_BYTES)
-        .on_upgrade(move |socket| relay(socket, terminal, terminals)))
+        .on_upgrade(move |socket| relay(socket, terminal, terminals, shutdown, connection)))
 }
 
 pub(super) async fn yard_orchestrator_terminal(
@@ -72,16 +81,18 @@ pub(super) async fn yard_orchestrator_terminal(
     websocket: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     validate_origin(&headers)?;
+    let connection = state.connections.track().ok_or_else(server_shutting_down)?;
     let terminal = state
         .terminals
         .open_yard_orchestrator(query.cols, query.rows)
         .await
         .map_err(|error| terminal_error(&error))?;
     let terminals = state.terminals.clone();
+    let shutdown = state.shutdown.clone();
     Ok(websocket
         .max_message_size(MAX_TERMINAL_MESSAGE_BYTES)
         .max_frame_size(MAX_TERMINAL_MESSAGE_BYTES)
-        .on_upgrade(move |socket| relay(socket, terminal, terminals)))
+        .on_upgrade(move |socket| relay(socket, terminal, terminals, shutdown, connection)))
 }
 
 pub(super) async fn coordination_node_terminal(
@@ -92,22 +103,27 @@ pub(super) async fn coordination_node_terminal(
     websocket: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     validate_origin(&headers)?;
+    let connection = state.connections.track().ok_or_else(server_shutting_down)?;
     let terminal = state
         .terminals
         .open_coordination_node(&node_id, query.cols, query.rows)
         .await
         .map_err(|error| terminal_error(&error))?;
     let terminals = state.terminals.clone();
+    let shutdown = state.shutdown.clone();
     Ok(websocket
         .max_message_size(MAX_TERMINAL_MESSAGE_BYTES)
         .max_frame_size(MAX_TERMINAL_MESSAGE_BYTES)
-        .on_upgrade(move |socket| relay(socket, terminal, terminals)))
+        .on_upgrade(move |socket| relay(socket, terminal, terminals, shutdown, connection)))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn relay(
     mut socket: WebSocket,
     terminal: crate::terminal_service::OpenedTerminal,
     terminals: crate::terminal_service::TerminalService,
+    mut shutdown: Option<watch::Receiver<bool>>,
+    _connection: ConnectionGuard,
 ) {
     let crate::terminal_service::OpenedTerminal { lease, mut session } = terminal;
     let mut last_sequence = None;
@@ -115,8 +131,15 @@ async fn relay(
     lease_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            () = wait_for_shutdown(&mut shutdown) => {
+                send_closed(&mut socket, "server_shutdown").await;
+                break;
+            }
             _ = lease_check.tick() => {
-                if terminals.validate_lease(&lease).await.is_err() {
+                if !matches!(
+                    timeout(TERMINAL_OPERATION_TIMEOUT, terminals.validate_lease(&lease)).await,
+                    Ok(Ok(()))
+                ) {
                     send_closed(&mut socket, lease.revoked_reason()).await;
                     break;
                 }
@@ -124,7 +147,11 @@ async fn relay(
             runtime_message = session.next_message() => {
                 match runtime_message {
                     Ok(Some(message)) => {
-                        if terminals.validate_lease(&lease).await.is_err() {
+                        if !matches!(
+                            timeout(TERMINAL_OPERATION_TIMEOUT, terminals.validate_lease(&lease))
+                                .await,
+                            Ok(Ok(()))
+                        ) {
                             send_closed(&mut socket, lease.revoked_reason()).await;
                             break;
                         }
@@ -174,18 +201,31 @@ async fn relay(
                             break;
                         }
                         if matches!(command, TerminalClientMessage::Release) {
-                            let _ = session.release().await;
+                            let _ =
+                                timeout(TERMINAL_OPERATION_TIMEOUT, session.release()).await;
                             send_closed(&mut socket, "released").await;
                             break;
                         }
-                        if terminals.validate_lease(&lease).await.is_err() {
+                        if !matches!(
+                            timeout(TERMINAL_OPERATION_TIMEOUT, terminals.validate_lease(&lease))
+                                .await,
+                            Ok(Ok(()))
+                        ) {
                             send_closed(&mut socket, lease.revoked_reason()).await;
                             break;
                         }
-                        if let Err(error) = session.send(command).await {
-                            tracing::warn!(%error, "interactive terminal command failed");
-                            send_closed(&mut socket, "runtime_error").await;
-                            break;
+                        match timeout(TERMINAL_OPERATION_TIMEOUT, session.send(command)).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                tracing::warn!(%error, "interactive terminal command failed");
+                                send_closed(&mut socket, "runtime_error").await;
+                                break;
+                            }
+                            Err(_) => {
+                                tracing::warn!("interactive terminal command timed out");
+                                send_closed(&mut socket, "runtime_error").await;
+                                break;
+                            }
                         }
                     }
                     Message::Close(_) => break,
@@ -198,16 +238,23 @@ async fn relay(
             }
         }
     }
-    let _ = session.release().await;
-    let _ = socket.send(Message::Close(None)).await;
+    let _ = timeout(TERMINAL_OPERATION_TIMEOUT, session.release()).await;
+    let _ = timeout(
+        TERMINAL_SOCKET_WRITE_TIMEOUT,
+        socket.send(Message::Close(None)),
+    )
+    .await;
 }
 
 async fn send_message(socket: &mut WebSocket, message: &TerminalServerMessage) -> Result<(), ()> {
     let text = serde_json::to_string(message).map_err(|_| ())?;
-    socket
-        .send(Message::Text(text.into()))
-        .await
-        .map_err(|_| ())
+    timeout(
+        TERMINAL_SOCKET_WRITE_TIMEOUT,
+        socket.send(Message::Text(text.into())),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())
 }
 
 async fn send_closed(socket: &mut WebSocket, reason: &str) {
@@ -218,6 +265,24 @@ async fn send_closed(socket: &mut WebSocket, reason: &str) {
         },
     )
     .await;
+}
+
+async fn wait_for_shutdown(shutdown: &mut Option<watch::Receiver<bool>>) {
+    let Some(shutdown) = shutdown else {
+        pending::<()>().await;
+        return;
+    };
+    if *shutdown.borrow() {
+        return;
+    }
+    loop {
+        if shutdown.changed().await.is_err() {
+            pending::<()>().await;
+        }
+        if *shutdown.borrow() {
+            return;
+        }
+    }
 }
 
 fn validate_origin(headers: &HeaderMap) -> Result<(), ApiError> {
@@ -245,6 +310,14 @@ fn origin_forbidden() -> ApiError {
         status: StatusCode::FORBIDDEN,
         code: "terminal_origin_forbidden",
         message: "Interactive terminal connections require a loopback web origin".to_owned(),
+    }
+}
+
+fn server_shutting_down() -> ApiError {
+    ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "server_shutting_down",
+        message: "Yard is shutting down".to_owned(),
     }
 }
 

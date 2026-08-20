@@ -29,8 +29,7 @@ From the repository root:
 cargo fmt --all -- --check
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
-bash -n scripts/live-v1-acceptance.sh
-bash -n scripts/live-herdr-smoke.sh
+bash -n scripts/*.sh
 git diff --check
 ```
 
@@ -40,8 +39,13 @@ From `web/`:
 npm ci
 npm run lint
 npm run build
+npm run test:unit
 npm run test:e2e
 ```
+
+Run `scripts/embedded-binary-smoke.sh` and
+`scripts/cli-lifecycle-smoke.sh` when changing executable packaging, startup,
+shutdown, or configuration.
 
 Run `./scripts/live-herdr-smoke.sh` when changing the Herdr adapter, runtime
 creation, reconciliation, or terminal transport. The one-hour historical

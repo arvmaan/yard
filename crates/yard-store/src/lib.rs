@@ -783,7 +783,7 @@ pub enum SnapshotDeliveryResult {
 
 #[derive(Debug, Clone)]
 pub struct SqliteProjectStore {
-    _lock: Arc<File>,
+    database_lock: Arc<File>,
     connection: Arc<std::sync::Mutex<Connection>>,
 }
 
@@ -813,7 +813,7 @@ impl SqliteProjectStore {
         })
         .await??;
         Ok(Self {
-            _lock: Arc::new(lock),
+            database_lock: Arc::new(lock),
             connection: Arc::new(std::sync::Mutex::new(connection)),
         })
     }
@@ -824,7 +824,9 @@ impl SqliteProjectStore {
         F: FnOnce(&mut Connection) -> Result<T, ProjectStoreError> + Send + 'static,
     {
         let connection = Arc::clone(&self.connection);
+        let database_lock = Arc::clone(&self.database_lock);
         task::spawn_blocking(move || {
+            let _database_lock = database_lock;
             let mut connection = connection
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -12366,7 +12368,11 @@ impl From<rusqlite::Error> for ProjectStoreError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashSet};
+    use std::{
+        collections::{BTreeMap, HashSet},
+        sync::{Arc, Condvar, Mutex},
+        time::Duration,
+    };
 
     use rusqlite::Connection;
     use serde_json::Value;
@@ -12636,6 +12642,51 @@ mod tests {
 
         drop(store);
         SqliteProjectStore::open(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_store_future_retains_database_lock_until_blocking_work_finishes() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = SqliteProjectStore::open(&path).await.unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let operation_gate = Arc::clone(&gate);
+        let (entered, entered_receiver) = tokio::sync::oneshot::channel();
+        let operation_store = store.clone();
+        let operation = tokio::spawn(async move {
+            operation_store
+                .run(move |_connection| {
+                    let _ = entered.send(());
+                    let (ready, signal) = &*operation_gate;
+                    let mut released = ready.lock().unwrap();
+                    while !*released {
+                        released = signal.wait(released).unwrap();
+                    }
+                    Ok(())
+                })
+                .await
+        });
+        entered_receiver.await.unwrap();
+        operation.abort();
+        let _ = operation.await;
+        drop(store);
+
+        let error = SqliteProjectStore::open(&path).await.unwrap_err();
+        assert!(matches!(error, ProjectStoreError::DatabaseAlreadyOpen));
+
+        let (ready, signal) = &*gate;
+        *ready.lock().unwrap() = true;
+        signal.notify_all();
+        for _ in 0..100 {
+            match SqliteProjectStore::open(&path).await {
+                Ok(_) => return,
+                Err(ProjectStoreError::DatabaseAlreadyOpen) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("unexpected reopen error: {error}"),
+            }
+        }
+        panic!("database lock was not released after blocking work finished");
     }
 
     fn profile_spec(name: &str) -> WorkerProfileSpec {

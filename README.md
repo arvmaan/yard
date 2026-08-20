@@ -123,11 +123,11 @@ outcome instead of guessing or retrying destructive work.
 
 ## Quick start
 
-Source-build prerequisites:
+Source-install prerequisites:
 
 - Git and a native C build toolchain;
 - Rust 1.85 or newer;
-- Node.js `^20.19.0` or `>=22.12.0` and npm;
+- Node.js `^20.19.0` or `>=22.12.0` and npm.
 
 Runtime prerequisites:
 
@@ -135,32 +135,64 @@ Runtime prerequisites:
 - an authenticated agent provider supported by Herdr, such as Codex or Claude;
 - a running Herdr session containing the agents you want to operate.
 
-Install Herdr if needed:
+Install Herdr first if needed:
 
 ```sh
 curl -fsSL https://herdr.dev/install.sh | sh
 herdr --version
 ```
 
-Clone Yard and install its dependencies:
+Then build and install Yard without `sudo`:
 
 ```sh
 git clone https://github.com/arvmaan/yard.git
 cd yard
-cargo fetch
-
-cd web
-npm ci
-cd ..
-cargo build --release --locked -p yard-server
-./target/release/yard-server
+./scripts/install.sh
+export PATH="$HOME/.local/bin:$PATH"
+yard start
 ```
 
-Open the UI URL printed at startup, by default <http://127.0.0.1:4317/>.
-The React app, REST API, and terminal WebSockets use that one origin and one
-Yard process. The built executable can be copied and run outside the source
-tree; Node.js, npm, Vite, `node_modules`, and `web/` are not runtime
-dependencies.
+The installer runs the locked frontend and Rust builds, then atomically
+installs `yard` to `~/.local/bin`. Pass another bin directory as its first
+argument or set `YARD_INSTALL_DIR` to change the destination. Add that
+directory to `PATH` in your shell profile if needed.
+
+`yard start` starts one managed background instance and opens its UI. The
+other lifecycle commands are:
+
+```sh
+yard start --no-open  # start without launching a browser
+yard status           # print mode, URL, PID, and managed log path
+yard stop             # gracefully stop only a managed instance
+yard run              # foreground mode for logs, development, or containers
+```
+
+`yard status` exits `0` for a running or stopping instance and exits `1` after
+printing `Yard is not running`. Repeated `start` and `stop` commands are safe.
+A browser-launch failure prints a warning and URL but leaves Yard running.
+Invalid CLI or configuration input exits `2`. Starting with a different
+nonzero `YARD_BIND` while the same database is already running reuses the
+verified owner and warns that the active address won. Bare `yard` prints help;
+foreground operation is intentionally explicit.
+
+The UI defaults to <http://127.0.0.1:4317/>. The React app, REST API, and
+terminal WebSockets use that one loopback origin and one Yard process. The
+installed executable embeds the production app and can run outside the source
+tree; Node.js, npm, Vite, `node_modules`, and `web/` are build-time only.
+
+Each database gets a private lifecycle directory below
+`$YARD_RUNTIME_DIR`, `$XDG_RUNTIME_DIR/yard`, or a UID-qualified temporary
+directory. The directory name is derived from the normalized database path.
+It contains retained `yard.log`, persistent `launch.lock` and `instance.lock`
+files, and the live instance's `instance.json` and `control.sock`. Directories
+are mode `0700`; files and the socket are mode `0600`.
+
+The instance lock is held for the process lifetime. `status` and `stop`
+authenticate the same-UID process through the private Unix socket using a
+random per-launch secret. The stored PID is for display only and never drives
+a signal. `yard run` publishes foreground ownership through the same channel;
+`yard stop` refuses it and tells the operator to stop it in the owning
+terminal.
 
 Yard will display the sessions reported by Herdr. If there are none, start one
 with Herdr before continuing.
@@ -235,7 +267,8 @@ and successful delivery means only that the prompt reached its target.
 
 ## Architecture
 
-Yard is a Rust workspace with a React client embedded in `yard-server`:
+Yard is a Rust workspace with a React client embedded in the `yard`
+executable:
 
 ```text
 crates/
@@ -247,10 +280,15 @@ web/
   src/            React source for the embedded UI and Vite development
   tests/          Playwright acceptance coverage
 scripts/
+  install.sh
+  cli-lifecycle-smoke.sh
   embedded-binary-smoke.sh
   live-herdr-smoke.sh
   live-v1-acceptance.sh
 ```
+
+The Cargo package and library remain internally named `yard-server` and
+`yard_server`; the package's sole executable target is named `yard`.
 
 The production web build is compiled into the Rust executable and served by
 the same Axum router as the API. The server binds only to loopback while Yard
@@ -269,6 +307,7 @@ exclusively owns a database.
 | `YARD_COORDINATION_PATH` | managed workstream directories | `coordination/` beside the database |
 | `YARD_KNOWLEDGE_PATH` | managed knowledge snapshots | `knowledge/` beside the database |
 | `YARD_ORCHESTRATOR_CWD` | working directory for the superintendent | process working directory |
+| `YARD_RUNTIME_DIR` | private base directory for database-scoped lifecycle state and logs | `$XDG_RUNTIME_DIR/yard` or UID-qualified temporary directory |
 | `YARD_API_TARGET` | Vite development proxy target only | `http://127.0.0.1:4317` |
 
 Stop Yard before copying its database and managed directories for backup.
@@ -278,7 +317,8 @@ Managed coordination and knowledge paths reject symlink traversal.
 
 ### Embedded production build
 
-`yard-server`'s Cargo build script runs the local `npm run build` with
+The `yard-server` Cargo package's build script runs the local `npm run build`
+with
 `NODE_ENV=production` and writes the production assets under Cargo's `OUT_DIR`;
 `include_dir` then embeds those bytes in the executable. Cargo reruns that step
 after a clean target or when frontend source, public assets, package manifests,
@@ -300,7 +340,7 @@ For React work, keep the two-process Vite workflow. Start the API from the
 repository root:
 
 ```sh
-cargo run -p yard-server
+cargo run -p yard-server -- run
 ```
 
 Then start Vite in another terminal:
@@ -334,8 +374,11 @@ Run the Rust gates from the repository root:
 cargo fmt --all -- --check
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
-cargo build --release --locked -p yard-server
-bash scripts/embedded-binary-smoke.sh target/release/yard-server
+cargo build --release --locked -p yard-server --bin yard
+bash scripts/embedded-binary-smoke.sh target/release/yard
+bash scripts/cli-lifecycle-smoke.sh target/release/yard
+bash -n scripts/install.sh
+bash -n scripts/cli-lifecycle-smoke.sh
 bash -n scripts/live-herdr-smoke.sh
 bash -n scripts/live-v1-acceptance.sh
 ```
@@ -344,6 +387,12 @@ bash -n scripts/live-v1-acceptance.sh
 isolated temporary directory, launches it with no Node/npm tools on its runtime
 `PATH`, and verifies health, UI, an embedded asset, SPA fallback, a real API
 route, and unknown-API behavior.
+
+`scripts/cli-lifecycle-smoke.sh` uses isolated HOME/XDG paths and ephemeral
+IPv4/IPv6 ports. It covers managed and foreground ownership, status/stop
+semantics, repeated and concurrent commands, permissions, SIGTERM, stale crash
+recovery, browser suppression/failure, bind conflict, separate database roots,
+and unrelated-PID safety.
 
 `scripts/live-herdr-smoke.sh` creates real temporary Herdr resources. The
 historical `live-v1-acceptance.sh` harness also launches authenticated Codex
@@ -361,6 +410,8 @@ Yard 0.1 is an early, single-user local tool:
 - there is no authentication, authorization, TLS, or remote deployment model;
 - Herdr 0.8.0 is the only runtime adapter;
 - there are no published installers or signed binaries;
+- managed background lifecycle and automatic browser launch target Linux and
+  macOS; Windows is not currently supported;
 - interrupted project creation, allocation, or handoff can retain a safety
   reservation without a self-service cancel or resolve workflow;
 - knowledge collection and automation delivery are transport events, not
