@@ -29,12 +29,12 @@ use yard_domain::{
     RunAutomationNow, RuntimeInventory, RuntimeSessions, SendAssignmentPrompt,
     SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
     SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SetAutomationPaused, TerminalOutput,
-    TokenSpendSettings, UpdateAgentProfile, UpdateAutomation, UpdateAutomationPlacement,
-    UpdateCoordinationNode, UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile,
-    UpdateProjectPlacement, UpdateTokenSpendSettings, UpdateWorkerProfile, UploadArtifact,
-    WorkerCandidates, WorkerProfile, WorkerProfiles, YardOrchestrator,
-    YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute, YardOrchestratorRoutes,
-    YardOrchestratorTerminalOutput,
+    TokenSpendSettings, TransferProjectOrchestrator, TransferredProjectOrchestrator,
+    UpdateAgentProfile, UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
+    UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
+    UpdateTokenSpendSettings, UpdateWorkerProfile, UploadArtifact, WorkerCandidates, WorkerProfile,
+    WorkerProfiles, YardOrchestrator, YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute,
+    YardOrchestratorRoutes, YardOrchestratorTerminalOutput,
 };
 use yard_herdr::HerdrError;
 use yard_store::{ProjectStoreError, YardStore};
@@ -55,6 +55,9 @@ use crate::orchestrator_workflow_profile_service::{
     OrchestratorWorkflowProfileService, OrchestratorWorkflowProfileServiceError,
 };
 use crate::profile_service::{AgentProfileServiceError, ProfileService, ProfileServiceError};
+use crate::project_orchestrator_transfer_service::{
+    ProjectOrchestratorTransferService, ProjectOrchestratorTransferServiceError,
+};
 use crate::project_service::{ProjectService, ProjectServiceError};
 use crate::reconciliation_service::{ReconciliationService, ReconciliationServiceError};
 use crate::terminal_service::{RuntimeTerminal, TerminalService};
@@ -74,6 +77,7 @@ struct AppState {
     orchestrator_workflow_profiles: OrchestratorWorkflowProfileService,
     allocations: AllocationService,
     orchestrator_replacements: OrchestratorReplacementService,
+    orchestrator_transfers: ProjectOrchestratorTransferService,
     worker_sessions: WorkerSessionService,
     interventions: InterventionService,
     terminals: TerminalService,
@@ -188,6 +192,8 @@ pub(crate) fn router_with_reconciliation_and_shutdown(
         Arc::clone(&runtime),
         Arc::clone(&store),
     );
+    let orchestrator_transfers =
+        ProjectOrchestratorTransferService::new(Arc::clone(&source), Arc::clone(&store));
     let coordination_nodes = CoordinationNodeService::new(
         Arc::clone(&source),
         Arc::clone(&runtime),
@@ -346,6 +352,10 @@ pub(crate) fn router_with_reconciliation_and_shutdown(
         )
         .route("/api/v1/projects/{project_id}", get(get_project))
         .route(
+            "/api/v1/projects/{project_id}/orchestrator",
+            put(transfer_project_orchestrator),
+        )
+        .route(
             "/api/v1/projects/{project_id}/placement",
             put(update_project_placement),
         )
@@ -427,6 +437,7 @@ pub(crate) fn router_with_reconciliation_and_shutdown(
             orchestrator_workflow_profiles,
             allocations,
             orchestrator_replacements,
+            orchestrator_transfers,
             worker_sessions,
             interventions,
             terminals,
@@ -1399,6 +1410,19 @@ async fn replace_project_orchestrator(
         .map_err(ApiError::from)
 }
 
+async fn transfer_project_orchestrator(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(command): Json<TransferProjectOrchestrator>,
+) -> Result<NoStoreJson<TransferredProjectOrchestrator>, ApiError> {
+    state
+        .orchestrator_transfers
+        .transfer(&project_id, command)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct OutputQuery {
     #[serde(default = "default_output_lines")]
@@ -1968,6 +1992,73 @@ impl From<OrchestratorReplacementServiceError> for ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "orchestrator_replacement_storage_error",
                 message: "Yard orchestrator replacement storage is unavailable".to_owned(),
+            },
+        }
+    }
+}
+
+impl From<ProjectOrchestratorTransferServiceError> for ApiError {
+    fn from(error: ProjectOrchestratorTransferServiceError) -> Self {
+        match error {
+            ProjectOrchestratorTransferServiceError::InvalidCommand(error)
+            | ProjectOrchestratorTransferServiceError::Store(
+                ProjectStoreError::InvalidOrchestratorTransfer(error),
+            ) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid_project_orchestrator_transfer",
+                message: error.to_string(),
+            },
+            ProjectOrchestratorTransferServiceError::RuntimeWorkspaceMismatch
+            | ProjectOrchestratorTransferServiceError::RuntimeWorkspaceMissing
+            | ProjectOrchestratorTransferServiceError::RuntimeUnavailable
+            | ProjectOrchestratorTransferServiceError::RuntimeIdentityChanged
+            | ProjectOrchestratorTransferServiceError::RuntimeIdentityAmbiguous => Self {
+                status: StatusCode::CONFLICT,
+                code: "project_orchestrator_identity_changed",
+                message: error.to_string(),
+            },
+            ProjectOrchestratorTransferServiceError::Inventory(error) => Self::from(error),
+            ProjectOrchestratorTransferServiceError::Store(ProjectStoreError::ProjectNotFound) => {
+                Self {
+                    status: StatusCode::NOT_FOUND,
+                    code: "project_not_found",
+                    message: "Yard project was not found".to_owned(),
+                }
+            }
+            ProjectOrchestratorTransferServiceError::Store(ProjectStoreError::WorkerNotFound) => {
+                Self {
+                    status: StatusCode::NOT_FOUND,
+                    code: "worker_not_found",
+                    message: "Yard worker was not found".to_owned(),
+                }
+            }
+            ProjectOrchestratorTransferServiceError::Store(ProjectStoreError::DatabaseBusy) => {
+                Self {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    code: "database_busy",
+                    message: "Yard storage is busy; retry the request".to_owned(),
+                }
+            }
+            ProjectOrchestratorTransferServiceError::Store(
+                error @ (ProjectStoreError::ProjectVersionConflict { .. }
+                | ProjectStoreError::WorkerVersionConflict { .. }
+                | ProjectStoreError::OrchestratorNotCurrent { .. }
+                | ProjectStoreError::WorkerNotAvailable { .. }
+                | ProjectStoreError::RuntimeBindingMissing
+                | ProjectStoreError::RuntimeWorkspaceMismatch
+                | ProjectStoreError::StaleRuntimeSnapshot
+                | ProjectStoreError::OrchestratorInterventionInProgress
+                | ProjectStoreError::OrchestratorTransferTargetChanged
+                | ProjectStoreError::IdempotencyConflict),
+            ) => Self {
+                status: StatusCode::CONFLICT,
+                code: "project_orchestrator_transfer_conflict",
+                message: error.to_string(),
+            },
+            ProjectOrchestratorTransferServiceError::Store(_) => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "project_orchestrator_transfer_storage_error",
+                message: "Yard project orchestrator transfer storage is unavailable".to_owned(),
             },
         }
     }
@@ -4545,6 +4636,79 @@ mod tests {
         (uri, command, project_id)
     }
 
+    async fn create_orchestrator_transfer_request(
+        app: &Router,
+    ) -> (String, serde_json::Value, String) {
+        let target_project_body = serde_json::json!({
+            "name": "Transfer API",
+            "runtime": {
+                "adapter": "herdr",
+                "session": "default",
+                "workspace_id": "workspace-2"
+            },
+            "orchestrator_observed_worker_id": "terminal-target-orchestrator",
+            "placement": {
+                "x": 480.0,
+                "y": 70.0,
+                "width": 322.0,
+                "height": 240.0
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(target_project_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = response_json(response).await;
+        let inventory = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/sessions/default/inventory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inventory.status(), StatusCode::OK);
+        let project_id = created["id"].as_str().unwrap().to_owned();
+        let project = get_json(app, &format!("/api/v1/projects/{project_id}")).await;
+        let workers = get_json(app, "/api/v1/workers").await;
+        let candidate = workers["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| {
+                candidate["worker"]["runtime"]["terminal_id"] == "terminal-yard-handoffcommand1"
+            })
+            .unwrap();
+        assert_eq!(candidate["availability"], "unassigned_live");
+        let command = serde_json::json!({
+            "command_id": "transfer-command-1",
+            "actor": "local-user",
+            "worker_id": candidate["worker"]["id"],
+            "expected_worker_version": candidate["worker"]["version"],
+            "expected_worker_runtime": candidate["worker"]["runtime"],
+            "expected_project_version": project["version"],
+            "expected_orchestrator_worker_id": project["orchestrator"]["id"],
+            "expected_orchestrator_worker_version": project["orchestrator"]["version"],
+            "expected_orchestrator_runtime": project["orchestrator"]["runtime"]
+        });
+        (
+            format!("/api/v1/projects/{project_id}/orchestrator"),
+            command,
+            project_id,
+        )
+    }
+
     #[test]
     fn maps_pending_prompt_completion_to_conflict() {
         let error = super::allocation_store_error(
@@ -4785,6 +4949,187 @@ mod tests {
         assert!(runtime.retirement_calls.lock().unwrap().is_empty());
         let project = get_json(&app, &format!("/api/v1/projects/{project_id}")).await;
         assert_eq!(project["orchestrator"]["id"], displaced_worker_id);
+    }
+
+    #[tokio::test]
+    async fn project_orchestrator_transfer_replays_keeps_displaced_live_and_revokes_lease() {
+        let (app, _temp, _runtime) = handoff_test_router().await;
+        let (uri, command, project_id) = create_orchestrator_transfer_request(&app).await;
+        let replaced_worker_id = command["expected_orchestrator_worker_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, app.clone()).into_future());
+        let terminal_url = format!(
+            "ws://{address}/api/v1/projects/{project_id}/orchestrator/terminal?cols=80&rows=24"
+        );
+        let mut terminal_request = terminal_url.into_client_request().unwrap();
+        terminal_request.headers_mut().insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://127.0.0.1:5173"),
+        );
+        let (mut socket, response) = connect_async(terminal_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert!(matches!(
+            socket.next().await.unwrap().unwrap(),
+            TungsteniteMessage::Text(_)
+        ));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(&uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let transferred = response_json(response).await;
+        assert_eq!(transferred["replaced_worker_id"], replaced_worker_id);
+        assert_eq!(
+            transferred["project"]["orchestrator"]["id"],
+            command["worker_id"]
+        );
+        assert_eq!(transferred["replayed"], false);
+
+        let replay = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(&uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(response_json(replay).await["replayed"], true);
+        let workers = get_json(&app, "/api/v1/workers").await;
+        let displaced = workers["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["worker"]["id"] == replaced_worker_id)
+            .unwrap();
+        assert_eq!(displaced["availability"], "unassigned_live");
+        assert!(!displaced["worker"]["runtime"].is_null());
+
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .expect("orchestrator terminal lease was not revoked")
+            .unwrap()
+            .unwrap();
+        let TungsteniteMessage::Text(closed) = closed else {
+            panic!("expected terminal.closed");
+        };
+        let closed: serde_json::Value = serde_json::from_str(&closed).unwrap();
+        assert_eq!(closed["type"], "terminal.closed");
+        assert_eq!(closed["reason"], "orchestrator_changed");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn project_orchestrator_transfer_http_rejects_stale_cross_workspace_and_unavailable() {
+        let (app, temp, _runtime) = handoff_test_router().await;
+        let (uri, command, _project_id) = create_orchestrator_transfer_request(&app).await;
+
+        let mut stale = command.clone();
+        stale["command_id"] = serde_json::json!("stale-transfer");
+        stale["expected_project_version"] = serde_json::json!(
+            (command["expected_project_version"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                + 1)
+            .to_string()
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(&uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(stale.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "project_orchestrator_transfer_conflict"
+        );
+
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE worker_runtime_bindings
+                    SET runtime_workspace_id = 'workspace-other'
+                  WHERE worker_id = ?1",
+                [command["worker_id"].as_str().unwrap()],
+            )
+            .unwrap();
+        drop(connection);
+        let mut cross_workspace = command.clone();
+        cross_workspace["command_id"] = serde_json::json!("cross-workspace-transfer");
+        cross_workspace["expected_worker_runtime"]["workspace_id"] =
+            serde_json::json!("workspace-other");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(&uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(cross_workspace.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "project_orchestrator_identity_changed"
+        );
+
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE worker_runtime_bindings
+                    SET process_state = 'exited'
+                  WHERE worker_id = ?1",
+                [command["worker_id"].as_str().unwrap()],
+            )
+            .unwrap();
+        drop(connection);
+        cross_workspace["command_id"] = serde_json::json!("unavailable-transfer");
+        cross_workspace["expected_worker_runtime"]["process_state"] = serde_json::json!("exited");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(cross_workspace.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "project_orchestrator_transfer_conflict"
+        );
     }
 
     #[tokio::test]

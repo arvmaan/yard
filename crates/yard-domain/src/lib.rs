@@ -7,6 +7,7 @@ mod coordination_node;
 mod intervention;
 mod inventory;
 mod orchestrator_replacement;
+mod orchestrator_transfer;
 mod orchestrator_workflow_profile;
 mod profile;
 mod project;
@@ -73,6 +74,10 @@ pub use inventory::{
 pub use orchestrator_replacement::{
     OldSessionDisposition, OrchestratorReplacementValidationError, ReplaceProjectOrchestrator,
     ReplacedProjectOrchestrator,
+};
+pub use orchestrator_transfer::{
+    OrchestratorTransferValidationError, TransferProjectOrchestrator,
+    TransferredProjectOrchestrator,
 };
 pub use orchestrator_workflow_profile::{
     FACTORY_ORCHESTRATOR_WORKFLOW_INSTRUCTIONS, FACTORY_ORCHESTRATOR_WORKFLOW_MONITOR_INTERVAL_MS,

@@ -43,7 +43,8 @@ use yard_domain::{
     RunAutomationNow, RuntimeInventory, RuntimeObservationState, RuntimeProcessState,
     RuntimeReconciliation, SendAssignmentPrompt, SendCoordinationNodePrompt,
     SendCoordinationNodeRoute, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
-    SendYardOrchestratorRoute, SetAutomationPaused, TokenSpendSettings, UpdateAgentProfile,
+    SendYardOrchestratorRoute, SetAutomationPaused, TokenSpendSettings,
+    TransferProjectOrchestrator, TransferredProjectOrchestrator, UpdateAgentProfile,
     UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
     UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
     UpdateTokenSpendSettings, UpdateWorkerProfile, Worker, WorkerAllocation, WorkerAvailability,
@@ -57,7 +58,7 @@ mod coordination_node_store;
 mod orchestrator_workflow_profile_store;
 mod token_spend_store;
 
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_projects.sql");
 const PROFILE_ASSIGNMENT_MIGRATION: &str =
     include_str!("../migrations/0002_profiles_assignments.sql");
@@ -94,6 +95,8 @@ const ORCHESTRATOR_REPLACEMENT_MIGRATION: &str =
 const AGENT_PROFILES_MIGRATION: &str = include_str!("../migrations/0021_agent_profiles.sql");
 const ORCHESTRATOR_WORKFLOW_PROFILE_MIGRATION: &str =
     include_str!("../migrations/0022_orchestrator_workflow_profile.sql");
+const PROJECT_ORCHESTRATOR_TRANSFER_MIGRATION: &str =
+    include_str!("../migrations/0023_project_orchestrator_transfer.sql");
 const BLANK_WORKER_PROFILE_ID: &str = "yard:managed-blank-profile";
 const BLANK_WORKER_PROFILE_NAME: &str = "Blank profile";
 const MAX_ROUTE_LIST_LIMIT: usize = 500;
@@ -316,6 +319,16 @@ pub trait YardStore: Send + Sync {
         command: DeleteProjectRelationship,
     ) -> Result<DeletedProjectRelationship, ProjectStoreError>;
     async fn get_project(&self, project_id: &str) -> Result<Project, ProjectStoreError>;
+    async fn replay_project_orchestrator_transfer(
+        &self,
+        project_id: &str,
+        command: TransferProjectOrchestrator,
+    ) -> Result<Option<TransferredProjectOrchestrator>, ProjectStoreError>;
+    async fn transfer_project_orchestrator(
+        &self,
+        project_id: &str,
+        command: TransferProjectOrchestrator,
+    ) -> Result<TransferredProjectOrchestrator, ProjectStoreError>;
     async fn create_project(
         &self,
         project: CreateProject,
@@ -1807,6 +1820,401 @@ impl YardStore for SqliteProjectStore {
         let project_id = required_id(project_id)?;
         self.run(move |connection| select_project(connection, &project_id))
             .await
+    }
+
+    async fn replay_project_orchestrator_transfer(
+        &self,
+        project_id: &str,
+        command: TransferProjectOrchestrator,
+    ) -> Result<Option<TransferredProjectOrchestrator>, ProjectStoreError> {
+        let project_id = required_id(project_id)?;
+        let command = command.normalize()?;
+        self.run(move |connection| {
+            let Some(existing) =
+                select_project_orchestrator_transfer_command(connection, &command.command_id)?
+            else {
+                if command_id_exists(connection, &command.command_id)? {
+                    return Err(ProjectStoreError::IdempotencyConflict);
+                }
+                return Ok(None);
+            };
+            if !existing.matches(&project_id, &command) {
+                return Err(ProjectStoreError::IdempotencyConflict);
+            }
+            select_transferred_project_orchestrator(connection, &command.command_id, true).map(Some)
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn transfer_project_orchestrator(
+        &self,
+        project_id: &str,
+        command: TransferProjectOrchestrator,
+    ) -> Result<TransferredProjectOrchestrator, ProjectStoreError> {
+        let project_id = required_id(project_id)?;
+        let command = command.normalize()?;
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(existing) =
+                select_project_orchestrator_transfer_command(&transaction, &command.command_id)?
+            {
+                if !existing.matches(&project_id, &command) {
+                    return Err(ProjectStoreError::IdempotencyConflict);
+                }
+                return select_transferred_project_orchestrator(
+                    &transaction,
+                    &command.command_id,
+                    true,
+                );
+            }
+            if command_id_exists(&transaction, &command.command_id)? {
+                return Err(ProjectStoreError::IdempotencyConflict);
+            }
+
+            let project = select_project(&transaction, &project_id)?;
+            if project.version != command.expected_project_version {
+                return Err(ProjectStoreError::ProjectVersionConflict {
+                    current_version: project.version,
+                });
+            }
+            if project.orchestrator.id != command.expected_orchestrator_worker_id {
+                return Err(ProjectStoreError::OrchestratorNotCurrent {
+                    current_worker_id: project.orchestrator.id,
+                });
+            }
+            if project.orchestrator.version != command.expected_orchestrator_worker_version {
+                return Err(ProjectStoreError::WorkerVersionConflict {
+                    current_version: project.orchestrator.version,
+                });
+            }
+            if project.orchestrator.runtime.as_ref() != Some(&command.expected_orchestrator_runtime)
+            {
+                return Err(ProjectStoreError::OrchestratorTransferTargetChanged);
+            }
+            let candidate = select_worker_candidate(&transaction, &command.worker_id)?
+                .ok_or(ProjectStoreError::WorkerNotFound)?;
+            if candidate.worker.version != command.expected_worker_version {
+                return Err(ProjectStoreError::WorkerVersionConflict {
+                    current_version: candidate.worker.version,
+                });
+            }
+            if candidate.availability != WorkerAvailability::UnassignedLive {
+                return Err(ProjectStoreError::WorkerNotAvailable {
+                    availability: candidate.availability,
+                });
+            }
+            if candidate.worker.runtime.as_ref() != Some(&command.expected_worker_runtime) {
+                return Err(ProjectStoreError::OrchestratorTransferTargetChanged);
+            }
+            for runtime in [
+                &command.expected_worker_runtime,
+                &command.expected_orchestrator_runtime,
+            ] {
+                if runtime.adapter != project.runtime.adapter
+                    || runtime.session != project.runtime.session
+                    || runtime.workspace_id != project.runtime.workspace_id
+                {
+                    return Err(ProjectStoreError::RuntimeWorkspaceMismatch);
+                }
+                ensure_runtime_snapshot_current(&transaction, runtime)?;
+            }
+
+            let blocked = transaction.query_row(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM orchestrator_prompt_commands opc
+                      JOIN command_acknowledgements ca ON ca.id = opc.command_id
+                     WHERE opc.project_id = ?1 AND ca.status = 'pending'
+                    UNION ALL
+                    SELECT 1
+                      FROM yard_orchestrator_route_commands yorc
+                      JOIN command_acknowledgements ca
+                        ON ca.id = yorc.command_id
+                     WHERE yorc.target_project_id = ?1 AND ca.status = 'pending'
+                    UNION ALL
+                    SELECT 1
+                      FROM worker_handoff_commands whc
+                     WHERE whc.target_project_id = ?1
+                       AND whc.target_role = 'orchestrator'
+                       AND whc.finished_at_unix_ms IS NULL
+                    UNION ALL
+                    SELECT 1
+                      FROM project_orchestrator_replacement_commands porc
+                     WHERE porc.project_id = ?1
+                       AND porc.finished_at_unix_ms IS NULL
+                 )",
+                [&project_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if blocked {
+                return Err(ProjectStoreError::OrchestratorInterventionInProgress);
+            }
+
+            let displaced_allocation_id = transaction
+                .query_row(
+                    "SELECT id
+                       FROM worker_allocations
+                      WHERE project_id = ?1 AND worker_id = ?2
+                        AND ended_at_unix_ms IS NULL",
+                    params![project_id, command.expected_orchestrator_worker_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or(ProjectStoreError::OrchestratorTransferTargetChanged)?;
+            let displaced_assignment = transaction
+                .query_row(
+                    "SELECT a.id, a.version, aa.id, aa.version
+                       FROM assignments a
+                       JOIN assignment_attempts aa ON aa.assignment_id = a.id
+                        AND aa.ordinal = (
+                            SELECT MAX(latest.ordinal)
+                              FROM assignment_attempts latest
+                             WHERE latest.assignment_id = a.id
+                        )
+                      WHERE a.project_id = ?1 AND a.worker_id = ?2
+                        AND a.allocation_id = ?3
+                        AND a.lifecycle = 'active'
+                        AND aa.lifecycle = 'active'",
+                    params![
+                        project_id,
+                        command.expected_orchestrator_worker_id,
+                        displaced_allocation_id
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row_u64(row, 1)?,
+                            row.get::<_, String>(2)?,
+                            row_u64(row, 3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if displaced_assignment.is_none()
+                && transaction.query_row(
+                    "SELECT EXISTS (
+                        SELECT 1
+                          FROM assignments
+                         WHERE project_id = ?1 AND worker_id = ?2
+                           AND lifecycle IN (
+                               'allocating', 'active', 'handing_off'
+                           )
+                    )",
+                    params![project_id, command.expected_orchestrator_worker_id],
+                    |row| row.get::<_, bool>(0),
+                )?
+            {
+                return Err(ProjectStoreError::OrchestratorTransferTargetChanged);
+            }
+
+            let next_project_version = project
+                .version
+                .checked_add(1)
+                .ok_or(ProjectStoreError::VersionOverflow)?;
+            let next_worker_version = candidate
+                .worker
+                .version
+                .checked_add(1)
+                .ok_or(ProjectStoreError::VersionOverflow)?;
+            let next_replaced_worker_version = project
+                .orchestrator
+                .version
+                .checked_add(1)
+                .ok_or(ProjectStoreError::VersionOverflow)?;
+            let allocation_id = Uuid::now_v7().to_string();
+            let now = unix_time_ms()?;
+
+            transaction.execute(
+                "INSERT INTO command_acknowledgements (
+                    id, command_type, actor, status, error_message,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (
+                    ?1, 'project_orchestrator_transfer', ?2, 'succeeded',
+                    NULL, ?3, ?3
+                 )",
+                params![command.command_id, command.actor, to_i64(now)?],
+            )?;
+            let old_allocation_rows = transaction.execute(
+                "UPDATE worker_allocations
+                    SET ended_at_unix_ms = ?1
+                  WHERE id = ?2 AND project_id = ?3 AND worker_id = ?4
+                    AND ended_at_unix_ms IS NULL",
+                params![
+                    to_i64(now)?,
+                    displaced_allocation_id,
+                    project_id,
+                    command.expected_orchestrator_worker_id,
+                ],
+            )?;
+            if old_allocation_rows != 1 {
+                return Err(ProjectStoreError::OrchestratorTransferTargetChanged);
+            }
+            if let Some((assignment_id, assignment_version, attempt_id, attempt_version)) =
+                displaced_assignment
+            {
+                let assignment_rows = transaction.execute(
+                    "UPDATE assignments
+                        SET lifecycle = 'handed_off', version = version + 1,
+                            updated_at_unix_ms = ?1
+                      WHERE id = ?2 AND version = ?3
+                        AND lifecycle = 'active'",
+                    params![to_i64(now)?, assignment_id, to_i64(assignment_version)?,],
+                )?;
+                let attempt_rows = transaction.execute(
+                    "UPDATE assignment_attempts
+                        SET lifecycle = 'handed_off', version = version + 1,
+                            updated_at_unix_ms = ?1
+                      WHERE id = ?2 AND assignment_id = ?3 AND version = ?4
+                        AND lifecycle = 'active'",
+                    params![
+                        to_i64(now)?,
+                        attempt_id,
+                        assignment_id,
+                        to_i64(attempt_version)?,
+                    ],
+                )?;
+                if assignment_rows != 1 || attempt_rows != 1 {
+                    return Err(ProjectStoreError::OrchestratorTransferTargetChanged);
+                }
+            }
+            let replaced_worker_rows = transaction.execute(
+                "UPDATE workers
+                    SET version = ?1, updated_at_unix_ms = ?2
+                  WHERE id = ?3 AND version = ?4
+                    AND ended_at_unix_ms IS NULL",
+                params![
+                    to_i64(next_replaced_worker_version)?,
+                    to_i64(now)?,
+                    command.expected_orchestrator_worker_id,
+                    to_i64(command.expected_orchestrator_worker_version)?,
+                ],
+            )?;
+            let candidate_rows = transaction.execute(
+                "UPDATE workers
+                    SET version = ?1, updated_at_unix_ms = ?2
+                  WHERE id = ?3 AND version = ?4
+                    AND ended_at_unix_ms IS NULL",
+                params![
+                    to_i64(next_worker_version)?,
+                    to_i64(now)?,
+                    command.worker_id,
+                    to_i64(command.expected_worker_version)?,
+                ],
+            )?;
+            if replaced_worker_rows != 1 || candidate_rows != 1 {
+                return Err(ProjectStoreError::OrchestratorTransferTargetChanged);
+            }
+            let project_rows = transaction.execute(
+                "UPDATE projects
+                    SET orchestrator_worker_id = ?1, version = ?2,
+                        updated_at_unix_ms = ?3
+                  WHERE id = ?4 AND version = ?5
+                    AND orchestrator_worker_id = ?6",
+                params![
+                    command.worker_id,
+                    to_i64(next_project_version)?,
+                    to_i64(now)?,
+                    project_id,
+                    to_i64(command.expected_project_version)?,
+                    command.expected_orchestrator_worker_id,
+                ],
+            )?;
+            if project_rows != 1 {
+                return Err(ProjectStoreError::OrchestratorTransferTargetChanged);
+            }
+            transaction.execute(
+                "INSERT INTO worker_allocations (
+                    id, project_id, worker_id, mode, started_by_command_id,
+                    started_at_unix_ms, ended_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, 'adopt_existing', ?4, ?5, NULL)",
+                params![
+                    allocation_id,
+                    project_id,
+                    command.worker_id,
+                    command.command_id,
+                    to_i64(now)?,
+                ],
+            )?;
+            let result_project = select_project(&transaction, &project_id)?;
+            let result_project_json = serde_json::to_string(&result_project)
+                .map_err(ProjectStoreError::StoredResultJson)?;
+            transaction.execute(
+                "INSERT INTO project_orchestrator_transfer_commands (
+                    command_id, project_id, worker_id, expected_worker_version,
+                    expected_project_version, expected_orchestrator_worker_id,
+                    expected_orchestrator_worker_version, replaced_worker_id,
+                    result_project_version, result_worker_version,
+                    result_replaced_worker_version, result_allocation_id,
+                    result_project_json, finished_at_unix_ms
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?6, ?8, ?9, ?10, ?11,
+                    ?12, ?13
+                 )",
+                params![
+                    command.command_id,
+                    project_id,
+                    command.worker_id,
+                    to_i64(command.expected_worker_version)?,
+                    to_i64(command.expected_project_version)?,
+                    command.expected_orchestrator_worker_id,
+                    to_i64(command.expected_orchestrator_worker_version)?,
+                    to_i64(next_project_version)?,
+                    to_i64(next_worker_version)?,
+                    to_i64(next_replaced_worker_version)?,
+                    allocation_id,
+                    result_project_json,
+                    to_i64(now)?,
+                ],
+            )?;
+            insert_project_orchestrator_transfer_runtime(
+                &transaction,
+                &command.command_id,
+                "candidate",
+                &command.worker_id,
+                &command.expected_worker_runtime,
+            )?;
+            insert_project_orchestrator_transfer_runtime(
+                &transaction,
+                &command.command_id,
+                "displaced",
+                &command.expected_orchestrator_worker_id,
+                &command.expected_orchestrator_runtime,
+            )?;
+            insert_lifecycle_event(
+                &transaction,
+                "project",
+                &project_id,
+                next_project_version,
+                "project_orchestrator_transferred",
+                &command.actor,
+                now,
+            )?;
+            insert_lifecycle_event(
+                &transaction,
+                "worker",
+                &command.worker_id,
+                next_worker_version,
+                "project_orchestrator_assigned",
+                &command.actor,
+                now,
+            )?;
+            insert_lifecycle_event(
+                &transaction,
+                "worker",
+                &command.expected_orchestrator_worker_id,
+                next_replaced_worker_version,
+                "project_orchestrator_displaced",
+                &command.actor,
+                now,
+            )?;
+            let transferred =
+                select_transferred_project_orchestrator(&transaction, &command.command_id, false)?;
+            transaction.commit()?;
+            Ok(transferred)
+        })
+        .await
     }
 
     async fn create_project(
@@ -7762,6 +8170,27 @@ const WORKER_CANDIDATE_SELECT: &str = "
                  FROM runtime_cleanup_jobs cleanup
                 WHERE cleanup.worker_id = w.id
                   AND cleanup.status = 'pending'
+           ),
+           EXISTS (
+               SELECT 1
+                 FROM project_orchestrator_transfer_runtime_bindings captured
+                WHERE captured.binding_role = 'displaced'
+                  AND captured.worker_id = w.id
+                  AND captured.adapter = wrb.adapter
+                  AND captured.runtime_session = wrb.runtime_session
+                  AND captured.runtime_workspace_id = wrb.runtime_workspace_id
+                  AND captured.terminal_id = wrb.terminal_id
+                  AND captured.tab_id IS wrb.tab_id
+                  AND captured.pane_id = wrb.pane_id
+                  AND captured.provider_session_source
+                      IS wrb.provider_session_source
+                  AND captured.provider_session_provider
+                      IS wrb.provider_session_provider
+                  AND captured.provider_session_kind
+                      IS wrb.provider_session_kind
+                  AND captured.provider_session_value
+                      IS wrb.provider_session_value
+                  AND captured.owns_tab = wrb.owns_tab
            )
       FROM workers w
       LEFT JOIN worker_profile_revisions pr
@@ -8231,6 +8660,21 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         orchestrator_workflow_profile_store::seed_factory_profile(&transaction)?;
         ensure_foreign_keys(&transaction)?;
         transaction.commit()?;
+        current = 22;
+    }
+    if current == 22 {
+        connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let migration = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(PROJECT_ORCHESTRATOR_TRANSFER_MIGRATION)?;
+            ensure_foreign_keys(&transaction)?;
+            transaction.commit()?;
+            Ok::<(), ProjectStoreError>(())
+        })();
+        let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
+        migration?;
+        foreign_keys?;
     }
     ensure_foreign_keys(connection)?;
     Ok(())
@@ -9329,6 +9773,19 @@ struct StoredProjectOrchestratorReplacement {
 }
 
 #[derive(Debug)]
+struct StoredProjectOrchestratorTransfer {
+    project_id: String,
+    worker_id: String,
+    expected_worker_version: u64,
+    expected_worker_runtime: WorkerRuntimeBinding,
+    expected_project_version: u64,
+    expected_orchestrator_worker_id: String,
+    expected_orchestrator_worker_version: u64,
+    expected_orchestrator_runtime: WorkerRuntimeBinding,
+    actor: String,
+}
+
+#[derive(Debug)]
 struct StoredReplacementOwnership {
     allocation_id: String,
     assignment_id: Option<String>,
@@ -9377,6 +9834,21 @@ impl StoredProjectOrchestratorReplacement {
             && self.role == command.role
             && self.old_session_disposition == command.old_session_disposition
             && self.handoff_artifact_ref == command.handoff_artifact_ref
+            && self.actor == command.actor
+    }
+}
+
+impl StoredProjectOrchestratorTransfer {
+    fn matches(&self, project_id: &str, command: &TransferProjectOrchestrator) -> bool {
+        self.project_id == project_id
+            && self.worker_id == command.worker_id
+            && self.expected_worker_version == command.expected_worker_version
+            && self.expected_worker_runtime == command.expected_worker_runtime
+            && self.expected_project_version == command.expected_project_version
+            && self.expected_orchestrator_worker_id == command.expected_orchestrator_worker_id
+            && self.expected_orchestrator_worker_version
+                == command.expected_orchestrator_worker_version
+            && self.expected_orchestrator_runtime == command.expected_orchestrator_runtime
             && self.actor == command.actor
     }
 }
@@ -9745,6 +10217,107 @@ fn select_project_orchestrator_replacement_command(
     }))
 }
 
+fn select_project_orchestrator_transfer_command(
+    connection: &Connection,
+    command_id: &str,
+) -> Result<Option<StoredProjectOrchestratorTransfer>, ProjectStoreError> {
+    let stored = connection
+        .query_row(
+            "SELECT potc.project_id, potc.worker_id,
+                    potc.expected_worker_version,
+                    potc.expected_project_version,
+                    potc.expected_orchestrator_worker_id,
+                    potc.expected_orchestrator_worker_version,
+                    ca.actor
+               FROM project_orchestrator_transfer_commands potc
+               JOIN command_acknowledgements ca ON ca.id = potc.command_id
+              WHERE potc.command_id = ?1",
+            [command_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row_u64(row, 2)?,
+                    row_u64(row, 3)?,
+                    row.get::<_, String>(4)?,
+                    row_u64(row, 5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        project_id,
+        worker_id,
+        expected_worker_version,
+        expected_project_version,
+        expected_orchestrator_worker_id,
+        expected_orchestrator_worker_version,
+        actor,
+    )) = stored
+    else {
+        return Ok(None);
+    };
+    let expected_worker_runtime =
+        select_project_orchestrator_transfer_runtime(connection, command_id, "candidate")?
+            .ok_or(ProjectStoreError::RuntimeBindingMissing)?;
+    let expected_orchestrator_runtime =
+        select_project_orchestrator_transfer_runtime(connection, command_id, "displaced")?
+            .ok_or(ProjectStoreError::RuntimeBindingMissing)?;
+    Ok(Some(StoredProjectOrchestratorTransfer {
+        project_id,
+        worker_id,
+        expected_worker_version,
+        expected_worker_runtime,
+        expected_project_version,
+        expected_orchestrator_worker_id,
+        expected_orchestrator_worker_version,
+        expected_orchestrator_runtime,
+        actor,
+    }))
+}
+
+fn select_project_orchestrator_transfer_runtime(
+    connection: &Connection,
+    command_id: &str,
+    binding_role: &str,
+) -> Result<Option<WorkerRuntimeBinding>, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT adapter, runtime_session, runtime_workspace_id,
+                    terminal_id, tab_id, pane_id, provider_session_source,
+                    provider_session_provider, provider_session_kind,
+                    provider_session_value, owns_tab, observation_state,
+                    process_state, observed_status, state_change_sequence,
+                    runtime_revision, runtime_version,
+                    last_observed_at_unix_ms
+               FROM project_orchestrator_transfer_runtime_bindings
+              WHERE command_id = ?1 AND binding_role = ?2",
+            params![command_id, binding_role],
+            |row| {
+                Ok(WorkerRuntimeBinding {
+                    adapter: row.get(0)?,
+                    session: row.get(1)?,
+                    workspace_id: row.get(2)?,
+                    terminal_id: row.get(3)?,
+                    tab_id: row.get(4)?,
+                    pane_id: row.get(5)?,
+                    provider_session: provider_session_from_columns(row, 6)?,
+                    owns_tab: row.get(10)?,
+                    observation_state: runtime_observation_state(row, 11)?,
+                    process_state: runtime_process_state(row, 12)?,
+                    status: observed_status(row, 13)?,
+                    state_change_sequence: row_u64(row, 14)?,
+                    revision: row_u64(row, 15)?,
+                    version: row_u64(row, 16)?,
+                    last_observed_at_unix_ms: row_u64(row, 17)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
 fn select_orchestrator_replacement_ownership(
     connection: &Connection,
     command_id: &str,
@@ -10096,6 +10669,65 @@ fn insert_orchestrator_replacement_runtime(
             to_i64(runtime.version)?,
             to_i64(runtime.last_observed_at_unix_ms)?,
             to_i64(now)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_project_orchestrator_transfer_runtime(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    binding_role: &str,
+    worker_id: &str,
+    runtime: &WorkerRuntimeBinding,
+) -> Result<(), ProjectStoreError> {
+    transaction.execute(
+        "INSERT INTO project_orchestrator_transfer_runtime_bindings (
+            command_id, binding_role, worker_id, adapter, runtime_session,
+            runtime_workspace_id, terminal_id, tab_id, pane_id,
+            provider_session_source, provider_session_provider,
+            provider_session_kind, provider_session_value, owns_tab,
+            observation_state, process_state, observed_status,
+            state_change_sequence, runtime_revision, runtime_version,
+            last_observed_at_unix_ms
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+            ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+         )",
+        params![
+            command_id,
+            binding_role,
+            worker_id,
+            runtime.adapter,
+            runtime.session,
+            runtime.workspace_id,
+            runtime.terminal_id,
+            runtime.tab_id,
+            runtime.pane_id,
+            runtime
+                .provider_session
+                .as_ref()
+                .map(|session| session.source.as_str()),
+            runtime
+                .provider_session
+                .as_ref()
+                .map(|session| session.provider.as_str()),
+            runtime
+                .provider_session
+                .as_ref()
+                .map(|session| session.kind.as_str()),
+            runtime
+                .provider_session
+                .as_ref()
+                .map(|session| session.value.as_str()),
+            runtime.owns_tab,
+            runtime_observation_state_value(runtime.observation_state),
+            runtime_process_state_value(runtime.process_state),
+            observed_status_value(runtime.status),
+            to_i64(runtime.state_change_sequence)?,
+            to_i64(runtime.revision)?,
+            to_i64(runtime.version)?,
+            to_i64(runtime.last_observed_at_unix_ms)?,
         ],
     )?;
     Ok(())
@@ -10710,6 +11342,7 @@ fn worker_candidate_from_row(row: &Row<'_>) -> rusqlite::Result<WorkerCandidate>
     let assignment_id = row.get::<_, Option<String>>(30)?;
     let coordination_node_id = row.get::<_, Option<String>>(31)?;
     let has_pending_cleanup = row.get::<_, bool>(32)?;
+    let has_transfer_displacement = row.get::<_, bool>(33)?;
     let (availability, project_id, reason) = worker_availability(
         desired_state,
         WorkerAvailabilityContext {
@@ -10718,6 +11351,7 @@ fn worker_candidate_from_row(row: &Row<'_>) -> rusqlite::Result<WorkerCandidate>
             orchestrator_project_id,
             active_project_id,
             has_pending_cleanup,
+            has_transfer_displacement,
         },
         profile_id.as_deref(),
         runtime.as_ref(),
@@ -10748,6 +11382,7 @@ struct WorkerAvailabilityContext {
     orchestrator_project_id: Option<String>,
     active_project_id: Option<String>,
     has_pending_cleanup: bool,
+    has_transfer_displacement: bool,
 }
 
 fn worker_availability(
@@ -10810,7 +11445,7 @@ fn worker_availability(
     let is_live = runtime.is_some_and(|runtime| {
         runtime.observation_state == RuntimeObservationState::Observed
             && runtime.process_state == RuntimeProcessState::Running
-            && runtime.provider_session.is_some()
+            && (runtime.provider_session.is_some() || context.has_transfer_displacement)
     });
     if is_live {
         return (WorkerAvailability::UnassignedLive, None, None);
@@ -11186,6 +11821,40 @@ fn select_replaced_project_orchestrator(
         displaced_worker_id: command.expected_orchestrator_worker_id,
         old_session_disposition: command.old_session_disposition,
         cleanup_pending: runtime_cleanup_pending(connection, command_id)?,
+        replayed,
+    })
+}
+
+fn select_transferred_project_orchestrator(
+    connection: &Connection,
+    command_id: &str,
+    replayed: bool,
+) -> Result<TransferredProjectOrchestrator, ProjectStoreError> {
+    let (worker_id, replaced_worker_id, result_project_json) = connection
+        .query_row(
+            "SELECT worker_id, replaced_worker_id, result_project_json
+               FROM project_orchestrator_transfer_commands
+              WHERE command_id = ?1",
+            [command_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(ProjectStoreError::CommandNotFound)?;
+    let project = serde_json::from_str::<Project>(&result_project_json)
+        .map_err(ProjectStoreError::StoredResultJson)?;
+    if !replayed && project.orchestrator.id != worker_id {
+        return Err(ProjectStoreError::OrchestratorTransferTargetChanged);
+    }
+    Ok(TransferredProjectOrchestrator {
+        command_id: command_id.to_owned(),
+        project,
+        replaced_worker_id,
         replayed,
     })
 }
@@ -12200,6 +12869,8 @@ pub enum ProjectStoreError {
     InvalidAgentProfile(#[from] yard_domain::AgentProfileValidationError),
     #[error("agent profile JSON operation failed: {0}")]
     AgentProfileJson(#[from] serde_json::Error),
+    #[error("stored command result JSON is invalid: {0}")]
+    StoredResultJson(serde_json::Error),
     #[error(transparent)]
     InvalidAssignment(#[from] yard_domain::AssignmentValidationError),
     #[error(transparent)]
@@ -12210,6 +12881,8 @@ pub enum ProjectStoreError {
     InvalidWorkerSession(#[from] yard_domain::WorkerSessionValidationError),
     #[error(transparent)]
     InvalidOrchestratorReplacement(#[from] yard_domain::OrchestratorReplacementValidationError),
+    #[error(transparent)]
+    InvalidOrchestratorTransfer(#[from] yard_domain::OrchestratorTransferValidationError),
     #[error(transparent)]
     InvalidYardOrchestrator(#[from] yard_domain::YardOrchestratorValidationError),
     #[error(transparent)]
@@ -12380,6 +13053,8 @@ pub enum ProjectStoreError {
     OrchestratorReplacementReserved,
     #[error("the project orchestrator or its runtime changed during replacement")]
     OrchestratorReplacementTargetChanged,
+    #[error("the project orchestrator transfer runtime identity changed")]
+    OrchestratorTransferTargetChanged,
     #[error("the replacement command has not claimed a prepared runtime")]
     OrchestratorReplacementRuntimeMissing,
     #[error("the prepared replacement runtime conflicts with the verified runtime")]
@@ -12512,9 +13187,10 @@ mod tests {
         RuntimeInventory, RuntimeObservationState, RuntimeProcessState, SendAssignmentPrompt,
         SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
         SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SnapshotCollectionStatus,
-        UpdateAgentProfile, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
-        UpdateProjectPlacement, UpdateTokenSpendSettings, UpdateWorkerProfile, WorkerAvailability,
-        WorkerProfile, WorkerProfileSpec, WorkerRuntimeBinding, YardOrchestrator,
+        TransferProjectOrchestrator, UpdateAgentProfile, UpdateCoordinationNode,
+        UpdateCoordinationNodePlacement, UpdateProjectPlacement, UpdateTokenSpendSettings,
+        UpdateWorkerProfile, WorkerAvailability, WorkerProfile, WorkerProfileSpec,
+        WorkerRuntimeBinding, YardOrchestrator,
     };
 
     use super::{
@@ -12577,6 +13253,8 @@ mod tests {
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = OFF;
+                 DROP TABLE project_orchestrator_transfer_runtime_bindings;
+                 DROP TABLE project_orchestrator_transfer_commands;
                  ALTER TABLE yard_orchestrator_configure_commands
                     DROP COLUMN workflow_profile_version;
                  ALTER TABLE yard_orchestrator
@@ -16286,6 +16964,8 @@ mod tests {
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = OFF;
+                 DROP TABLE project_orchestrator_transfer_runtime_bindings;
+                 DROP TABLE project_orchestrator_transfer_commands;
                  ALTER TABLE yard_orchestrator_configure_commands
                     DROP COLUMN workflow_profile_version;
                  ALTER TABLE yard_orchestrator
@@ -16346,6 +17026,8 @@ mod tests {
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = OFF;
+                 DROP TABLE project_orchestrator_transfer_runtime_bindings;
+                 DROP TABLE project_orchestrator_transfer_commands;
                  ALTER TABLE yard_orchestrator_configure_commands
                     DROP COLUMN workflow_profile_version;
                  ALTER TABLE yard_orchestrator
@@ -17495,6 +18177,323 @@ mod tests {
             panic!("expected Yard orchestrator prompt replay");
         };
         assert_eq!(replayed, acknowledged);
+    }
+
+    async fn create_project_orchestrator_transfer_fixture(
+        store: &SqliteProjectStore,
+        candidate_workspace_id: &str,
+    ) -> (Project, TransferProjectOrchestrator) {
+        create_project_orchestrator_transfer_fixture_with_provider(
+            store,
+            candidate_workspace_id,
+            Some(provider_session("session-current")),
+        )
+        .await
+    }
+
+    async fn create_project_orchestrator_transfer_fixture_with_provider(
+        store: &SqliteProjectStore,
+        candidate_workspace_id: &str,
+        displaced_provider: Option<ProviderSessionRef>,
+    ) -> (Project, TransferProjectOrchestrator) {
+        let (project_draft, mut orchestrator) = draft("workspace-transfer", "terminal-current");
+        orchestrator
+            .provider_session
+            .clone_from(&displaced_provider);
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+        store
+            .reconcile_runtime_inventory(inventory(
+                20,
+                vec![
+                    observed_worker(
+                        "terminal-current",
+                        "workspace-transfer",
+                        "tab-1",
+                        "pane-1",
+                        displaced_provider,
+                    ),
+                    observed_worker(
+                        "terminal-candidate",
+                        candidate_workspace_id,
+                        "tab-candidate",
+                        "pane-candidate",
+                        Some(provider_session("session-candidate")),
+                    ),
+                ],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let project = store.get_project(&project.id).await.unwrap();
+        let candidate = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| {
+                candidate
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.terminal_id == "terminal-candidate")
+            })
+            .unwrap();
+        assert_eq!(candidate.availability, WorkerAvailability::UnassignedLive);
+        let command = TransferProjectOrchestrator {
+            command_id: "transfer-project-orchestrator".to_owned(),
+            actor: "local-user".to_owned(),
+            worker_id: candidate.worker.id.clone(),
+            expected_worker_version: candidate.worker.version,
+            expected_worker_runtime: candidate.worker.runtime.clone().unwrap(),
+            expected_project_version: project.version,
+            expected_orchestrator_worker_id: project.orchestrator.id.clone(),
+            expected_orchestrator_worker_version: project.orchestrator.version,
+            expected_orchestrator_runtime: project.orchestrator.runtime.clone().unwrap(),
+        };
+        (project, command)
+    }
+
+    #[tokio::test]
+    async fn project_orchestrator_transfer_replays_and_leaves_displaced_worker_live() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project, command) =
+            create_project_orchestrator_transfer_fixture(&store, "workspace-transfer").await;
+        let displaced_runtime = command.expected_orchestrator_runtime.clone();
+
+        let transferred = store
+            .transfer_project_orchestrator(&project.id, command.clone())
+            .await
+            .unwrap();
+        drop(store);
+        let store = open_store(&temp).await;
+        let replayed = store
+            .replay_project_orchestrator_transfer(&project.id, command.clone())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(transferred.project.orchestrator.id, command.worker_id);
+        assert_eq!(
+            transferred.replaced_worker_id,
+            command.expected_orchestrator_worker_id
+        );
+        assert_eq!(
+            transferred.project.version,
+            command.expected_project_version + 1
+        );
+        assert!(!transferred.replayed);
+        assert!(replayed.replayed);
+        let displaced = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.worker.id == command.expected_orchestrator_worker_id)
+            .unwrap();
+        assert_eq!(displaced.availability, WorkerAvailability::UnassignedLive);
+        assert_eq!(displaced.worker.runtime.as_ref(), Some(&displaced_runtime));
+
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let cleanup_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_cleanup_jobs
+                  WHERE command_id = ?1",
+                [&command.command_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let lifecycle_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM lifecycle_events
+                  WHERE aggregate_id = ?1
+                    AND event_type = 'project_orchestrator_displaced'
+                    AND source = ?2",
+                [
+                    command.expected_orchestrator_worker_id.as_str(),
+                    command.actor.as_str(),
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cleanup_count, 0);
+        assert_eq!(lifecycle_count, 1);
+
+        let mut conflict = command;
+        conflict.actor = "different-user".to_owned();
+        assert!(matches!(
+            store
+                .transfer_project_orchestrator(&project.id, conflict)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_orchestrator_transfer_keeps_providerless_displaced_worker_unassigned_live() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project, command) = create_project_orchestrator_transfer_fixture_with_provider(
+            &store,
+            "workspace-transfer",
+            None,
+        )
+        .await;
+
+        store
+            .transfer_project_orchestrator(&project.id, command.clone())
+            .await
+            .unwrap();
+
+        let displaced = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.worker.id == command.expected_orchestrator_worker_id)
+            .unwrap();
+        assert_eq!(displaced.availability, WorkerAvailability::UnassignedLive);
+        assert!(
+            displaced
+                .worker
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.provider_session.is_none())
+        );
+
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE worker_runtime_bindings
+                    SET terminal_id = 'terminal-rebound',
+                        tab_id = 'tab-rebound',
+                        pane_id = 'pane-rebound'
+                  WHERE worker_id = ?1",
+                [&command.expected_orchestrator_worker_id],
+            )
+            .unwrap();
+        drop(connection);
+        let rebound = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.worker.id == command.expected_orchestrator_worker_id)
+            .unwrap();
+        assert_eq!(rebound.availability, WorkerAvailability::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn project_orchestrator_transfer_rejects_stale_versions_and_cross_workspace_worker() {
+        let stale_temp = TempDir::new().unwrap();
+        let stale_store = open_store(&stale_temp).await;
+        let (project, command) =
+            create_project_orchestrator_transfer_fixture(&stale_store, "workspace-transfer").await;
+
+        let mut stale_project = command.clone();
+        stale_project.command_id = "stale-project-transfer".to_owned();
+        stale_project.expected_project_version += 1;
+        assert!(matches!(
+            stale_store
+                .transfer_project_orchestrator(&project.id, stale_project)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::ProjectVersionConflict { .. }
+        ));
+        let mut stale_candidate = command.clone();
+        stale_candidate.command_id = "stale-candidate-transfer".to_owned();
+        stale_candidate.expected_worker_version += 1;
+        assert!(matches!(
+            stale_store
+                .transfer_project_orchestrator(&project.id, stale_candidate)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::WorkerVersionConflict { .. }
+        ));
+        let mut stale_orchestrator = command;
+        stale_orchestrator.command_id = "stale-orchestrator-transfer".to_owned();
+        stale_orchestrator.expected_orchestrator_worker_version += 1;
+        assert!(matches!(
+            stale_store
+                .transfer_project_orchestrator(&project.id, stale_orchestrator)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::WorkerVersionConflict { .. }
+        ));
+
+        let cross_temp = TempDir::new().unwrap();
+        let cross_store = open_store(&cross_temp).await;
+        let (cross_project, cross_command) =
+            create_project_orchestrator_transfer_fixture(&cross_store, "workspace-other").await;
+        assert!(matches!(
+            cross_store
+                .transfer_project_orchestrator(&cross_project.id, cross_command)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::RuntimeWorkspaceMismatch
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_orchestrator_transfer_rejects_unavailable_worker_and_pending_prompt() {
+        let unavailable_temp = TempDir::new().unwrap();
+        let unavailable_store = open_store(&unavailable_temp).await;
+        let (project, mut command) =
+            create_project_orchestrator_transfer_fixture(&unavailable_store, "workspace-transfer")
+                .await;
+        let connection = Connection::open(unavailable_temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE worker_runtime_bindings
+                    SET process_state = 'exited'
+                  WHERE worker_id = ?1",
+                [&command.worker_id],
+            )
+            .unwrap();
+        drop(connection);
+        command.expected_worker_runtime.process_state = RuntimeProcessState::Exited;
+        assert!(matches!(
+            unavailable_store
+                .transfer_project_orchestrator(&project.id, command)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::WorkerNotAvailable { .. }
+        ));
+
+        let pending_temp = TempDir::new().unwrap();
+        let pending_store = open_store(&pending_temp).await;
+        let (project, command) =
+            create_project_orchestrator_transfer_fixture(&pending_store, "workspace-transfer")
+                .await;
+        pending_store
+            .begin_orchestrator_prompt(
+                &project.id,
+                SendOrchestratorPrompt {
+                    command_id: "pending-before-transfer".to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_project_version: project.version,
+                    orchestrator_worker_id: project.orchestrator.id.clone(),
+                    text: "Finish this intervention before transfer.".to_owned(),
+                },
+                TokenSpendCommandSource::Manual,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            pending_store
+                .transfer_project_orchestrator(&project.id, command)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::OrchestratorInterventionInProgress
+        ));
     }
 
     #[tokio::test]
