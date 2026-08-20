@@ -18,6 +18,7 @@ use yard_server::{
     app_with_reconciliation_and_paths_and_automation_and_shutdown,
     config::{ConfigError, ServerConfig},
     inventory_service::HerdrInventorySource,
+    orchestrator_replacement_service::OrchestratorReplacementService,
     reconciliation_service::ReconciliationService,
     runtime_cleanup_service::RuntimeCleanupService,
 };
@@ -116,6 +117,36 @@ async fn run(mode: RunMode<'_>) -> Result<(), ServerError> {
     });
     let runtime = Arc::new(HerdrInventorySource::new(adapter));
     let store = Arc::new(SqliteProjectStore::open(&config.database_path).await?);
+    let replacement_recovery =
+        OrchestratorReplacementService::new(runtime.clone(), runtime.clone(), store.clone());
+    match replacement_recovery
+        .reconcile_ambiguous_replacements()
+        .await
+    {
+        Ok(report)
+            if report.captures > 0 || report.prepare_intents > 0 || report.deferred_items > 0 =>
+        {
+            tracing::info!(
+                target: "yard_server",
+                captures = report.captures,
+                prepare_intents = report.prepare_intents,
+                adopted_commands = report.adopted_commands,
+                absent_captures = report.absent_captures,
+                conflicting_captures = report.conflicting_captures,
+                quarantined_captures = report.quarantined_captures,
+                deferred_items = report.deferred_items,
+                "Reconciled ambiguous orchestrator replacement runtimes before startup"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                target: "yard_server",
+                %error,
+                "Orchestrator replacement startup reconciliation failed; durable captures remain reserved for inspection"
+            );
+        }
+    }
     let reconciliation = ReconciliationService::new(runtime.clone(), store.clone());
     let cleanup = RuntimeCleanupService::new(runtime.clone(), store.clone());
     let (shutdown, shutdown_receiver) = watch::channel(false);
@@ -160,6 +191,10 @@ async fn run(mode: RunMode<'_>) -> Result<(), ServerError> {
     background_tasks.spawn(async move {
         cleanup.run().await;
         "runtime cleanup"
+    });
+    background_tasks.spawn(async move {
+        replacement_recovery.run().await;
+        "orchestrator replacement recovery"
     });
     background_tasks.spawn(async move {
         automations.run().await;

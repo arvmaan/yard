@@ -3696,6 +3696,7 @@ mod tests {
             Err(RuntimeProvisionError::AfterPreparation {
                 message: "Herdr closed the socket before returning a response".to_owned(),
                 ambiguous: true,
+                started_runtime: None,
             })
         }
 

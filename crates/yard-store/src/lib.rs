@@ -58,7 +58,7 @@ mod coordination_node_store;
 mod orchestrator_workflow_profile_store;
 mod token_spend_store;
 
-const SCHEMA_VERSION: i64 = 23;
+const SCHEMA_VERSION: i64 = 24;
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_projects.sql");
 const PROFILE_ASSIGNMENT_MIGRATION: &str =
     include_str!("../migrations/0002_profiles_assignments.sql");
@@ -97,6 +97,8 @@ const ORCHESTRATOR_WORKFLOW_PROFILE_MIGRATION: &str =
     include_str!("../migrations/0022_orchestrator_workflow_profile.sql");
 const PROJECT_ORCHESTRATOR_TRANSFER_MIGRATION: &str =
     include_str!("../migrations/0023_project_orchestrator_transfer.sql");
+const ORCHESTRATOR_REPLACEMENT_RECOVERY_MIGRATION: &str =
+    include_str!("../migrations/0024_orchestrator_replacement_recovery.sql");
 const BLANK_WORKER_PROFILE_ID: &str = "yard:managed-blank-profile";
 const BLANK_WORKER_PROFILE_NAME: &str = "Blank profile";
 const MAX_ROUTE_LIST_LIMIT: usize = 500;
@@ -483,6 +485,7 @@ pub trait YardStore: Send + Sync {
         &self,
         command_id: &str,
         runtime: WorkerRuntimeBinding,
+        evidence: OrchestratorReplacementStartEvidence,
     ) -> Result<(), ProjectStoreError>;
     async fn finalize_project_orchestrator_replacement(
         &self,
@@ -495,6 +498,29 @@ pub trait YardStore: Send + Sync {
         message: &str,
         ambiguous: bool,
     ) -> Result<(), ProjectStoreError>;
+    async fn list_ambiguous_orchestrator_replacement_recoveries(
+        &self,
+        command_id: Option<&str>,
+    ) -> Result<Vec<OrchestratorReplacementRecovery>, ProjectStoreError>;
+    async fn capture_ambiguous_orchestrator_replacement_prepared_runtime(
+        &self,
+        command_id: &str,
+        runtime: WorkerRuntimeBinding,
+    ) -> Result<(), ProjectStoreError>;
+    async fn record_orchestrator_replacement_recovery_attempt(
+        &self,
+        command_id: &str,
+        target: OrchestratorReplacementRecoveryTarget,
+        expected_attempts: u32,
+        outcome: Option<OrchestratorReplacementRecoveryOutcome>,
+        detail: &str,
+        retry_after_ms: Option<u64>,
+    ) -> Result<(), ProjectStoreError>;
+    async fn recover_project_orchestrator_replacement(
+        &self,
+        command_id: &str,
+        runtime: WorkerRuntimeBinding,
+    ) -> Result<ReplacedProjectOrchestrator, ProjectStoreError>;
     async fn end_worker_session(
         &self,
         worker_id: &str,
@@ -696,6 +722,62 @@ pub struct ProjectOrchestratorReplacementContext {
     pub command: ReplaceProjectOrchestrator,
     pub project: Project,
     pub profile: WorkerProfile,
+    pub prepare_tab_label: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestratorReplacementStartEvidence {
+    Confirmed,
+    Unverified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestratorReplacementRuntimeRole {
+    Prepared,
+    Started,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestratorReplacementRecoveryOutcome {
+    AdoptedCurrent,
+    AbsentConverged,
+    ConflictingReused,
+    PresentNotSafelyRetirable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestratorReplacementRecoveryTarget {
+    PrepareIntent,
+    PrepareIntentAbsence,
+    Runtime(OrchestratorReplacementRuntimeRole),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorReplacementPrepareIntent {
+    pub adapter: String,
+    pub session: String,
+    pub workspace_id: String,
+    pub tab_label: String,
+    pub intent_at_unix_ms: u64,
+    pub recovery_outcome: Option<OrchestratorReplacementRecoveryOutcome>,
+    pub recovery_attempts: u32,
+    pub absence_observations: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorReplacementRuntimeCapture {
+    pub role: OrchestratorReplacementRuntimeRole,
+    pub runtime: WorkerRuntimeBinding,
+    pub objective_delivery_confirmed: bool,
+    pub recovery_outcome: Option<OrchestratorReplacementRecoveryOutcome>,
+    pub recovery_attempts: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorReplacementRecovery {
+    pub command_id: String,
+    pub prepare_intent: Option<OrchestratorReplacementPrepareIntent>,
+    pub captures: Vec<OrchestratorReplacementRuntimeCapture>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5110,6 +5192,7 @@ impl YardStore for SqliteProjectStore {
             }
 
             let now = unix_time_ms()?;
+            let prepare_tab_label = replacement_prepare_tab_label(&command.command_id);
             transaction.execute(
                 "INSERT INTO command_acknowledgements (
                     id, command_type, actor, status, error_message,
@@ -5130,10 +5213,11 @@ impl YardStore for SqliteProjectStore {
                         profile_id, profile_version, objective, role,
                         old_session_disposition, handoff_artifact_ref,
                         result_worker_id, result_allocation_id,
-                        result_assignment_id, finished_at_unix_ms
+                        result_assignment_id, finished_at_unix_ms,
+                        prepare_tab_label, prepare_intent_at_unix_ms
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                        ?11, ?12, NULL, NULL, NULL, NULL
+                        ?11, ?12, NULL, NULL, NULL, NULL, ?13, ?14
                      )",
                     params![
                         command.command_id,
@@ -5148,6 +5232,8 @@ impl YardStore for SqliteProjectStore {
                         command.role,
                         old_session_disposition_value(command.old_session_disposition),
                         command.handoff_artifact_ref,
+                        prepare_tab_label,
+                        to_i64(now)?,
                     ],
                 )
                 .map_err(|error| {
@@ -5164,6 +5250,7 @@ impl YardStore for SqliteProjectStore {
                 Some(&command.expected_orchestrator_worker_id),
                 Some(&displaced_ownership),
                 current_runtime,
+                false,
                 now,
             )?;
             transaction.commit()?;
@@ -5172,6 +5259,7 @@ impl YardStore for SqliteProjectStore {
                     command,
                     project,
                     profile,
+                    prepare_tab_label,
                 },
             )))
         })
@@ -5223,6 +5311,7 @@ impl YardStore for SqliteProjectStore {
                 None,
                 None,
                 &runtime,
+                false,
                 now,
             )
             .map_err(|error| match error {
@@ -5243,6 +5332,7 @@ impl YardStore for SqliteProjectStore {
         &self,
         command_id: &str,
         runtime: WorkerRuntimeBinding,
+        evidence: OrchestratorReplacementStartEvidence,
     ) -> Result<(), ProjectStoreError> {
         let command_id = required_command_id(command_id)?;
         let runtime = runtime.normalize()?;
@@ -5259,9 +5349,12 @@ impl YardStore for SqliteProjectStore {
                 .prepared_runtime
                 .as_ref()
                 .ok_or(ProjectStoreError::OrchestratorReplacementRuntimeMissing)?;
-            if !replacement_runtime_claim_matches(prepared, &runtime)
+            if runtime.adapter != prepared.adapter
+                || runtime.session != prepared.session
                 || runtime.provider_session.is_none()
                 || runtime.process_state != RuntimeProcessState::Running
+                || (evidence == OrchestratorReplacementStartEvidence::Confirmed
+                    && !replacement_runtime_claim_matches(prepared, &runtime))
             {
                 return Err(ProjectStoreError::OrchestratorReplacementRuntimeConflict);
             }
@@ -5269,12 +5362,24 @@ impl YardStore for SqliteProjectStore {
                 if replacement_runtime_claim_matches(started, &runtime)
                     && started.provider_session == runtime.provider_session
                 {
+                    if evidence == OrchestratorReplacementStartEvidence::Confirmed {
+                        transaction.execute(
+                            "UPDATE orchestrator_replacement_runtime_bindings
+                                SET objective_delivery_confirmed = 1
+                              WHERE command_id = ?1
+                                AND binding_role = 'replacement_started'",
+                            [&command_id],
+                        )?;
+                        transaction.commit()?;
+                    }
                     return Ok(());
                 }
                 return Err(ProjectStoreError::OrchestratorReplacementRuntimeConflict);
             }
-            ensure_worker_binding_available(&transaction, &runtime)?;
-            ensure_replacement_runtime_available(&transaction, &command_id, &runtime)?;
+            if evidence == OrchestratorReplacementStartEvidence::Confirmed {
+                ensure_worker_binding_available(&transaction, &runtime)?;
+                ensure_replacement_runtime_available(&transaction, &command_id, &runtime)?;
+            }
             insert_orchestrator_replacement_runtime(
                 &transaction,
                 &command_id,
@@ -5282,6 +5387,7 @@ impl YardStore for SqliteProjectStore {
                 None,
                 None,
                 &runtime,
+                evidence == OrchestratorReplacementStartEvidence::Confirmed,
                 unix_time_ms()?,
             )?;
             transaction.commit()?;
@@ -5307,13 +5413,66 @@ impl YardStore for SqliteProjectStore {
             if command.status == "succeeded" {
                 return select_replaced_project_orchestrator(&transaction, &command_id, true);
             }
-            if command.status != "pending" {
+            let recovering = command.status == "ambiguous";
+            if command.status != "pending" && !recovering {
                 return Err(ProjectStoreError::CommandNotPending);
+            }
+            if recovering {
+                let objective_delivery_confirmed = transaction.query_row(
+                    "SELECT objective_delivery_confirmed
+                       FROM orchestrator_replacement_runtime_bindings
+                      WHERE command_id = ?1
+                        AND binding_role = 'replacement_started'",
+                    [&command_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !objective_delivery_confirmed {
+                    return Err(ProjectStoreError::OrchestratorReplacementRecoveryUnconfirmed);
+                }
+                let conflicting_work = transaction.query_row(
+                    "SELECT EXISTS (
+                        SELECT 1
+                          FROM project_orchestrator_replacement_commands replacement
+                         WHERE replacement.project_id = ?1
+                           AND replacement.command_id <> ?2
+                           AND replacement.finished_at_unix_ms IS NULL
+                        UNION ALL
+                        SELECT 1
+                          FROM orchestrator_prompt_commands prompt
+                          JOIN command_acknowledgements command
+                            ON command.id = prompt.command_id
+                         WHERE prompt.project_id = ?1
+                           AND command.status = 'pending'
+                        UNION ALL
+                        SELECT 1
+                          FROM yard_orchestrator_route_commands route
+                          JOIN command_acknowledgements command
+                            ON command.id = route.command_id
+                         WHERE route.target_project_id = ?1
+                           AND command.status = 'pending'
+                        UNION ALL
+                        SELECT 1
+                          FROM worker_handoff_commands handoff
+                         WHERE handoff.target_project_id = ?1
+                           AND handoff.target_role = 'orchestrator'
+                           AND handoff.finished_at_unix_ms IS NULL
+                    )",
+                    params![command.project_id, command_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if conflicting_work {
+                    return Err(ProjectStoreError::OrchestratorInterventionInProgress);
+                }
             }
             let claimed = command
                 .started_runtime
                 .as_ref()
                 .ok_or(ProjectStoreError::OrchestratorReplacementRuntimeMissing)?;
+            if recovering
+                && runtime.last_observed_at_unix_ms <= claimed.last_observed_at_unix_ms
+            {
+                return Err(ProjectStoreError::OrchestratorReplacementFreshObservationRequired);
+            }
             if !replacement_runtime_claim_matches(claimed, &runtime)
                 || claimed.provider_session != runtime.provider_session
                 || runtime.provider_session.is_none()
@@ -5585,7 +5744,7 @@ impl YardStore for SqliteProjectStore {
                 "UPDATE project_orchestrator_replacement_commands
                     SET result_worker_id = ?1, result_allocation_id = ?2,
                         result_assignment_id = ?3, finished_at_unix_ms = ?4
-                  WHERE command_id = ?5 AND finished_at_unix_ms IS NULL",
+                  WHERE command_id = ?5 AND result_worker_id IS NULL",
                 params![
                     worker_id,
                     allocation_id,
@@ -5596,10 +5755,44 @@ impl YardStore for SqliteProjectStore {
             )?;
             transaction.execute(
                 "UPDATE command_acknowledgements
-                    SET status = 'succeeded', updated_at_unix_ms = ?1
-                  WHERE id = ?2 AND status = 'pending'",
+                    SET status = 'succeeded', error_message = NULL,
+                        updated_at_unix_ms = ?1
+                  WHERE id = ?2 AND status IN ('pending', 'ambiguous')",
                 params![to_i64(now)?, command_id],
             )?;
+            if recovering {
+                transaction.execute(
+                    "UPDATE orchestrator_replacement_runtime_bindings
+                        SET recovery_outcome = 'adopted_current',
+                            recovery_detail = ?1,
+                            reconciled_at_unix_ms = ?2,
+                            next_recovery_at_unix_ms = NULL
+                      WHERE command_id = ?3
+                        AND binding_role IN (
+                            'replacement_prepared',
+                            'replacement_started'
+                        )",
+                    params![
+                        "Confirmed started replacement matched fresh provider and topology identity; project ownership was recovered atomically",
+                        to_i64(now)?,
+                        command_id,
+                    ],
+                )?;
+                transaction.execute(
+                    "UPDATE project_orchestrator_replacement_commands
+                        SET prepare_recovery_outcome = 'adopted_current',
+                            prepare_recovery_detail = ?1,
+                            prepare_reconciled_at_unix_ms = ?2,
+                            prepare_next_recovery_at_unix_ms = NULL
+                      WHERE command_id = ?3
+                        AND prepare_tab_label IS NOT NULL",
+                    params![
+                        "Confirmed started replacement matched fresh provider and topology identity; project ownership was recovered atomically",
+                        to_i64(now)?,
+                        command_id,
+                    ],
+                )?;
+            }
             insert_lifecycle_event(
                 &transaction,
                 "worker",
@@ -5623,6 +5816,15 @@ impl YardStore for SqliteProjectStore {
             Ok(result)
         })
         .await
+    }
+
+    async fn recover_project_orchestrator_replacement(
+        &self,
+        command_id: &str,
+        runtime: WorkerRuntimeBinding,
+    ) -> Result<ReplacedProjectOrchestrator, ProjectStoreError> {
+        self.finalize_project_orchestrator_replacement(command_id, runtime)
+            .await
     }
 
     async fn fail_project_orchestrator_replacement(
@@ -5678,6 +5880,304 @@ impl YardStore for SqliteProjectStore {
                     command_id,
                 ],
             )?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_ambiguous_orchestrator_replacement_recoveries(
+        &self,
+        command_id: Option<&str>,
+    ) -> Result<Vec<OrchestratorReplacementRecovery>, ProjectStoreError> {
+        let command_id = command_id.map(required_command_id).transpose()?;
+        self.run(move |connection| {
+            let now = to_i64(unix_time_ms()?)?;
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT command.id
+                   FROM command_acknowledgements command
+                   JOIN project_orchestrator_replacement_commands replacement
+                     ON replacement.command_id = command.id
+                  WHERE command.command_type = 'project_orchestrator_replacement'
+                    AND command.status = 'ambiguous'
+                    AND (?1 IS NULL OR command.id = ?1)
+                    AND (
+                        EXISTS (
+                            SELECT 1
+                              FROM orchestrator_replacement_runtime_bindings capture
+                             WHERE capture.command_id = command.id
+                               AND capture.binding_role IN (
+                                   'replacement_prepared',
+                                   'replacement_started'
+                               )
+                               AND (
+                                   capture.recovery_outcome IS NULL
+                                   OR capture.recovery_outcome IN (
+                                       'conflicting_reused',
+                                       'present_not_safely_retirable'
+                                   )
+                               )
+                               AND (
+                                   capture.next_recovery_at_unix_ms IS NULL
+                                   OR capture.next_recovery_at_unix_ms <= ?2
+                               )
+                        )
+                        OR (
+                            replacement.prepare_tab_label IS NOT NULL
+                            AND NOT EXISTS (
+                                SELECT 1
+                                  FROM orchestrator_replacement_runtime_bindings capture
+                                 WHERE capture.command_id = command.id
+                                   AND capture.binding_role IN (
+                                       'replacement_prepared',
+                                       'replacement_started'
+                                   )
+                            )
+                            AND (
+                                replacement.prepare_recovery_outcome IS NULL
+                                OR replacement.prepare_recovery_outcome IN (
+                                    'conflicting_reused',
+                                    'present_not_safely_retirable'
+                                )
+                            )
+                            AND (
+                                replacement.prepare_next_recovery_at_unix_ms
+                                    IS NULL
+                                OR replacement.prepare_next_recovery_at_unix_ms
+                                    <= ?2
+                            )
+                        )
+                    )
+                  ORDER BY command.created_at_unix_ms DESC, command.id DESC",
+            )?;
+            let command_ids = statement
+                .query_map(params![command_id, now], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+
+            let mut recoveries = Vec::with_capacity(command_ids.len());
+            for command_id in command_ids {
+                let prepare_intent =
+                    select_orchestrator_replacement_prepare_intent(connection, &command_id, now)?;
+                let mut captures = Vec::with_capacity(2);
+                for role in [
+                    OrchestratorReplacementRuntimeRole::Started,
+                    OrchestratorReplacementRuntimeRole::Prepared,
+                ] {
+                    if let Some(capture) = select_orchestrator_replacement_recovery_capture(
+                        connection,
+                        &command_id,
+                        role,
+                        now,
+                    )? {
+                        captures.push(capture);
+                    }
+                }
+                recoveries.push(OrchestratorReplacementRecovery {
+                    command_id,
+                    prepare_intent,
+                    captures,
+                });
+            }
+            Ok(recoveries)
+        })
+        .await
+    }
+
+    async fn capture_ambiguous_orchestrator_replacement_prepared_runtime(
+        &self,
+        command_id: &str,
+        runtime: WorkerRuntimeBinding,
+    ) -> Result<(), ProjectStoreError> {
+        let command_id = required_command_id(command_id)?;
+        let runtime = runtime.normalize()?;
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let command =
+                select_project_orchestrator_replacement_command(&transaction, &command_id)?
+                    .ok_or(ProjectStoreError::CommandNotFound)?;
+            if command.status != "ambiguous" {
+                return Err(ProjectStoreError::CommandOutcomeAmbiguous(
+                    "replacement prepare intent can only recover an ambiguous command".to_owned(),
+                ));
+            }
+            let intent_exists = transaction.query_row(
+                "SELECT prepare_tab_label IS NOT NULL
+                   FROM project_orchestrator_replacement_commands
+                  WHERE command_id = ?1",
+                [&command_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !intent_exists {
+                return Err(ProjectStoreError::OrchestratorReplacementRuntimeMissing);
+            }
+            if let Some(prepared) = command.prepared_runtime.as_ref() {
+                if replacement_runtime_claim_matches(prepared, &runtime) {
+                    return Ok(());
+                }
+                return Err(ProjectStoreError::OrchestratorReplacementRuntimeConflict);
+            }
+            if runtime.adapter != command.expected_runtime.adapter
+                || runtime.session != command.expected_runtime.session
+                || runtime.workspace_id != command.expected_runtime.workspace_id
+            {
+                return Err(ProjectStoreError::RuntimeWorkspaceMismatch);
+            }
+            ensure_worker_binding_available(&transaction, &runtime)?;
+            ensure_replacement_runtime_available(&transaction, &command_id, &runtime)?;
+            let now = unix_time_ms()?;
+            insert_orchestrator_replacement_runtime(
+                &transaction,
+                &command_id,
+                "replacement_prepared",
+                None,
+                None,
+                &runtime,
+                false,
+                now,
+            )?;
+            transaction.execute(
+                "UPDATE project_orchestrator_replacement_commands
+                    SET prepare_recovery_outcome =
+                            'present_not_safely_retirable',
+                        prepare_recovery_detail = ?1,
+                        prepare_reconciled_at_unix_ms = ?2,
+                        prepare_next_recovery_at_unix_ms = NULL
+                  WHERE command_id = ?3",
+                params![
+                    "Fresh inventory matched the command-unique prepare intent to exact tab, pane, and terminal topology; the prepared runtime was captured for operator inspection",
+                    to_i64(now)?,
+                    command_id,
+                ],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn record_orchestrator_replacement_recovery_attempt(
+        &self,
+        command_id: &str,
+        target: OrchestratorReplacementRecoveryTarget,
+        expected_attempts: u32,
+        outcome: Option<OrchestratorReplacementRecoveryOutcome>,
+        detail: &str,
+        retry_after_ms: Option<u64>,
+    ) -> Result<(), ProjectStoreError> {
+        let command_id = required_command_id(command_id)?;
+        let detail = detail.trim().to_owned();
+        if detail.is_empty() {
+            return Err(ProjectStoreError::CommandFailureMessageRequired);
+        }
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let command_status = transaction
+                .query_row(
+                    "SELECT status
+                       FROM command_acknowledgements
+                      WHERE id = ?1
+                        AND command_type =
+                            'project_orchestrator_replacement'",
+                    [&command_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or(ProjectStoreError::CommandNotFound)?;
+            if command_status != "ambiguous" {
+                return Err(ProjectStoreError::CommandOutcomeAmbiguous(
+                    "replacement recovery attempt requires an ambiguous command".to_owned(),
+                ));
+            }
+            let now = unix_time_ms()?;
+            let next_recovery_at = retry_after_ms
+                .map(|delay| now.saturating_add(delay))
+                .map(to_i64)
+                .transpose()?;
+            let outcome_value = outcome.map(orchestrator_replacement_recovery_outcome_value);
+            let expected_attempts = i64::from(expected_attempts);
+            let updated = match target {
+                OrchestratorReplacementRecoveryTarget::PrepareIntent => transaction.execute(
+                    "UPDATE project_orchestrator_replacement_commands
+                        SET prepare_recovery_outcome = COALESCE(
+                                ?1,
+                                prepare_recovery_outcome
+                            ),
+                            prepare_recovery_detail = ?2,
+                            prepare_reconciled_at_unix_ms = ?3,
+                            prepare_recovery_attempts =
+                                prepare_recovery_attempts + 1,
+                            prepare_absence_observations = CASE
+                                WHEN ?1 IS NULL
+                                THEN prepare_absence_observations
+                                ELSE 0
+                            END,
+                            prepare_next_recovery_at_unix_ms = ?4
+                      WHERE command_id = ?5
+                        AND prepare_tab_label IS NOT NULL
+                        AND prepare_recovery_attempts = ?6",
+                    params![
+                        outcome_value,
+                        detail,
+                        to_i64(now)?,
+                        next_recovery_at,
+                        command_id,
+                        expected_attempts,
+                    ],
+                )?,
+                OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence => transaction
+                    .execute(
+                        "UPDATE project_orchestrator_replacement_commands
+                            SET prepare_recovery_detail = ?1,
+                                prepare_reconciled_at_unix_ms = ?2,
+                                prepare_recovery_attempts =
+                                    prepare_recovery_attempts + 1,
+                                prepare_absence_observations =
+                                    prepare_absence_observations + 1,
+                                prepare_next_recovery_at_unix_ms = ?3
+                          WHERE command_id = ?4
+                            AND prepare_tab_label IS NOT NULL
+                            AND prepare_recovery_attempts = ?5",
+                        params![
+                            detail,
+                            to_i64(now)?,
+                            next_recovery_at,
+                            command_id,
+                            expected_attempts,
+                        ],
+                    )?,
+                OrchestratorReplacementRecoveryTarget::Runtime(role) => transaction.execute(
+                    "UPDATE orchestrator_replacement_runtime_bindings
+                        SET recovery_outcome = COALESCE(?1, recovery_outcome),
+                            recovery_detail = ?2,
+                            reconciled_at_unix_ms = ?3,
+                            recovery_attempts = recovery_attempts + 1,
+                            next_recovery_at_unix_ms = ?4
+                      WHERE command_id = ?5 AND binding_role = ?6
+                        AND recovery_attempts = ?7",
+                    params![
+                        outcome_value,
+                        detail,
+                        to_i64(now)?,
+                        next_recovery_at,
+                        command_id,
+                        orchestrator_replacement_role_value(role),
+                        expected_attempts,
+                    ],
+                )?,
+            };
+            if updated == 0
+                && !orchestrator_replacement_recovery_target_advanced(
+                    &transaction,
+                    &command_id,
+                    target,
+                    expected_attempts,
+                )?
+            {
+                return Err(ProjectStoreError::OrchestratorReplacementRuntimeMissing);
+            }
             transaction.commit()?;
             Ok(())
         })
@@ -7424,7 +7924,7 @@ fn runtime_identity_is_reserved(
     worker: &ObservedWorker,
 ) -> Result<bool, ProjectStoreError> {
     let provider = worker.provider_session.as_ref();
-    transaction
+    let reserved = transaction
         .query_row(
             "SELECT
                 EXISTS (
@@ -7462,25 +7962,6 @@ fn runtime_identity_is_reserved(
                 )
                 OR EXISTS (
                     SELECT 1
-                      FROM orchestrator_replacement_runtime_bindings snapshot
-                      JOIN command_acknowledgements command
-                        ON command.id = snapshot.command_id
-                     WHERE command.status IN ('pending', 'ambiguous')
-                       AND snapshot.adapter = ?1
-                       AND snapshot.runtime_session = ?2
-                       AND (
-                           snapshot.terminal_id = ?3
-                           OR (
-                               ?4 IS NOT NULL
-                               AND snapshot.provider_session_source = ?4
-                               AND snapshot.provider_session_provider = ?5
-                               AND snapshot.provider_session_kind = ?6
-                               AND snapshot.provider_session_value = ?7
-                           )
-                       )
-                )
-                OR EXISTS (
-                    SELECT 1
                       FROM runtime_cleanup_jobs cleanup
                      WHERE cleanup.status = 'pending'
                        AND cleanup.adapter = ?1
@@ -7496,6 +7977,67 @@ fn runtime_identity_is_reserved(
                            )
                        )
                 )",
+            params![
+                inventory.adapter,
+                inventory.session,
+                worker.terminal_id,
+                provider.map(|session| session.source.as_str()),
+                provider.map(|session| session.provider.as_str()),
+                provider.map(|session| session.kind.as_str()),
+                provider.map(|session| session.value.as_str()),
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(ProjectStoreError::from)?;
+    if reserved {
+        return Ok(true);
+    }
+    orchestrator_replacement_identity_is_reserved(transaction, inventory, worker)
+}
+
+fn orchestrator_replacement_identity_is_reserved(
+    transaction: &Transaction<'_>,
+    inventory: &RuntimeInventory,
+    worker: &ObservedWorker,
+) -> Result<bool, ProjectStoreError> {
+    let provider = worker.provider_session.as_ref();
+    transaction
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM orchestrator_replacement_runtime_bindings snapshot
+                  JOIN command_acknowledgements command
+                    ON command.id = snapshot.command_id
+                 WHERE (
+                       command.status = 'pending'
+                       OR (
+                           command.status = 'ambiguous'
+                           AND (
+                               snapshot.recovery_outcome IS NULL
+                               OR snapshot.recovery_outcome IN (
+                                   'conflicting_reused',
+                                   'present_not_safely_retirable'
+                               )
+                           )
+                       )
+                   )
+                   AND snapshot.binding_role IN (
+                       'replacement_prepared',
+                       'replacement_started'
+                   )
+                   AND snapshot.adapter = ?1
+                   AND snapshot.runtime_session = ?2
+                   AND (
+                       snapshot.terminal_id = ?3
+                       OR (
+                           ?4 IS NOT NULL
+                           AND snapshot.provider_session_source = ?4
+                           AND snapshot.provider_session_provider = ?5
+                           AND snapshot.provider_session_kind = ?6
+                           AND snapshot.provider_session_value = ?7
+                       )
+                   )
+            )",
             params![
                 inventory.adapter,
                 inventory.session,
@@ -8686,6 +9228,13 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
         migration?;
         foreign_keys?;
+        current = 23;
+    }
+    if current == 23 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(ORCHESTRATOR_REPLACEMENT_RECOVERY_MIGRATION)?;
+        ensure_foreign_keys(&transaction)?;
+        transaction.commit()?;
     }
     ensure_foreign_keys(connection)?;
     Ok(())
@@ -10396,6 +10945,155 @@ fn select_orchestrator_replacement_runtime(
         .map_err(Into::into)
 }
 
+fn select_orchestrator_replacement_recovery_capture(
+    connection: &Connection,
+    command_id: &str,
+    role: OrchestratorReplacementRuntimeRole,
+    now_unix_ms: i64,
+) -> Result<Option<OrchestratorReplacementRuntimeCapture>, ProjectStoreError> {
+    let role_value = orchestrator_replacement_role_value(role);
+    let Some(runtime) =
+        select_orchestrator_replacement_runtime(connection, command_id, role_value)?
+    else {
+        return Ok(None);
+    };
+    connection
+        .query_row(
+            "SELECT objective_delivery_confirmed, recovery_outcome,
+                    recovery_attempts
+               FROM orchestrator_replacement_runtime_bindings
+              WHERE command_id = ?1 AND binding_role = ?2
+              AND (
+                  recovery_outcome IS NULL
+                  OR recovery_outcome IN (
+                      'conflicting_reused',
+                      'present_not_safely_retirable'
+                  )
+              )
+              AND (
+                  next_recovery_at_unix_ms IS NULL
+                  OR next_recovery_at_unix_ms <= ?3
+              )",
+            params![command_id, role_value, now_unix_ms],
+            |row| {
+                Ok(OrchestratorReplacementRuntimeCapture {
+                    role,
+                    runtime: runtime.clone(),
+                    objective_delivery_confirmed: row.get(0)?,
+                    recovery_outcome: row
+                        .get::<_, Option<String>>(1)?
+                        .map(|value| orchestrator_replacement_recovery_outcome(&value))
+                        .transpose()?,
+                    recovery_attempts: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn select_orchestrator_replacement_prepare_intent(
+    connection: &Connection,
+    command_id: &str,
+    now_unix_ms: i64,
+) -> Result<Option<OrchestratorReplacementPrepareIntent>, ProjectStoreError> {
+    let intent = connection
+        .query_row(
+            "SELECT prepare_tab_label, prepare_intent_at_unix_ms,
+                    prepare_recovery_outcome, prepare_recovery_attempts,
+                    prepare_absence_observations
+               FROM project_orchestrator_replacement_commands replacement
+              WHERE command_id = ?1
+                AND prepare_tab_label IS NOT NULL
+                AND prepare_intent_at_unix_ms IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM orchestrator_replacement_runtime_bindings capture
+                     WHERE capture.command_id = replacement.command_id
+                       AND capture.binding_role IN (
+                           'replacement_prepared',
+                           'replacement_started'
+                       )
+                )
+                AND (
+                    prepare_recovery_outcome IS NULL
+                    OR prepare_recovery_outcome IN (
+                        'conflicting_reused',
+                        'present_not_safely_retirable'
+                    )
+                )
+                AND (
+                    prepare_next_recovery_at_unix_ms IS NULL
+                    OR prepare_next_recovery_at_unix_ms <= ?2
+                )",
+            params![command_id, now_unix_ms],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row_u64(row, 1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, u32>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        tab_label,
+        intent_at_unix_ms,
+        recovery_outcome,
+        recovery_attempts,
+        absence_observations,
+    )) = intent
+    else {
+        return Ok(None);
+    };
+    let expected = select_orchestrator_replacement_runtime(connection, command_id, "displaced")?
+        .ok_or(ProjectStoreError::OrchestratorReplacementRuntimeMissing)?;
+    Ok(Some(OrchestratorReplacementPrepareIntent {
+        adapter: expected.adapter,
+        session: expected.session,
+        workspace_id: expected.workspace_id,
+        tab_label,
+        intent_at_unix_ms,
+        recovery_outcome: recovery_outcome
+            .map(|value| orchestrator_replacement_recovery_outcome(&value))
+            .transpose()?,
+        recovery_attempts,
+        absence_observations,
+    }))
+}
+
+fn orchestrator_replacement_recovery_target_advanced(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    target: OrchestratorReplacementRecoveryTarget,
+    expected_attempts: i64,
+) -> Result<bool, ProjectStoreError> {
+    let attempts = match target {
+        OrchestratorReplacementRecoveryTarget::PrepareIntent
+        | OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence => transaction
+            .query_row(
+                "SELECT prepare_recovery_attempts
+                       FROM project_orchestrator_replacement_commands
+                      WHERE command_id = ?1 AND prepare_tab_label IS NOT NULL",
+                [command_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?,
+        OrchestratorReplacementRecoveryTarget::Runtime(role) => transaction
+            .query_row(
+                "SELECT recovery_attempts
+                   FROM orchestrator_replacement_runtime_bindings
+                  WHERE command_id = ?1 AND binding_role = ?2",
+                params![command_id, orchestrator_replacement_role_value(role)],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?,
+    };
+    Ok(attempts.is_some_and(|attempts| attempts > expected_attempts))
+}
+
 fn select_allocation_command(
     connection: &Connection,
     command_id: &str,
@@ -10483,11 +11181,27 @@ fn ensure_replacement_runtime_available(
     let exists = transaction.query_row(
         "SELECT EXISTS (
             SELECT 1
-              FROM orchestrator_replacement_runtime_bindings snapshot
+             FROM orchestrator_replacement_runtime_bindings snapshot
               JOIN command_acknowledgements command
                 ON command.id = snapshot.command_id
              WHERE snapshot.command_id <> ?1
-               AND command.status IN ('pending', 'ambiguous')
+               AND (
+                   command.status = 'pending'
+                   OR (
+                       command.status = 'ambiguous'
+                       AND (
+                           snapshot.recovery_outcome IS NULL
+                           OR snapshot.recovery_outcome IN (
+                               'conflicting_reused',
+                               'present_not_safely_retirable'
+                           )
+                       )
+                   )
+               )
+               AND snapshot.binding_role IN (
+                   'replacement_prepared',
+                   'replacement_started'
+               )
                AND snapshot.adapter = ?2
                AND snapshot.runtime_session = ?3
                AND (
@@ -10608,6 +11322,7 @@ fn insert_runtime_cleanup_job(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_orchestrator_replacement_runtime(
     transaction: &Transaction<'_>,
     command_id: &str,
@@ -10615,6 +11330,7 @@ fn insert_orchestrator_replacement_runtime(
     worker_id: Option<&str>,
     ownership: Option<&StoredReplacementOwnership>,
     runtime: &WorkerRuntimeBinding,
+    objective_delivery_confirmed: bool,
     now: u64,
 ) -> Result<(), ProjectStoreError> {
     transaction.execute(
@@ -10627,11 +11343,12 @@ fn insert_orchestrator_replacement_runtime(
             provider_session_kind, provider_session_value, owns_tab,
             observation_state, process_state, observed_status,
             state_change_sequence, runtime_revision, runtime_version,
-            last_observed_at_unix_ms, captured_at_unix_ms
+            last_observed_at_unix_ms, captured_at_unix_ms,
+            objective_delivery_confirmed
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
             ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22,
-            ?23, ?24, ?25, ?26, ?27, ?28
+            ?23, ?24, ?25, ?26, ?27, ?28, ?29
          )",
         params![
             Uuid::now_v7().to_string(),
@@ -10680,6 +11397,7 @@ fn insert_orchestrator_replacement_runtime(
             to_i64(runtime.version)?,
             to_i64(runtime.last_observed_at_unix_ms)?,
             to_i64(now)?,
+            objective_delivery_confirmed,
         ],
     )?;
     Ok(())
@@ -12636,6 +13354,50 @@ const fn old_session_disposition_value(disposition: OldSessionDisposition) -> &'
     }
 }
 
+fn replacement_prepare_tab_label(command_id: &str) -> String {
+    format!("Yard replacement [{command_id}]")
+}
+
+fn orchestrator_replacement_recovery_outcome(
+    value: &str,
+) -> rusqlite::Result<OrchestratorReplacementRecoveryOutcome> {
+    match value {
+        "adopted_current" => Ok(OrchestratorReplacementRecoveryOutcome::AdoptedCurrent),
+        "absent_converged" => Ok(OrchestratorReplacementRecoveryOutcome::AbsentConverged),
+        "conflicting_reused" => Ok(OrchestratorReplacementRecoveryOutcome::ConflictingReused),
+        "present_not_safely_retirable" => {
+            Ok(OrchestratorReplacementRecoveryOutcome::PresentNotSafelyRetirable)
+        }
+        value => Err(enum_conversion_error(
+            1,
+            "orchestrator replacement recovery outcome",
+            value,
+        )),
+    }
+}
+
+const fn orchestrator_replacement_recovery_outcome_value(
+    outcome: OrchestratorReplacementRecoveryOutcome,
+) -> &'static str {
+    match outcome {
+        OrchestratorReplacementRecoveryOutcome::AdoptedCurrent => "adopted_current",
+        OrchestratorReplacementRecoveryOutcome::AbsentConverged => "absent_converged",
+        OrchestratorReplacementRecoveryOutcome::ConflictingReused => "conflicting_reused",
+        OrchestratorReplacementRecoveryOutcome::PresentNotSafelyRetirable => {
+            "present_not_safely_retirable"
+        }
+    }
+}
+
+const fn orchestrator_replacement_role_value(
+    role: OrchestratorReplacementRuntimeRole,
+) -> &'static str {
+    match role {
+        OrchestratorReplacementRuntimeRole::Prepared => "replacement_prepared",
+        OrchestratorReplacementRuntimeRole::Started => "replacement_started",
+    }
+}
+
 const fn handoff_target_role_value(role: HandoffTargetRole) -> &'static str {
     match role {
         HandoffTargetRole::Member => "member",
@@ -13075,6 +13837,10 @@ pub enum ProjectStoreError {
     OrchestratorReplacementRuntimeMissing,
     #[error("the prepared replacement runtime conflicts with the verified runtime")]
     OrchestratorReplacementRuntimeConflict,
+    #[error("the captured started runtime has no durable objective-delivery confirmation")]
+    OrchestratorReplacementRecoveryUnconfirmed,
+    #[error("orchestrator replacement recovery requires a newer runtime inventory observation")]
+    OrchestratorReplacementFreshObservationRequired,
     #[error("the handoff command has not claimed a target runtime")]
     RuntimeHandoffClaimMissing,
     #[error("the handoff target runtime conflicts with another durable identity")]
@@ -13215,9 +13981,11 @@ mod tests {
         BeginOrchestratorPrompt, BeginProfileAllocation, BeginProfileProjectCreation,
         BeginProjectOrchestratorReplacement, BeginWorkerAllocation, BeginWorkerHandoff,
         BeginWorkspaceProjectCreation, BeginYardOrchestratorPrompt, BeginYardOrchestratorRoute,
-        COMPLETION_RECEIPT_MIGRATION, INITIAL_MIGRATION, PROFILE_ASSIGNMENT_MIGRATION,
-        ProjectStoreError, SCHEMA_VERSION, SnapshotDeliveryResult, SnapshotProjectFolder,
-        SqliteProjectStore, TokenSpendCommandSource, YardStore, insert_worker_runtime_binding,
+        COMPLETION_RECEIPT_MIGRATION, INITIAL_MIGRATION, OrchestratorReplacementRecoveryOutcome,
+        OrchestratorReplacementRecoveryTarget, OrchestratorReplacementRuntimeRole,
+        OrchestratorReplacementStartEvidence, PROFILE_ASSIGNMENT_MIGRATION, ProjectStoreError,
+        SCHEMA_VERSION, SnapshotDeliveryResult, SnapshotProjectFolder, SqliteProjectStore,
+        TokenSpendCommandSource, YardStore, insert_worker_runtime_binding,
         insert_worker_runtime_binding_unchecked,
     };
 
@@ -13262,6 +14030,53 @@ mod tests {
         SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
             .await
             .unwrap()
+    }
+
+    fn downgrade_replacement_recovery_schema_to_v23(connection: &Connection) {
+        connection
+            .execute_batch(
+                "DROP INDEX project_replacement_runtime_identity;
+                 ALTER TABLE orchestrator_replacement_runtime_bindings
+                    DROP COLUMN next_recovery_at_unix_ms;
+                 ALTER TABLE orchestrator_replacement_runtime_bindings
+                    DROP COLUMN recovery_attempts;
+                 ALTER TABLE orchestrator_replacement_runtime_bindings
+                    DROP COLUMN reconciled_at_unix_ms;
+                 ALTER TABLE orchestrator_replacement_runtime_bindings
+                    DROP COLUMN recovery_detail;
+                 ALTER TABLE orchestrator_replacement_runtime_bindings
+                    DROP COLUMN recovery_outcome;
+                 ALTER TABLE orchestrator_replacement_runtime_bindings
+                    DROP COLUMN objective_delivery_confirmed;
+                 ALTER TABLE project_orchestrator_replacement_commands
+                    DROP COLUMN prepare_next_recovery_at_unix_ms;
+                 ALTER TABLE project_orchestrator_replacement_commands
+                    DROP COLUMN prepare_absence_observations;
+                 ALTER TABLE project_orchestrator_replacement_commands
+                    DROP COLUMN prepare_recovery_attempts;
+                 ALTER TABLE project_orchestrator_replacement_commands
+                    DROP COLUMN prepare_reconciled_at_unix_ms;
+                 ALTER TABLE project_orchestrator_replacement_commands
+                    DROP COLUMN prepare_recovery_detail;
+                 ALTER TABLE project_orchestrator_replacement_commands
+                    DROP COLUMN prepare_recovery_outcome;
+                 ALTER TABLE project_orchestrator_replacement_commands
+                    DROP COLUMN prepare_intent_at_unix_ms;
+                 ALTER TABLE project_orchestrator_replacement_commands
+                    DROP COLUMN prepare_tab_label;
+                 CREATE UNIQUE INDEX one_project_replacement_claim_per_runtime
+                    ON orchestrator_replacement_runtime_bindings (
+                        adapter,
+                        runtime_session,
+                        terminal_id,
+                        binding_role
+                    )
+                    WHERE binding_role IN (
+                        'replacement_prepared',
+                        'replacement_started'
+                    );",
+            )
+            .unwrap();
     }
 
     #[allow(clippy::too_many_lines)]
@@ -13996,6 +14811,7 @@ mod tests {
             .record_project_orchestrator_replacement_started_runtime(
                 &command.command_id,
                 started.clone(),
+                OrchestratorReplacementStartEvidence::Confirmed,
             )
             .await
             .unwrap();
@@ -14266,6 +15082,411 @@ mod tests {
         ));
     }
 
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn confirmed_started_replacement_recovers_once_across_restart() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project, _profile, command, prepared, started) =
+            create_orchestrator_replacement_fixture(
+                &store,
+                "replace-recover-started",
+                OldSessionDisposition::RetireAfterCutover,
+            )
+            .await;
+        store
+            .begin_project_orchestrator_replacement(&project.id, command.clone())
+            .await
+            .unwrap();
+        store
+            .claim_project_orchestrator_replacement_runtime(&command.command_id, prepared.clone())
+            .await
+            .unwrap();
+        store
+            .record_project_orchestrator_replacement_started_runtime(
+                &command.command_id,
+                started.clone(),
+                OrchestratorReplacementStartEvidence::Confirmed,
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let reopened = open_store(&temp).await;
+        let recoveries = reopened
+            .list_ambiguous_orchestrator_replacement_recoveries(Some(&command.command_id))
+            .await
+            .unwrap();
+        assert_eq!(recoveries.len(), 1, "{recoveries:?}");
+        assert_eq!(recoveries[0].captures.len(), 2);
+        assert!(recoveries[0].captures.iter().any(|capture| capture.role
+            == OrchestratorReplacementRuntimeRole::Started
+            && capture.objective_delivery_confirmed));
+
+        assert!(matches!(
+            reopened
+                .recover_project_orchestrator_replacement(&command.command_id, started.clone(),)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::OrchestratorReplacementFreshObservationRequired
+        ));
+        let mut freshly_observed = started;
+        freshly_observed.last_observed_at_unix_ms += 1;
+        let recovered = reopened
+            .recover_project_orchestrator_replacement(&command.command_id, freshly_observed.clone())
+            .await
+            .unwrap();
+        let replayed = reopened
+            .recover_project_orchestrator_replacement(&command.command_id, freshly_observed)
+            .await
+            .unwrap();
+        assert!(!recovered.replayed);
+        assert!(replayed.replayed);
+        assert_eq!(
+            recovered.project.orchestrator.id,
+            replayed.project.orchestrator.id
+        );
+        assert!(
+            reopened
+                .list_ambiguous_orchestrator_replacement_recoveries(Some(&command.command_id))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let event_counts = connection
+            .prepare(
+                "SELECT event_type, COUNT(*)
+                   FROM lifecycle_events
+                  WHERE event_type IN (
+                      'orchestrator_replaced',
+                      'orchestrator_replacement_started'
+                  )
+                  GROUP BY event_type
+                  ORDER BY event_type",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            event_counts,
+            [
+                ("orchestrator_replaced".to_owned(), 1),
+                ("orchestrator_replacement_started".to_owned(), 1),
+            ]
+        );
+        let cleanup_count = connection
+            .query_row(
+                "SELECT COUNT(*)
+                   FROM runtime_cleanup_jobs
+                  WHERE command_id = ?1",
+                [&command.command_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(cleanup_count, 1);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn recovery_outcomes_preserve_only_colliding_runtime_reservations() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project, _profile, command, prepared, _started) =
+            create_orchestrator_replacement_fixture(
+                &store,
+                "replace-recovery-reservation",
+                OldSessionDisposition::RetainForInspection,
+            )
+            .await;
+        store
+            .begin_project_orchestrator_replacement(&project.id, command.clone())
+            .await
+            .unwrap();
+        store
+            .claim_project_orchestrator_replacement_runtime(&command.command_id, prepared.clone())
+            .await
+            .unwrap();
+        store
+            .fail_project_orchestrator_replacement(
+                &command.command_id,
+                "replacement outcome is unknown",
+                true,
+            )
+            .await
+            .unwrap();
+        store
+            .record_orchestrator_replacement_recovery_attempt(
+                &command.command_id,
+                OrchestratorReplacementRecoveryTarget::Runtime(
+                    OrchestratorReplacementRuntimeRole::Prepared,
+                ),
+                0,
+                Some(OrchestratorReplacementRecoveryOutcome::ConflictingReused),
+                "captured terminal identity is reused",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut unrelated_command = command.clone();
+        unrelated_command.command_id = "replace-unrelated-after-quarantine".to_owned();
+        store
+            .begin_project_orchestrator_replacement(&project.id, unrelated_command.clone())
+            .await
+            .unwrap();
+        let mut unrelated_runtime = prepared.clone();
+        unrelated_runtime.terminal_id = "terminal-unrelated".to_owned();
+        unrelated_runtime.tab_id = Some("tab-unrelated".to_owned());
+        unrelated_runtime.pane_id = "pane-unrelated".to_owned();
+        store
+            .claim_project_orchestrator_replacement_runtime(
+                &unrelated_command.command_id,
+                unrelated_runtime,
+            )
+            .await
+            .unwrap();
+        store
+            .fail_project_orchestrator_replacement(
+                &unrelated_command.command_id,
+                "test cleanup",
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut colliding_command = command.clone();
+        colliding_command.command_id = "replace-colliding-quarantine".to_owned();
+        store
+            .begin_project_orchestrator_replacement(&project.id, colliding_command.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .claim_project_orchestrator_replacement_runtime(
+                    &colliding_command.command_id,
+                    prepared.clone(),
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::OrchestratorReplacementRuntimeConflict
+        ));
+        store
+            .fail_project_orchestrator_replacement(
+                &colliding_command.command_id,
+                "test cleanup",
+                false,
+            )
+            .await
+            .unwrap();
+
+        store
+            .record_orchestrator_replacement_recovery_attempt(
+                &command.command_id,
+                OrchestratorReplacementRecoveryTarget::Runtime(
+                    OrchestratorReplacementRuntimeRole::Prepared,
+                ),
+                1,
+                Some(OrchestratorReplacementRecoveryOutcome::AbsentConverged),
+                "captured identity is absent",
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_ambiguous_orchestrator_replacement_recoveries(Some(&command.command_id))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut after_absence = command;
+        after_absence.command_id = "replace-after-proven-absence".to_owned();
+        store
+            .begin_project_orchestrator_replacement(&project.id, after_absence.clone())
+            .await
+            .unwrap();
+        store
+            .claim_project_orchestrator_replacement_runtime(&after_absence.command_id, prepared)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepare_intent_requires_two_absence_observations_before_convergence() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project, _profile, command, _prepared, _started) =
+            create_orchestrator_replacement_fixture(
+                &store,
+                "replace-prepare-absence",
+                OldSessionDisposition::RetainForInspection,
+            )
+            .await;
+        store
+            .begin_project_orchestrator_replacement(&project.id, command.clone())
+            .await
+            .unwrap();
+        store
+            .fail_project_orchestrator_replacement(
+                &command.command_id,
+                "tab creation outcome is unknown",
+                true,
+            )
+            .await
+            .unwrap();
+
+        let pending = store
+            .list_ambiguous_orchestrator_replacement_recoveries(Some(&command.command_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            pending[0]
+                .prepare_intent
+                .as_ref()
+                .unwrap()
+                .absence_observations,
+            0
+        );
+        store
+            .record_orchestrator_replacement_recovery_attempt(
+                &command.command_id,
+                OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence,
+                0,
+                None,
+                "first fresh inventory observation found no command-unique tab",
+                Some(0),
+            )
+            .await
+            .unwrap();
+        let confirmation = store
+            .list_ambiguous_orchestrator_replacement_recoveries(Some(&command.command_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            confirmation[0]
+                .prepare_intent
+                .as_ref()
+                .unwrap()
+                .absence_observations,
+            1
+        );
+        store
+            .record_orchestrator_replacement_recovery_attempt(
+                &command.command_id,
+                OrchestratorReplacementRecoveryTarget::PrepareIntent,
+                1,
+                Some(OrchestratorReplacementRecoveryOutcome::AbsentConverged),
+                "second fresh inventory observation confirmed the prepare intent absent",
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_ambiguous_orchestrator_replacement_recoveries(Some(&command.command_id))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn version_23_replacement_captures_migrate_to_recovery_state() {
+        let temp = TempDir::new().unwrap();
+        let database_path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let (project, _profile, command, prepared, _started) =
+            create_orchestrator_replacement_fixture(
+                &store,
+                "replace-migrate-recovery",
+                OldSessionDisposition::RetainForInspection,
+            )
+            .await;
+        store
+            .begin_project_orchestrator_replacement(&project.id, command.clone())
+            .await
+            .unwrap();
+        store
+            .claim_project_orchestrator_replacement_runtime(&command.command_id, prepared)
+            .await
+            .unwrap();
+        store
+            .fail_project_orchestrator_replacement(
+                &command.command_id,
+                "replacement outcome is unknown",
+                true,
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&database_path).unwrap();
+        downgrade_replacement_recovery_schema_to_v23(&connection);
+        connection
+            .execute_batch("PRAGMA user_version = 23;")
+            .unwrap();
+        drop(connection);
+
+        let migrated = SqliteProjectStore::open(&database_path).await.unwrap();
+        let recoveries = migrated
+            .list_ambiguous_orchestrator_replacement_recoveries(Some(&command.command_id))
+            .await
+            .unwrap();
+        assert_eq!(recoveries.len(), 1);
+        assert_eq!(recoveries[0].captures.len(), 1);
+        assert!(!recoveries[0].captures[0].objective_delivery_confirmed);
+        assert_eq!(recoveries[0].captures[0].recovery_outcome, None);
+        drop(migrated);
+
+        let connection = Connection::open(database_path).unwrap();
+        let version = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        let recovery_columns = connection
+            .prepare("PRAGMA table_info(orchestrator_replacement_runtime_bindings)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let prepare_columns = connection
+            .prepare("PRAGMA table_info(project_orchestrator_replacement_commands)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        for column in [
+            "objective_delivery_confirmed",
+            "recovery_outcome",
+            "recovery_detail",
+            "reconciled_at_unix_ms",
+            "recovery_attempts",
+            "next_recovery_at_unix_ms",
+        ] {
+            assert!(recovery_columns.iter().any(|value| value == column));
+        }
+        for column in [
+            "prepare_tab_label",
+            "prepare_intent_at_unix_ms",
+            "prepare_recovery_outcome",
+            "prepare_recovery_detail",
+            "prepare_reconciled_at_unix_ms",
+            "prepare_recovery_attempts",
+            "prepare_absence_observations",
+            "prepare_next_recovery_at_unix_ms",
+        ] {
+            assert!(prepare_columns.iter().any(|value| value == column));
+        }
+    }
+
     #[tokio::test]
     async fn replacement_cutover_rolls_back_when_captured_assignment_changes() {
         let temp = TempDir::new().unwrap();
@@ -14289,6 +15510,7 @@ mod tests {
             .record_project_orchestrator_replacement_started_runtime(
                 &command.command_id,
                 started.clone(),
+                OrchestratorReplacementStartEvidence::Confirmed,
             )
             .await
             .unwrap();
@@ -16989,6 +18211,7 @@ mod tests {
         drop(store);
 
         let connection = Connection::open(&path).unwrap();
+        downgrade_replacement_recovery_schema_to_v23(&connection);
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = OFF;
@@ -17051,6 +18274,7 @@ mod tests {
         drop(open_store(&temp).await);
 
         let connection = Connection::open(&path).unwrap();
+        downgrade_replacement_recovery_schema_to_v23(&connection);
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = OFF;

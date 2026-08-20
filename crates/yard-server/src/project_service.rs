@@ -290,7 +290,9 @@ impl ProjectService {
                     .await?;
                 Err(ProjectServiceError::RuntimeProvision(message))
             }
-            Err(RuntimeProvisionError::AfterPreparation { message, ambiguous }) => {
+            Err(RuntimeProvisionError::AfterPreparation {
+                message, ambiguous, ..
+            }) => {
                 self.store
                     .fail_profile_project_creation(&command_id, &message, ambiguous)
                     .await?;
@@ -417,7 +419,9 @@ impl ProjectService {
                     .await?;
                 Err(ProjectServiceError::RuntimeProvision(message))
             }
-            Err(RuntimeProvisionError::AfterPreparation { message, ambiguous }) => {
+            Err(RuntimeProvisionError::AfterPreparation {
+                message, ambiguous, ..
+            }) => {
                 self.store
                     .fail_workspace_project_creation(&command_id, &message, ambiguous)
                     .await?;

@@ -112,11 +112,14 @@ pub enum HerdrControlError {
     Runtime(#[from] HerdrError),
     #[error("Herdr workspace creation failed: {source}; command outcome ambiguous: {ambiguous}")]
     WorkspaceCreateFailed { source: HerdrError, ambiguous: bool },
+    #[error("Herdr tab preparation failed: {source}; command outcome ambiguous: {ambiguous}")]
+    PrepareFailed { source: HerdrError, ambiguous: bool },
     #[error("Herdr agent start failed: {start}; runtime rollback: {rollback}")]
     StartFailed {
         start: HerdrError,
         rollback: String,
         rollback_succeeded: bool,
+        started_runtime: Option<Box<WorkerRuntimeBinding>>,
     },
     #[error("Herdr created the worker but initial prompt delivery failed: {source}")]
     PromptDeliveryFailed {
@@ -182,7 +185,7 @@ async fn bootstrap_agent_at_socket(
     )
     .await
     .map_err(|source| HerdrControlError::WorkspaceCreateFailed {
-        ambiguous: workspace_create_outcome_ambiguous(&source),
+        ambiguous: runtime_creation_outcome_ambiguous(&source),
         source,
     })?;
     expect_result_type(&create_result, "workspace_created").map_err(|source| {
@@ -253,9 +256,31 @@ async fn prepare_agent_at_socket(
         }),
         config.request_timeout,
     )
-    .await?;
-    expect_result_type(&tab_result, "tab_created")?;
-    let tab: TabCreated = serde_json::from_value(tab_result).map_err(HerdrError::CommandDecode)?;
+    .await
+    .map_err(|source| HerdrControlError::PrepareFailed {
+        ambiguous: runtime_creation_outcome_ambiguous(&source),
+        source,
+    })?;
+    expect_result_type(&tab_result, "tab_created").map_err(|source| {
+        HerdrControlError::PrepareFailed {
+            source,
+            ambiguous: true,
+        }
+    })?;
+    let tab: TabCreated =
+        serde_json::from_value(tab_result).map_err(|source| HerdrControlError::PrepareFailed {
+            source: HerdrError::CommandDecode(source),
+            ambiguous: true,
+        })?;
+    if tab.tab.workspace_id != tab.root_pane.workspace_id || tab.tab.tab_id != tab.root_pane.tab_id
+    {
+        return Err(HerdrControlError::PrepareFailed {
+            source: HerdrError::InvalidTopology(
+                "created tab and root pane have different ancestry".to_owned(),
+            ),
+            ambiguous: true,
+        });
+    }
     Ok(PreparedAgent {
         runtime: prepared_runtime_binding(&request.session, &tab.tab, &tab.root_pane),
     })
@@ -339,6 +364,7 @@ async fn start_agent_at_socket(
                 rollback,
                 start,
                 true,
+                None,
             )
             .await);
         }
@@ -406,6 +432,7 @@ async fn validate_started_topology(
             rollback,
             start,
             false,
+            Some(runtime),
         )
         .await);
     }
@@ -419,6 +446,7 @@ async fn start_failure_after_rollback(
     rollback: StartRollback,
     start: HerdrError,
     rollback_covers_started_runtime: bool,
+    started_runtime: Option<WorkerRuntimeBinding>,
 ) -> HerdrControlError {
     let rollback_result = rollback_start(config, socket_path, command_id, rollback).await;
     let rollback_succeeded = rollback_covers_started_runtime && rollback_result.is_ok();
@@ -436,6 +464,7 @@ async fn start_failure_after_rollback(
         start,
         rollback,
         rollback_succeeded,
+        started_runtime: started_runtime.map(Box::new),
     }
 }
 
@@ -602,7 +631,7 @@ fn is_definitely_not_submitted(error: &HerdrError) -> bool {
     )
 }
 
-fn workspace_create_outcome_ambiguous(error: &HerdrError) -> bool {
+fn runtime_creation_outcome_ambiguous(error: &HerdrError) -> bool {
     !matches!(
         error,
         HerdrError::SocketConnect { .. } | HerdrError::Api { .. }
@@ -784,8 +813,8 @@ mod tests {
         BootstrapAgentRequest, HerdrControlError, PrepareAgentRequest, PromptAgentRequest,
         ReadPaneRequest, StartPreparedAgentRequest, bootstrap_agent_at_socket,
         prepare_agent_at_socket, prompt_agent_at_socket, read_pane_at_socket,
-        retained_prepared_topology, start_prepared_agent_at_socket,
-        workspace_create_outcome_ambiguous,
+        retained_prepared_topology, runtime_creation_outcome_ambiguous,
+        start_prepared_agent_at_socket,
     };
     use crate::{HerdrConfig, HerdrError};
     use yard_domain::{
@@ -826,6 +855,107 @@ mod tests {
             &prepared,
             &runtime_topology("workspace-2", "tab-1", "pane-1", "terminal-1"),
         ));
+    }
+
+    #[tokio::test]
+    async fn topology_mismatch_retains_the_unverified_started_runtime() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            for step in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].as_str().unwrap();
+                let result = if step == 0 {
+                    assert_eq!(request["method"], "agent.start");
+                    serde_json::json!({
+                        "type": "agent_started",
+                        "agent": {
+                            "terminal_id": "terminal-mismatch",
+                            "name": "yard-replacement",
+                            "agent": "codex",
+                            "display_agent": "Codex",
+                            "agent_status": "idle",
+                            "tokens": {},
+                            "agent_session": {
+                                "source": "herdr:codex",
+                                "agent": "codex",
+                                "kind": "id",
+                                "value": "session-mismatch"
+                            },
+                            "workspace_id": "workspace-mismatch",
+                            "tab_id": "tab-mismatch",
+                            "pane_id": "pane-mismatch",
+                            "focused": false,
+                            "launch_pending": false,
+                            "interactive_ready": true,
+                            "state_change_seq": 3,
+                            "cwd": "/tmp/mismatch",
+                            "foreground_cwd": "/tmp/mismatch",
+                            "revision": 2
+                        }
+                    })
+                } else {
+                    assert_eq!(request["method"], "tab.close");
+                    assert_eq!(request["params"]["tab_id"], "tab-prepared");
+                    serde_json::json!({ "type": "ok" })
+                };
+                writer
+                    .write_all(
+                        format!("{}\n", serde_json::json!({"id": id, "result": result})).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let error = start_prepared_agent_at_socket(
+            &config,
+            &socket_path,
+            StartPreparedAgentRequest {
+                command_id: "replacement-mismatch".to_owned(),
+                prepared: runtime_topology(
+                    "workspace-prepared",
+                    "tab-prepared",
+                    "pane-prepared",
+                    "terminal-prepared",
+                ),
+                agent_name: "yard-replacement".to_owned(),
+                kind: "codex".to_owned(),
+                args: Vec::new(),
+                prompt: "Continue.".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        let HerdrControlError::StartFailed {
+            rollback_succeeded,
+            started_runtime: Some(started_runtime),
+            ..
+        } = error
+        else {
+            panic!("expected topology mismatch with captured started runtime");
+        };
+        assert!(!rollback_succeeded);
+        assert_eq!(started_runtime.workspace_id, "workspace-mismatch");
+        assert_eq!(started_runtime.terminal_id, "terminal-mismatch");
+        assert_eq!(
+            started_runtime
+                .provider_session
+                .as_ref()
+                .map(|session| session.value.as_str()),
+            Some("session-mismatch")
+        );
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1050,13 +1180,55 @@ mod tests {
 
     #[test]
     fn classifies_workspace_creation_transport_ambiguity() {
-        assert!(workspace_create_outcome_ambiguous(
+        assert!(runtime_creation_outcome_ambiguous(
             &HerdrError::SocketTimeout
         ));
-        assert!(!workspace_create_outcome_ambiguous(&HerdrError::Api {
+        assert!(!runtime_creation_outcome_ambiguous(&HerdrError::Api {
             code: "workspace_create_failed".to_owned(),
             message: "invalid directory".to_owned(),
         }));
+    }
+
+    #[tokio::test]
+    async fn lost_tab_create_response_is_reported_as_ambiguous_preparation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, _writer) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "tab.create");
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let error = prepare_agent_at_socket(
+            &config,
+            &socket_path,
+            PrepareAgentRequest {
+                command_id: "replacement-lost-response".to_owned(),
+                session: "default".to_owned(),
+                workspace_id: "workspace-1".to_owned(),
+                cwd: "/tmp/project".to_owned(),
+                tab_label: "Yard replacement [replacement-lost-response]".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(
+            error,
+            HerdrControlError::PrepareFailed {
+                ambiguous: true,
+                ..
+            }
+        ));
     }
 
     #[allow(clippy::too_many_lines)]

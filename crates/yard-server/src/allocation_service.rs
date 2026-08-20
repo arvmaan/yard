@@ -60,7 +60,11 @@ pub enum RuntimeProvisionError {
         message: String,
     },
     #[error("{message}")]
-    AfterPreparation { message: String, ambiguous: bool },
+    AfterPreparation {
+        message: String,
+        ambiguous: bool,
+        started_runtime: Option<Box<WorkerRuntimeBinding>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -545,7 +549,9 @@ impl AllocationService {
                     .await?;
                 Err(AllocationServiceError::RuntimeProvision(message))
             }
-            Err(RuntimeProvisionError::AfterPreparation { message, ambiguous }) => {
+            Err(RuntimeProvisionError::AfterPreparation {
+                message, ambiguous, ..
+            }) => {
                 self.store
                     .fail_worker_allocation(&context.command.command_id, &message, ambiguous)
                     .await?;
@@ -678,7 +684,9 @@ impl AllocationService {
                     .await?;
                 return Err(AllocationServiceError::RuntimeProvision(message));
             }
-            Err(RuntimeProvisionError::AfterPreparation { message, ambiguous }) => {
+            Err(RuntimeProvisionError::AfterPreparation {
+                message, ambiguous, ..
+            }) => {
                 self.store
                     .fail_worker_handoff(&context.command.command_id, &message, ambiguous)
                     .await?;
@@ -758,7 +766,9 @@ impl AllocationService {
                     .await?;
                 Err(AllocationServiceError::ObjectiveDeliveryFailed(message))
             }
-            Err(RuntimeProvisionError::AfterPreparation { message, ambiguous }) => {
+            Err(RuntimeProvisionError::AfterPreparation {
+                message, ambiguous, ..
+            }) => {
                 self.store
                     .fail_worker_handoff(&context.command.command_id, &message, ambiguous)
                     .await?;
