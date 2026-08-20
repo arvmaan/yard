@@ -100,6 +100,8 @@ const PROJECT_ORCHESTRATOR_TRANSFER_MIGRATION: &str =
 const BLANK_WORKER_PROFILE_ID: &str = "yard:managed-blank-profile";
 const BLANK_WORKER_PROFILE_NAME: &str = "Blank profile";
 const MAX_ROUTE_LIST_LIMIT: usize = 500;
+const CLEANUP_OWNERSHIP_RETRY_BASE_MS: u64 = 60_000;
+const CLEANUP_OWNERSHIP_RETRY_CAP_MS: u64 = 60 * 60_000;
 
 #[async_trait]
 pub trait YardStore: Send + Sync {
@@ -514,6 +516,7 @@ pub trait YardStore: Send + Sync {
         cleanup_id: &str,
         claim_token: &str,
         message: &str,
+        retry_after_ms: u64,
     ) -> Result<(), ProjectStoreError>;
     async fn list_project_assignments(
         &self,
@@ -5910,7 +5913,7 @@ impl YardStore for SqliteProjectStore {
             let now = unix_time_ms()?;
             let expires_at = now.saturating_add(claim_ttl_ms.max(1));
             let sql = if command_id.is_some() {
-                "SELECT cleanup.id
+                "SELECT cleanup.id, cleanup.attempts
                    FROM runtime_cleanup_jobs cleanup
                   WHERE cleanup.status = 'pending' AND cleanup.command_id = ?1
                     AND cleanup.next_attempt_at_unix_ms <= ?2
@@ -5921,7 +5924,7 @@ impl YardStore for SqliteProjectStore {
                   ORDER BY cleanup.created_at_unix_ms, cleanup.id
                   LIMIT ?3"
             } else {
-                "SELECT cleanup.id
+                "SELECT cleanup.id, cleanup.attempts
                    FROM runtime_cleanup_jobs cleanup
                   WHERE cleanup.status = 'pending'
                     AND cleanup.next_attempt_at_unix_ms <= ?1
@@ -5936,21 +5939,28 @@ impl YardStore for SqliteProjectStore {
             let cleanup_ids = if let Some(command_id) = command_id {
                 statement
                     .query_map(params![command_id, to_i64(now)?, limit], |row| {
-                        row.get::<_, String>(0)
+                        Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
                     })?
                     .collect::<Result<Vec<_>, _>>()?
             } else {
                 statement
-                    .query_map(params![to_i64(now)?, limit], |row| row.get::<_, String>(0))?
+                    .query_map(params![to_i64(now)?, limit], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+                    })?
                     .collect::<Result<Vec<_>, _>>()?
             };
             drop(statement);
 
             let mut jobs = Vec::new();
             let mut rejected = 0;
-            for cleanup_id in cleanup_ids {
+            for (cleanup_id, attempts) in cleanup_ids {
                 if let Err(message) = validate_runtime_cleanup_ownership(&transaction, &cleanup_id)
                 {
+                    let retry_after_ms = capped_exponential_delay(
+                        CLEANUP_OWNERSHIP_RETRY_BASE_MS,
+                        CLEANUP_OWNERSHIP_RETRY_CAP_MS,
+                        attempts,
+                    );
                     transaction.execute(
                         "UPDATE runtime_cleanup_jobs
                             SET attempts = attempts + 1, last_error = ?1,
@@ -5961,7 +5971,7 @@ impl YardStore for SqliteProjectStore {
                           WHERE id = ?4 AND status = 'pending'",
                         params![
                             message,
-                            to_i64(now.saturating_add(1_000))?,
+                            to_i64(now.saturating_add(retry_after_ms))?,
                             to_i64(now)?,
                             cleanup_id,
                         ],
@@ -6027,6 +6037,7 @@ impl YardStore for SqliteProjectStore {
         cleanup_id: &str,
         claim_token: &str,
         message: &str,
+        retry_after_ms: u64,
     ) -> Result<(), ProjectStoreError> {
         let cleanup_id = required_id(cleanup_id)?;
         let claim_token = required_id(claim_token)?;
@@ -6036,7 +6047,7 @@ impl YardStore for SqliteProjectStore {
         }
         self.run(move |connection| {
             let now = unix_time_ms()?;
-            let next_attempt = now.saturating_add(1_000);
+            let next_attempt = now.saturating_add(retry_after_ms.max(1));
             let rows = connection.execute(
                 "UPDATE runtime_cleanup_jobs
                     SET attempts = attempts + 1, last_error = ?1,
@@ -10816,6 +10827,11 @@ fn runtime_cleanup_pending(
         .map_err(Into::into)
 }
 
+fn capped_exponential_delay(base_ms: u64, cap_ms: u64, attempts: u32) -> u64 {
+    let multiplier = 1_u64.checked_shl(attempts).unwrap_or(u64::MAX);
+    base_ms.saturating_mul(multiplier).min(cap_ms)
+}
+
 fn select_claimed_runtime_cleanup(
     connection: &Connection,
     cleanup_id: &str,
@@ -14545,18 +14561,26 @@ mod tests {
             .unwrap();
         assert!(batch.jobs.is_empty());
         assert_eq!(batch.rejected, 1);
+        let immediate_retry = store
+            .claim_pending_runtime_cleanups(Some(&command.command_id), 10, 30_000)
+            .await
+            .unwrap();
+        assert!(immediate_retry.jobs.is_empty());
+        assert_eq!(immediate_retry.rejected, 0);
         let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
-        let (status, error): (String, String) = connection
+        let (status, error, retry_delay_ms): (String, String, i64) = connection
             .query_row(
-                "SELECT status, last_error
+                "SELECT status, last_error,
+                        next_attempt_at_unix_ms - updated_at_unix_ms
                    FROM runtime_cleanup_jobs
                   WHERE command_id = ?1",
                 [&command.command_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(status, "pending");
         assert!(error.contains("no longer detached"));
+        assert_eq!(retry_delay_ms, 60_000);
     }
 
     #[tokio::test]
@@ -14814,6 +14838,7 @@ mod tests {
                 &cleanup_id,
                 &claim_token,
                 "Herdr is temporarily unavailable",
+                60_000,
             )
             .await
             .unwrap();
@@ -14840,15 +14865,17 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let (cleanup_attempts, cleanup_error): (i64, Option<String>) = connection
-            .query_row(
-                "SELECT attempts, last_error
+        let (cleanup_attempts, cleanup_error, retry_delay_ms): (i64, Option<String>, i64) =
+            connection
+                .query_row(
+                    "SELECT attempts, last_error,
+                            next_attempt_at_unix_ms - updated_at_unix_ms
                    FROM runtime_cleanup_jobs
                   WHERE id = ?1",
-                [&cleanup_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
+                    [&cleanup_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
         connection
             .execute(
                 "UPDATE runtime_cleanup_jobs
@@ -14864,6 +14891,7 @@ mod tests {
             cleanup_error.as_deref(),
             Some("Herdr is temporarily unavailable")
         );
+        assert_eq!(retry_delay_ms, 60_000);
         drop(connection);
 
         drop(reopened);

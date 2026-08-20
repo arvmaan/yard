@@ -14,7 +14,7 @@ pub use config::HerdrConfig;
 pub use control::{
     BootstrapAgentRequest, HerdrControlError, PaneOutput, PrepareAgentRequest, PreparedAgent,
     PromptAgentRequest, PromptedAgent, ProvisionAgentRequest, ProvisionedAgent, ReadPaneRequest,
-    RetireRuntimeRequest, StartPreparedAgentRequest,
+    StartPreparedAgentRequest,
 };
 pub use error::HerdrError;
 pub use terminal::{
@@ -168,21 +168,6 @@ impl HerdrAdapter {
     /// response does not match the pinned protocol.
     pub async fn read_pane(&self, request: ReadPaneRequest) -> Result<PaneOutput, HerdrError> {
         control::read_pane(&self.config, request).await
-    }
-
-    /// Destructively retire a Herdr runtime by closing its owned tab or pane.
-    ///
-    /// A runtime that owns its tab closes the entire tab. Other runtimes close
-    /// only their pane. A matching already-absent target is treated as
-    /// successful convergence.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HerdrError`] when the session is unavailable, an owned tab ID
-    /// is missing, the close request fails, or the response does not match the
-    /// pinned protocol.
-    pub async fn retire_runtime(&self, request: RetireRuntimeRequest) -> Result<(), HerdrError> {
-        control::retire_runtime(&self.config, request).await
     }
 
     /// Open one interactive Herdr terminal controller process.

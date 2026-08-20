@@ -6,8 +6,7 @@ use yard_domain::{RuntimeInventory, RuntimeSessions};
 use yard_herdr::{
     BootstrapAgentRequest, HerdrAdapter, HerdrControlError, HerdrError, HerdrTerminal,
     HerdrTerminalError, OpenTerminalRequest as HerdrOpenTerminalRequest, PrepareAgentRequest,
-    PromptAgentRequest, ProvisionAgentRequest, ReadPaneRequest,
-    RetireRuntimeRequest as HerdrRetireRuntimeRequest, StartPreparedAgentRequest,
+    PromptAgentRequest, ProvisionAgentRequest, ReadPaneRequest, StartPreparedAgentRequest,
     TerminalCommand as HerdrTerminalCommand, TerminalDimensions, TerminalEncoding, TerminalEvent,
     TerminalInput,
 };
@@ -269,44 +268,28 @@ impl RuntimeControl for HerdrInventorySource {
             .inventory(&request.session)
             .await
             .map_err(|error| RuntimeRetirementError::Runtime(error.to_string()))?;
-        let target = match retirement_resolution(&inventory, &request) {
-            RetirementResolution::Target(target) => target,
-            RetirementResolution::Absent => return Ok(()),
-            RetirementResolution::Conflict => {
-                return if request.require_identity_match {
-                    Err(RuntimeRetirementError::IdentityNotObserved)
-                } else {
-                    Ok(())
-                };
-            }
-        };
-        self.adapter
-            .retire_runtime(HerdrRetireRuntimeRequest {
-                cleanup_id: request.cleanup_id,
-                session: request.session,
-                tab_id: Some(target.tab_id),
-                pane_id: target.pane_id,
-                owns_tab: target.owns_tab,
-            })
-            .await
-            .map_err(|error| RuntimeRetirementError::Runtime(error.to_string()))
+        retirement_outcome(&inventory, &request)
     }
 }
 
-struct RetirementTarget {
-    tab_id: String,
-    pane_id: String,
-    owns_tab: bool,
+fn retirement_outcome(
+    inventory: &RuntimeInventory,
+    request: &RuntimeRetirementRequest,
+) -> Result<(), RuntimeRetirementError> {
+    match retirement_resolution(inventory, request) {
+        // Protocol 19 accepts only a target ID, so any separate identity precheck still races.
+        RetirementResolution::Target => Err(RuntimeRetirementError::AtomicIdentityGuardUnavailable),
+        RetirementResolution::Absent => Ok(()),
+        RetirementResolution::Conflict => Err(RuntimeRetirementError::IdentityNotObserved),
+    }
 }
 
 struct RetirementIdentity {
     workspace: String,
-    tab: String,
-    pane: String,
 }
 
 enum RetirementResolution {
-    Target(RetirementTarget),
+    Target,
     Absent,
     Conflict,
 }
@@ -328,18 +311,7 @@ fn retirement_resolution(
     if identity.workspace != request.workspace_id {
         return RetirementResolution::Conflict;
     }
-    let owns_tab = request.owns_tab
-        && request.tab_id.as_deref() == Some(identity.tab.as_str())
-        && inventory.tabs.iter().any(|tab| {
-            tab.runtime_id == identity.tab
-                && tab.workspace_id == identity.workspace
-                && tab.pane_count == 1
-        });
-    RetirementResolution::Target(RetirementTarget {
-        tab_id: identity.tab,
-        pane_id: identity.pane,
-        owns_tab,
-    })
+    RetirementResolution::Target
 }
 
 fn retirement_by_provider(
@@ -364,8 +336,6 @@ fn retirement_by_provider(
         }
         return Ok(Some(RetirementIdentity {
             workspace: worker.workspace_id.clone(),
-            tab: worker.tab_id.clone(),
-            pane: worker.pane_id.clone(),
         }));
     }
 
@@ -380,8 +350,6 @@ fn retirement_by_provider(
     if let Some(pane) = matching_panes.first() {
         return Ok(Some(RetirementIdentity {
             workspace: pane.workspace_id.clone(),
-            tab: pane.tab_id.clone(),
-            pane: pane.runtime_id.clone(),
         }));
     }
     let captured_terminal_reused = inventory
@@ -416,8 +384,6 @@ fn retirement_by_topology(
         }
         return Ok(Some(RetirementIdentity {
             workspace: worker.workspace_id.clone(),
-            tab: worker.tab_id.clone(),
-            pane: worker.pane_id.clone(),
         }));
     }
     let Some(pane) = inventory
@@ -435,8 +401,6 @@ fn retirement_by_topology(
     }
     Ok(Some(RetirementIdentity {
         workspace: pane.workspace_id.clone(),
-        tab: pane.tab_id.clone(),
-        pane: pane.runtime_id.clone(),
     }))
 }
 
@@ -682,8 +646,8 @@ mod tests {
         TabObservation,
     };
 
-    use super::{RetirementResolution, retirement_resolution};
-    use crate::allocation_service::RuntimeRetirementRequest;
+    use super::{RetirementResolution, retirement_outcome, retirement_resolution};
+    use crate::allocation_service::{RuntimeRetirementError, RuntimeRetirementRequest};
 
     fn provider(value: &str) -> ProviderSessionRef {
         ProviderSessionRef {
@@ -748,22 +712,17 @@ mod tests {
             pane_id: "pane-stale".to_owned(),
             provider_session: Some(provider_session),
             owns_tab: true,
-            require_identity_match: false,
         }
     }
 
     #[test]
     fn retirement_follows_the_matching_runtime_identity() {
-        let RetirementResolution::Target(target) = retirement_resolution(
+        let RetirementResolution::Target = retirement_resolution(
             &inventory(provider("session-1"), 1),
             &request(provider("session-1")),
         ) else {
             panic!("expected matching retirement target");
         };
-
-        assert_eq!(target.tab_id, "tab-current");
-        assert_eq!(target.pane_id, "pane-current");
-        assert!(target.owns_tab);
     }
 
     #[test]
@@ -782,15 +741,11 @@ mod tests {
         replacement.provider_session = Some(provider("replacement-session"));
         inventory.workers.push(replacement);
 
-        let RetirementResolution::Target(target) =
+        let RetirementResolution::Target =
             retirement_resolution(&inventory, &request(provider("session-1")))
         else {
             panic!("expected moved retirement target");
         };
-
-        assert_eq!(target.tab_id, "tab-moved");
-        assert_eq!(target.pane_id, "pane-moved");
-        assert!(!target.owns_tab);
     }
 
     #[test]
@@ -806,21 +761,6 @@ mod tests {
     }
 
     #[test]
-    fn retirement_does_not_transfer_captured_tab_ownership() {
-        let mut request = request(provider("session-1"));
-        request.tab_id = Some("tab-captured".to_owned());
-        let RetirementResolution::Target(target) =
-            retirement_resolution(&inventory(provider("session-1"), 1), &request)
-        else {
-            panic!("expected matching retirement target");
-        };
-
-        assert_eq!(target.tab_id, "tab-current");
-        assert_eq!(target.pane_id, "pane-current");
-        assert!(!target.owns_tab);
-    }
-
-    #[test]
     fn retirement_converges_without_closing_a_reused_terminal_identity() {
         let resolution = retirement_resolution(
             &inventory(provider("replacement-session"), 1),
@@ -831,16 +771,32 @@ mod tests {
     }
 
     #[test]
-    fn retirement_closes_only_the_pane_when_the_tab_is_shared() {
-        let RetirementResolution::Target(target) = retirement_resolution(
-            &inventory(provider("session-1"), 2),
-            &request(provider("session-1")),
-        ) else {
-            panic!("expected matching retirement target");
-        };
+    fn retirement_fails_closed_when_identity_changes_after_inventory() {
+        let request = request(provider("original-session"));
+        let captured_inventory = inventory(provider("original-session"), 1);
+        assert!(matches!(
+            retirement_resolution(&captured_inventory, &request),
+            RetirementResolution::Target
+        ));
 
-        assert!(!target.owns_tab);
-        assert_eq!(target.pane_id, "pane-current");
+        let live_after_inventory = inventory(provider("replacement-session"), 1);
+        let stale_result = retirement_outcome(&captured_inventory, &request);
+
+        assert!(matches!(
+            stale_result,
+            Err(RuntimeRetirementError::AtomicIdentityGuardUnavailable)
+        ));
+        assert_eq!(
+            live_after_inventory.workers[0]
+                .provider_session
+                .as_ref()
+                .map(|session| session.value.as_str()),
+            Some("replacement-session")
+        );
+        assert!(matches!(
+            retirement_outcome(&live_after_inventory, &request),
+            Err(RuntimeRetirementError::IdentityNotObserved)
+        ));
     }
 
     #[test]
@@ -859,7 +815,7 @@ mod tests {
         request.pane_id = "pane-current".to_owned();
         assert!(matches!(
             retirement_resolution(&inventory, &request),
-            RetirementResolution::Target(_)
+            RetirementResolution::Target
         ));
     }
 
@@ -880,10 +836,12 @@ mod tests {
     fn retirement_treats_a_fully_absent_captured_terminal_as_converged() {
         let mut inventory = inventory(provider("session-1"), 1);
         inventory.workers.clear();
+        let request = request(provider("session-1"));
 
         assert!(matches!(
-            retirement_resolution(&inventory, &request(provider("session-1"))),
+            retirement_resolution(&inventory, &request),
             RetirementResolution::Absent
         ));
+        assert!(retirement_outcome(&inventory, &request).is_ok());
     }
 }

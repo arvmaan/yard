@@ -74,7 +74,6 @@ pub struct RuntimeRetirementRequest {
     pub pane_id: String,
     pub provider_session: Option<ProviderSessionRef>,
     pub owns_tab: bool,
-    pub require_identity_match: bool,
 }
 
 #[derive(Debug, Error)]
@@ -85,6 +84,10 @@ pub enum RuntimeRetirementError {
     Runtime(String),
     #[error("the captured runtime identity is not currently observable")]
     IdentityNotObserved,
+    #[error(
+        "Herdr protocol 19 cannot atomically guard tab.close or pane.close by runtime identity"
+    )]
+    AtomicIdentityGuardUnavailable,
 }
 
 #[async_trait]

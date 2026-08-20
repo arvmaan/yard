@@ -16,9 +16,9 @@ use yard_store::{ProjectStoreError, YardStore};
 
 use crate::{
     allocation_service::{
-        AllocationServiceError, RuntimeControl, RuntimeProvisionError, RuntimeRetirementRequest,
-        RuntimeSessionRequest, RuntimeWorkspaceProvisionRequest, assignment_prompt, provider_args,
-        validate_supported_profile,
+        AllocationServiceError, RuntimeControl, RuntimeProvisionError, RuntimeRetirementError,
+        RuntimeRetirementRequest, RuntimeSessionRequest, RuntimeWorkspaceProvisionRequest,
+        assignment_prompt, provider_args, validate_supported_profile,
     },
     intervention_service::{RuntimeIntervention, RuntimePromptRequest},
     reconciliation_service::{ReconciliationService, ReconciliationServiceError},
@@ -535,13 +535,17 @@ impl YardOrchestratorService {
             pane_id: runtime.pane_id,
             provider_session: runtime.provider_session,
             owns_tab: runtime.owns_tab,
-            require_identity_match: true,
         };
         let deadline = Instant::now() + RUNTIME_IDENTITY_TIMEOUT;
         loop {
             match self.runtime.retire_runtime(request.clone()).await {
                 Ok(()) => break,
-                Err(_) if Instant::now() < deadline => {
+                Err(error)
+                    if !matches!(
+                        &error,
+                        RuntimeRetirementError::AtomicIdentityGuardUnavailable
+                    ) && Instant::now() < deadline =>
+                {
                     sleep(Duration::from_millis(100)).await;
                 }
                 Err(error) => {
@@ -700,6 +704,7 @@ mod tests {
         never_ready: AtomicBool,
         retirement_identity_misses: AtomicUsize,
         retirement_runtime_failures: AtomicUsize,
+        retirement_guard_unavailable: AtomicBool,
         session_requests: Mutex<Vec<RuntimeSessionRequest>>,
         bootstrap_requests: Mutex<Vec<RuntimeWorkspaceProvisionRequest>>,
         prompt_requests: Mutex<Vec<crate::intervention_service::RuntimePromptRequest>>,
@@ -853,6 +858,9 @@ mod tests {
             request: RuntimeRetirementRequest,
         ) -> Result<(), RuntimeRetirementError> {
             self.retirement_calls.lock().unwrap().push(request);
+            if self.retirement_guard_unavailable.load(Ordering::SeqCst) {
+                return Err(RuntimeRetirementError::AtomicIdentityGuardUnavailable);
+            }
             if self
                 .retirement_runtime_failures
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -1288,7 +1296,6 @@ mod tests {
         assert_eq!(retirement.pane_id, "pane-yard-orchestrator");
         assert!(retirement.provider_session.is_some());
         assert!(retirement.owns_tab);
-        assert!(retirement.require_identity_match);
     }
 
     #[tokio::test]
@@ -1308,6 +1315,23 @@ mod tests {
         let retirements = runtime.retirement_calls.lock().unwrap();
         assert_eq!(retirements.len(), 1);
         assert_eq!(retirements[0].terminal_id, "terminal-yard-orchestrator");
-        assert!(retirements[0].require_identity_match);
+    }
+
+    #[tokio::test]
+    async fn orphan_retirement_stops_when_atomic_identity_guard_is_unavailable() {
+        let runtime = Arc::new(DedicatedRuntime::default());
+        runtime.fail_prompt_delivery.store(true, Ordering::SeqCst);
+        runtime
+            .retirement_guard_unavailable
+            .store(true, Ordering::SeqCst);
+        let (service, _store, _temp, profile_id) = service(runtime.clone()).await;
+
+        let error = service.provision(command(&profile_id)).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::YardOrchestratorServiceError::ObjectiveDeliveryFailed(_)
+        ));
+        assert_eq!(runtime.retirement_calls.lock().unwrap().len(), 1);
     }
 }
