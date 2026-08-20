@@ -6,6 +6,8 @@ import type {
   AutomationRuns,
   Automations,
   Assignments,
+  ChangedProjectOrchestrator,
+  ChangeProjectOrchestratorInput,
   ConfirmedAllocation,
   ConfirmedProjectCreation,
   ConfirmedWorkerHandoff,
@@ -141,6 +143,22 @@ export function fetchInventory(
 
 export function fetchProjects(signal?: AbortSignal): Promise<Projects> {
   return requestJson('/api/v1/projects', { signal })
+}
+
+export function changeProjectOrchestrator(
+  projectId: string,
+  command: ChangeProjectOrchestratorInput,
+  signal?: AbortSignal,
+): Promise<ChangedProjectOrchestrator> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/orchestrator`,
+    {
+      body: JSON.stringify(command),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'PUT',
+      signal,
+    },
+  )
 }
 
 export function fetchProjectRelationships(

@@ -1717,11 +1717,11 @@ function buildNodes(
     const allProjectAssignments = assignments.filter(
       (assignment) => assignment.project_id === project.id,
     )
-    const projectAssignments = allProjectAssignments.filter((assignment) =>
-      isVisibleAssignment(assignment, project),
+    const activeVisibleAssignments = allProjectAssignments.filter(
+      (assignment) => isVisibleAssignment(assignment, project),
     )
     const assignedTerminalIdentities = new Set(
-      projectAssignments
+      activeVisibleAssignments
         .map((assignment) =>
           runtimeTerminalIdentity(assignment.worker.runtime),
         )
@@ -1767,7 +1767,7 @@ function buildNodes(
         nodeId: `worker:${worker.runtime_id}`,
         session: worker.provider_session,
       })),
-      ...projectAssignments.map((assignment) => {
+      ...activeVisibleAssignments.map((assignment) => {
         const observed = observedWorker(
           project,
           assignment.worker.runtime,
@@ -1784,7 +1784,7 @@ function buildNodes(
     ]
     const linkedChildren = linkedChildAgents(inventory, childRoots)
     const rootWorkerCount =
-      1 + workers.length + projectAssignments.length
+      1 + workers.length + activeVisibleAssignments.length
     const visibleWorkerCount = rootWorkerCount
     const childAgentCount = linkedChildren.length
     const treeLayout = layoutAgentTrees(
@@ -1921,7 +1921,7 @@ function buildNodes(
         }
       },
     )
-    const assignedNodes: AssignedWorkerNode[] = projectAssignments.map(
+    const assignedNodes: AssignedWorkerNode[] = activeVisibleAssignments.map(
       (assignment, assignmentIndex) => {
         const observed = observedWorker(
           project,

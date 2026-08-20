@@ -37,6 +37,8 @@ import {
   X,
 } from 'lucide-react'
 import {
+  YardApiError,
+  changeProjectOrchestrator,
   confirmWorkerHandoff,
   confirmWorkerAssignment,
   createAutomation,
@@ -164,6 +166,7 @@ import {
   writeMapVisualMode,
   type MapVisualMode,
 } from './mapVisualMode'
+import { useModalDialog } from './useModalDialog'
 import type {
   Artifact,
   Assignment,
@@ -368,6 +371,37 @@ function findObservedWorker(
     (worker) => worker.terminal_id === runtime.terminal_id,
   )
   return matches.length === 1 ? matches[0] : undefined
+}
+
+function eligibleProjectOrchestratorCandidates(
+  inventory: RuntimeInventory | null,
+  project: Project,
+  candidates: WorkerCandidate[],
+) {
+  if (!project.orchestrator.runtime) return []
+
+  return candidates.filter((candidate) => {
+    const runtime = candidate.worker.runtime
+    if (
+      candidate.availability !== 'unassigned_live' ||
+      candidate.worker.desired_state !== 'running' ||
+      !runtime ||
+      runtime.adapter !== project.runtime.adapter ||
+      runtime.session !== project.runtime.session ||
+      runtime.workspace_id !== project.runtime.workspace_id ||
+      runtime.observation_state !== 'observed' ||
+      runtime.process_state !== 'running'
+    ) {
+      return false
+    }
+
+    const observed = findObservedWorker(inventory, runtime)
+    return Boolean(
+      observed?.interactive_ready &&
+      !observed.launch_pending &&
+      observed.workspace_id === project.runtime.workspace_id,
+    )
+  })
 }
 
 function findCandidateForObservedWorker(
@@ -1000,12 +1034,169 @@ function YardOrchestratorInspector({
   )
 }
 
+function ProjectOrchestratorTransferDialog({
+  busy,
+  candidates,
+  error,
+  onClose,
+  onConfirm,
+  project,
+  returnFocus,
+}: {
+  busy: boolean
+  candidates: WorkerCandidate[]
+  error: string | null
+  onClose: () => void
+  onConfirm: (workerId: string) => Promise<void>
+  project: Project
+  returnFocus: HTMLElement | null
+}) {
+  const dialogRef = useRef<HTMLElement>(null)
+  const selectRef = useRef<HTMLSelectElement>(null)
+  const [workerId, setWorkerId] = useState(
+    candidates[0]?.worker.id ?? '',
+  )
+  const selectedCandidate = candidates.find(
+    (candidate) => candidate.worker.id === workerId,
+  )
+  useModalDialog({
+    canClose: !busy,
+    dialogRef,
+    initialFocusRef: selectRef,
+    onClose,
+    returnFocus,
+  })
+
+  useEffect(() => {
+    setWorkerId((current) =>
+      candidates.some((candidate) => candidate.worker.id === current)
+        ? current
+        : (candidates[0]?.worker.id ?? ''),
+    )
+  }, [candidates])
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault()
+    if (workerId) void onConfirm(workerId)
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section
+        aria-labelledby="project-orchestrator-transfer-title"
+        aria-modal="true"
+        className="control-dialog orchestrator-transfer-dialog"
+        ref={dialogRef}
+        role="dialog"
+      >
+        <header className="dialog-heading">
+          <div>
+            <p className="eyebrow">Project ownership</p>
+            <h2 id="project-orchestrator-transfer-title">
+              Change orchestrator
+            </h2>
+          </div>
+          <button
+            aria-label="Close orchestrator change"
+            className="icon-button"
+            disabled={busy}
+            onClick={onClose}
+            title="Close"
+            type="button"
+          >
+            <X aria-hidden="true" size={17} />
+          </button>
+        </header>
+        <form className="dialog-form" onSubmit={submit}>
+          <label>
+            <span>Next orchestrator</span>
+            <select
+              disabled={busy || candidates.length === 0}
+              onChange={(event) => setWorkerId(event.target.value)}
+              ref={selectRef}
+              value={workerId}
+            >
+              {candidates.map((candidate) => (
+                <option
+                  key={candidate.worker.id}
+                  value={candidate.worker.id}
+                >
+                  {candidateLabel(candidate)} -{' '}
+                  {candidate.worker.runtime?.terminal_id}
+                </option>
+              ))}
+            </select>
+          </label>
+          {selectedCandidate ? (
+            <div className="ownership-transfer-impact">
+              <ArrowRightLeft aria-hidden="true" size={17} />
+              <p>
+                <span>
+                  {`${candidateLabel(selectedCandidate)} takes project orchestration for ${project.name}. The current orchestrator (${project.orchestrator.id}) remains live and becomes unassigned.`}
+                </span>
+                <small>
+                  This transfers ownership only; it does not create or end a
+                  runtime.
+                </small>
+              </p>
+            </div>
+          ) : (
+            <div className="dialog-error" role="alert">
+              <CircleAlert aria-hidden="true" size={16} />
+              <span>
+                No live unassigned worker is currently eligible for this
+                project.
+              </span>
+            </div>
+          )}
+          {error ? (
+            <div className="dialog-error" role="alert">
+              <CircleAlert aria-hidden="true" size={16} />
+              <span>{error}</span>
+            </div>
+          ) : null}
+          <footer className="dialog-actions">
+            <button
+              className="secondary-button"
+              disabled={busy}
+              onClick={onClose}
+              type="button"
+            >
+              Cancel
+            </button>
+            <button
+              className="command-button"
+              disabled={busy || !selectedCandidate}
+              type="submit"
+            >
+              {busy ? (
+                <LoaderCircle
+                  aria-hidden="true"
+                  className="status-spin"
+                  size={16}
+                />
+              ) : (
+                <ArrowRightLeft aria-hidden="true" size={16} />
+              )}
+              Change orchestrator
+            </button>
+          </footer>
+        </form>
+      </section>
+    </div>
+  )
+}
+
 function ProjectOrchestratorInspector({
+  candidates,
   inventory,
+  onChange,
   project,
   statusReport,
 }: {
+  candidates: WorkerCandidate[]
   inventory: RuntimeInventory | null
+  onChange: (trigger: HTMLButtonElement) => void
   project: Project
   statusReport: StatusReport | undefined
 }) {
@@ -1042,6 +1233,20 @@ function ProjectOrchestratorInspector({
           <DetailRow label="Herdr session" value={runtime?.session} mono />
           <DetailRow label="Terminal" value={runtime?.terminal_id} mono />
         </dl>
+        <button
+          className="secondary-button project-orchestrator-transfer"
+          disabled={candidates.length === 0}
+          onClick={(event) => onChange(event.currentTarget)}
+          title={
+            candidates.length === 0
+              ? 'No eligible live unassigned workers in this project workspace'
+              : 'Transfer project orchestration'
+          }
+          type="button"
+        >
+          <ArrowRightLeft aria-hidden="true" size={15} />
+          Change orchestrator
+        </button>
       </section>
       <WorkerInterventions
         key={[
@@ -2010,6 +2215,16 @@ function App() {
   } | null>(null)
   const [handoffBusy, setHandoffBusy] = useState(false)
   const [handoffError, setHandoffError] = useState<string | null>(null)
+  const [projectOrchestratorTransfer, setProjectOrchestratorTransfer] =
+    useState<{
+      commandId: string
+      projectId: string
+      returnFocus: HTMLElement | null
+    } | null>(null)
+  const [projectOrchestratorTransferBusy, setProjectOrchestratorTransferBusy] =
+    useState(false)
+  const [projectOrchestratorTransferError, setProjectOrchestratorTransferError] =
+    useState<string | null>(null)
   const [completionProposal, setCompletionProposal] = useState<{
     assignment: Assignment
     commandId: string
@@ -2581,6 +2796,33 @@ function App() {
     selection?.kind === 'orchestrator'
       ? projects.find((project) => project.id === selection.projectId)
       : undefined
+  const selectedProjectOrchestratorCandidates = useMemo(
+    () =>
+      selectedProjectOrchestrator
+        ? eligibleProjectOrchestratorCandidates(
+            inventory,
+            selectedProjectOrchestrator,
+            workerCandidates,
+          )
+        : [],
+    [inventory, selectedProjectOrchestrator, workerCandidates],
+  )
+  const projectOrchestratorTransferProject = projectOrchestratorTransfer
+    ? projects.find(
+        (project) => project.id === projectOrchestratorTransfer.projectId,
+      )
+    : undefined
+  const projectOrchestratorTransferCandidates = useMemo(
+    () =>
+      projectOrchestratorTransferProject
+        ? eligibleProjectOrchestratorCandidates(
+            inventory,
+            projectOrchestratorTransferProject,
+            workerCandidates,
+          )
+        : [],
+    [inventory, projectOrchestratorTransferProject, workerCandidates],
+  )
   const selectedYardOrchestrator =
     selection?.kind === 'yard-orchestrator'
       ? yardOrchestrator ?? undefined
@@ -3078,6 +3320,148 @@ function App() {
       setOrchestratorWorkflowBusy(false)
     }
   }, [loadOrchestratorWorkflowProfile, orchestratorWorkflowProfile])
+
+  const proposeProjectOrchestratorTransfer = useCallback(
+    (project: Project, returnFocus: HTMLElement) => {
+      setActionError(null)
+      setActionNotice(null)
+      setProjectOrchestratorTransferError(null)
+      setProjectOrchestratorTransfer({
+        commandId: crypto.randomUUID(),
+        projectId: project.id,
+        returnFocus,
+      })
+    },
+    [],
+  )
+
+  const transferProjectOrchestrator = useCallback(
+    async (workerId: string) => {
+      if (!projectOrchestratorTransfer) return
+      const project = projects.find(
+        (candidate) =>
+          candidate.id === projectOrchestratorTransfer.projectId,
+      )
+      const candidate = workerCandidates.find(
+        ({ worker }) => worker.id === workerId,
+      )
+      const workerRuntime = candidate?.worker.runtime
+      const orchestratorRuntime = project?.orchestrator.runtime
+      if (
+        !project ||
+        !candidate ||
+        !workerRuntime ||
+        !orchestratorRuntime ||
+        !eligibleProjectOrchestratorCandidates(
+          inventory,
+          project,
+          [candidate],
+        ).length
+      ) {
+        setProjectOrchestratorTransferError(
+          'The selected worker is no longer eligible. Choose a refreshed candidate.',
+        )
+        await Promise.all([
+          loadProjects(),
+          loadWorkers(),
+          loadInventory(selectedSession),
+        ]).catch(() => undefined)
+        return
+      }
+
+      setProjectOrchestratorTransferBusy(true)
+      setProjectOrchestratorTransferError(null)
+      setActionError(null)
+      try {
+        const result = await changeProjectOrchestrator(project.id, {
+          command_id: projectOrchestratorTransfer.commandId,
+          actor: 'local-user',
+          worker_id: candidate.worker.id,
+          expected_worker_version: candidate.worker.version,
+          expected_worker_runtime: workerRuntime,
+          expected_project_version: project.version,
+          expected_orchestrator_worker_id: project.orchestrator.id,
+          expected_orchestrator_worker_version: project.orchestrator.version,
+          expected_orchestrator_runtime: orchestratorRuntime,
+        })
+        setProjects((current) =>
+          current.map((item) =>
+            item.id === result.project.id ? result.project : item,
+          ),
+        )
+        try {
+          await Promise.all([
+            loadProjects(),
+            loadWorkers(),
+            loadInventory(selectedSession),
+          ])
+        } catch (caught) {
+          setActionError(
+            caught instanceof Error
+              ? `Orchestrator changed, but refresh failed: ${caught.message}`
+              : 'Orchestrator changed, but refresh failed',
+          )
+        }
+        setProjectOrchestratorTransfer(null)
+      } catch (caught) {
+        let reconciledProject: Project | undefined
+        try {
+          const [projectResult] = await Promise.all([
+            fetchProjects(),
+            loadWorkers(),
+            loadInventory(selectedSession),
+          ])
+          setProjects(projectResult.projects)
+          await loadAssignments(
+            projectResult.projects.map((item) => item.id),
+          )
+          reconciledProject = projectResult.projects.find(
+            (item) => item.id === project.id,
+          )
+        } catch {
+          // Keep the original command ID when the outcome cannot be reconciled.
+        }
+
+        if (reconciledProject?.orchestrator.id === workerId) {
+          setProjectOrchestratorTransferError(null)
+          setProjectOrchestratorTransfer(null)
+          setActionNotice(
+            'Orchestrator changed. Yard reconciled the project after the response was unavailable.',
+          )
+        } else {
+          setProjectOrchestratorTransferError(
+            caught instanceof Error
+              ? caught.message
+              : 'Project orchestrator change failed',
+          )
+          if (
+            caught instanceof YardApiError &&
+            (caught.code === 'project_orchestrator_transfer_conflict' ||
+              caught.code === 'project_orchestrator_identity_changed')
+          ) {
+            setProjectOrchestratorTransfer((current) =>
+              current
+                ? { ...current, commandId: crypto.randomUUID() }
+                : current,
+            )
+          }
+        }
+      } finally {
+        setProjectOrchestratorTransferBusy(false)
+      }
+    },
+    [
+      inventory,
+      loadInventory,
+      loadAssignments,
+      loadProjects,
+      loadWorkers,
+      projectOrchestratorTransfer,
+      projects,
+      selectedSession,
+      workerCandidates,
+    ],
+  )
 
   const proposeEndSession = useCallback((candidate: WorkerCandidate) => {
     if (!canEndCandidate(candidate)) return
@@ -4820,7 +5204,14 @@ function App() {
           />
         ) : selectedProjectOrchestrator ? (
           <ProjectOrchestratorInspector
+            candidates={selectedProjectOrchestratorCandidates}
             inventory={inventory}
+            onChange={(trigger) =>
+              proposeProjectOrchestratorTransfer(
+                selectedProjectOrchestrator,
+                trigger,
+              )
+            }
             project={selectedProjectOrchestrator}
             statusReport={
               projectStatusReports[selectedProjectOrchestrator.id]
@@ -5103,6 +5494,22 @@ function App() {
           sourceAssignment={handoffProposal.sourceAssignment}
           sourceProject={handoffProposal.sourceProject}
           targetProject={handoffProposal.targetProject}
+        />
+      ) : null}
+      {projectOrchestratorTransfer &&
+      projectOrchestratorTransferProject ? (
+        <ProjectOrchestratorTransferDialog
+          busy={projectOrchestratorTransferBusy}
+          candidates={projectOrchestratorTransferCandidates}
+          error={projectOrchestratorTransferError}
+          onClose={() => {
+            if (projectOrchestratorTransferBusy) return
+            setProjectOrchestratorTransferError(null)
+            setProjectOrchestratorTransfer(null)
+          }}
+          onConfirm={transferProjectOrchestrator}
+          project={projectOrchestratorTransferProject}
+          returnFocus={projectOrchestratorTransfer.returnFocus}
         />
       ) : null}
       {completionProposal ? (

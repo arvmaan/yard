@@ -10,6 +10,7 @@ import type {
   Assignment,
   Automation,
   AutomationRun,
+  ChangeProjectOrchestratorInput,
   CompletionReceipt,
   ConfigureYardOrchestratorInput,
   CoordinationNode,
@@ -410,9 +411,11 @@ interface MockState {
   projectRelationships: ProjectRelationship[]
   projects: ReturnType<typeof initialProjects>
   projectRequests: number
+  projectOrchestratorCommands: ChangeProjectOrchestratorInput[]
   assignmentRequests: number
   profiles: ReturnType<typeof profile>[]
   workerCandidates: WorkerCandidate[]
+  workerRequests: number
   assignments: Assignment[]
   runtimeInventory: typeof inventory
   runtimeSessions: Array<{
@@ -529,6 +532,7 @@ async function mockApi(
       | 'command_outcome_ambiguous'
       | 'command_previously_failed'
     promptLosesResponseOnce?: boolean
+    projectOrchestratorStaleOnce?: boolean
     reconcileWorkerOnInventory?: boolean
     sessionWait?: Promise<void>
     orchestratorStatusReports?: Record<string, unknown>
@@ -598,12 +602,14 @@ async function mockApi(
     projectRelationships: [],
     projects: initialProjectState,
     projectRequests: 0,
+    projectOrchestratorCommands: [],
     assignmentRequests: 0,
     profiles: initialProfileState,
     workerCandidates: initialWorkerCandidates(
       initialProjectState,
       initialProfileState,
     ),
+    workerRequests: 0,
     assignments: [],
     runtimeInventory: {
       ...inventory,
@@ -653,6 +659,8 @@ async function mockApi(
   let completionFailsOnce = options.completionFailsOnce ?? false
   let promptDurableFailureOnce = options.promptDurableFailureOnce
   let promptLosesResponseOnce = options.promptLosesResponseOnce ?? false
+  let projectOrchestratorStaleOnce =
+    options.projectOrchestratorStaleOnce ?? false
   const promptAcknowledgements = new Map<
     string,
     {
@@ -1108,6 +1116,7 @@ async function mockApi(
 
   await page.route('**/api/v1/workers', async (route) => {
     if (route.request().method() === 'GET') {
+      state.workerRequests += 1
       await route.fulfill({ json: { workers: state.workerCandidates } })
       return
     }
@@ -1555,6 +1564,9 @@ async function mockApi(
     const placementMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)\/placement$/,
     )
+    const orchestratorTransferMatch = url.pathname.match(
+      /^\/api\/v1\/projects\/([^/]+)\/orchestrator$/,
+    )
     const assignmentMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)\/assignments$/,
     )
@@ -1582,6 +1594,153 @@ async function mockApi(
     const orchestratorTerminalOutputMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)\/orchestrator\/terminal-output$/,
     )
+
+    if (orchestratorTransferMatch && request.method() === 'PUT') {
+      const projectId = decodeURIComponent(orchestratorTransferMatch[1])
+      const input =
+        request.postDataJSON() as ChangeProjectOrchestratorInput
+      state.projectOrchestratorCommands.push(input)
+      const projectIndex = state.projects.findIndex(
+        (candidate) => candidate.id === projectId,
+      )
+      const workerIndex = state.workerCandidates.findIndex(
+        (candidate) => candidate.worker.id === input.worker_id,
+      )
+      if (projectIndex < 0 || workerIndex < 0) {
+        await route.fulfill({ status: 404 })
+        return
+      }
+
+      let currentProject = state.projects[projectIndex]
+      let selectedCandidate = state.workerCandidates[workerIndex]
+      if (projectOrchestratorStaleOnce) {
+        projectOrchestratorStaleOnce = false
+        const now = Date.now()
+        const bumpedOrchestrator = {
+          ...currentProject.orchestrator,
+          version: String(Number(currentProject.orchestrator.version) + 1),
+          updated_at_unix_ms: now,
+        }
+        const bumpedWorker = {
+          ...selectedCandidate.worker,
+          version: String(Number(selectedCandidate.worker.version) + 1),
+          updated_at_unix_ms: now,
+        }
+        currentProject = {
+          ...currentProject,
+          orchestrator: bumpedOrchestrator,
+          version: String(Number(currentProject.version) + 1),
+          updated_at_unix_ms: now,
+        }
+        selectedCandidate = {
+          ...selectedCandidate,
+          worker: bumpedWorker,
+        }
+        state.projects[projectIndex] = currentProject
+        state.workerCandidates[workerIndex] = selectedCandidate
+        const orchestratorCandidateIndex = state.workerCandidates.findIndex(
+          (candidate) =>
+            candidate.worker.id === bumpedOrchestrator.id,
+        )
+        if (orchestratorCandidateIndex >= 0) {
+          state.workerCandidates[orchestratorCandidateIndex] = {
+            ...state.workerCandidates[orchestratorCandidateIndex],
+            worker: bumpedOrchestrator,
+          }
+        }
+        await route.fulfill({
+          status: 409,
+          json: {
+            error: {
+              code: 'project_orchestrator_transfer_conflict',
+              message:
+                'Project ownership changed. Review the refreshed workers and retry.',
+            },
+          },
+        })
+        return
+      }
+
+      const workerRuntime = selectedCandidate.worker.runtime
+      const orchestratorRuntime = currentProject.orchestrator.runtime
+      const validIdentity =
+        selectedCandidate.availability === 'unassigned_live' &&
+        workerRuntime?.adapter === currentProject.runtime.adapter &&
+        workerRuntime.session === currentProject.runtime.session &&
+        workerRuntime.workspace_id === currentProject.runtime.workspace_id &&
+        input.expected_worker_version === selectedCandidate.worker.version &&
+        input.expected_project_version === currentProject.version &&
+        input.expected_orchestrator_worker_id ===
+          currentProject.orchestrator.id &&
+        input.expected_orchestrator_worker_version ===
+          currentProject.orchestrator.version &&
+        JSON.stringify(input.expected_worker_runtime) ===
+          JSON.stringify(workerRuntime) &&
+        JSON.stringify(input.expected_orchestrator_runtime) ===
+          JSON.stringify(orchestratorRuntime)
+      if (!validIdentity) {
+        await route.fulfill({
+          status: 409,
+          json: {
+            error: {
+              code: 'project_orchestrator_identity_changed',
+              message:
+                'Project or worker runtime identity changed. Refresh and retry.',
+            },
+          },
+        })
+        return
+      }
+
+      const now = Date.now()
+      const replacedWorker = {
+        ...currentProject.orchestrator,
+        version: String(Number(currentProject.orchestrator.version) + 1),
+        updated_at_unix_ms: now,
+      }
+      const nextOrchestrator = {
+        ...selectedCandidate.worker,
+        version: String(Number(selectedCandidate.worker.version) + 1),
+        updated_at_unix_ms: now,
+      }
+      const updatedProject = {
+        ...currentProject,
+        orchestrator: nextOrchestrator,
+        version: String(Number(currentProject.version) + 1),
+        updated_at_unix_ms: now,
+      }
+      state.projects[projectIndex] = updatedProject
+      state.workerCandidates[workerIndex] = {
+        ...selectedCandidate,
+        worker: nextOrchestrator,
+        availability: 'orchestrator',
+        project_id: currentProject.id,
+        assignment_id: null,
+        reason: 'Project orchestrators cannot be reallocated.',
+      }
+      const replacedCandidateIndex = state.workerCandidates.findIndex(
+        (candidate) => candidate.worker.id === replacedWorker.id,
+      )
+      if (replacedCandidateIndex >= 0) {
+        state.workerCandidates[replacedCandidateIndex] = {
+          ...state.workerCandidates[replacedCandidateIndex],
+          worker: replacedWorker,
+          availability: 'unassigned_live',
+          project_id: null,
+          assignment_id: null,
+          reason: 'Live worker is not assigned to a project.',
+        }
+      }
+      await route.fulfill({
+        json: {
+          command_id: input.command_id,
+          project: updatedProject,
+          replaced_worker_id: replacedWorker.id,
+          replayed: false,
+        },
+      })
+      return
+    }
 
     if (artifactContentMatch && request.method() === 'GET') {
       const artifactId = decodeURIComponent(artifactContentMatch[3])
@@ -3750,7 +3909,7 @@ test('keeps exactly one durable orchestrator visible across selected sessions', 
   })
 })
 
-test('projects active assignments once and completed live workers as observed', async ({
+test('projects active assignments once and historical live workers as observed', async ({
   page,
 }, testInfo) => {
   const state = await mockApi(page)
@@ -3783,9 +3942,26 @@ test('projects active assignments once and completed live workers as observed', 
     created_at_unix_ms: Date.now(),
   }
   state.assignments.push(completed)
+  const failed = assignment(
+    'assignment-failed-live',
+    'project-1',
+    state.profiles[0],
+    'Keep the failed worker available for diagnosis.',
+    'implementer',
+    durableWorker(
+      'worker-failed-live',
+      'terminal-5',
+      state.profiles[0],
+    ),
+  )
+  failed.lifecycle = 'failed'
+  failed.attempt.lifecycle = 'failed'
+  failed.attempt.error = 'Synthetic historical failure.'
+  state.assignments.push(failed)
   const activeTerminalId = active.worker.runtime?.terminal_id
   const completedTerminalId = completed.worker.runtime?.terminal_id
-  if (!activeTerminalId || !completedTerminalId) {
+  const failedTerminalId = failed.worker.runtime?.terminal_id
+  if (!activeTerminalId || !completedTerminalId || !failedTerminalId) {
     throw new Error('Projection fixtures require terminal-backed workers')
   }
   await page.setViewportSize({ width: 1280, height: 800 })
@@ -3804,6 +3980,12 @@ test('projects active assignments once and completed live workers as observed', 
   const completedObservedNode = page.locator(
     `.react-flow__node-worker[data-id="worker:${completedTerminalId}"]`,
   )
+  const failedMarker = page.locator(
+    `.assigned-worker-marker[data-worker-id="${failed.worker.id}"]`,
+  )
+  const failedObservedNode = page.locator(
+    `.react-flow__node-worker[data-id="worker:${failedTerminalId}"]`,
+  )
   const projectNode = page.locator(
     '.react-flow__node-project[data-id="project:project-1"]',
   )
@@ -3815,6 +3997,9 @@ test('projects active assignments once and completed live workers as observed', 
     await expect(completedMarker).toHaveCount(0)
     await expect(completedObservedNode).toHaveCount(1)
     await expect(completedObservedNode).toBeVisible()
+    await expect(failedMarker).toHaveCount(0)
+    await expect(failedObservedNode).toHaveCount(1)
+    await expect(failedObservedNode).toBeVisible()
 
     const [projectBox, workerBox] = await Promise.all([
       projectNode.boundingBox(),
@@ -3836,7 +4021,7 @@ test('projects active assignments once and completed live workers as observed', 
   await page.reload()
   await expectProjection()
   await page.screenshot({
-    path: testInfo.outputPath('worker-projection-active-completed.png'),
+    path: testInfo.outputPath('worker-projection-active-historical.png'),
     fullPage: true,
   })
 })
@@ -7912,6 +8097,251 @@ test('controls the project orchestrator terminal, output, and prompt idempotentl
   ])
 
   await page.setViewportSize({ width: 390, height: 844 })
+})
+
+test('changes a project orchestrator only to an eligible live workspace worker', async ({
+  page,
+}, testInfo) => {
+  const state = await mockApi(page)
+  state.projects[0].name = 'Yard'
+  const eligibleIndex = state.workerCandidates.findIndex(
+    (candidate) => candidate.worker.id === 'worker-unassigned',
+  )
+  state.workerCandidates[eligibleIndex] = {
+    ...state.workerCandidates[eligibleIndex],
+    profile_name: 'Ready worker',
+  }
+  const originalProject = structuredClone(state.projects[0])
+  const eligibleWorker = structuredClone(
+    state.workerCandidates[eligibleIndex].worker,
+  )
+  const wrongWorkspaceWorker = durableWorker(
+    'worker-wrong-workspace',
+    'terminal-7',
+    state.profiles[0],
+    'workspace-2',
+  )
+  const wrongSessionWorker = durableWorker(
+    'worker-wrong-session',
+    'terminal-beta',
+    state.profiles[0],
+    'workspace-1',
+    'beta',
+  )
+  const wrongAdapterWorker = durableWorker(
+    'worker-wrong-adapter',
+    'terminal-other-adapter',
+    state.profiles[0],
+  )
+  wrongAdapterWorker.runtime = {
+    ...wrongAdapterWorker.runtime!,
+    adapter: 'other',
+  }
+  const unreadyWorker = durableWorker(
+    'worker-not-interactive',
+    'terminal-4',
+    state.profiles[0],
+  )
+  state.runtimeInventory.workers = state.runtimeInventory.workers.map(
+    (observed) =>
+      observed.terminal_id === 'terminal-4'
+        ? { ...observed, interactive_ready: false }
+        : observed,
+  )
+  state.workerCandidates.push(
+    {
+      worker: wrongWorkspaceWorker,
+      profile_name: 'Wrong workspace',
+      availability: 'unassigned_live',
+    },
+    {
+      worker: wrongSessionWorker,
+      profile_name: 'Wrong session',
+      availability: 'unassigned_live',
+    },
+    {
+      worker: wrongAdapterWorker,
+      profile_name: 'Wrong adapter',
+      availability: 'unassigned_live',
+    },
+    {
+      worker: unreadyWorker,
+      profile_name: 'Not interactive',
+      availability: 'unassigned_live',
+    },
+  )
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page
+    .locator('.orchestrator-marker[data-project-id="project-1"]')
+    .click()
+  const inspector = page.locator('.inspector')
+  await inspector
+    .getByRole('button', { name: 'Change orchestrator' })
+    .click()
+  const dialog = page.getByRole('dialog', { name: 'Change orchestrator' })
+  const workerSelect = dialog.getByLabel('Next orchestrator')
+  await expect(workerSelect.locator('option')).toHaveCount(1)
+  await expect(workerSelect).toHaveValue('worker-unassigned')
+  await expect(dialog.locator('.ownership-transfer-impact')).toContainText(
+    'Ready worker takes project orchestration for Yard',
+  )
+  await expect(dialog.locator('.ownership-transfer-impact')).toContainText(
+    'project-1-orchestrator) remains live and becomes unassigned',
+  )
+  await page.screenshot({
+    path: testInfo.outputPath('project-orchestrator-transfer-desktop.png'),
+    fullPage: true,
+  })
+
+  const requestCounts = {
+    inventory: state.inventoryRequests,
+    projects: state.projectRequests,
+    workers: state.workerRequests,
+  }
+  await dialog
+    .getByRole('button', { name: 'Change orchestrator' })
+    .click()
+  await expect.poll(() => state.projectOrchestratorCommands.length).toBe(1)
+  expect(state.projectOrchestratorCommands[0]).toMatchObject({
+    actor: 'local-user',
+    worker_id: eligibleWorker.id,
+    expected_worker_version: eligibleWorker.version,
+    expected_worker_runtime: eligibleWorker.runtime,
+    expected_project_version: originalProject.version,
+    expected_orchestrator_worker_id: originalProject.orchestrator.id,
+    expected_orchestrator_worker_version:
+      originalProject.orchestrator.version,
+    expected_orchestrator_runtime: originalProject.orchestrator.runtime,
+  })
+  await expect(dialog).toHaveCount(0)
+  await expect(
+    inspector
+      .getByRole('region', { name: 'Orchestrator runtime' })
+      .locator('.detail-row')
+      .filter({ hasText: 'Worker ID' }),
+  ).toContainText('worker-unassigned')
+  await expect(inspector.getByRole('heading', { name: 'Yard' })).toBeVisible()
+  expect(state.projectRequests).toBeGreaterThan(requestCounts.projects)
+  expect(state.workerRequests).toBeGreaterThan(requestCounts.workers)
+  expect(state.inventoryRequests).toBeGreaterThan(requestCounts.inventory)
+
+  const replacedCandidate = state.workerCandidates.find(
+    (candidate) => candidate.worker.id === 'project-1-orchestrator',
+  )
+  expect(replacedCandidate).toMatchObject({
+    availability: 'unassigned_live',
+    project_id: null,
+  })
+  expect(replacedCandidate?.worker.runtime).toEqual(
+    originalProject.orchestrator.runtime,
+  )
+
+  await inspector
+    .getByRole('button', { name: 'Open terminal', exact: true })
+    .click()
+  await expect(
+    page.locator('.agent-workspace-toolbar__target small'),
+  ).toHaveText('terminal-2')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  await page.getByRole('button', { name: 'Close terminal' }).click()
+  await page.getByRole('tab', { name: 'Workers' }).click()
+  await expect(
+    page.locator(
+      '.worker-row[data-worker-id="project-1-orchestrator"][data-availability="unassigned_live"]',
+    ),
+  ).toBeVisible()
+  await expect(
+    page.locator(
+      '.worker-row[data-worker-id="worker-unassigned"][data-availability="orchestrator"]',
+    ),
+  ).toBeVisible()
+})
+
+test('recovers a stale project orchestrator transfer on mobile', async ({
+  page,
+}, testInfo) => {
+  const state = await mockApi(page, {
+    projectOrchestratorStaleOnce: true,
+  })
+  state.projects[0].name = 'Yard'
+  const eligibleIndex = state.workerCandidates.findIndex(
+    (candidate) => candidate.worker.id === 'worker-unassigned',
+  )
+  state.workerCandidates[eligibleIndex] = {
+    ...state.workerCandidates[eligibleIndex],
+    profile_name: 'Ready worker',
+  }
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto('/')
+
+  await page
+    .locator('.orchestrator-marker[data-project-id="project-1"]')
+    .click()
+  const inspector = page.locator('.inspector')
+  await inspector
+    .getByRole('button', { name: 'Change orchestrator' })
+    .click()
+  const dialog = page.getByRole('dialog', { name: 'Change orchestrator' })
+  const dialogBounds = await dialog.boundingBox()
+  expect(dialogBounds?.x ?? -1).toBeGreaterThanOrEqual(0)
+  expect(
+    dialogBounds ? dialogBounds.x + dialogBounds.width : Infinity,
+  ).toBeLessThanOrEqual(390)
+
+  await dialog
+    .getByRole('button', { name: 'Change orchestrator' })
+    .click()
+  await expect(
+    dialog.getByText(
+      'Project ownership changed. Review the refreshed workers and retry.',
+    ),
+  ).toBeVisible()
+  await expect(dialog.getByLabel('Next orchestrator')).toHaveValue(
+    'worker-unassigned',
+  )
+  await expect.poll(() => state.projectOrchestratorCommands.length).toBe(1)
+  await page.screenshot({
+    path: testInfo.outputPath('project-orchestrator-transfer-mobile.png'),
+    fullPage: true,
+  })
+
+  await dialog
+    .getByRole('button', { name: 'Change orchestrator' })
+    .click()
+  await expect(dialog).toHaveCount(0)
+  await expect.poll(() => state.projectOrchestratorCommands.length).toBe(2)
+  expect(state.projectOrchestratorCommands[0].command_id).not.toBe(
+    state.projectOrchestratorCommands[1].command_id,
+  )
+  expect(state.projectOrchestratorCommands[1]).toMatchObject({
+    expected_project_version: '2',
+    expected_worker_version: '2',
+    expected_orchestrator_worker_version: '2',
+  })
+  await expect(
+    inspector
+      .getByRole('region', { name: 'Orchestrator runtime' })
+      .locator('.detail-row')
+      .filter({ hasText: 'Worker ID' }),
+  ).toContainText('worker-unassigned')
+  const overflow = await page.evaluate(() => ({
+    dialog:
+      document.querySelector<HTMLElement>('.orchestrator-transfer-dialog')
+        ?.scrollWidth ?? 0,
+    document:
+      document.documentElement.scrollWidth -
+      document.documentElement.clientWidth,
+    inspector:
+      document.querySelector<HTMLElement>('.inspector')?.scrollWidth ??
+      0,
+    inspectorClient:
+      document.querySelector<HTMLElement>('.inspector')?.clientWidth ??
+      0,
+  }))
+  expect(overflow.document).toBeLessThanOrEqual(0)
+  expect(overflow.inspector).toBeLessThanOrEqual(overflow.inspectorClient)
 })
 
 test('opens chat and terminal from an assigned worker in the worker rail', async ({

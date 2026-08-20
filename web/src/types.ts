@@ -243,6 +243,25 @@ export interface Projects {
   projects: Project[]
 }
 
+export interface ChangeProjectOrchestratorInput {
+  command_id: string
+  actor: string
+  worker_id: string
+  expected_worker_version: string
+  expected_worker_runtime: WorkerRuntimeBinding
+  expected_project_version: string
+  expected_orchestrator_worker_id: string
+  expected_orchestrator_worker_version: string
+  expected_orchestrator_runtime: WorkerRuntimeBinding
+}
+
+export interface ChangedProjectOrchestrator {
+  command_id: string
+  project: Project
+  replaced_worker_id: string
+  replayed: boolean
+}
+
 export type ProjectRelationshipKind = 'depends_on'
 
 export interface ProjectRelationship {
