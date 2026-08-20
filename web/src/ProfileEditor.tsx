@@ -1,12 +1,12 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { useEffect, useReducer, useRef, type FormEvent } from 'react'
 import { LoaderCircle, Save, X } from 'lucide-react'
 import type {
   CreateWorkerProfileInput,
   WorkerProfile,
-  WorkerProfileSpec,
 } from './types'
 import {
-  emptyWorkerProfile,
+  createWorkerProfileEditorState,
+  workerProfileEditorReducer,
   WORKER_PROFILE_TEMPLATES,
 } from './workerProfileTemplates'
 import { useModalDialog } from './useModalDialog'
@@ -36,10 +36,11 @@ export function ProfileEditor({
   onSave,
 }: ProfileEditorProps) {
   const dialogRef = useRef<HTMLElement>(null)
-  const [spec, setSpec] = useState<WorkerProfileSpec>(
-    emptyWorkerProfile,
+  const [{ spec, templateId }, dispatch] = useReducer(
+    workerProfileEditorReducer,
+    profile,
+    createWorkerProfileEditorState,
   )
-  const [templateId, setTemplateId] = useState('')
   useModalDialog({
     canClose: !busy,
     dialogRef,
@@ -47,8 +48,7 @@ export function ProfileEditor({
   })
 
   useEffect(() => {
-    setSpec(profile ?? emptyWorkerProfile())
-    setTemplateId('')
+    dispatch({ profile, type: 'reset' })
   }, [profile])
 
   const submit = (event: FormEvent) => {
@@ -89,18 +89,17 @@ export function ProfileEditor({
               <span>Profile template</span>
               <select
                 onChange={(event) => {
-                  const template = WORKER_PROFILE_TEMPLATES.find(
-                    ({ id }) => id === event.target.value,
-                  )
-                  setTemplateId(event.target.value)
-                  if (template) setSpec({ ...template.spec })
+                  dispatch({
+                    templateId: event.target.value,
+                    type: 'select-template',
+                  })
                 }}
                 value={templateId}
               >
                 <option value="">Blank profile</option>
                 {WORKER_PROFILE_TEMPLATES.map((template) => (
                   <option key={template.id} value={template.id}>
-                    {template.label}
+                    {template.label} - {template.description}
                   </option>
                 ))}
               </select>
@@ -113,7 +112,10 @@ export function ProfileEditor({
                 autoFocus
                 maxLength={120}
                 onChange={(event) =>
-                  setSpec({ ...spec, name: event.target.value })
+                  dispatch({
+                    patch: { name: event.target.value },
+                    type: 'update-spec',
+                  })
                 }
                 required
                 value={spec.name}
@@ -123,7 +125,10 @@ export function ProfileEditor({
               <span>Provider</span>
               <select
                 onChange={(event) =>
-                  setSpec({ ...spec, provider: event.target.value })
+                  dispatch({
+                    patch: { provider: event.target.value },
+                    type: 'update-spec',
+                  })
                 }
                 value={spec.provider}
               >
@@ -136,9 +141,11 @@ export function ProfileEditor({
               <span>Model</span>
               <input
                 onChange={(event) =>
-                  setSpec({
-                    ...spec,
-                    model: event.target.value.trim() || null,
+                  dispatch({
+                    patch: {
+                      model: event.target.value.trim() || null,
+                    },
+                    type: 'update-spec',
                   })
                 }
                 placeholder="Runtime default"
@@ -149,7 +156,10 @@ export function ProfileEditor({
               <span>Default role</span>
               <input
                 onChange={(event) =>
-                  setSpec({ ...spec, default_role: event.target.value })
+                  dispatch({
+                    patch: { default_role: event.target.value },
+                    type: 'update-spec',
+                  })
                 }
                 required
                 value={spec.default_role}
@@ -161,9 +171,12 @@ export function ProfileEditor({
             <span>Instructions reference</span>
             <input
               onChange={(event) =>
-                setSpec({
-                  ...spec,
-                  instructions_ref: event.target.value.trim() || null,
+                dispatch({
+                  patch: {
+                    instructions_ref:
+                      event.target.value.trim() || null,
+                  },
+                  type: 'update-spec',
                 })
               }
               placeholder="AGENTS.md"
@@ -176,7 +189,10 @@ export function ProfileEditor({
               <span>Tools</span>
               <input
                 onChange={(event) =>
-                  setSpec({ ...spec, tools: parseList(event.target.value) })
+                  dispatch({
+                    patch: { tools: parseList(event.target.value) },
+                    type: 'update-spec',
+                  })
                 }
                 value={listValue(spec.tools)}
               />
@@ -185,7 +201,10 @@ export function ProfileEditor({
               <span>Skills</span>
               <input
                 onChange={(event) =>
-                  setSpec({ ...spec, skills: parseList(event.target.value) })
+                  dispatch({
+                    patch: { skills: parseList(event.target.value) },
+                    type: 'update-spec',
+                  })
                 }
                 value={listValue(spec.skills)}
               />
@@ -194,9 +213,11 @@ export function ProfileEditor({
               <span>MCP servers</span>
               <input
                 onChange={(event) =>
-                  setSpec({
-                    ...spec,
-                    mcp_servers: parseList(event.target.value),
+                  dispatch({
+                    patch: {
+                      mcp_servers: parseList(event.target.value),
+                    },
+                    type: 'update-spec',
                   })
                 }
                 value={listValue(spec.mcp_servers)}
@@ -209,7 +230,10 @@ export function ProfileEditor({
               <span>Sandbox</span>
               <select
                 onChange={(event) =>
-                  setSpec({ ...spec, sandbox_policy: event.target.value })
+                  dispatch({
+                    patch: { sandbox_policy: event.target.value },
+                    type: 'update-spec',
+                  })
                 }
                 value={spec.sandbox_policy}
               >
@@ -220,7 +244,10 @@ export function ProfileEditor({
               <span>Worktree</span>
               <select
                 onChange={(event) =>
-                  setSpec({ ...spec, worktree_policy: event.target.value })
+                  dispatch({
+                    patch: { worktree_policy: event.target.value },
+                    type: 'update-spec',
+                  })
                 }
                 value={spec.worktree_policy}
               >
@@ -231,7 +258,10 @@ export function ProfileEditor({
               <span>Permissions</span>
               <select
                 onChange={(event) =>
-                  setSpec({ ...spec, permission_policy: event.target.value })
+                  dispatch({
+                    patch: { permission_policy: event.target.value },
+                    type: 'update-spec',
+                  })
                 }
                 value={spec.permission_policy}
               >
