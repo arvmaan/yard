@@ -250,11 +250,70 @@ impl ProjectService {
             ),
         };
 
-        match self.runtime.provision_worker(provision).await {
+        let prepared = match self.runtime.prepare_worker(provision.clone()).await {
+            Ok(prepared) => prepared,
+            Err(RuntimeProvisionError::BeforeWorker(message)) => {
+                self.store
+                    .fail_profile_project_creation(&command_id, &message, false)
+                    .await?;
+                return Err(ProjectServiceError::RuntimeProvision(message));
+            }
+            Err(RuntimeProvisionError::PromptDelivery { runtime, message }) => {
+                self.store
+                    .quarantine_provisioning_runtime(&command_id, *runtime)
+                    .await?;
+                self.store
+                    .fail_profile_project_creation(&command_id, &message, true)
+                    .await?;
+                return Err(ProjectServiceError::ObjectiveDeliveryFailed(message));
+            }
+            Err(RuntimeProvisionError::AfterPreparation {
+                message,
+                ambiguous,
+                started_runtime,
+            }) => {
+                let ambiguous = if let Some(runtime) = started_runtime {
+                    self.store
+                        .quarantine_provisioning_runtime(&command_id, *runtime)
+                        .await?;
+                    true
+                } else {
+                    ambiguous
+                };
+                self.store
+                    .fail_profile_project_creation(&command_id, &message, ambiguous)
+                    .await?;
+                return if ambiguous {
+                    Err(ProjectServiceError::RuntimeProvisionAmbiguous(message))
+                } else {
+                    Err(ProjectServiceError::RuntimeProvision(message))
+                };
+            }
+        };
+        if let Err(error) = self
+            .store
+            .claim_provisioning_runtime(&command_id, prepared.clone())
+            .await
+        {
+            self.store
+                .fail_profile_project_creation(&command_id, &error.to_string(), true)
+                .await?;
+            return Err(error.into());
+        }
+
+        match self
+            .runtime
+            .start_prepared_worker(provision, prepared)
+            .await
+        {
             Ok(runtime) => {
+                let unverified_runtime = runtime.clone();
                 let runtime = match self.verify_runtime_identity(runtime).await {
                     Ok(runtime) => runtime,
                     Err(error) => {
+                        self.store
+                            .quarantine_provisioning_runtime(&command_id, unverified_runtime)
+                            .await?;
                         self.store
                             .fail_profile_project_creation(&command_id, &error.to_string(), true)
                             .await?;
@@ -263,22 +322,27 @@ impl ProjectService {
                 };
                 match self
                     .store
-                    .finalize_profile_project_creation(&command_id, runtime)
+                    .finalize_profile_project_creation(&command_id, runtime.clone())
                     .await
                 {
                     Ok(project) => Ok(project),
                     Err(error) => {
                         self.store
+                            .quarantine_provisioning_runtime(&command_id, runtime)
+                            .await?;
+                        self.store
                             .fail_profile_project_creation(&command_id, &error.to_string(), true)
                             .await?;
-                        Err(error.into())
+                        Err(ProjectServiceError::RuntimeProvisionAmbiguous(
+                            error.to_string(),
+                        ))
                     }
                 }
             }
-            Err(RuntimeProvisionError::PromptDelivery {
-                runtime: _,
-                message,
-            }) => {
+            Err(RuntimeProvisionError::PromptDelivery { runtime, message }) => {
+                self.store
+                    .quarantine_provisioning_runtime(&command_id, *runtime)
+                    .await?;
                 self.store
                     .fail_profile_project_creation(&command_id, &message, true)
                     .await?;
@@ -286,17 +350,36 @@ impl ProjectService {
             }
             Err(RuntimeProvisionError::BeforeWorker(message)) => {
                 self.store
-                    .fail_profile_project_creation(&command_id, &message, false)
+                    .fail_profile_project_creation(&command_id, &message, true)
                     .await?;
-                Err(ProjectServiceError::RuntimeProvision(message))
+                Err(ProjectServiceError::RuntimeProvisionAmbiguous(message))
             }
             Err(RuntimeProvisionError::AfterPreparation {
-                message, ambiguous, ..
+                message,
+                ambiguous,
+                started_runtime,
             }) => {
+                let ambiguous = if let Some(runtime) = started_runtime {
+                    self.store
+                        .quarantine_provisioning_runtime(&command_id, *runtime)
+                        .await?;
+                    true
+                } else {
+                    ambiguous
+                };
+                if !ambiguous {
+                    self.store
+                        .release_provisioning_runtime_claim(&command_id)
+                        .await?;
+                }
                 self.store
                     .fail_profile_project_creation(&command_id, &message, ambiguous)
                     .await?;
-                Err(ProjectServiceError::RuntimeProvision(message))
+                if ambiguous {
+                    Err(ProjectServiceError::RuntimeProvisionAmbiguous(message))
+                } else {
+                    Err(ProjectServiceError::RuntimeProvision(message))
+                }
             }
         }
     }
@@ -373,11 +456,74 @@ impl ProjectService {
             ),
         };
 
-        match self.runtime.bootstrap_worker(provision).await {
+        let prepared = match self
+            .runtime
+            .prepare_workspace_worker(provision.clone())
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(RuntimeProvisionError::BeforeWorker(message)) => {
+                self.store
+                    .fail_workspace_project_creation(&command_id, &message, false)
+                    .await?;
+                return Err(ProjectServiceError::RuntimeProvision(message));
+            }
+            Err(RuntimeProvisionError::PromptDelivery { runtime, message }) => {
+                self.store
+                    .quarantine_provisioning_runtime(&command_id, *runtime)
+                    .await?;
+                self.store
+                    .fail_workspace_project_creation(&command_id, &message, true)
+                    .await?;
+                return Err(ProjectServiceError::ObjectiveDeliveryFailed(message));
+            }
+            Err(RuntimeProvisionError::AfterPreparation {
+                message,
+                ambiguous,
+                started_runtime,
+            }) => {
+                let ambiguous = if let Some(runtime) = started_runtime {
+                    self.store
+                        .quarantine_provisioning_runtime(&command_id, *runtime)
+                        .await?;
+                    true
+                } else {
+                    ambiguous
+                };
+                self.store
+                    .fail_workspace_project_creation(&command_id, &message, ambiguous)
+                    .await?;
+                return if ambiguous {
+                    Err(ProjectServiceError::RuntimeProvisionAmbiguous(message))
+                } else {
+                    Err(ProjectServiceError::RuntimeProvision(message))
+                };
+            }
+        };
+        if let Err(error) = self
+            .store
+            .claim_provisioning_runtime(&command_id, prepared.clone())
+            .await
+        {
+            self.store
+                .fail_workspace_project_creation(&command_id, &error.to_string(), true)
+                .await?;
+            return Err(error.into());
+        }
+
+        match self
+            .runtime
+            .start_prepared_workspace_worker(provision, prepared)
+            .await
+        {
             Ok(runtime) => {
+                let unverified_runtime = runtime.clone();
                 let runtime = match self.verify_runtime_identity(runtime).await {
                     Ok(runtime) => runtime,
                     Err(error) => {
+                        self.store
+                            .quarantine_provisioning_runtime(&command_id, unverified_runtime)
+                            .await?;
                         self.store
                             .fail_workspace_project_creation(&command_id, &error.to_string(), true)
                             .await?;
@@ -386,42 +532,80 @@ impl ProjectService {
                 };
                 match self
                     .store
-                    .finalize_workspace_project_creation(&command_id, runtime)
+                    .finalize_workspace_project_creation(&command_id, runtime.clone())
                     .await
                 {
                     Ok(project) => Ok(project),
                     Err(error) => {
                         self.store
+                            .quarantine_provisioning_runtime(&command_id, runtime)
+                            .await?;
+                        self.store
                             .fail_workspace_project_creation(&command_id, &error.to_string(), true)
                             .await?;
-                        Err(error.into())
+                        Err(ProjectServiceError::RuntimeProvisionAmbiguous(
+                            error.to_string(),
+                        ))
                     }
                 }
             }
             Err(RuntimeProvisionError::PromptDelivery { runtime, message }) => {
+                let unverified_runtime = (*runtime).clone();
                 let runtime = match self.verify_runtime_identity(*runtime).await {
                     Ok(runtime) => runtime,
                     Err(error) => {
+                        self.store
+                            .quarantine_provisioning_runtime(&command_id, unverified_runtime)
+                            .await?;
                         self.store
                             .fail_workspace_project_creation(&command_id, &error.to_string(), true)
                             .await?;
                         return Err(error);
                     }
                 };
-                self.store
-                    .finalize_workspace_project_creation(&command_id, runtime)
-                    .await?;
-                Err(ProjectServiceError::ObjectiveDeliveryFailed(message))
+                match self
+                    .store
+                    .finalize_workspace_project_creation(&command_id, runtime.clone())
+                    .await
+                {
+                    Ok(_) => Err(ProjectServiceError::ObjectiveDeliveryFailed(message)),
+                    Err(error) => {
+                        self.store
+                            .quarantine_provisioning_runtime(&command_id, runtime)
+                            .await?;
+                        self.store
+                            .fail_workspace_project_creation(&command_id, &error.to_string(), true)
+                            .await?;
+                        Err(ProjectServiceError::RuntimeProvisionAmbiguous(
+                            error.to_string(),
+                        ))
+                    }
+                }
             }
             Err(RuntimeProvisionError::BeforeWorker(message)) => {
                 self.store
-                    .fail_workspace_project_creation(&command_id, &message, false)
+                    .fail_workspace_project_creation(&command_id, &message, true)
                     .await?;
-                Err(ProjectServiceError::RuntimeProvision(message))
+                Err(ProjectServiceError::RuntimeProvisionAmbiguous(message))
             }
             Err(RuntimeProvisionError::AfterPreparation {
-                message, ambiguous, ..
+                message,
+                ambiguous,
+                started_runtime,
             }) => {
+                let ambiguous = if let Some(runtime) = started_runtime {
+                    self.store
+                        .quarantine_provisioning_runtime(&command_id, *runtime)
+                        .await?;
+                    true
+                } else {
+                    ambiguous
+                };
+                if !ambiguous {
+                    self.store
+                        .release_provisioning_runtime_claim(&command_id)
+                        .await?;
+                }
                 self.store
                     .fail_workspace_project_creation(&command_id, &message, ambiguous)
                     .await?;

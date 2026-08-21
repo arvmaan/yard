@@ -114,6 +114,21 @@ pub trait RuntimeControl: Send + Sync {
         ))
     }
 
+    async fn prepare_workspace_worker(
+        &self,
+        request: RuntimeWorkspaceProvisionRequest,
+    ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+        self.bootstrap_worker(request).await
+    }
+
+    async fn start_prepared_workspace_worker(
+        &self,
+        _request: RuntimeWorkspaceProvisionRequest,
+        prepared: WorkerRuntimeBinding,
+    ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+        Ok(prepared)
+    }
+
     async fn provision_worker(
         &self,
         request: RuntimeProvisionRequest,
@@ -213,7 +228,7 @@ impl AllocationService {
         };
         if let Err(message) = validate_supported_profile(&context.profile) {
             self.store
-                .fail_profile_allocation(&context.command.command_id, &message)
+                .fail_profile_allocation(&context.command.command_id, &message, false)
                 .await?;
             return Err(AllocationServiceError::UnsupportedProfile(message));
         }
@@ -221,7 +236,7 @@ impl AllocationService {
             Ok(args) => args,
             Err(error) => {
                 self.store
-                    .fail_profile_allocation(&context.command.command_id, &error.to_string())
+                    .fail_profile_allocation(&context.command.command_id, &error.to_string(), false)
                     .await?;
                 return Err(error);
             }
@@ -235,7 +250,7 @@ impl AllocationService {
             Ok(inventory) => inventory,
             Err(error) => {
                 self.store
-                    .fail_profile_allocation(&context.command.command_id, &error.to_string())
+                    .fail_profile_allocation(&context.command.command_id, &error.to_string(), false)
                     .await?;
                 return Err(error.into());
             }
@@ -251,7 +266,7 @@ impl AllocationService {
             Ok(workspace) => workspace,
             Err(error) => {
                 self.store
-                    .fail_profile_allocation(&context.command.command_id, &error.to_string())
+                    .fail_profile_allocation(&context.command.command_id, &error.to_string(), false)
                     .await?;
                 return Err(error);
             }
@@ -270,7 +285,7 @@ impl AllocationService {
         let Some(cwd) = cwd else {
             let error = AllocationServiceError::RuntimeCwdUnavailable;
             self.store
-                .fail_profile_allocation(&context.command.command_id, &error.to_string())
+                .fail_profile_allocation(&context.command.command_id, &error.to_string(), false)
                 .await?;
             return Err(error);
         };
@@ -290,14 +305,69 @@ impl AllocationService {
             ),
         };
 
-        match self.runtime.provision_worker(provision).await {
+        let prepared = match self.runtime.prepare_worker(provision.clone()).await {
+            Ok(prepared) => prepared,
+            Err(RuntimeProvisionError::BeforeWorker(message)) => {
+                self.store
+                    .fail_profile_allocation(&context.command.command_id, &message, false)
+                    .await?;
+                return Err(AllocationServiceError::RuntimeProvision(message));
+            }
+            Err(RuntimeProvisionError::PromptDelivery { runtime, message }) => {
+                self.store
+                    .quarantine_provisioning_runtime(&context.command.command_id, *runtime)
+                    .await?;
+                self.store
+                    .fail_profile_allocation(&context.command.command_id, &message, true)
+                    .await?;
+                return Err(AllocationServiceError::ObjectiveDeliveryFailed(message));
+            }
+            Err(RuntimeProvisionError::AfterPreparation {
+                message,
+                ambiguous,
+                started_runtime,
+            }) => {
+                let ambiguous = if let Some(runtime) = started_runtime {
+                    self.store
+                        .quarantine_provisioning_runtime(&context.command.command_id, *runtime)
+                        .await?;
+                    true
+                } else {
+                    ambiguous
+                };
+                self.store
+                    .fail_profile_allocation(&context.command.command_id, &message, ambiguous)
+                    .await?;
+                return if ambiguous {
+                    Err(AllocationServiceError::RuntimeProvisionAmbiguous(message))
+                } else {
+                    Err(AllocationServiceError::RuntimeProvision(message))
+                };
+            }
+        };
+        if let Err(error) = self
+            .store
+            .claim_provisioning_runtime(&context.command.command_id, prepared.clone())
+            .await
+        {
+            self.store
+                .fail_profile_allocation(&context.command.command_id, &error.to_string(), true)
+                .await?;
+            return Err(error.into());
+        }
+
+        match self
+            .runtime
+            .start_prepared_worker(provision, prepared)
+            .await
+        {
             Ok(runtime) => {
                 let unverified_runtime = runtime.clone();
                 let runtime = match self.verify_runtime_identity(runtime).await {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         self.store
-                            .persist_runtime_allocation(
+                            .quarantine_provisioning_runtime(
                                 &context.command.command_id,
                                 unverified_runtime,
                             )
@@ -306,14 +376,31 @@ impl AllocationService {
                             .fail_profile_allocation(
                                 &context.command.command_id,
                                 &error.to_string(),
+                                true,
                             )
                             .await?;
                         return Err(error);
                     }
                 };
-                self.store
-                    .persist_runtime_allocation(&context.command.command_id, runtime)
-                    .await?;
+                if let Err(error) = self
+                    .store
+                    .persist_runtime_allocation(&context.command.command_id, runtime.clone())
+                    .await
+                {
+                    self.store
+                        .quarantine_provisioning_runtime(&context.command.command_id, runtime)
+                        .await?;
+                    self.store
+                        .fail_profile_allocation(
+                            &context.command.command_id,
+                            &error.to_string(),
+                            true,
+                        )
+                        .await?;
+                    return Err(AllocationServiceError::RuntimeProvisionAmbiguous(
+                        error.to_string(),
+                    ));
+                }
                 self.store
                     .activate_profile_allocation(&context.command.command_id)
                     .await
@@ -321,21 +408,45 @@ impl AllocationService {
             }
             Err(RuntimeProvisionError::PromptDelivery { runtime, message }) => {
                 self.store
-                    .persist_runtime_allocation(&context.command.command_id, *runtime)
+                    .quarantine_provisioning_runtime(&context.command.command_id, *runtime)
                     .await?;
                 self.store
-                    .fail_profile_allocation(&context.command.command_id, &message)
+                    .fail_profile_allocation(&context.command.command_id, &message, true)
                     .await?;
                 Err(AllocationServiceError::ObjectiveDeliveryFailed(message))
             }
-            Err(
-                RuntimeProvisionError::BeforeWorker(message)
-                | RuntimeProvisionError::AfterPreparation { message, .. },
-            ) => {
+            Err(RuntimeProvisionError::BeforeWorker(message)) => {
                 self.store
-                    .fail_profile_allocation(&context.command.command_id, &message)
+                    .fail_profile_allocation(&context.command.command_id, &message, true)
                     .await?;
-                Err(AllocationServiceError::RuntimeProvision(message))
+                Err(AllocationServiceError::RuntimeProvisionAmbiguous(message))
+            }
+            Err(RuntimeProvisionError::AfterPreparation {
+                message,
+                ambiguous,
+                started_runtime,
+            }) => {
+                let ambiguous = if let Some(runtime) = started_runtime {
+                    self.store
+                        .quarantine_provisioning_runtime(&context.command.command_id, *runtime)
+                        .await?;
+                    true
+                } else {
+                    ambiguous
+                };
+                if !ambiguous {
+                    self.store
+                        .release_provisioning_runtime_claim(&context.command.command_id)
+                        .await?;
+                }
+                self.store
+                    .fail_profile_allocation(&context.command.command_id, &message, ambiguous)
+                    .await?;
+                if ambiguous {
+                    Err(AllocationServiceError::RuntimeProvisionAmbiguous(message))
+                } else {
+                    Err(AllocationServiceError::RuntimeProvision(message))
+                }
             }
         }
     }
@@ -507,14 +618,72 @@ impl AllocationService {
             ),
         };
 
-        match self.runtime.provision_worker(provision).await {
+        let prepared = match self.runtime.prepare_worker(provision.clone()).await {
+            Ok(prepared) => prepared,
+            Err(RuntimeProvisionError::BeforeWorker(message)) => {
+                self.store
+                    .fail_worker_allocation(&context.command.command_id, &message, false)
+                    .await?;
+                return Err(AllocationServiceError::RuntimeProvision(message));
+            }
+            Err(RuntimeProvisionError::PromptDelivery { runtime, message }) => {
+                self.store
+                    .quarantine_provisioning_runtime(&context.command.command_id, *runtime)
+                    .await?;
+                self.store
+                    .fail_worker_allocation(&context.command.command_id, &message, true)
+                    .await?;
+                return Err(AllocationServiceError::ObjectiveDeliveryFailed(message));
+            }
+            Err(RuntimeProvisionError::AfterPreparation {
+                message,
+                ambiguous,
+                started_runtime,
+            }) => {
+                let ambiguous = if let Some(runtime) = started_runtime {
+                    self.store
+                        .quarantine_provisioning_runtime(&context.command.command_id, *runtime)
+                        .await?;
+                    true
+                } else {
+                    ambiguous
+                };
+                self.store
+                    .fail_worker_allocation(&context.command.command_id, &message, ambiguous)
+                    .await?;
+                return if ambiguous {
+                    Err(AllocationServiceError::RuntimeProvisionAmbiguous(message))
+                } else {
+                    Err(AllocationServiceError::RuntimeProvision(message))
+                };
+            }
+        };
+        if let Err(error) = self
+            .store
+            .claim_provisioning_runtime(&context.command.command_id, prepared.clone())
+            .await
+        {
+            self.store
+                .fail_worker_allocation(&context.command.command_id, &error.to_string(), true)
+                .await?;
+            return Err(error.into());
+        }
+
+        match self
+            .runtime
+            .start_prepared_worker(provision, prepared)
+            .await
+        {
             Ok(runtime) => {
                 let unverified_runtime = runtime.clone();
                 let runtime = match self.verify_runtime_identity(runtime).await {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         self.store
-                            .replace_worker_runtime(&context.command.command_id, unverified_runtime)
+                            .quarantine_provisioning_runtime(
+                                &context.command.command_id,
+                                unverified_runtime,
+                            )
                             .await?;
                         self.store
                             .fail_worker_allocation(
@@ -526,9 +695,25 @@ impl AllocationService {
                         return Err(error);
                     }
                 };
-                self.store
-                    .replace_worker_runtime(&context.command.command_id, runtime)
-                    .await?;
+                if let Err(error) = self
+                    .store
+                    .replace_worker_runtime(&context.command.command_id, runtime.clone())
+                    .await
+                {
+                    self.store
+                        .quarantine_provisioning_runtime(&context.command.command_id, runtime)
+                        .await?;
+                    self.store
+                        .fail_worker_allocation(
+                            &context.command.command_id,
+                            &error.to_string(),
+                            true,
+                        )
+                        .await?;
+                    return Err(AllocationServiceError::RuntimeProvisionAmbiguous(
+                        error.to_string(),
+                    ));
+                }
                 self.store
                     .activate_worker_allocation(&context.command.command_id)
                     .await
@@ -536,7 +721,7 @@ impl AllocationService {
             }
             Err(RuntimeProvisionError::PromptDelivery { runtime, message }) => {
                 self.store
-                    .replace_worker_runtime(&context.command.command_id, *runtime)
+                    .quarantine_provisioning_runtime(&context.command.command_id, *runtime)
                     .await?;
                 self.store
                     .fail_worker_allocation(&context.command.command_id, &message, true)
@@ -545,17 +730,36 @@ impl AllocationService {
             }
             Err(RuntimeProvisionError::BeforeWorker(message)) => {
                 self.store
-                    .fail_worker_allocation(&context.command.command_id, &message, false)
+                    .fail_worker_allocation(&context.command.command_id, &message, true)
                     .await?;
-                Err(AllocationServiceError::RuntimeProvision(message))
+                Err(AllocationServiceError::RuntimeProvisionAmbiguous(message))
             }
             Err(RuntimeProvisionError::AfterPreparation {
-                message, ambiguous, ..
+                message,
+                ambiguous,
+                started_runtime,
             }) => {
+                let ambiguous = if let Some(runtime) = started_runtime {
+                    self.store
+                        .quarantine_provisioning_runtime(&context.command.command_id, *runtime)
+                        .await?;
+                    true
+                } else {
+                    ambiguous
+                };
+                if !ambiguous {
+                    self.store
+                        .release_provisioning_runtime_claim(&context.command.command_id)
+                        .await?;
+                }
                 self.store
                     .fail_worker_allocation(&context.command.command_id, &message, ambiguous)
                     .await?;
-                Err(AllocationServiceError::RuntimeProvision(message))
+                if ambiguous {
+                    Err(AllocationServiceError::RuntimeProvisionAmbiguous(message))
+                } else {
+                    Err(AllocationServiceError::RuntimeProvision(message))
+                }
             }
         }
     }
@@ -685,12 +889,26 @@ impl AllocationService {
                 return Err(AllocationServiceError::RuntimeProvision(message));
             }
             Err(RuntimeProvisionError::AfterPreparation {
-                message, ambiguous, ..
+                message,
+                ambiguous,
+                started_runtime,
             }) => {
+                let ambiguous = if let Some(runtime) = started_runtime {
+                    self.store
+                        .quarantine_provisioning_runtime(&context.command.command_id, *runtime)
+                        .await?;
+                    true
+                } else {
+                    ambiguous
+                };
                 self.store
                     .fail_worker_handoff(&context.command.command_id, &message, ambiguous)
                     .await?;
-                return Err(AllocationServiceError::RuntimeProvision(message));
+                return if ambiguous {
+                    Err(AllocationServiceError::RuntimeProvisionAmbiguous(message))
+                } else {
+                    Err(AllocationServiceError::RuntimeProvision(message))
+                };
             }
             Err(RuntimeProvisionError::PromptDelivery { runtime, message }) => {
                 let claim = self
@@ -726,9 +944,16 @@ impl AllocationService {
             .await
         {
             Ok(runtime) => {
+                let unverified_runtime = runtime.clone();
                 let runtime = match self.verify_runtime_identity(runtime).await {
                     Ok(runtime) => runtime,
                     Err(error) => {
+                        self.store
+                            .quarantine_provisioning_runtime(
+                                &context.command.command_id,
+                                unverified_runtime,
+                            )
+                            .await?;
                         self.store
                             .fail_worker_handoff(
                                 &context.command.command_id,
@@ -741,7 +966,7 @@ impl AllocationService {
                 };
                 match self
                     .store
-                    .finalize_worker_handoff(&context.command.command_id, runtime)
+                    .finalize_worker_handoff(&context.command.command_id, runtime.clone())
                     .await
                 {
                     Ok(handoff) => {
@@ -750,29 +975,51 @@ impl AllocationService {
                     }
                     Err(error) => {
                         self.store
+                            .quarantine_provisioning_runtime(&context.command.command_id, runtime)
+                            .await?;
+                        self.store
                             .fail_worker_handoff(
                                 &context.command.command_id,
                                 &error.to_string(),
                                 true,
                             )
                             .await?;
-                        Err(error.into())
+                        Err(AllocationServiceError::RuntimeProvisionAmbiguous(
+                            error.to_string(),
+                        ))
                     }
                 }
             }
-            Err(RuntimeProvisionError::PromptDelivery { message, .. }) => {
+            Err(RuntimeProvisionError::PromptDelivery { runtime, message }) => {
+                self.store
+                    .quarantine_provisioning_runtime(&context.command.command_id, *runtime)
+                    .await?;
                 self.store
                     .fail_worker_handoff(&context.command.command_id, &message, true)
                     .await?;
                 Err(AllocationServiceError::ObjectiveDeliveryFailed(message))
             }
             Err(RuntimeProvisionError::AfterPreparation {
-                message, ambiguous, ..
+                message,
+                ambiguous,
+                started_runtime,
             }) => {
+                let ambiguous = if let Some(runtime) = started_runtime {
+                    self.store
+                        .quarantine_provisioning_runtime(&context.command.command_id, *runtime)
+                        .await?;
+                    true
+                } else {
+                    ambiguous
+                };
                 self.store
                     .fail_worker_handoff(&context.command.command_id, &message, ambiguous)
                     .await?;
-                Err(AllocationServiceError::RuntimeProvision(message))
+                if ambiguous {
+                    Err(AllocationServiceError::RuntimeProvisionAmbiguous(message))
+                } else {
+                    Err(AllocationServiceError::RuntimeProvision(message))
+                }
             }
             Err(RuntimeProvisionError::BeforeWorker(message)) => {
                 self.store
@@ -1136,6 +1383,8 @@ pub enum AllocationServiceError {
     RuntimeCwdUnavailable,
     #[error("Herdr worker provisioning failed: {0}")]
     RuntimeProvision(String),
+    #[error("Herdr worker provisioning outcome is ambiguous: {0}")]
+    RuntimeProvisionAmbiguous(String),
     #[error("Herdr worker binding could not be verified: {0}")]
     RuntimeBindingUnverified(String),
     #[error("worker was created but assignment delivery failed: {0}")]

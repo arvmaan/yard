@@ -19,7 +19,7 @@ use yard_domain::{
     CreateCoordinationNode, OrchestratorStatusReport, ProvisionCoordinationNode,
     RequestCoordinationSnapshot, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
     SnapshotCollectionStatus, UpdateCoordinationNode, UpdateCoordinationNodePlacement, Worker,
-    WorkerAvailability,
+    WorkerAvailability, WorkerRuntimeBinding,
 };
 use yard_store::{
     BeginCoordinationNodePrompt, BeginCoordinationNodeRoute, ProjectStoreError,
@@ -217,36 +217,104 @@ impl CoordinationNodeService {
             .map_err(runtime_error)?;
         let (inventory, _) = self.reconciliation.refresh(COORDINATION_SESSION).await?;
         let mut observed = dedicated_worker(&inventory, &node);
+        self.store
+            .begin_coordination_node_runtime_provision(&node.id, command.clone())
+            .await?;
         if observed.is_none() {
-            let runtime = self
-                .runtime
-                .bootstrap_worker(RuntimeWorkspaceProvisionRequest {
-                    command_id: command.command_id.clone(),
-                    session: COORDINATION_SESSION.to_owned(),
-                    workspace_label: workspace_label(&node.id),
-                    cwd: cwd.to_owned(),
-                    agent_name: agent_name(&node.id),
-                    kind: profile.spec.provider.clone(),
-                    args,
-                    prompt: with_orchestrator_status_contract(
-                        &assignment_prompt(
-                            &format!(
-                                "Coordinate the '{}' workstream across only its attached Yard \
-                                 projects. Track objectives, dependencies, interfaces, decisions, \
-                                 risks, and next actions without claiming project completion.",
-                                node.name
-                            ),
-                            "coordination workstream",
-                            &profile,
+            let provision = RuntimeWorkspaceProvisionRequest {
+                command_id: command.command_id.clone(),
+                session: COORDINATION_SESSION.to_owned(),
+                workspace_label: workspace_label(&node.id),
+                cwd: cwd.to_owned(),
+                agent_name: agent_name(&node.id),
+                kind: profile.spec.provider.clone(),
+                args,
+                prompt: with_orchestrator_status_contract(
+                    &assignment_prompt(
+                        &format!(
+                            "Coordinate the '{}' workstream across only its attached Yard \
+                             projects. Track objectives, dependencies, interfaces, decisions, \
+                             risks, and next actions without claiming project completion.",
+                            node.name
                         ),
-                        &command.command_id,
+                        "coordination workstream",
+                        &profile,
                     ),
-                })
+                    &command.command_id,
+                ),
+            };
+            let prepared = match self
+                .runtime
+                .prepare_workspace_worker(provision.clone())
                 .await
-                .map_err(runtime_error)?;
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return self
+                        .fail_dedicated_preparation(&command.command_id, error)
+                        .await;
+                }
+            };
+            if let Err(error) = self
+                .store
+                .claim_provisioning_runtime(&command.command_id, prepared.clone())
+                .await
+            {
+                self.store
+                    .quarantine_provisioning_runtime(&command.command_id, prepared)
+                    .await?;
+                self.store
+                    .fail_dedicated_runtime_provision(&command.command_id, &error.to_string(), true)
+                    .await?;
+                return Err(CoordinationNodeServiceError::RuntimeProvisionAmbiguous(
+                    error.to_string(),
+                ));
+            }
+            let runtime = match self
+                .runtime
+                .start_prepared_workspace_worker(provision, prepared)
+                .await
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return self.fail_dedicated_start(&command.command_id, error).await;
+                }
+            };
+            if let Err(error) = self
+                .store
+                .confirm_dedicated_runtime_provision(&command.command_id, runtime.clone())
+                .await
+            {
+                self.store
+                    .quarantine_provisioning_runtime(&command.command_id, runtime)
+                    .await?;
+                self.store
+                    .fail_dedicated_runtime_provision(&command.command_id, &error.to_string(), true)
+                    .await?;
+                return Err(CoordinationNodeServiceError::RuntimeProvisionAmbiguous(
+                    error.to_string(),
+                ));
+            }
             observed = Some(
-                self.reconcile_provisioned_worker(&node, &runtime.terminal_id)
-                    .await?,
+                match self
+                    .reconcile_provisioned_worker(&node, &runtime.terminal_id)
+                    .await
+                {
+                    Ok(observed) => observed,
+                    Err(error) => {
+                        self.store
+                            .quarantine_provisioning_runtime(&command.command_id, runtime.clone())
+                            .await?;
+                        self.store
+                            .fail_dedicated_runtime_provision(
+                                &command.command_id,
+                                &error.to_string(),
+                                true,
+                            )
+                            .await?;
+                        return Err(error);
+                    }
+                },
             );
         }
         let observed = observed.ok_or(CoordinationNodeServiceError::RuntimeBindingUnverified)?;
@@ -285,6 +353,53 @@ impl CoordinationNodeService {
             .configure_coordination_node(&node.id, command, &worker.id, worker.version)
             .await
             .map_err(Into::into)
+    }
+
+    async fn fail_dedicated_preparation(
+        &self,
+        command_id: &str,
+        error: RuntimeProvisionError,
+    ) -> Result<CoordinationNodeCommandResult, CoordinationNodeServiceError> {
+        let (message, ambiguous, runtime, objective_delivery) = provisioning_failure(error);
+        if let Some(runtime) = runtime {
+            self.store
+                .quarantine_provisioning_runtime(command_id, runtime)
+                .await?;
+        }
+        self.store
+            .fail_dedicated_runtime_provision(command_id, &message, ambiguous)
+            .await?;
+        Err(coordination_provision_error(
+            message,
+            ambiguous,
+            objective_delivery,
+        ))
+    }
+
+    async fn fail_dedicated_start(
+        &self,
+        command_id: &str,
+        error: RuntimeProvisionError,
+    ) -> Result<CoordinationNodeCommandResult, CoordinationNodeServiceError> {
+        let (message, mut ambiguous, runtime, objective_delivery) = provisioning_failure(error);
+        if let Some(runtime) = runtime {
+            ambiguous = true;
+            self.store
+                .quarantine_provisioning_runtime(command_id, runtime)
+                .await?;
+        } else if !ambiguous {
+            self.store
+                .release_provisioning_runtime_claim(command_id)
+                .await?;
+        }
+        self.store
+            .fail_dedicated_runtime_provision(command_id, &message, ambiguous)
+            .await?;
+        Err(coordination_provision_error(
+            message,
+            ambiguous,
+            objective_delivery,
+        ))
     }
 
     pub(crate) async fn prompt(
@@ -769,12 +884,34 @@ impl CoordinationNodeService {
                 text: with_orchestrator_status_contract(&prompt, &command_id),
             })
             .await?;
-        self.validate_worker_runtime(&project.orchestrator)
+        let current = self
+            .store
+            .get_project(&collection.project_id)
             .await
             .map_err(|error| {
                 CoordinationNodeServiceError::Runtime(RuntimeInterventionError::Ambiguous(format!(
                     "Herdr acknowledged the snapshot prompt, but the project orchestrator \
-                         binding changed: {error}"
+                         could not be revalidated: {error}"
+                )))
+            })?;
+        if current.version != collection.project_version
+            || current.orchestrator.id != collection.orchestrator_worker_id
+            || !same_runtime_identity(&current.orchestrator, &project.orchestrator)
+        {
+            return Err(CoordinationNodeServiceError::Runtime(
+                RuntimeInterventionError::Ambiguous(
+                    "Herdr acknowledged the snapshot prompt, but the project orchestrator \
+                     changed"
+                        .to_owned(),
+                ),
+            ));
+        }
+        self.validate_worker_runtime(&current.orchestrator)
+            .await
+            .map_err(|error| {
+                CoordinationNodeServiceError::Runtime(RuntimeInterventionError::Ambiguous(format!(
+                    "Herdr acknowledged the snapshot prompt, but the project orchestrator \
+                     binding changed: {error}"
                 )))
             })?;
         Ok(result.status)
@@ -1034,6 +1171,39 @@ fn runtime_error(error: RuntimeProvisionError) -> CoordinationNodeServiceError {
     }
 }
 
+fn provisioning_failure(
+    error: RuntimeProvisionError,
+) -> (String, bool, Option<WorkerRuntimeBinding>, bool) {
+    match error {
+        RuntimeProvisionError::BeforeWorker(message) => (message, false, None, false),
+        RuntimeProvisionError::PromptDelivery { runtime, message } => {
+            (message, true, Some(*runtime), true)
+        }
+        RuntimeProvisionError::AfterPreparation {
+            message,
+            ambiguous,
+            started_runtime,
+        } => {
+            let runtime = started_runtime.map(|runtime| *runtime);
+            (message, ambiguous || runtime.is_some(), runtime, false)
+        }
+    }
+}
+
+fn coordination_provision_error(
+    message: String,
+    ambiguous: bool,
+    objective_delivery: bool,
+) -> CoordinationNodeServiceError {
+    if objective_delivery {
+        CoordinationNodeServiceError::ObjectiveDeliveryFailed(message)
+    } else if ambiguous {
+        CoordinationNodeServiceError::RuntimeProvisionAmbiguous(message)
+    } else {
+        CoordinationNodeServiceError::RuntimeProvision(message)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CoordinationNodeServiceError {
     #[error(transparent)]
@@ -1068,6 +1238,8 @@ pub enum CoordinationNodeServiceError {
     UnsupportedProfile(String),
     #[error("Herdr coordination-node provisioning failed: {0}")]
     RuntimeProvision(String),
+    #[error("Herdr coordination-node provisioning outcome is ambiguous: {0}")]
+    RuntimeProvisionAmbiguous(String),
     #[error("the provisioned Herdr worker did not appear in a fresh inventory")]
     RuntimeBindingUnverified,
     #[error("the reconciled Herdr worker is missing from Yard's durable worker inventory")]
@@ -1099,12 +1271,12 @@ mod tests {
     use async_trait::async_trait;
     use tempfile::TempDir;
     use yard_domain::{
-        CanvasPlacement, CoordinationNodeKind, CreateCoordinationNode, CreateProject,
-        CreateWorkerProfile, FocusObservation, ObservedStatus, ObservedWorker,
+        CanvasPlacement, CoordinationDeliveryStatus, CoordinationNodeKind, CreateCoordinationNode,
+        CreateProject, CreateWorkerProfile, FocusObservation, ObservedStatus, ObservedWorker,
         ProjectRuntimeBinding, ProviderSessionRef, ProvisionCoordinationNode,
         RequestCoordinationSnapshot, RuntimeInventory, RuntimeObservationState,
         RuntimeProcessState, RuntimeSession, RuntimeSessions, SnapshotCollectionStatus,
-        WorkerProfileSpec, WorkerRuntimeBinding, WorkspaceObservation,
+        TransferProjectOrchestrator, WorkerProfileSpec, WorkerRuntimeBinding, WorkspaceObservation,
     };
     use yard_store::{SqliteProjectStore, YardStore};
 
@@ -1132,7 +1304,17 @@ mod tests {
         observed_at: AtomicU64,
         session_requests: Mutex<Vec<RuntimeSessionRequest>>,
         bootstrap: Mutex<Option<RuntimeWorkspaceProvisionRequest>>,
+        provision_failure: Mutex<Option<RuntimeProvisionError>>,
         prompts: Mutex<Vec<RuntimePromptRequest>>,
+        project_mutation: Mutex<Option<(PathBuf, String, String)>>,
+        project_read_failure: Mutex<Option<PathBuf>>,
+        prompt_gate: Mutex<Option<PromptGate>>,
+    }
+
+    #[derive(Clone)]
+    struct PromptGate {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
     }
 
     impl FakeRuntime {
@@ -1237,6 +1419,9 @@ mod tests {
             request: RuntimeWorkspaceProvisionRequest,
         ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
             *self.bootstrap.lock().unwrap() = Some(request);
+            if let Some(error) = self.provision_failure.lock().unwrap().take() {
+                return Err(error);
+            }
             self.live.store(true, Ordering::SeqCst);
             Ok(Self::coordination_binding())
         }
@@ -1256,6 +1441,32 @@ mod tests {
             request: RuntimePromptRequest,
         ) -> Result<RuntimePromptResult, RuntimeInterventionError> {
             self.prompts.lock().unwrap().push(request);
+            let prompt_gate = self.prompt_gate.lock().unwrap().clone();
+            if let Some(prompt_gate) = prompt_gate {
+                prompt_gate.entered.notify_one();
+                prompt_gate.release.notified().await;
+            }
+            if let Some((database_path, project_id, worker_id)) =
+                self.project_mutation.lock().unwrap().take()
+            {
+                let connection = rusqlite::Connection::open(database_path).unwrap();
+                connection
+                    .execute(
+                        "UPDATE projects
+                            SET orchestrator_worker_id = ?1,
+                                version = version + 1,
+                                updated_at_unix_ms = updated_at_unix_ms + 1
+                          WHERE id = ?2",
+                        rusqlite::params![worker_id, project_id],
+                    )
+                    .unwrap();
+            }
+            if let Some(database_path) = self.project_read_failure.lock().unwrap().take() {
+                let connection = rusqlite::Connection::open(database_path).unwrap();
+                connection
+                    .execute_batch("ALTER TABLE projects RENAME TO unavailable_projects;")
+                    .unwrap();
+            }
             Ok(RuntimePromptResult {
                 status: "accepted".to_owned(),
             })
@@ -1360,6 +1571,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_delivery_runtime_is_quarantined_for_coordination_bootstrap() {
+        let (service, store, runtime, temp) = setup().await;
+        let created = service
+            .create(create_command(
+                CoordinationNodeKind::Workstream,
+                Vec::new(),
+                "create-ambiguous-workstream",
+            ))
+            .await
+            .unwrap();
+        let profile = store.create_worker_profile(profile()).await.unwrap();
+        *runtime.provision_failure.lock().unwrap() = Some(RuntimeProvisionError::PromptDelivery {
+            runtime: Box::new(FakeRuntime::coordination_binding()),
+            message: "initial coordination prompt acknowledgement was lost".to_owned(),
+        });
+        let command = ProvisionCoordinationNode {
+            command_id: "provision-ambiguous-workstream".to_owned(),
+            actor: "local-user".to_owned(),
+            profile_id: profile.id,
+            expected_profile_version: profile.version,
+            expected_node_version: created.node.version,
+        };
+
+        let error = service
+            .provision(&created.node.id, command.clone())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CoordinationNodeServiceError::ObjectiveDeliveryFailed(_)
+        ));
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let captured: (String, String, Option<String>) = connection
+            .query_row(
+                "SELECT command.status, quarantine.terminal_id,
+                        quarantine.provider_session_value
+                   FROM command_acknowledgements command
+                   JOIN quarantined_provisioning_runtime_bindings quarantine
+                     ON quarantine.command_id = command.id
+                  WHERE command.id = ?1",
+                [&command.command_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            captured,
+            (
+                "ambiguous".to_owned(),
+                "coordination-terminal".to_owned(),
+                Some("coordination-provider-session".to_owned())
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn snapshot_prompts_exact_managed_path_and_never_create_receipts() {
         let (service, store, runtime, temp) = setup().await;
         let project = store
@@ -1437,6 +1704,274 @@ mod tests {
             })
             .unwrap();
         assert_eq!(receipt_count, 0);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn snapshot_delivery_blocks_concurrent_orchestrator_transfer() {
+        let (service, store, runtime, _temp) = setup().await;
+        let project = store
+            .create_project(
+                CreateProject {
+                    name: "Project".to_owned(),
+                    runtime: ProjectRuntimeBinding {
+                        adapter: "herdr".to_owned(),
+                        session: "default".to_owned(),
+                        workspace_id: "project-workspace".to_owned(),
+                    },
+                    orchestrator_observed_worker_id: "project-terminal".to_owned(),
+                    placement: placement(),
+                },
+                binding(
+                    "default",
+                    "project-workspace",
+                    "project-terminal",
+                    "project-tab",
+                    "project-pane",
+                    "project-provider-session",
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .reconcile_runtime_inventory(inventory(
+                "default",
+                20,
+                vec![workspace("project-workspace", "Project")],
+                vec![
+                    observed_worker(
+                        "project-terminal",
+                        "project-workspace",
+                        "project-tab",
+                        "project-pane",
+                        "project-orchestrator",
+                        "project-provider-session",
+                    ),
+                    observed_worker(
+                        "transfer-terminal",
+                        "project-workspace",
+                        "transfer-tab",
+                        "transfer-pane",
+                        "transfer-candidate",
+                        "transfer-provider-session",
+                    ),
+                ],
+            ))
+            .await
+            .unwrap();
+        let current_project = store.get_project(&project.id).await.unwrap();
+        let candidate = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| {
+                candidate
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|binding| binding.terminal_id == "transfer-terminal")
+            })
+            .unwrap();
+        let transfer = TransferProjectOrchestrator {
+            command_id: "transfer-during-snapshot-delivery".to_owned(),
+            actor: "local-user".to_owned(),
+            worker_id: candidate.worker.id.clone(),
+            expected_worker_version: candidate.worker.version,
+            expected_worker_runtime: candidate.worker.runtime.clone().unwrap(),
+            expected_project_version: current_project.version,
+            expected_orchestrator_worker_id: current_project.orchestrator.id.clone(),
+            expected_orchestrator_worker_version: current_project.orchestrator.version,
+            expected_orchestrator_runtime: current_project.orchestrator.runtime.clone().unwrap(),
+        };
+        let node = service
+            .create(create_command(
+                CoordinationNodeKind::KnowledgeStore,
+                vec![project.id.clone()],
+                "create-transfer-racing-knowledge",
+            ))
+            .await
+            .unwrap()
+            .node;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *runtime.prompt_gate.lock().unwrap() = Some(PromptGate {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let service = Arc::new(service);
+        let request_service = Arc::clone(&service);
+        let node_id = node.id.clone();
+        let snapshot_task = tokio::spawn(async move {
+            request_service
+                .request_snapshot(
+                    &node_id,
+                    RequestCoordinationSnapshot {
+                        command_id: "request-transfer-racing-snapshot".to_owned(),
+                        actor: "local-user".to_owned(),
+                        expected_node_version: node.version,
+                    },
+                )
+                .await
+        });
+        entered.notified().await;
+
+        assert!(matches!(
+            store
+                .transfer_project_orchestrator(&project.id, transfer.clone())
+                .await
+                .unwrap_err(),
+            yard_store::ProjectStoreError::OrchestratorInterventionInProgress
+        ));
+        release.notify_one();
+        let snapshot = snapshot_task.await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.projects[0].delivery_status,
+            CoordinationDeliveryStatus::Submitted
+        );
+
+        let transferred = store
+            .transfer_project_orchestrator(&project.id, transfer)
+            .await
+            .unwrap();
+        assert_eq!(transferred.project.orchestrator.id, candidate.worker.id);
+    }
+
+    #[tokio::test]
+    async fn snapshot_acknowledgement_is_ambiguous_if_orchestrator_changes_after_send() {
+        let (service, store, runtime, temp) = setup().await;
+        let project = store
+            .create_project(
+                CreateProject {
+                    name: "Project".to_owned(),
+                    runtime: ProjectRuntimeBinding {
+                        adapter: "herdr".to_owned(),
+                        session: "default".to_owned(),
+                        workspace_id: "project-workspace".to_owned(),
+                    },
+                    orchestrator_observed_worker_id: "project-terminal".to_owned(),
+                    placement: placement(),
+                },
+                binding(
+                    "default",
+                    "project-workspace",
+                    "project-terminal",
+                    "project-tab",
+                    "project-pane",
+                    "project-provider-session",
+                ),
+            )
+            .await
+            .unwrap();
+        let node = service
+            .create(create_command(
+                CoordinationNodeKind::KnowledgeStore,
+                vec![project.id.clone()],
+                "create-racing-knowledge",
+            ))
+            .await
+            .unwrap()
+            .node;
+        let replacement_worker_id = uuid::Uuid::now_v7().to_string();
+        let database_path = temp.path().join("yard.sqlite3");
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workers (
+                    id, profile_id, profile_version, desired_state, version,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (?1, NULL, NULL, 'running', 1, 1, 1)",
+                [&replacement_worker_id],
+            )
+            .unwrap();
+        drop(connection);
+        *runtime.project_mutation.lock().unwrap() = Some((
+            database_path,
+            project.id.clone(),
+            replacement_worker_id.clone(),
+        ));
+
+        let snapshot = service
+            .request_snapshot(
+                &node.id,
+                RequestCoordinationSnapshot {
+                    command_id: "request-racing-snapshot".to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_node_version: node.version,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshot.projects[0].delivery_status,
+            CoordinationDeliveryStatus::Ambiguous
+        );
+        assert_eq!(
+            store
+                .get_project(&project.id)
+                .await
+                .unwrap()
+                .orchestrator
+                .id,
+            replacement_worker_id
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_acknowledgement_is_ambiguous_if_post_send_owner_read_fails() {
+        let (service, store, runtime, temp) = setup().await;
+        let project = store
+            .create_project(
+                CreateProject {
+                    name: "Project".to_owned(),
+                    runtime: ProjectRuntimeBinding {
+                        adapter: "herdr".to_owned(),
+                        session: "default".to_owned(),
+                        workspace_id: "project-workspace".to_owned(),
+                    },
+                    orchestrator_observed_worker_id: "project-terminal".to_owned(),
+                    placement: placement(),
+                },
+                binding(
+                    "default",
+                    "project-workspace",
+                    "project-terminal",
+                    "project-tab",
+                    "project-pane",
+                    "project-provider-session",
+                ),
+            )
+            .await
+            .unwrap();
+        let node = service
+            .create(create_command(
+                CoordinationNodeKind::KnowledgeStore,
+                vec![project.id],
+                "create-read-failure-knowledge",
+            ))
+            .await
+            .unwrap()
+            .node;
+        *runtime.project_read_failure.lock().unwrap() = Some(temp.path().join("yard.sqlite3"));
+
+        let snapshot = service
+            .request_snapshot(
+                &node.id,
+                RequestCoordinationSnapshot {
+                    command_id: "request-read-failure-snapshot".to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_node_version: node.version,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshot.projects[0].delivery_status,
+            CoordinationDeliveryStatus::Ambiguous
+        );
     }
 
     #[cfg(unix)]

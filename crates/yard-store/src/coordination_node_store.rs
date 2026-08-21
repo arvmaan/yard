@@ -12,8 +12,9 @@ use yard_domain::{
 use super::{
     BeginCoordinationNodePrompt, BeginCoordinationNodeRoute, ProjectStoreError,
     SnapshotDeliveryResult, SnapshotProjectFolder, SqliteProjectStore, WorkerAvailability,
-    command_id_exists, insert_lifecycle_event, project_exists, required_command_id,
-    required_runtime_status, select_project, select_worker_candidate, to_i64, unix_time_ms,
+    command_id_exists, insert_lifecycle_event, project_exists,
+    reject_project_orchestrator_intervention, required_command_id, required_runtime_status,
+    select_project, select_worker_candidate, to_i64, unix_time_ms,
 };
 
 const MAX_ROUTE_LIST_LIMIT: usize = 500;
@@ -516,7 +517,33 @@ pub(super) async fn configure_node(
                     replayed: true,
                 });
             }
-            reject_reused_command(&transaction, &command.command_id)?;
+            let provision_intent = super::select_dedicated_runtime_provision_intent(
+                &transaction,
+                &command.command_id,
+            )?;
+            if let Some(intent) = provision_intent.as_ref() {
+                let has_runtime_claim =
+                    super::select_provisioning_runtime_claim(&transaction, &command.command_id)?
+                        .is_some();
+                if intent.command_type != "coordination_node_provision"
+                    || intent.actor != command.actor
+                    || intent.status != "pending"
+                    || intent.kind != "coordination_node"
+                    || intent.target_id != node_id
+                    || intent.profile_id != command.profile_id
+                    || intent.profile_version != command.expected_profile_version
+                    || intent.expected_target_version != command.expected_node_version
+                    || intent
+                        .result_worker_id
+                        .as_deref()
+                        .is_some_and(|claimed_worker_id| claimed_worker_id != worker_id)
+                    || (intent.result_worker_id.is_none() && has_runtime_claim)
+                {
+                    return Err(ProjectStoreError::IdempotencyConflict);
+                }
+            } else {
+                reject_reused_command(&transaction, &command.command_id)?;
+            }
             let current = select_node(&transaction, &node_id)?;
             if current.kind != CoordinationNodeKind::Workstream {
                 return Err(ProjectStoreError::CoordinationNodeKindMismatch);
@@ -555,16 +582,36 @@ pub(super) async fn configure_node(
                 .checked_add(1)
                 .ok_or(ProjectStoreError::VersionOverflow)?;
             let now = unix_time_ms()?;
-            transaction.execute(
-                "INSERT INTO command_acknowledgements (
-                    id, command_type, actor, status, error_message,
-                    created_at_unix_ms, updated_at_unix_ms
-                 ) VALUES (
-                    ?1, 'coordination_node_provision', ?2, 'succeeded',
-                    NULL, ?3, ?3
-                 )",
-                params![command.command_id, command.actor, to_i64(now)?],
-            )?;
+            if provision_intent.is_some() {
+                transaction.execute(
+                    "UPDATE dedicated_runtime_provision_intents
+                        SET result_worker_id = COALESCE(result_worker_id, ?1),
+                            updated_at_unix_ms = ?2
+                      WHERE command_id = ?3",
+                    params![worker_id, to_i64(now)?, command.command_id],
+                )?;
+                let updated = transaction.execute(
+                    "UPDATE command_acknowledgements
+                        SET status = 'succeeded', error_message = NULL,
+                            updated_at_unix_ms = ?1
+                      WHERE id = ?2 AND status = 'pending'",
+                    params![to_i64(now)?, command.command_id],
+                )?;
+                if updated != 1 {
+                    return Err(ProjectStoreError::CommandNotPending);
+                }
+            } else {
+                transaction.execute(
+                    "INSERT INTO command_acknowledgements (
+                        id, command_type, actor, status, error_message,
+                        created_at_unix_ms, updated_at_unix_ms
+                     ) VALUES (
+                        ?1, 'coordination_node_provision', ?2, 'succeeded',
+                        NULL, ?3, ?3
+                     )",
+                    params![command.command_id, command.actor, to_i64(now)?],
+                )?;
+            }
             transaction.execute(
                 "UPDATE workers
                     SET version = version + 1, updated_at_unix_ms = ?1
@@ -825,6 +872,7 @@ pub(super) async fn list_routes(
         .await
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn begin_route(
     store: &SqliteProjectStore,
     node_id: &str,
@@ -870,6 +918,11 @@ pub(super) async fn begin_route(
                 return Err(ProjectStoreError::CoordinationNodeProjectNotAttached);
             }
             reject_pending_node_intervention(&transaction, &node_id)?;
+            reject_project_orchestrator_intervention(
+                &transaction,
+                &command.target_project_id,
+                None,
+            )?;
             let project = select_project(&transaction, &command.target_project_id)?;
             if project.version != command.expected_project_version {
                 return Err(ProjectStoreError::ProjectVersionConflict {
@@ -1077,6 +1130,11 @@ pub(super) async fn create_snapshot(
             let projects = project_folders
                 .iter()
                 .map(|folder| {
+                    reject_project_orchestrator_intervention(
+                        &transaction,
+                        &folder.project_id,
+                        None,
+                    )?;
                     select_project(&transaction, &folder.project_id)
                         .map(|project| (folder, project))
                 })
@@ -1284,7 +1342,7 @@ pub(super) async fn record_snapshot_collected(
         .await
 }
 
-fn select_node(
+pub(super) fn select_node(
     connection: &Connection,
     node_id: &str,
 ) -> Result<CoordinationNode, ProjectStoreError> {
@@ -1758,7 +1816,7 @@ const fn node_kind_value(kind: CoordinationNodeKind) -> &'static str {
     }
 }
 
-fn canonical_node_id(value: &str) -> Result<String, ProjectStoreError> {
+pub(super) fn canonical_node_id(value: &str) -> Result<String, ProjectStoreError> {
     canonical_coordination_uuid("node_id", value).map_err(Into::into)
 }
 

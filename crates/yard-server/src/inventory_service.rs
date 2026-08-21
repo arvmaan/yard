@@ -6,9 +6,9 @@ use yard_domain::{RuntimeInventory, RuntimeSessions};
 use yard_herdr::{
     BootstrapAgentRequest, HerdrAdapter, HerdrControlError, HerdrError, HerdrTerminal,
     HerdrTerminalError, OpenTerminalRequest as HerdrOpenTerminalRequest, PrepareAgentRequest,
-    PromptAgentRequest, ProvisionAgentRequest, ReadPaneRequest, StartPreparedAgentRequest,
-    TerminalCommand as HerdrTerminalCommand, TerminalDimensions, TerminalEncoding, TerminalEvent,
-    TerminalInput,
+    PrepareWorkspaceAgentRequest, PromptAgentRequest, ProvisionAgentRequest, ReadPaneRequest,
+    StartPreparedAgentRequest, TerminalCommand as HerdrTerminalCommand, TerminalDimensions,
+    TerminalEncoding, TerminalEvent, TerminalInput,
 };
 
 use crate::allocation_service::{
@@ -158,6 +158,84 @@ impl RuntimeControl for HerdrInventorySource {
         }
     }
 
+    async fn prepare_workspace_worker(
+        &self,
+        request: RuntimeWorkspaceProvisionRequest,
+    ) -> Result<yard_domain::WorkerRuntimeBinding, RuntimeProvisionError> {
+        match self
+            .adapter
+            .prepare_workspace_agent(PrepareWorkspaceAgentRequest {
+                command_id: request.command_id,
+                session: request.session,
+                workspace_label: request.workspace_label,
+                cwd: request.cwd,
+            })
+            .await
+        {
+            Ok(prepared) => Ok(prepared.runtime),
+            Err(HerdrControlError::WorkspaceCreateFailed { source, ambiguous }) => {
+                if ambiguous {
+                    Err(RuntimeProvisionError::AfterPreparation {
+                        message: source.to_string(),
+                        ambiguous,
+                        started_runtime: None,
+                    })
+                } else {
+                    Err(RuntimeProvisionError::BeforeWorker(source.to_string()))
+                }
+            }
+            Err(error) => Err(RuntimeProvisionError::BeforeWorker(error.to_string())),
+        }
+    }
+
+    async fn start_prepared_workspace_worker(
+        &self,
+        request: RuntimeWorkspaceProvisionRequest,
+        prepared: yard_domain::WorkerRuntimeBinding,
+    ) -> Result<yard_domain::WorkerRuntimeBinding, RuntimeProvisionError> {
+        match self
+            .adapter
+            .start_prepared_workspace_agent(StartPreparedAgentRequest {
+                command_id: request.command_id,
+                prepared,
+                agent_name: request.agent_name,
+                kind: request.kind,
+                args: request.args,
+                prompt: request.prompt,
+            })
+            .await
+        {
+            Ok(agent) => Ok(agent.runtime),
+            Err(HerdrControlError::PromptDeliveryFailed { runtime, source }) => {
+                Err(RuntimeProvisionError::PromptDelivery {
+                    runtime,
+                    message: source.to_string(),
+                })
+            }
+            Err(HerdrControlError::StartFailed {
+                start,
+                rollback,
+                rollback_succeeded,
+                started_runtime,
+            }) => Err(RuntimeProvisionError::AfterPreparation {
+                message: HerdrControlError::StartFailed {
+                    start,
+                    rollback,
+                    rollback_succeeded,
+                    started_runtime: started_runtime.clone(),
+                }
+                .to_string(),
+                ambiguous: !rollback_succeeded,
+                started_runtime,
+            }),
+            Err(error) => Err(RuntimeProvisionError::AfterPreparation {
+                message: error.to_string(),
+                ambiguous: true,
+                started_runtime: None,
+            }),
+        }
+    }
+
     async fn provision_worker(
         &self,
         request: RuntimeProvisionRequest,
@@ -181,7 +259,43 @@ impl RuntimeControl for HerdrInventorySource {
                     message: source.to_string(),
                 })
             }
-            Err(error) => Err(RuntimeProvisionError::BeforeWorker(error.to_string())),
+            Err(HerdrControlError::PrepareFailed { source, ambiguous }) => {
+                if ambiguous {
+                    Err(RuntimeProvisionError::AfterPreparation {
+                        message: source.to_string(),
+                        ambiguous,
+                        started_runtime: None,
+                    })
+                } else {
+                    Err(RuntimeProvisionError::BeforeWorker(source.to_string()))
+                }
+            }
+            Err(HerdrControlError::StartFailed {
+                start,
+                rollback,
+                rollback_succeeded,
+                started_runtime,
+            }) => Err(RuntimeProvisionError::AfterPreparation {
+                message: HerdrControlError::StartFailed {
+                    start,
+                    rollback,
+                    rollback_succeeded,
+                    started_runtime: started_runtime.clone(),
+                }
+                .to_string(),
+                ambiguous: !rollback_succeeded,
+                started_runtime,
+            }),
+            Err(HerdrControlError::WorkspaceCreateFailed { source, ambiguous }) => {
+                Err(RuntimeProvisionError::AfterPreparation {
+                    message: source.to_string(),
+                    ambiguous,
+                    started_runtime: None,
+                })
+            }
+            Err(HerdrControlError::Runtime(error)) => {
+                Err(RuntimeProvisionError::BeforeWorker(error.to_string()))
+            }
         }
     }
 
@@ -189,7 +303,8 @@ impl RuntimeControl for HerdrInventorySource {
         &self,
         request: RuntimeProvisionRequest,
     ) -> Result<yard_domain::WorkerRuntimeBinding, RuntimeProvisionError> {
-        self.adapter
+        match self
+            .adapter
             .prepare_agent(PrepareAgentRequest {
                 command_id: request.command_id,
                 session: request.session,
@@ -198,8 +313,21 @@ impl RuntimeControl for HerdrInventorySource {
                 tab_label: request.tab_label,
             })
             .await
-            .map(|prepared| prepared.runtime)
-            .map_err(|error| RuntimeProvisionError::BeforeWorker(error.to_string()))
+        {
+            Ok(prepared) => Ok(prepared.runtime),
+            Err(HerdrControlError::PrepareFailed { source, ambiguous }) => {
+                if ambiguous {
+                    Err(RuntimeProvisionError::AfterPreparation {
+                        message: source.to_string(),
+                        ambiguous,
+                        started_runtime: None,
+                    })
+                } else {
+                    Err(RuntimeProvisionError::BeforeWorker(source.to_string()))
+                }
+            }
+            Err(error) => Err(RuntimeProvisionError::BeforeWorker(error.to_string())),
+        }
     }
 
     async fn start_prepared_worker(

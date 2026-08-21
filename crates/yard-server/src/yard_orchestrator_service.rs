@@ -104,7 +104,6 @@ impl YardOrchestratorService {
             })
             .await
             .map_err(runtime_error)?;
-
         let current = self.store.get_yard_orchestrator().await?;
         let (inventory, _) = self
             .reconciliation
@@ -112,6 +111,9 @@ impl YardOrchestratorService {
             .await?;
         let mut observed = dedicated_worker(&inventory, current.worker.as_ref());
         let bootstrapped = observed.is_none();
+        self.store
+            .begin_yard_orchestrator_runtime_provision(command.clone())
+            .await?;
 
         if bootstrapped {
             observed = Some(
@@ -395,48 +397,146 @@ impl YardOrchestratorService {
         args: Vec<String>,
         workflow: &OrchestratorWorkflowProfile,
     ) -> Result<ObservedWorker, YardOrchestratorServiceError> {
-        let bootstrapped = self
-            .runtime
-            .bootstrap_worker(RuntimeWorkspaceProvisionRequest {
-                command_id: command.command_id.clone(),
-                session: YARD_ORCHESTRATOR_SESSION.to_owned(),
-                workspace_label: YARD_ORCHESTRATOR_WORKSPACE_LABEL.to_owned(),
-                cwd: self.cwd.clone(),
-                agent_name: YARD_ORCHESTRATOR_AGENT_NAME.to_owned(),
-                kind: profile.spec.provider.clone(),
-                args,
-                prompt: with_orchestrator_status_contract(
-                    &with_orchestrator_workflow(
-                        &assignment_prompt(
-                            CENTRAL_COORDINATION_OBJECTIVE,
-                            "central orchestrator",
-                            profile,
-                        ),
-                        workflow,
+        let provision = RuntimeWorkspaceProvisionRequest {
+            command_id: command.command_id.clone(),
+            session: YARD_ORCHESTRATOR_SESSION.to_owned(),
+            workspace_label: YARD_ORCHESTRATOR_WORKSPACE_LABEL.to_owned(),
+            cwd: self.cwd.clone(),
+            agent_name: YARD_ORCHESTRATOR_AGENT_NAME.to_owned(),
+            kind: profile.spec.provider.clone(),
+            args,
+            prompt: with_orchestrator_status_contract(
+                &with_orchestrator_workflow(
+                    &assignment_prompt(
+                        CENTRAL_COORDINATION_OBJECTIVE,
+                        "central orchestrator",
+                        profile,
                     ),
-                    &command.command_id,
+                    workflow,
                 ),
-            })
-            .await;
-        let runtime = match bootstrapped {
-            Ok(runtime) => runtime,
-            Err(RuntimeProvisionError::PromptDelivery { runtime, message }) => {
-                self.retire_orphaned_runtime(*runtime).await;
-                return Err(YardOrchestratorServiceError::ObjectiveDeliveryFailed(
-                    message,
-                ));
-            }
-            Err(error) => return Err(runtime_error(error)),
+                &command.command_id,
+            ),
         };
+        let prepared = match self
+            .runtime
+            .prepare_workspace_worker(provision.clone())
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => return self.fail_dedicated_preparation(command, error).await,
+        };
+        if let Err(error) = self
+            .store
+            .claim_provisioning_runtime(&command.command_id, prepared.clone())
+            .await
+        {
+            self.store
+                .quarantine_provisioning_runtime(&command.command_id, prepared)
+                .await?;
+            self.store
+                .fail_dedicated_runtime_provision(&command.command_id, &error.to_string(), true)
+                .await?;
+            return Err(YardOrchestratorServiceError::RuntimeProvisionAmbiguous(
+                error.to_string(),
+            ));
+        }
+        let runtime = match self
+            .runtime
+            .start_prepared_workspace_worker(provision, prepared)
+            .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) => return self.fail_dedicated_start(command, error).await,
+        };
+        if let Err(error) = self
+            .store
+            .confirm_dedicated_runtime_provision(&command.command_id, runtime.clone())
+            .await
+        {
+            self.store
+                .quarantine_provisioning_runtime(&command.command_id, runtime)
+                .await?;
+            self.store
+                .fail_dedicated_runtime_provision(&command.command_id, &error.to_string(), true)
+                .await?;
+            return Err(YardOrchestratorServiceError::RuntimeProvisionAmbiguous(
+                error.to_string(),
+            ));
+        }
         match self
             .reconcile_provisioned_worker(&runtime.terminal_id)
             .await
         {
             Ok(worker) => Ok(worker),
             Err(error) => {
+                self.store
+                    .quarantine_provisioning_runtime(&command.command_id, runtime.clone())
+                    .await?;
+                self.store
+                    .fail_dedicated_runtime_provision(&command.command_id, &error.to_string(), true)
+                    .await?;
                 self.retire_orphaned_runtime(runtime).await;
                 Err(error)
             }
+        }
+    }
+
+    async fn fail_dedicated_preparation(
+        &self,
+        command: &ProvisionYardOrchestrator,
+        error: RuntimeProvisionError,
+    ) -> Result<ObservedWorker, YardOrchestratorServiceError> {
+        let (message, ambiguous, runtime, objective_delivery) = provisioning_failure(error);
+        if let Some(runtime) = runtime {
+            self.store
+                .quarantine_provisioning_runtime(&command.command_id, runtime)
+                .await?;
+        }
+        self.store
+            .fail_dedicated_runtime_provision(&command.command_id, &message, ambiguous)
+            .await?;
+        if objective_delivery {
+            Err(YardOrchestratorServiceError::ObjectiveDeliveryFailed(
+                message,
+            ))
+        } else if ambiguous {
+            Err(YardOrchestratorServiceError::RuntimeProvisionAmbiguous(
+                message,
+            ))
+        } else {
+            Err(YardOrchestratorServiceError::RuntimeProvision(message))
+        }
+    }
+
+    async fn fail_dedicated_start(
+        &self,
+        command: &ProvisionYardOrchestrator,
+        error: RuntimeProvisionError,
+    ) -> Result<ObservedWorker, YardOrchestratorServiceError> {
+        let (message, mut ambiguous, runtime, objective_delivery) = provisioning_failure(error);
+        if let Some(runtime) = runtime {
+            ambiguous = true;
+            self.store
+                .quarantine_provisioning_runtime(&command.command_id, runtime)
+                .await?;
+        } else if !ambiguous {
+            self.store
+                .release_provisioning_runtime_claim(&command.command_id)
+                .await?;
+        }
+        self.store
+            .fail_dedicated_runtime_provision(&command.command_id, &message, ambiguous)
+            .await?;
+        if objective_delivery {
+            Err(YardOrchestratorServiceError::ObjectiveDeliveryFailed(
+                message,
+            ))
+        } else if ambiguous {
+            Err(YardOrchestratorServiceError::RuntimeProvisionAmbiguous(
+                message,
+            ))
+        } else {
+            Err(YardOrchestratorServiceError::RuntimeProvision(message))
         }
     }
 
@@ -622,6 +722,25 @@ fn runtime_error(error: RuntimeProvisionError) -> YardOrchestratorServiceError {
     }
 }
 
+fn provisioning_failure(
+    error: RuntimeProvisionError,
+) -> (String, bool, Option<WorkerRuntimeBinding>, bool) {
+    match error {
+        RuntimeProvisionError::BeforeWorker(message) => (message, false, None, false),
+        RuntimeProvisionError::PromptDelivery { runtime, message } => {
+            (message, true, Some(*runtime), true)
+        }
+        RuntimeProvisionError::AfterPreparation {
+            message,
+            ambiguous,
+            started_runtime,
+        } => {
+            let runtime = started_runtime.map(|runtime| *runtime);
+            (message, ambiguous || runtime.is_some(), runtime, false)
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum YardOrchestratorServiceError {
     #[error(transparent)]
@@ -634,6 +753,8 @@ pub enum YardOrchestratorServiceError {
     UnsupportedProfile(String),
     #[error("Herdr Yard orchestrator provisioning failed: {0}")]
     RuntimeProvision(String),
+    #[error("Herdr Yard orchestrator provisioning outcome is ambiguous: {0}")]
+    RuntimeProvisionAmbiguous(String),
     #[error("the provisioned Herdr worker did not appear in a fresh inventory")]
     RuntimeBindingUnverified,
     #[error("the reconciled Herdr worker is missing from Yard's durable worker inventory")]
@@ -696,6 +817,7 @@ mod tests {
         /// returns when an agent is successfully created and claims the
         /// reserved name, but the initial prompt cannot be delivered.
         fail_prompt_delivery: AtomicBool,
+        fail_after_preparation: AtomicBool,
         lifecycle_prompt_failures: AtomicUsize,
         /// When set, the bootstrapped worker never reports as
         /// `interactive_ready` with a provider session, so
@@ -833,6 +955,13 @@ mod tests {
         ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
             self.bootstrap_calls.fetch_add(1, Ordering::SeqCst);
             self.bootstrap_requests.lock().unwrap().push(request);
+            if self.fail_after_preparation.load(Ordering::SeqCst) {
+                return Err(RuntimeProvisionError::AfterPreparation {
+                    message: "agent.start returned an unverified runtime".to_owned(),
+                    ambiguous: false,
+                    started_runtime: Some(Box::new(Self::binding())),
+                });
+            }
             if self.fail_prompt_delivery.load(Ordering::SeqCst) {
                 // Mirrors Herdr: the agent was created and claimed the
                 // reserved name, but the initial prompt could not be
@@ -1266,36 +1395,82 @@ mod tests {
     // until a human runs `herdr session list`/`stop`/`delete` by hand.
 
     #[tokio::test]
-    async fn retires_the_orphaned_runtime_when_the_initial_prompt_cannot_be_delivered() {
+    async fn quarantines_prompt_delivery_identity_and_never_retries_bootstrap() {
         let runtime = Arc::new(DedicatedRuntime::default());
         runtime.fail_prompt_delivery.store(true, Ordering::SeqCst);
-        runtime
-            .retirement_identity_misses
-            .store(2, Ordering::SeqCst);
-        runtime
-            .retirement_runtime_failures
-            .store(1, Ordering::SeqCst);
-        let (service, _store, _temp, profile_id) = service(runtime.clone()).await;
+        let (service, store, temp, profile_id) = service(runtime.clone()).await;
 
-        let error = service.provision(command(&profile_id)).await.unwrap_err();
+        let provision = command(&profile_id);
+        let error = service.provision(provision.clone()).await.unwrap_err();
 
         assert!(matches!(
             error,
             super::YardOrchestratorServiceError::ObjectiveDeliveryFailed(_)
         ));
         assert_eq!(runtime.bootstrap_calls.load(Ordering::SeqCst), 1);
+        assert!(runtime.retirement_calls.lock().unwrap().is_empty());
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let quarantined: (String, Option<String>) = connection
+            .query_row(
+                "SELECT terminal_id, provider_session_value
+                   FROM quarantined_provisioning_runtime_bindings
+                  WHERE command_id = ?1",
+                [&provision.command_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            quarantined,
+            (
+                "terminal-yard-orchestrator".to_owned(),
+                Some("yard-orchestrator-session".to_owned())
+            )
+        );
+        drop(connection);
+        assert!(matches!(
+            service.provision(provision).await.unwrap_err(),
+            super::YardOrchestratorServiceError::Store(
+                yard_store::ProjectStoreError::CommandOutcomeAmbiguous(_)
+            )
+        ));
+        assert_eq!(runtime.bootstrap_calls.load(Ordering::SeqCst), 1);
+        drop(store);
+    }
 
-        let retirements = runtime.retirement_calls.lock().unwrap();
-        assert_eq!(retirements.len(), 4);
-        let retirement = retirements.last().unwrap();
-        assert_eq!(retirement.adapter, "herdr");
-        assert_eq!(retirement.session, YARD_ORCHESTRATOR_SESSION);
-        assert_eq!(retirement.workspace_id, "workspace-yard-orchestrator");
-        assert_eq!(retirement.terminal_id, "terminal-yard-orchestrator");
-        assert_eq!(retirement.tab_id.as_deref(), Some("tab-yard-orchestrator"));
-        assert_eq!(retirement.pane_id, "pane-yard-orchestrator");
-        assert!(retirement.provider_session.is_some());
-        assert!(retirement.owns_tab);
+    #[tokio::test]
+    async fn after_preparation_started_runtime_is_quarantined_as_ambiguous() {
+        let runtime = Arc::new(DedicatedRuntime::default());
+        runtime.fail_after_preparation.store(true, Ordering::SeqCst);
+        let (service, _store, temp, profile_id) = service(runtime.clone()).await;
+        let provision = command(&profile_id);
+
+        let error = service.provision(provision.clone()).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::YardOrchestratorServiceError::RuntimeProvisionAmbiguous(_)
+        ));
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let captured: (String, String, Option<String>) = connection
+            .query_row(
+                "SELECT command.status, quarantine.terminal_id,
+                        quarantine.provider_session_value
+                   FROM command_acknowledgements command
+                   JOIN quarantined_provisioning_runtime_bindings quarantine
+                     ON quarantine.command_id = command.id
+                  WHERE command.id = ?1",
+                [&provision.command_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            captured,
+            (
+                "ambiguous".to_owned(),
+                "terminal-yard-orchestrator".to_owned(),
+                Some("yard-orchestrator-session".to_owned())
+            )
+        );
     }
 
     #[tokio::test]
@@ -1320,7 +1495,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_retirement_stops_when_atomic_identity_guard_is_unavailable() {
         let runtime = Arc::new(DedicatedRuntime::default());
-        runtime.fail_prompt_delivery.store(true, Ordering::SeqCst);
+        runtime.never_ready.store(true, Ordering::SeqCst);
         runtime
             .retirement_guard_unavailable
             .store(true, Ordering::SeqCst);
@@ -1330,7 +1505,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            super::YardOrchestratorServiceError::ObjectiveDeliveryFailed(_)
+            super::YardOrchestratorServiceError::RuntimeBindingUnverified
         ));
         assert_eq!(runtime.retirement_calls.lock().unwrap().len(), 1);
     }

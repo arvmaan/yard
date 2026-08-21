@@ -12,9 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use config::HerdrConfig;
 pub use control::{
-    BootstrapAgentRequest, HerdrControlError, PaneOutput, PrepareAgentRequest, PreparedAgent,
-    PromptAgentRequest, PromptedAgent, ProvisionAgentRequest, ProvisionedAgent, ReadPaneRequest,
-    StartPreparedAgentRequest,
+    BootstrapAgentRequest, HerdrControlError, PaneOutput, PrepareAgentRequest,
+    PrepareWorkspaceAgentRequest, PreparedAgent, PromptAgentRequest, PromptedAgent,
+    ProvisionAgentRequest, ProvisionedAgent, ReadPaneRequest, StartPreparedAgentRequest,
 };
 pub use error::HerdrError;
 pub use terminal::{
@@ -134,6 +134,18 @@ impl HerdrAdapter {
         control::prepare_agent(&self.config, request).await
     }
 
+    /// Create one workspace and return its root pane without starting an agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HerdrControlError`] when the session or workspace creation fails.
+    pub async fn prepare_workspace_agent(
+        &self,
+        request: PrepareWorkspaceAgentRequest,
+    ) -> Result<PreparedAgent, HerdrControlError> {
+        control::prepare_workspace_agent(&self.config, request).await
+    }
+
     /// Start and prompt an agent in a previously prepared tab.
     ///
     /// # Errors
@@ -144,6 +156,19 @@ impl HerdrAdapter {
         request: StartPreparedAgentRequest,
     ) -> Result<ProvisionedAgent, HerdrControlError> {
         control::start_prepared_agent(&self.config, request).await
+    }
+
+    /// Start and prompt an agent in a previously prepared workspace root pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HerdrControlError`] when agent start, workspace rollback, or prompt delivery
+    /// fails.
+    pub async fn start_prepared_workspace_agent(
+        &self,
+        request: StartPreparedAgentRequest,
+    ) -> Result<ProvisionedAgent, HerdrControlError> {
+        control::start_prepared_workspace_agent(&self.config, request).await
     }
 
     /// Submit one prompt to an existing Herdr agent without waiting for a

@@ -1794,19 +1794,11 @@ impl From<ProjectServiceError> for ApiError {
                 code: "worker_provision_failed",
                 message,
             },
-            ProjectServiceError::RuntimeProvisionAmbiguous(message) => Self {
+            ProjectServiceError::RuntimeProvisionAmbiguous(message)
+            | ProjectServiceError::RuntimeBindingUnverified(message)
+            | ProjectServiceError::ObjectiveDeliveryFailed(message) => Self {
                 status: StatusCode::CONFLICT,
                 code: "command_outcome_ambiguous",
-                message,
-            },
-            ProjectServiceError::RuntimeBindingUnverified(message) => Self {
-                status: StatusCode::BAD_GATEWAY,
-                code: "runtime_binding_unverified",
-                message,
-            },
-            ProjectServiceError::ObjectiveDeliveryFailed(message) => Self {
-                status: StatusCode::BAD_GATEWAY,
-                code: "orchestrator_objective_delivery_failed",
                 message,
             },
             error @ (ProjectServiceError::RuntimeWorkspaceNotFound { .. }
@@ -1940,7 +1932,8 @@ impl From<OrchestratorReplacementServiceError> for ApiError {
                 code: "orchestrator_replacement_provision_failed",
                 message,
             },
-            OrchestratorReplacementServiceError::ObjectiveDeliveryFailed(message) => Self {
+            OrchestratorReplacementServiceError::RuntimeProvisionAmbiguous(message)
+            | OrchestratorReplacementServiceError::ObjectiveDeliveryFailed(message) => Self {
                 status: StatusCode::CONFLICT,
                 code: "command_outcome_ambiguous",
                 message,
@@ -2049,6 +2042,7 @@ impl From<ProjectOrchestratorTransferServiceError> for ApiError {
                 | ProjectStoreError::StaleRuntimeSnapshot
                 | ProjectStoreError::OrchestratorInterventionInProgress
                 | ProjectStoreError::OrchestratorTransferTargetChanged
+                | ProjectStoreError::OrchestratorTransferActiveAssignment
                 | ProjectStoreError::IdempotencyConflict),
             ) => Self {
                 status: StatusCode::CONFLICT,
@@ -2230,14 +2224,11 @@ impl From<AllocationServiceError> for ApiError {
                 code: "worker_provision_failed",
                 message,
             },
-            AllocationServiceError::RuntimeBindingUnverified(message) => Self {
-                status: StatusCode::BAD_GATEWAY,
-                code: "runtime_binding_unverified",
-                message,
-            },
-            AllocationServiceError::ObjectiveDeliveryFailed(message) => Self {
-                status: StatusCode::BAD_GATEWAY,
-                code: "assignment_delivery_failed",
+            AllocationServiceError::RuntimeProvisionAmbiguous(message)
+            | AllocationServiceError::RuntimeBindingUnverified(message)
+            | AllocationServiceError::ObjectiveDeliveryFailed(message) => Self {
+                status: StatusCode::CONFLICT,
+                code: "command_outcome_ambiguous",
                 message,
             },
             AllocationServiceError::RuntimeIntervention(error) => runtime_intervention_error(error),
@@ -2298,16 +2289,17 @@ impl From<CoordinationNodeServiceError> for ApiError {
                 code: "coordination_node_provision_failed",
                 message,
             },
+            CoordinationNodeServiceError::RuntimeProvisionAmbiguous(message)
+            | CoordinationNodeServiceError::ObjectiveDeliveryFailed(message) => Self {
+                status: StatusCode::CONFLICT,
+                code: "command_outcome_ambiguous",
+                message,
+            },
             CoordinationNodeServiceError::RuntimeBindingUnverified
             | CoordinationNodeServiceError::ReconciledWorkerMissing => Self {
-                status: StatusCode::BAD_GATEWAY,
-                code: "runtime_binding_unverified",
+                status: StatusCode::CONFLICT,
+                code: "command_outcome_ambiguous",
                 message: error.to_string(),
-            },
-            CoordinationNodeServiceError::ObjectiveDeliveryFailed(message) => Self {
-                status: StatusCode::BAD_GATEWAY,
-                code: "coordination_objective_delivery_failed",
-                message,
             },
             CoordinationNodeServiceError::Reconciliation(ReconciliationServiceError::Store(
                 error,
@@ -2361,10 +2353,16 @@ impl From<YardOrchestratorServiceError> for ApiError {
                 code: "yard_orchestrator_provision_failed",
                 message,
             },
+            YardOrchestratorServiceError::RuntimeProvisionAmbiguous(message)
+            | YardOrchestratorServiceError::ObjectiveDeliveryFailed(message) => Self {
+                status: StatusCode::CONFLICT,
+                code: "command_outcome_ambiguous",
+                message,
+            },
             YardOrchestratorServiceError::RuntimeBindingUnverified
             | YardOrchestratorServiceError::ReconciledWorkerMissing => Self {
-                status: StatusCode::BAD_GATEWAY,
-                code: "runtime_binding_unverified",
+                status: StatusCode::CONFLICT,
+                code: "command_outcome_ambiguous",
                 message: error.to_string(),
             },
             YardOrchestratorServiceError::RecoveryNotConfigured
@@ -2379,11 +2377,6 @@ impl From<YardOrchestratorServiceError> for ApiError {
                 status: StatusCode::CONFLICT,
                 code: "yard_orchestrator_recovery_conflict",
                 message: error.to_string(),
-            },
-            YardOrchestratorServiceError::ObjectiveDeliveryFailed(message) => Self {
-                status: StatusCode::BAD_GATEWAY,
-                code: "yard_orchestrator_prompt_failed",
-                message,
             },
             YardOrchestratorServiceError::Reconciliation(
                 ReconciliationServiceError::Inventory(_),
@@ -2558,11 +2551,9 @@ fn runtime_intervention_error(error: RuntimeInterventionError) -> ApiError {
             "runtime_intervention_unavailable",
             message,
         ),
-        RuntimeInterventionError::Ambiguous(message) => (
-            StatusCode::BAD_GATEWAY,
-            "runtime_intervention_ambiguous",
-            message,
-        ),
+        RuntimeInterventionError::Ambiguous(message) => {
+            (StatusCode::CONFLICT, "command_outcome_ambiguous", message)
+        }
     };
     ApiError {
         status,
@@ -3171,25 +3162,67 @@ mod tests {
     use yard_herdr::HerdrError;
     use yard_store::{SqliteProjectStore, YardStore};
 
-    use super::{router, test_router_with_shutdown};
+    use super::{ApiError, router, runtime_intervention_error, test_router_with_shutdown};
     use crate::allocation_service::{
-        RuntimeControl, RuntimeProvisionError, RuntimeProvisionRequest, RuntimeRetirementError,
-        RuntimeRetirementRequest, RuntimeWorkspaceProvisionRequest,
+        AllocationServiceError, RuntimeControl, RuntimeProvisionError, RuntimeProvisionRequest,
+        RuntimeRetirementError, RuntimeRetirementRequest, RuntimeWorkspaceProvisionRequest,
     };
     use crate::artifact_service::ArtifactService;
     use crate::automation_service::AutomationService;
-    use crate::coordination_node_service::CoordinationNodeService;
+    use crate::coordination_node_service::{CoordinationNodeService, CoordinationNodeServiceError};
     use crate::intervention_service::{
         InterventionService, RuntimeIntervention, RuntimeInterventionError, RuntimeOutputRequest,
         RuntimeOutputResult, RuntimePromptRequest, RuntimePromptResult,
     };
     use crate::inventory_service::{InventoryServiceError, InventorySource};
+    use crate::orchestrator_replacement_service::OrchestratorReplacementServiceError;
+    use crate::project_service::ProjectServiceError;
     use crate::reconciliation_service::ReconciliationService;
     use crate::runtime_cleanup_service::RuntimeCleanupService;
     use crate::terminal_service::{
         OpenTerminalRequest, RuntimeTerminal, RuntimeTerminalError, RuntimeTerminalSession,
         TerminalClientMessage, TerminalServerMessage,
     };
+    use crate::yard_orchestrator_service::YardOrchestratorServiceError;
+
+    #[test]
+    fn durable_runtime_ambiguity_maps_to_non_retryable_conflict() {
+        let errors = [
+            ApiError::from(ProjectServiceError::RuntimeBindingUnverified(
+                "project runtime changed".to_owned(),
+            )),
+            ApiError::from(ProjectServiceError::ObjectiveDeliveryFailed(
+                "project prompt acknowledgement was lost".to_owned(),
+            )),
+            ApiError::from(AllocationServiceError::RuntimeBindingUnverified(
+                "allocation runtime changed".to_owned(),
+            )),
+            ApiError::from(AllocationServiceError::ObjectiveDeliveryFailed(
+                "assignment prompt acknowledgement was lost".to_owned(),
+            )),
+            ApiError::from(CoordinationNodeServiceError::RuntimeBindingUnverified),
+            ApiError::from(CoordinationNodeServiceError::ObjectiveDeliveryFailed(
+                "coordination prompt acknowledgement was lost".to_owned(),
+            )),
+            ApiError::from(YardOrchestratorServiceError::RuntimeBindingUnverified),
+            ApiError::from(YardOrchestratorServiceError::ObjectiveDeliveryFailed(
+                "Yard orchestrator prompt acknowledgement was lost".to_owned(),
+            )),
+            ApiError::from(
+                OrchestratorReplacementServiceError::ObjectiveDeliveryFailed(
+                    "replacement prompt acknowledgement was lost".to_owned(),
+                ),
+            ),
+            runtime_intervention_error(RuntimeInterventionError::Ambiguous(
+                "runtime prompt acknowledgement was lost".to_owned(),
+            )),
+        ];
+
+        for error in errors {
+            assert_eq!(error.status, StatusCode::CONFLICT);
+            assert_eq!(error.code, "command_outcome_ambiguous");
+        }
+    }
 
     struct FakeInventory;
 
@@ -3708,11 +3741,191 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct PostMutationProvisionRuntime {
+        provision_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RuntimeControl for PostMutationProvisionRuntime {
+        async fn provision_worker(
+            &self,
+            request: RuntimeProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            self.provision_calls.fetch_add(1, Ordering::SeqCst);
+            let mut runtime = FakeRuntime.provision_worker(request).await?;
+            runtime.workspace_id = "foreign-workspace".to_owned();
+            runtime.terminal_id = "foreign-terminal".to_owned();
+            runtime.tab_id = Some("foreign-tab".to_owned());
+            runtime.pane_id = "foreign-pane".to_owned();
+            runtime.provider_session = Some(provider_session("foreign-provider-session"));
+            Err(RuntimeProvisionError::AfterPreparation {
+                message: "agent.start returned a mismatched runtime identity".to_owned(),
+                ambiguous: false,
+                started_runtime: Some(Box::new(runtime)),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct AmbiguousProvisionRuntime {
+        provision_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RuntimeControl for AmbiguousProvisionRuntime {
+        async fn provision_worker(
+            &self,
+            _request: RuntimeProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            self.provision_calls.fetch_add(1, Ordering::SeqCst);
+            Err(RuntimeProvisionError::AfterPreparation {
+                message: "tab.create response was lost".to_owned(),
+                ambiguous: true,
+                started_runtime: None,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct IdentityMismatchProjectRuntime {
+        bootstrap_calls: AtomicUsize,
+        provision_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RuntimeControl for IdentityMismatchProjectRuntime {
+        async fn bootstrap_worker(
+            &self,
+            request: RuntimeWorkspaceProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            self.bootstrap_calls.fetch_add(1, Ordering::SeqCst);
+            let mut runtime = FakeRuntime.bootstrap_worker(request).await?;
+            runtime.pane_id = "mismatched-workspace-project-pane".to_owned();
+            Ok(runtime)
+        }
+
+        async fn provision_worker(
+            &self,
+            request: RuntimeProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            self.provision_calls.fetch_add(1, Ordering::SeqCst);
+            let mut runtime = FakeRuntime.provision_worker(request).await?;
+            runtime.pane_id = "mismatched-profile-project-pane".to_owned();
+            Ok(runtime)
+        }
+    }
+
+    #[derive(Default)]
+    struct PromptDeliveryProjectRuntime {
+        provision_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RuntimeControl for PromptDeliveryProjectRuntime {
+        async fn provision_worker(
+            &self,
+            request: RuntimeProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            self.provision_calls.fetch_add(1, Ordering::SeqCst);
+            let runtime = FakeRuntime.provision_worker(request).await?;
+            Err(RuntimeProvisionError::PromptDelivery {
+                runtime: Box::new(runtime),
+                message: "initial objective acknowledgement was lost".to_owned(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct UnverifiedResumeRuntime {
+        provision_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RuntimeControl for UnverifiedResumeRuntime {
+        async fn provision_worker(
+            &self,
+            request: RuntimeProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            self.provision_calls.fetch_add(1, Ordering::SeqCst);
+            let is_resume = request.command_id == "prompt-allocation-command";
+            let mut runtime = FakeRuntime.provision_worker(request).await?;
+            if is_resume {
+                runtime.pane_id = "mismatched-resume-pane".to_owned();
+            }
+            Ok(runtime)
+        }
+    }
+
+    struct ClaimBarrierRuntime {
+        start_entered: Arc<tokio::sync::Notify>,
+        start_release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeControl for ClaimBarrierRuntime {
+        async fn provision_worker(
+            &self,
+            _request: RuntimeProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            unreachable!("the claim race uses staged provisioning")
+        }
+
+        async fn prepare_worker(
+            &self,
+            request: RuntimeProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            FakeRuntime.provision_worker(request).await
+        }
+
+        async fn start_prepared_worker(
+            &self,
+            _request: RuntimeProvisionRequest,
+            prepared: WorkerRuntimeBinding,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            self.start_entered.notify_one();
+            self.start_release.notified().await;
+            Ok(prepared)
+        }
+    }
+
+    struct AmbiguousStartRuntime;
+
+    #[async_trait]
+    impl RuntimeControl for AmbiguousStartRuntime {
+        async fn provision_worker(
+            &self,
+            _request: RuntimeProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            unreachable!("the ambiguous start regression uses staged provisioning")
+        }
+
+        async fn prepare_worker(
+            &self,
+            request: RuntimeProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            FakeRuntime.provision_worker(request).await
+        }
+
+        async fn start_prepared_worker(
+            &self,
+            _request: RuntimeProvisionRequest,
+            prepared: WorkerRuntimeBinding,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            Err(RuntimeProvisionError::AfterPreparation {
+                message: "agent.start response and rollback acknowledgement were lost".to_owned(),
+                ambiguous: true,
+                started_runtime: Some(Box::new(prepared)),
+            })
+        }
+    }
+
     struct ClaimCheckingRuntime {
         database_path: PathBuf,
         claim_seen_before_start: AtomicBool,
         start_calls: AtomicUsize,
         replacement_prompt_failure: AtomicBool,
+        replacement_start_ambiguity: AtomicBool,
         retirement_failures: AtomicUsize,
         retirement_calls: Mutex<Vec<RuntimeRetirementRequest>>,
         start_requests: Mutex<Vec<RuntimeProvisionRequest>>,
@@ -3742,33 +3955,64 @@ mod tests {
             request: RuntimeProvisionRequest,
             mut prepared: WorkerRuntimeBinding,
         ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
-            self.start_calls.fetch_add(1, Ordering::SeqCst);
-            self.start_requests.lock().unwrap().push(request.clone());
-
             // A separate connection proves the claim transaction committed before start.
             let connection = rusqlite::Connection::open(&self.database_path).unwrap();
-            let claimed = connection
+            let is_handoff = connection
                 .query_row(
-                    "SELECT target_runtime_adapter, target_runtime_session,
-                            target_runtime_workspace_id, target_terminal_id,
-                            target_tab_id, target_pane_id,
-                            target_runtime_claimed_at_unix_ms
-                       FROM worker_handoff_commands
-                      WHERE command_id = ?1",
+                    "SELECT EXISTS(
+                        SELECT 1
+                          FROM worker_handoff_commands
+                         WHERE command_id = ?1
+                    )",
                     [&request.command_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, Option<String>>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, Option<i64>>(6)?,
-                        ))
-                    },
+                    |row| row.get::<_, bool>(0),
                 )
                 .unwrap();
+            let claimed = if is_handoff {
+                connection
+                    .query_row(
+                        "SELECT target_runtime_adapter, target_runtime_session,
+                                target_runtime_workspace_id, target_terminal_id,
+                                target_tab_id, target_pane_id,
+                                target_runtime_claimed_at_unix_ms
+                           FROM worker_handoff_commands
+                          WHERE command_id = ?1",
+                        [&request.command_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, Option<String>>(4)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, Option<i64>>(6)?,
+                            ))
+                        },
+                    )
+                    .unwrap()
+            } else {
+                connection
+                    .query_row(
+                        "SELECT adapter, runtime_session, runtime_workspace_id,
+                                terminal_id, tab_id, pane_id, captured_at_unix_ms
+                           FROM provisioning_runtime_claims
+                          WHERE command_id = ?1",
+                        [&request.command_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, Option<String>>(4)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, Option<i64>>(6)?,
+                            ))
+                        },
+                    )
+                    .unwrap()
+            };
             assert_eq!(claimed.0, prepared.adapter);
             assert_eq!(claimed.1, prepared.session);
             assert_eq!(claimed.2, prepared.workspace_id);
@@ -3776,7 +4020,11 @@ mod tests {
             assert_eq!(claimed.4, prepared.tab_id);
             assert_eq!(claimed.5, prepared.pane_id);
             assert!(claimed.6.is_some());
-            self.claim_seen_before_start.store(true, Ordering::SeqCst);
+            if is_handoff {
+                self.start_calls.fetch_add(1, Ordering::SeqCst);
+                self.start_requests.lock().unwrap().push(request.clone());
+                self.claim_seen_before_start.store(true, Ordering::SeqCst);
+            }
 
             prepared.provider_session =
                 Some(provider_session(&format!("{}-session", request.agent_name)));
@@ -3836,6 +4084,13 @@ mod tests {
             prepared.provider_session =
                 Some(provider_session(&format!("{}-session", request.agent_name)));
             prepared.process_state = yard_domain::RuntimeProcessState::Running;
+            if self.replacement_start_ambiguity.load(Ordering::SeqCst) {
+                return Err(RuntimeProvisionError::AfterPreparation {
+                    message: "simulated agent.start acknowledgement ambiguity".to_owned(),
+                    ambiguous: true,
+                    started_runtime: Some(Box::new(prepared)),
+                });
+            }
             if self.replacement_prompt_failure.load(Ordering::SeqCst) {
                 return Err(RuntimeProvisionError::PromptDelivery {
                     runtime: Box::new(prepared),
@@ -4264,6 +4519,7 @@ mod tests {
             claim_seen_before_start: AtomicBool::new(false),
             start_calls: AtomicUsize::new(0),
             replacement_prompt_failure: AtomicBool::new(false),
+            replacement_start_ambiguity: AtomicBool::new(false),
             retirement_failures: AtomicUsize::new(retirement_failures),
             retirement_calls: Mutex::new(Vec::new()),
             start_requests: Mutex::new(Vec::new()),
@@ -4876,6 +5132,62 @@ mod tests {
         assert_eq!(status, "ambiguous");
         assert_eq!(started_snapshots, 1);
         assert_eq!(cleanup_jobs, 0);
+    }
+
+    #[tokio::test]
+    async fn replacement_start_ambiguity_returns_conflict_and_retains_identity() {
+        let (app, temp, runtime) = handoff_test_router().await;
+        runtime
+            .replacement_start_ambiguity
+            .store(true, Ordering::SeqCst);
+        let (uri, command, project_id) = create_orchestrator_replacement_request(&app).await;
+        let displaced_worker_id = command["expected_orchestrator_worker_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "command_outcome_ambiguous"
+        );
+        let project = get_json(&app, &format!("/api/v1/projects/{project_id}")).await;
+        assert_eq!(project["orchestrator"]["id"], displaced_worker_id);
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let captured: (String, String, Option<String>) = connection
+            .query_row(
+                "SELECT command.status, runtime.terminal_id,
+                        runtime.provider_session_value
+                   FROM command_acknowledgements command
+                   JOIN orchestrator_replacement_runtime_bindings runtime
+                     ON runtime.command_id = command.id
+                    AND runtime.binding_role = 'replacement_started'
+                  WHERE command.id = 'replace-command-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            captured,
+            (
+                "ambiguous".to_owned(),
+                "terminal-yard-replacecommand1".to_owned(),
+                Some("yard-replacecommand1-session".to_owned())
+            )
+        );
     }
 
     #[tokio::test]
@@ -6099,6 +6411,320 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn prepared_runtime_claim_blocks_adoption_until_project_finalization() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let start_entered = Arc::new(tokio::sync::Notify::new());
+        let start_release = Arc::new(tokio::sync::Notify::new());
+        let runtime = Arc::new(ClaimBarrierRuntime {
+            start_entered: Arc::clone(&start_entered),
+            start_release: Arc::clone(&start_release),
+        });
+        let interactive = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            Arc::new(ProjectCreationInventory),
+            runtime,
+            interactive.clone(),
+            interactive,
+            store.clone(),
+            artifacts,
+        );
+        let profile = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/worker-profiles")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(profile_body("Orchestrator")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let body = profile_project_body(profile["id"].as_str().unwrap());
+        let request_app = app.clone();
+        let request = tokio::spawn(async move {
+            request_app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/projects/from-profile")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+        });
+        start_entered.notified().await;
+
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let claims_before: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM provisioning_runtime_claims
+                  WHERE command_id = 'profile-project-command'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claims_before, 1);
+        drop(connection);
+        store
+            .reconcile_runtime_inventory(
+                ProjectCreationInventory.inventory("default").await.unwrap(),
+            )
+            .await
+            .unwrap();
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let authoritative_before: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM worker_runtime_bindings
+                  WHERE terminal_id = 'terminal-yard-profileprojectcommand'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authoritative_before, 0);
+        drop(connection);
+
+        start_release.notify_one();
+        let response = request.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let claims_after: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM provisioning_runtime_claims
+                  WHERE command_id = 'profile-project-command'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let authoritative_after: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM worker_runtime_bindings
+                  WHERE terminal_id = 'terminal-yard-profileprojectcommand'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claims_after, 0);
+        assert_eq!(authoritative_after, 1);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn finalization_failure_retains_runtime_claim_and_blocks_adoption() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(CountingRuntime::default());
+        let interactive = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            Arc::new(ProjectCreationInventory),
+            runtime,
+            interactive.clone(),
+            interactive,
+            store.clone(),
+            artifacts,
+        );
+        let profile = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/worker-profiles")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(profile_body("Orchestrator")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_profile_project_finalization
+                 BEFORE INSERT ON projects
+                 BEGIN
+                     SELECT RAISE(FAIL, 'injected project finalization failure');
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects/from-profile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(profile_project_body(
+                        profile["id"].as_str().unwrap(),
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "command_outcome_ambiguous"
+        );
+        store
+            .reconcile_runtime_inventory(
+                ProjectCreationInventory.inventory("default").await.unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let state: (String, i64, i64, i64, Option<String>) = connection
+            .query_row(
+                "SELECT command.status,
+                        EXISTS (
+                            SELECT 1 FROM provisioning_runtime_claims claim
+                             WHERE claim.command_id = command.id
+                        ),
+                        EXISTS (
+                            SELECT 1 FROM worker_runtime_bindings binding
+                             WHERE binding.terminal_id =
+                                   'terminal-yard-profileprojectcommand'
+                        ),
+                        EXISTS (
+                            SELECT 1
+                              FROM quarantined_provisioning_runtime_bindings quarantine
+                             WHERE quarantine.command_id = command.id
+                        ),
+                        (
+                            SELECT provider_session_value
+                              FROM quarantined_provisioning_runtime_bindings quarantine
+                             WHERE quarantine.command_id = command.id
+                        )
+                   FROM command_acknowledgements command
+                  WHERE command.id = 'profile-project-command'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (
+                "ambiguous".to_owned(),
+                1,
+                0,
+                1,
+                Some("yard-profileprojectcommand-session".to_owned())
+            )
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn ambiguous_start_preserves_prepared_claim_and_quarantines_identity() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(AmbiguousStartRuntime);
+        let interactive = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            Arc::new(ProjectCreationInventory),
+            runtime,
+            interactive.clone(),
+            interactive,
+            store.clone(),
+            artifacts,
+        );
+        let profile = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/worker-profiles")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(profile_body("Orchestrator")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects/from-profile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(profile_project_body(
+                        profile["id"].as_str().unwrap(),
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "command_outcome_ambiguous"
+        );
+        store
+            .reconcile_runtime_inventory(
+                ProjectCreationInventory.inventory("default").await.unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let state: (String, i64, i64, i64) = connection
+            .query_row(
+                "SELECT command.status,
+                        EXISTS (
+                            SELECT 1 FROM provisioning_runtime_claims claim
+                             WHERE claim.command_id = command.id
+                        ),
+                        EXISTS (
+                            SELECT 1
+                              FROM quarantined_provisioning_runtime_bindings quarantine
+                             WHERE quarantine.command_id = command.id
+                        ),
+                        EXISTS (
+                            SELECT 1 FROM worker_runtime_bindings binding
+                             WHERE binding.terminal_id =
+                                   'terminal-yard-profileprojectcommand'
+                        )
+                   FROM command_acknowledgements command
+                  WHERE command.id = 'profile-project-command'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("ambiguous".to_owned(), 1, 1, 0));
+    }
+
+    #[tokio::test]
     async fn creates_workspace_backed_project_once_and_replays_without_reprovisioning() {
         let temp = TempDir::new().unwrap();
         let store = Arc::new(
@@ -6263,6 +6889,521 @@ mod tests {
             "command_outcome_ambiguous"
         );
         assert_eq!(runtime.bootstrap_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn unverified_profile_project_runtime_is_quarantined_without_adoption() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(IdentityMismatchProjectRuntime::default());
+        let interactive = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            Arc::new(ProjectCreationInventory),
+            runtime.clone(),
+            interactive.clone(),
+            interactive,
+            store.clone(),
+            artifacts,
+        );
+        let profile = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/worker-profiles")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(profile_body("Orchestrator")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let body = profile_project_body(profile["id"].as_str().unwrap());
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects/from-profile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(first).await["error"]["code"],
+            "command_outcome_ambiguous"
+        );
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects/from-profile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(replay).await["error"]["code"],
+            "command_outcome_ambiguous"
+        );
+        assert_eq!(runtime.provision_calls.load(Ordering::SeqCst), 1);
+
+        let observed = ProjectCreationInventory.inventory("default").await.unwrap();
+        store.reconcile_runtime_inventory(observed).await.unwrap();
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let quarantined: (String, String) = connection
+            .query_row(
+                "SELECT command.status, runtime.pane_id
+                   FROM quarantined_provisioning_runtime_bindings runtime
+                   JOIN command_acknowledgements command
+                     ON command.id = runtime.command_id
+                  WHERE runtime.command_id = 'profile-project-command'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            quarantined,
+            (
+                "ambiguous".to_owned(),
+                "mismatched-profile-project-pane".to_owned()
+            )
+        );
+        let authoritative: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM worker_runtime_bindings
+                  WHERE terminal_id = 'terminal-yard-profileprojectcommand'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authoritative, 0);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn unverified_workspace_project_runtime_is_quarantined_without_adoption() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(IdentityMismatchProjectRuntime::default());
+        let interactive = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            Arc::new(WorkspaceProjectCreationInventory),
+            runtime.clone(),
+            interactive.clone(),
+            interactive,
+            store.clone(),
+            artifacts,
+        );
+        let profile = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/worker-profiles")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(profile_body("Orchestrator")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let body = workspace_project_body(profile["id"].as_str().unwrap());
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects/from-profile/workspace")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(first).await["error"]["code"],
+            "command_outcome_ambiguous"
+        );
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects/from-profile/workspace")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(replay).await["error"]["code"],
+            "command_outcome_ambiguous"
+        );
+        assert_eq!(runtime.bootstrap_calls.load(Ordering::SeqCst), 1);
+
+        let observed = WorkspaceProjectCreationInventory
+            .inventory("default")
+            .await
+            .unwrap();
+        store.reconcile_runtime_inventory(observed).await.unwrap();
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let quarantined: (String, String) = connection
+            .query_row(
+                "SELECT command.status, runtime.pane_id
+                   FROM quarantined_provisioning_runtime_bindings runtime
+                   JOIN command_acknowledgements command
+                     ON command.id = runtime.command_id
+                  WHERE runtime.command_id = 'workspace-project-command'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            quarantined,
+            (
+                "ambiguous".to_owned(),
+                "mismatched-workspace-project-pane".to_owned()
+            )
+        );
+        let authoritative: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM worker_runtime_bindings
+                  WHERE terminal_id = 'terminal-yard-workspaceprojectcommand'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authoritative, 0);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn project_prompt_delivery_runtime_is_quarantined_and_never_retried() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(PromptDeliveryProjectRuntime::default());
+        let interactive = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            Arc::new(ProjectCreationInventory),
+            runtime.clone(),
+            interactive.clone(),
+            interactive,
+            store.clone(),
+            artifacts,
+        );
+        let profile = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/worker-profiles")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(profile_body("Orchestrator")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let body = profile_project_body(profile["id"].as_str().unwrap());
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects/from-profile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(first).await["error"]["code"],
+            "command_outcome_ambiguous"
+        );
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects/from-profile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(replay).await["error"]["code"],
+            "command_outcome_ambiguous"
+        );
+        assert_eq!(runtime.provision_calls.load(Ordering::SeqCst), 1);
+
+        let observed = ProjectCreationInventory.inventory("default").await.unwrap();
+        store.reconcile_runtime_inventory(observed).await.unwrap();
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let captured: (String, String, String) = connection
+            .query_row(
+                "SELECT command.status, runtime.terminal_id, runtime.pane_id
+                   FROM quarantined_provisioning_runtime_bindings runtime
+                   JOIN command_acknowledgements command
+                     ON command.id = runtime.command_id
+                  WHERE runtime.command_id = 'profile-project-command'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            captured,
+            (
+                "ambiguous".to_owned(),
+                "terminal-yard-profileprojectcommand".to_owned(),
+                "pane-yard-profileprojectcommand".to_owned()
+            )
+        );
+        let authoritative: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM worker_runtime_bindings
+                  WHERE terminal_id = 'terminal-yard-profileprojectcommand'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authoritative, 0);
+    }
+
+    #[tokio::test]
+    async fn post_mutation_provisioning_identity_is_quarantined_and_never_retried() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(PostMutationProvisionRuntime::default());
+        let interactive = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            Arc::new(FakeInventory),
+            runtime.clone(),
+            interactive.clone(),
+            interactive,
+            store,
+            artifacts,
+        );
+        let profile = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/worker-profiles")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(profile_body("Orchestrator")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let body = profile_project_body(profile["id"].as_str().unwrap());
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/projects/from-profile")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                response_json(response).await["error"]["code"],
+                "command_outcome_ambiguous"
+            );
+        }
+        assert_eq!(runtime.provision_calls.load(Ordering::SeqCst), 1);
+
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let quarantined: (String, String, String, String) = connection
+            .query_row(
+                "SELECT command.status, runtime.runtime_workspace_id,
+                        runtime.terminal_id, runtime.pane_id
+                   FROM quarantined_provisioning_runtime_bindings runtime
+                   JOIN command_acknowledgements command
+                     ON command.id = runtime.command_id
+                  WHERE runtime.command_id = 'profile-project-command'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            quarantined,
+            (
+                "ambiguous".to_owned(),
+                "foreign-workspace".to_owned(),
+                "foreign-terminal".to_owned(),
+                "foreign-pane".to_owned(),
+            )
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn ambiguous_profile_allocation_without_identity_remains_reserved() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(AmbiguousProvisionRuntime::default());
+        let interactive = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            Arc::new(FakeInventory),
+            runtime.clone(),
+            interactive.clone(),
+            interactive,
+            store,
+            artifacts,
+        );
+        let project = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/projects")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(create_body("terminal-1")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let profile = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/worker-profiles")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(profile_body("Implementer")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let uri = format!(
+            "/api/v1/projects/{}/assignments",
+            project["id"].as_str().unwrap()
+        );
+        let command = serde_json::json!({
+            "command_id": "ambiguous-profile-allocation",
+            "actor": "local-user",
+            "profile_id": profile["id"],
+            "expected_profile_version": profile["version"],
+            "expected_project_version": project["version"],
+            "objective": "Preserve an uncertain tab creation.",
+            "role": "implementer",
+            "isolation_policy": "project_workspace"
+        });
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(&uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(command.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                response_json(response).await["error"]["code"],
+                "command_outcome_ambiguous"
+            );
+        }
+        assert_eq!(runtime.provision_calls.load(Ordering::SeqCst), 1);
+
+        let current = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/api/v1/projects/{}",
+                            project["id"].as_str().unwrap()
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let mut fresh = command;
+        fresh["command_id"] =
+            serde_json::Value::String("fresh-after-ambiguous-profile-allocation".to_owned());
+        fresh["expected_project_version"] = current["version"].clone();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(fresh.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "assignment_intervention_in_progress"
+        );
+        assert_eq!(runtime.provision_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -7056,6 +8197,256 @@ mod tests {
             "terminal-yard-promptallocationcommand"
         );
         assert_eq!(resumed["assignment"]["lifecycle"], "active");
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn resumable_worker_quarantines_unverified_runtime_without_rebinding() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(UnverifiedResumeRuntime::default());
+        let interactive = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            Arc::new(FakeInventory),
+            runtime.clone(),
+            interactive.clone(),
+            interactive,
+            store.clone(),
+            artifacts,
+        );
+        let project = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/projects")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(create_body("terminal-1")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let project_id = project["id"].as_str().unwrap();
+        let profile = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/worker-profiles")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(profile_body("Implementer")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let assignment_uri = format!("/api/v1/projects/{project_id}/assignments");
+        let first = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(&assignment_uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "command_id": "allocation-command-1",
+                                "actor": "local-user",
+                                "profile_id": profile["id"],
+                                "expected_profile_version": profile["version"],
+                                "expected_project_version": project["version"],
+                                "objective": "Complete the first assignment.",
+                                "role": "implementer",
+                                "isolation_policy": "project_workspace"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let worker_id = first["assignment"]["worker"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let assignment_id = first["assignment"]["id"].as_str().unwrap();
+        let completion_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/projects/{project_id}/assignments/{assignment_id}/completion-receipts"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command_id": "complete-before-unverified-resume",
+                            "actor": "local-user",
+                            "attempt_id": first["assignment"]["attempt"]["id"],
+                            "expected_assignment_version": first["assignment"]["version"],
+                            "expected_attempt_version": first["assignment"]["attempt"]["version"],
+                            "outcome": "completed",
+                            "summary": "The first assignment is complete.",
+                            "artifact_refs": [],
+                            "evidence_refs": ["test://unverified-resume"],
+                            "unresolved_blockers": []
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completion_response.status(), StatusCode::CREATED);
+
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE worker_runtime_bindings
+                    SET process_state = 'exited', observed_status = 'unknown'
+                  WHERE worker_id = ?1",
+                [&worker_id],
+            )
+            .unwrap();
+        drop(connection);
+        let candidates = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/workers")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let candidate = candidates["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["worker"]["id"] == worker_id)
+            .unwrap();
+        assert_eq!(candidate["availability"], "resumable");
+        let current_project = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/projects/{project_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let resume = serde_json::json!({
+            "command_id": "prompt-allocation-command",
+            "actor": "local-user",
+            "worker_id": worker_id,
+            "expected_worker_version": candidate["worker"]["version"],
+            "expected_project_version": current_project["version"],
+            "objective": "Continue with an identity-safe replacement.",
+            "role": "implementer",
+            "isolation_policy": "project_workspace"
+        });
+
+        let first_resume = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&assignment_uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(resume.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_resume.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(first_resume).await["error"]["code"],
+            "command_outcome_ambiguous"
+        );
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&assignment_uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(resume.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(replay).await["error"]["code"],
+            "command_outcome_ambiguous"
+        );
+        assert_eq!(runtime.provision_calls.load(Ordering::SeqCst), 2);
+
+        let reconciliation = store
+            .reconcile_runtime_inventory(FakeInventory.inventory("default").await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(reconciliation.adopted_workers, 0);
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let trusted: (String, String) = connection
+            .query_row(
+                "SELECT terminal_id, pane_id
+                   FROM worker_runtime_bindings
+                  WHERE worker_id = ?1",
+                [&worker_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            trusted,
+            (
+                "terminal-yard-allocationcommand1".to_owned(),
+                "pane-yard-allocationcommand1".to_owned()
+            )
+        );
+        let quarantined: (String, String, String) = connection
+            .query_row(
+                "SELECT command.status, runtime.terminal_id, runtime.pane_id
+                   FROM quarantined_provisioning_runtime_bindings runtime
+                   JOIN command_acknowledgements command
+                     ON command.id = runtime.command_id
+                  WHERE runtime.command_id = 'prompt-allocation-command'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            quarantined,
+            (
+                "ambiguous".to_owned(),
+                "terminal-yard-promptallocationcommand".to_owned(),
+                "mismatched-resume-pane".to_owned()
+            )
+        );
+        let unverified_authoritative: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM worker_runtime_bindings
+                  WHERE terminal_id = 'terminal-yard-promptallocationcommand'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unverified_authoritative, 0);
     }
 
     #[allow(clippy::too_many_lines)]

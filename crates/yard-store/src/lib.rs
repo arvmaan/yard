@@ -58,7 +58,7 @@ mod coordination_node_store;
 mod orchestrator_workflow_profile_store;
 mod token_spend_store;
 
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 25;
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_projects.sql");
 const PROFILE_ASSIGNMENT_MIGRATION: &str =
     include_str!("../migrations/0002_profiles_assignments.sql");
@@ -99,6 +99,8 @@ const PROJECT_ORCHESTRATOR_TRANSFER_MIGRATION: &str =
     include_str!("../migrations/0023_project_orchestrator_transfer.sql");
 const ORCHESTRATOR_REPLACEMENT_RECOVERY_MIGRATION: &str =
     include_str!("../migrations/0024_orchestrator_replacement_recovery.sql");
+const FINAL_BACKEND_SAFETY_MIGRATION: &str =
+    include_str!("../migrations/0025_final_backend_safety.sql");
 const BLANK_WORKER_PROFILE_ID: &str = "yard:managed-blank-profile";
 const BLANK_WORKER_PROFILE_NAME: &str = "Blank profile";
 const MAX_ROUTE_LIST_LIMIT: usize = 500;
@@ -225,6 +227,11 @@ pub trait YardStore: Send + Sync {
         node_id: &str,
         command: UpdateCoordinationNodePlacement,
     ) -> Result<CoordinationNodeCommandResult, ProjectStoreError>;
+    async fn begin_coordination_node_runtime_provision(
+        &self,
+        node_id: &str,
+        command: ProvisionCoordinationNode,
+    ) -> Result<(), ProjectStoreError>;
     async fn configure_coordination_node(
         &self,
         node_id: &str,
@@ -307,6 +314,10 @@ pub trait YardStore: Send + Sync {
         &self,
         command: ProvisionYardOrchestrator,
     ) -> Result<Option<ConfiguredYardOrchestrator>, ProjectStoreError>;
+    async fn begin_yard_orchestrator_runtime_provision(
+        &self,
+        command: ProvisionYardOrchestrator,
+    ) -> Result<(), ProjectStoreError>;
     async fn configure_yard_orchestrator(
         &self,
         command: ConfigureYardOrchestrator,
@@ -428,6 +439,7 @@ pub trait YardStore: Send + Sync {
         &self,
         command_id: &str,
         message: &str,
+        ambiguous: bool,
     ) -> Result<(), ProjectStoreError>;
     async fn begin_worker_allocation(
         &self,
@@ -444,6 +456,31 @@ pub trait YardStore: Send + Sync {
         command_id: &str,
     ) -> Result<ConfirmedAllocation, ProjectStoreError>;
     async fn fail_worker_allocation(
+        &self,
+        command_id: &str,
+        message: &str,
+        ambiguous: bool,
+    ) -> Result<(), ProjectStoreError>;
+    async fn claim_provisioning_runtime(
+        &self,
+        command_id: &str,
+        runtime: WorkerRuntimeBinding,
+    ) -> Result<(), ProjectStoreError>;
+    async fn release_provisioning_runtime_claim(
+        &self,
+        command_id: &str,
+    ) -> Result<(), ProjectStoreError>;
+    async fn quarantine_provisioning_runtime(
+        &self,
+        command_id: &str,
+        runtime: WorkerRuntimeBinding,
+    ) -> Result<(), ProjectStoreError>;
+    async fn confirm_dedicated_runtime_provision(
+        &self,
+        command_id: &str,
+        runtime: WorkerRuntimeBinding,
+    ) -> Result<(), ProjectStoreError>;
+    async fn fail_dedicated_runtime_provision(
         &self,
         command_id: &str,
         message: &str,
@@ -498,6 +535,16 @@ pub trait YardStore: Send + Sync {
         message: &str,
         ambiguous: bool,
     ) -> Result<(), ProjectStoreError>;
+    async fn recover_pending_project_orchestrator_replacement(
+        &self,
+        command_id: &str,
+        message: &str,
+    ) -> Result<(), ProjectStoreError>;
+    async fn recover_stranded_pending_project_orchestrator_replacements(
+        &self,
+        active_command_ids: Vec<String>,
+        message: &str,
+    ) -> Result<usize, ProjectStoreError>;
     async fn list_ambiguous_orchestrator_replacement_recoveries(
         &self,
         command_id: Option<&str>,
@@ -748,7 +795,8 @@ pub enum OrchestratorReplacementRecoveryOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrchestratorReplacementRecoveryTarget {
     PrepareIntent,
-    PrepareIntentAbsence,
+    PrepareIntentStaleObservation,
+    PrepareIntentAbsence { observed_at_unix_ms: u64 },
     Runtime(OrchestratorReplacementRuntimeRole),
 }
 
@@ -762,6 +810,7 @@ pub struct OrchestratorReplacementPrepareIntent {
     pub recovery_outcome: Option<OrchestratorReplacementRecoveryOutcome>,
     pub recovery_attempts: u32,
     pub absence_observations: u32,
+    pub last_absence_observed_at_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -879,6 +928,49 @@ pub struct SnapshotProjectFolder {
 pub enum SnapshotDeliveryResult {
     Submitted { runtime_status: String },
     Failed { message: String, ambiguous: bool },
+}
+
+struct DedicatedRuntimeProvisionIntent {
+    command_id: String,
+    command_type: &'static str,
+    actor: String,
+    kind: &'static str,
+    target_id: String,
+    profile_id: String,
+    profile_version: u64,
+    expected_target_version: u64,
+}
+
+fn validate_dedicated_runtime_provision_target(
+    transaction: &Transaction<'_>,
+    intent: &DedicatedRuntimeProvisionIntent,
+) -> Result<(), ProjectStoreError> {
+    match intent.kind {
+        "yard_orchestrator" => {
+            let current = select_yard_orchestrator(transaction)?;
+            if current.version != intent.expected_target_version {
+                return Err(ProjectStoreError::YardOrchestratorVersionConflict {
+                    current_version: current.version,
+                });
+            }
+        }
+        "coordination_node" => {
+            let current = coordination_node_store::select_node(transaction, &intent.target_id)?;
+            if current.kind != yard_domain::CoordinationNodeKind::Workstream {
+                return Err(ProjectStoreError::CoordinationNodeKindMismatch);
+            }
+            if current.version != intent.expected_target_version {
+                return Err(ProjectStoreError::CoordinationNodeVersionConflict {
+                    current_version: current.version,
+                });
+            }
+            if current.worker.is_some() {
+                return Err(ProjectStoreError::CoordinationNodeAlreadyProvisioned);
+            }
+        }
+        _ => return Err(ProjectStoreError::IdempotencyConflict),
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1037,6 +1129,181 @@ impl SqliteProjectStore {
             operation(&mut connection)
         })
         .await?
+    }
+
+    async fn begin_dedicated_runtime_provision(
+        &self,
+        intent: DedicatedRuntimeProvisionIntent,
+    ) -> Result<(), ProjectStoreError> {
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(existing) =
+                select_dedicated_runtime_provision_intent(&transaction, &intent.command_id)?
+            {
+                if !existing.matches(&intent) {
+                    return Err(ProjectStoreError::IdempotencyConflict);
+                }
+                return match existing.status.as_str() {
+                    "pending" | "ambiguous" => Err(ProjectStoreError::CommandOutcomeAmbiguous(
+                        existing.error_message.unwrap_or_else(|| {
+                            "dedicated runtime provisioning may have reached Herdr; it was not \
+                             retried"
+                                .to_owned()
+                        }),
+                    )),
+                    "failed" => Err(ProjectStoreError::CommandPreviouslyFailed(
+                        existing
+                            .error_message
+                            .unwrap_or_else(|| "dedicated runtime provisioning failed".to_owned()),
+                    )),
+                    _ => Err(ProjectStoreError::CommandInProgress),
+                };
+            }
+            if command_id_exists(&transaction, &intent.command_id)? {
+                return Err(ProjectStoreError::IdempotencyConflict);
+            }
+            let current_profile_version =
+                select_current_profile_version(&transaction, &intent.profile_id)?;
+            if current_profile_version != intent.profile_version {
+                return Err(ProjectStoreError::ProfileVersionConflict {
+                    current_version: current_profile_version,
+                });
+            }
+            select_worker_profile_revision(
+                &transaction,
+                &intent.profile_id,
+                intent.profile_version,
+            )?;
+            validate_dedicated_runtime_provision_target(&transaction, &intent)?;
+            let now = unix_time_ms()?;
+            transaction.execute(
+                "INSERT INTO command_acknowledgements (
+                    id, command_type, actor, status, error_message,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, 'pending', NULL, ?4, ?4)",
+                params![
+                    intent.command_id,
+                    intent.command_type,
+                    intent.actor,
+                    to_i64(now)?
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO dedicated_runtime_provision_intents (
+                    command_id, kind, target_id, profile_id, profile_version,
+                    expected_target_version, runtime_start_confirmed,
+                    result_worker_id, created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, ?7, ?7)",
+                params![
+                    intent.command_id,
+                    intent.kind,
+                    intent.target_id,
+                    intent.profile_id,
+                    to_i64(intent.profile_version)?,
+                    to_i64(intent.expected_target_version)?,
+                    to_i64(now)?,
+                ],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn confirm_dedicated_runtime_provision(
+        &self,
+        command_id: &str,
+        runtime: WorkerRuntimeBinding,
+    ) -> Result<(), ProjectStoreError> {
+        let command_id = required_command_id(command_id)?;
+        let runtime = runtime.normalize()?;
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let intent = select_dedicated_runtime_provision_intent(&transaction, &command_id)?
+                .ok_or(ProjectStoreError::CommandNotFound)?;
+            if intent.status != "pending" {
+                return Err(ProjectStoreError::CommandNotPending);
+            }
+            let claim = select_provisioning_runtime_claim(&transaction, &command_id)?
+                .ok_or(ProjectStoreError::ProvisioningRuntimeClaimMissing)?;
+            if claim.adapter != runtime.adapter
+                || claim.session != runtime.session
+                || claim.workspace_id != runtime.workspace_id
+                || claim.terminal_id != runtime.terminal_id
+                || claim.tab_id != runtime.tab_id
+                || claim.pane_id != runtime.pane_id
+                || claim.owns_tab != runtime.owns_tab
+                || claim
+                    .provider_session
+                    .as_ref()
+                    .is_some_and(|expected| runtime.provider_session.as_ref() != Some(expected))
+                || runtime.provider_session.is_none()
+                || runtime.process_state != RuntimeProcessState::Running
+            {
+                return Err(ProjectStoreError::ProvisioningRuntimeClaimMismatch);
+            }
+            let updated_claim = transaction.execute(
+                "UPDATE provisioning_runtime_claims
+                    SET provider_session_source = ?1,
+                        provider_session_provider = ?2,
+                        provider_session_kind = ?3,
+                        provider_session_value = ?4,
+                        observation_state = ?5,
+                        process_state = ?6,
+                        observed_status = ?7,
+                        state_change_sequence = ?8,
+                        runtime_revision = ?9,
+                        runtime_version = ?10,
+                        last_observed_at_unix_ms = ?11
+                  WHERE command_id = ?12",
+                params![
+                    runtime
+                        .provider_session
+                        .as_ref()
+                        .map(|session| session.source.as_str()),
+                    runtime
+                        .provider_session
+                        .as_ref()
+                        .map(|session| session.provider.as_str()),
+                    runtime
+                        .provider_session
+                        .as_ref()
+                        .map(|session| session.kind.as_str()),
+                    runtime
+                        .provider_session
+                        .as_ref()
+                        .map(|session| session.value.as_str()),
+                    runtime_observation_state_value(runtime.observation_state),
+                    runtime_process_state_value(runtime.process_state),
+                    observed_status_value(runtime.status),
+                    to_i64(runtime.state_change_sequence)?,
+                    to_i64(runtime.revision)?,
+                    to_i64(runtime.version)?,
+                    to_i64(runtime.last_observed_at_unix_ms)?,
+                    command_id,
+                ],
+            )?;
+            if updated_claim != 1 {
+                return Err(ProjectStoreError::ProvisioningRuntimeClaimMissing);
+            }
+            let updated = transaction.execute(
+                "UPDATE dedicated_runtime_provision_intents
+                    SET runtime_start_confirmed = 1,
+                        updated_at_unix_ms = ?1
+                  WHERE command_id = ?2
+                    AND runtime_start_confirmed = 0
+                    AND result_worker_id IS NULL",
+                params![to_i64(unix_time_ms()?)?, command_id],
+            )?;
+            if updated != 1 {
+                return Err(ProjectStoreError::CommandInProgress);
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -1272,6 +1539,26 @@ impl YardStore for SqliteProjectStore {
         coordination_node_store::update_placement(self, node_id, command).await
     }
 
+    async fn begin_coordination_node_runtime_provision(
+        &self,
+        node_id: &str,
+        command: ProvisionCoordinationNode,
+    ) -> Result<(), ProjectStoreError> {
+        let node_id = coordination_node_store::canonical_node_id(node_id)?;
+        let command = command.normalize()?;
+        let intent = DedicatedRuntimeProvisionIntent {
+            command_id: command.command_id,
+            command_type: "coordination_node_provision",
+            actor: command.actor,
+            kind: "coordination_node",
+            target_id: node_id,
+            profile_id: command.profile_id,
+            profile_version: command.expected_profile_version,
+            expected_target_version: command.expected_node_version,
+        };
+        self.begin_dedicated_runtime_provision(intent).await
+    }
+
     async fn configure_coordination_node(
         &self,
         node_id: &str,
@@ -1430,6 +1717,36 @@ impl YardStore for SqliteProjectStore {
                 )
                 .optional()?;
             let Some((expected_orchestrator_version, actor)) = existing else {
+                if let Some(intent) =
+                    select_dedicated_runtime_provision_intent(connection, &command.command_id)?
+                {
+                    if intent.command_type != "yard_orchestrator_configure"
+                        || intent.actor != command.actor
+                        || intent.kind != "yard_orchestrator"
+                        || intent.target_id != "yard"
+                        || intent.profile_id != command.profile_id
+                        || intent.profile_version != command.expected_profile_version
+                        || intent.expected_target_version != command.expected_orchestrator_version
+                    {
+                        return Err(ProjectStoreError::IdempotencyConflict);
+                    }
+                    return match intent.status.as_str() {
+                        "pending" => Ok(None),
+                        "ambiguous" => Err(ProjectStoreError::CommandOutcomeAmbiguous(
+                            intent.error_message.unwrap_or_else(|| {
+                                "Yard orchestrator provisioning may have reached Herdr; it was not \
+                                 retried"
+                                    .to_owned()
+                            }),
+                        )),
+                        "failed" => Err(ProjectStoreError::CommandPreviouslyFailed(
+                            intent.error_message.unwrap_or_else(|| {
+                                "Yard orchestrator provisioning failed".to_owned()
+                            }),
+                        )),
+                        _ => Err(ProjectStoreError::CommandInProgress),
+                    };
+                }
                 if command_id_exists(connection, &command.command_id)? {
                     return Err(ProjectStoreError::IdempotencyConflict);
                 }
@@ -1452,6 +1769,32 @@ impl YardStore for SqliteProjectStore {
             Ok(Some(configured))
         })
         .await
+    }
+
+    async fn begin_yard_orchestrator_runtime_provision(
+        &self,
+        command: ProvisionYardOrchestrator,
+    ) -> Result<(), ProjectStoreError> {
+        let command = command.normalize()?;
+        let intent = DedicatedRuntimeProvisionIntent {
+            command_id: command.command_id,
+            command_type: "yard_orchestrator_configure",
+            actor: command.actor,
+            kind: "yard_orchestrator",
+            target_id: "yard".to_owned(),
+            profile_id: command.profile_id,
+            profile_version: command.expected_profile_version,
+            expected_target_version: command.expected_orchestrator_version,
+        };
+        self.begin_dedicated_runtime_provision(intent).await
+    }
+
+    async fn confirm_dedicated_runtime_provision(
+        &self,
+        command_id: &str,
+        runtime: WorkerRuntimeBinding,
+    ) -> Result<(), ProjectStoreError> {
+        SqliteProjectStore::confirm_dedicated_runtime_provision(self, command_id, runtime).await
     }
 
     async fn configure_yard_orchestrator(
@@ -1512,7 +1855,26 @@ impl YardStore for SqliteProjectStore {
                     true,
                 );
             }
-            if command_id_exists(&transaction, &command.command_id)? {
+            let provision_intent =
+                select_dedicated_runtime_provision_intent(&transaction, &command.command_id)?;
+            if let Some(intent) = provision_intent.as_ref() {
+                let has_runtime_claim =
+                    select_provisioning_runtime_claim(&transaction, &command.command_id)?.is_some();
+                if intent.command_type != "yard_orchestrator_configure"
+                    || intent.actor != command.actor
+                    || intent.status != "pending"
+                    || intent.kind != "yard_orchestrator"
+                    || intent.target_id != "yard"
+                    || intent.expected_target_version != command.expected_orchestrator_version
+                    || intent
+                        .result_worker_id
+                        .as_deref()
+                        .is_some_and(|worker_id| worker_id != command.worker_id)
+                    || (intent.result_worker_id.is_none() && has_runtime_claim)
+                {
+                    return Err(ProjectStoreError::IdempotencyConflict);
+                }
+            } else if command_id_exists(&transaction, &command.command_id)? {
                 return Err(ProjectStoreError::IdempotencyConflict);
             }
 
@@ -1528,6 +1890,12 @@ impl YardStore for SqliteProjectStore {
                 return Err(ProjectStoreError::WorkerVersionConflict {
                     current_version: candidate.worker.version,
                 });
+            }
+            if provision_intent.as_ref().is_some_and(|intent| {
+                candidate.worker.profile_id.as_deref() != Some(intent.profile_id.as_str())
+                    || candidate.worker.profile_version != Some(intent.profile_version)
+            }) {
+                return Err(ProjectStoreError::WorkerProfileRevisionMismatch);
             }
             let is_current = current
                 .worker
@@ -1638,16 +2006,36 @@ impl YardStore for SqliteProjectStore {
                 next_version
             };
 
-            transaction.execute(
-                "INSERT INTO command_acknowledgements (
-                    id, command_type, actor, status, error_message,
-                    created_at_unix_ms, updated_at_unix_ms
-                 ) VALUES (
-                    ?1, 'yard_orchestrator_configure', ?2, 'succeeded',
-                    NULL, ?3, ?3
-                 )",
-                params![command.command_id, command.actor, to_i64(now)?],
-            )?;
+            if provision_intent.is_some() {
+                transaction.execute(
+                    "UPDATE dedicated_runtime_provision_intents
+                        SET result_worker_id = COALESCE(result_worker_id, ?1),
+                            updated_at_unix_ms = ?2
+                      WHERE command_id = ?3",
+                    params![command.worker_id, to_i64(now)?, command.command_id],
+                )?;
+                let updated = transaction.execute(
+                    "UPDATE command_acknowledgements
+                        SET status = 'succeeded', error_message = NULL,
+                            updated_at_unix_ms = ?1
+                      WHERE id = ?2 AND status = 'pending'",
+                    params![to_i64(now)?, command.command_id],
+                )?;
+                if updated != 1 {
+                    return Err(ProjectStoreError::CommandNotPending);
+                }
+            } else {
+                transaction.execute(
+                    "INSERT INTO command_acknowledgements (
+                        id, command_type, actor, status, error_message,
+                        created_at_unix_ms, updated_at_unix_ms
+                     ) VALUES (
+                        ?1, 'yard_orchestrator_configure', ?2, 'succeeded',
+                        NULL, ?3, ?3
+                     )",
+                    params![command.command_id, command.actor, to_i64(now)?],
+                )?;
+            }
             transaction.execute(
                 "INSERT INTO yard_orchestrator_configure_commands (
                     command_id, worker_id, expected_worker_version,
@@ -2006,36 +2394,7 @@ impl YardStore for SqliteProjectStore {
                 ensure_runtime_snapshot_current(&transaction, runtime)?;
             }
 
-            let blocked = transaction.query_row(
-                "SELECT EXISTS (
-                    SELECT 1
-                      FROM orchestrator_prompt_commands opc
-                      JOIN command_acknowledgements ca ON ca.id = opc.command_id
-                     WHERE opc.project_id = ?1 AND ca.status = 'pending'
-                    UNION ALL
-                    SELECT 1
-                      FROM yard_orchestrator_route_commands yorc
-                      JOIN command_acknowledgements ca
-                        ON ca.id = yorc.command_id
-                     WHERE yorc.target_project_id = ?1 AND ca.status = 'pending'
-                    UNION ALL
-                    SELECT 1
-                      FROM worker_handoff_commands whc
-                     WHERE whc.target_project_id = ?1
-                       AND whc.target_role = 'orchestrator'
-                       AND whc.finished_at_unix_ms IS NULL
-                    UNION ALL
-                    SELECT 1
-                      FROM project_orchestrator_replacement_commands porc
-                     WHERE porc.project_id = ?1
-                       AND porc.finished_at_unix_ms IS NULL
-                 )",
-                [&project_id],
-                |row| row.get::<_, bool>(0),
-            )?;
-            if blocked {
-                return Err(ProjectStoreError::OrchestratorInterventionInProgress);
-            }
+            reject_project_orchestrator_intervention(&transaction, &project_id, None)?;
 
             let displaced_allocation_id = transaction
                 .query_row(
@@ -2136,33 +2495,8 @@ impl YardStore for SqliteProjectStore {
             if old_allocation_rows != 1 {
                 return Err(ProjectStoreError::OrchestratorTransferTargetChanged);
             }
-            if let Some((assignment_id, assignment_version, attempt_id, attempt_version)) =
-                displaced_assignment
-            {
-                let assignment_rows = transaction.execute(
-                    "UPDATE assignments
-                        SET lifecycle = 'handed_off', version = version + 1,
-                            updated_at_unix_ms = ?1
-                      WHERE id = ?2 AND version = ?3
-                        AND lifecycle = 'active'",
-                    params![to_i64(now)?, assignment_id, to_i64(assignment_version)?,],
-                )?;
-                let attempt_rows = transaction.execute(
-                    "UPDATE assignment_attempts
-                        SET lifecycle = 'handed_off', version = version + 1,
-                            updated_at_unix_ms = ?1
-                      WHERE id = ?2 AND assignment_id = ?3 AND version = ?4
-                        AND lifecycle = 'active'",
-                    params![
-                        to_i64(now)?,
-                        attempt_id,
-                        assignment_id,
-                        to_i64(attempt_version)?,
-                    ],
-                )?;
-                if assignment_rows != 1 || attempt_rows != 1 {
-                    return Err(ProjectStoreError::OrchestratorTransferTargetChanged);
-                }
+            if displaced_assignment.is_some() {
+                return Err(ProjectStoreError::OrchestratorTransferActiveAssignment);
             }
             let replaced_worker_rows = transaction.execute(
                 "UPDATE workers
@@ -2471,6 +2805,7 @@ impl YardStore for SqliteProjectStore {
 
             ensure_project_workspace_unbound(&transaction, &command.runtime)?;
             ensure_runtime_snapshot_current(&transaction, &orchestrator_runtime)?;
+            consume_provisioning_runtime_claim(&transaction, &command_id, &orchestrator_runtime)?;
             let project_id = Uuid::now_v7().to_string();
             let reusable_worker_id =
                 select_reusable_runtime_worker(&transaction, &orchestrator_runtime)?;
@@ -2707,6 +3042,7 @@ impl YardStore for SqliteProjectStore {
             };
             ensure_project_workspace_unbound(&transaction, &project_runtime)?;
             ensure_runtime_snapshot_current(&transaction, &orchestrator_runtime)?;
+            consume_provisioning_runtime_claim(&transaction, &command_id, &orchestrator_runtime)?;
             let project_id = Uuid::now_v7().to_string();
             let reusable_worker_id =
                 select_reusable_runtime_worker(&transaction, &orchestrator_runtime)?;
@@ -3258,16 +3594,45 @@ impl YardStore for SqliteProjectStore {
                             .map(Box::new)
                             .map(BeginProfileAllocation::Replayed)
                     }
+                    "pending" if existing.result_assignment_id.is_some() => {
+                        let allocation = activate_profile_allocation_transaction(
+                            &transaction,
+                            &command.command_id,
+                            true,
+                        )?;
+                        transaction.commit()?;
+                        Ok(BeginProfileAllocation::Replayed(Box::new(allocation)))
+                    }
                     "failed" => Err(ProjectStoreError::CommandPreviouslyFailed(
                         existing
                             .error_message
                             .unwrap_or_else(|| "allocation command failed".to_owned()),
+                    )),
+                    "ambiguous" => Err(ProjectStoreError::CommandOutcomeAmbiguous(
+                        existing
+                            .error_message
+                            .unwrap_or_else(|| "allocation command outcome is unknown".to_owned()),
                     )),
                     _ => Err(ProjectStoreError::CommandInProgress),
                 };
             }
             if command_id_exists(&transaction, &command.command_id)? {
                 return Err(ProjectStoreError::IdempotencyConflict);
+            }
+            let allocation_in_progress = transaction.query_row(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM profile_allocation_commands allocation
+                      JOIN command_acknowledgements command
+                        ON command.id = allocation.command_id
+                     WHERE allocation.project_id = ?1
+                       AND command.status IN ('pending', 'ambiguous')
+                 )",
+                [&project_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if allocation_in_progress {
+                return Err(ProjectStoreError::AssignmentInterventionInProgress);
             }
 
             let project = select_project(&transaction, &project_id)?;
@@ -3369,6 +3734,7 @@ impl YardStore for SqliteProjectStore {
                     yard_domain::ProjectValidationError::RuntimeBindingMismatch,
                 ));
             }
+            consume_provisioning_runtime_claim(&transaction, &command_id, &runtime)?;
             ensure_worker_binding_available(&transaction, &runtime)?;
 
             let worker_id = Uuid::now_v7().to_string();
@@ -3463,48 +3829,8 @@ impl YardStore for SqliteProjectStore {
         self.run(move |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let command = select_allocation_command(&transaction, &command_id)?
-                .ok_or(ProjectStoreError::CommandNotFound)?;
-            if command.status == "succeeded" {
-                return select_confirmed_allocation(&transaction, &command_id, true);
-            }
-            if command.status != "pending" {
-                return Err(ProjectStoreError::CommandNotPending);
-            }
-            let assignment_id = command
-                .result_assignment_id
-                .ok_or(ProjectStoreError::RuntimeAllocationMissing)?;
-            let now = unix_time_ms()?;
-            transaction.execute(
-                "UPDATE assignments
-                    SET lifecycle = 'active', version = version + 1,
-                        updated_at_unix_ms = ?1
-                  WHERE id = ?2 AND lifecycle = 'allocating'",
-                params![to_i64(now)?, assignment_id],
-            )?;
-            transaction.execute(
-                "UPDATE assignment_attempts
-                    SET lifecycle = 'active', version = version + 1,
-                        updated_at_unix_ms = ?1
-                  WHERE assignment_id = ?2 AND lifecycle = 'starting'",
-                params![to_i64(now)?, assignment_id],
-            )?;
-            transaction.execute(
-                "UPDATE command_acknowledgements
-                    SET status = 'succeeded', updated_at_unix_ms = ?1
-                  WHERE id = ?2 AND status = 'pending'",
-                params![to_i64(now)?, command_id],
-            )?;
-            insert_lifecycle_event(
-                &transaction,
-                "assignment",
-                &assignment_id,
-                2,
-                "objective_delivered",
-                "herdr",
-                now,
-            )?;
-            let allocation = select_confirmed_allocation(&transaction, &command_id, false)?;
+            let allocation =
+                activate_profile_allocation_transaction(&transaction, &command_id, false)?;
             transaction.commit()?;
             Ok(allocation)
         })
@@ -3515,6 +3841,7 @@ impl YardStore for SqliteProjectStore {
         &self,
         command_id: &str,
         message: &str,
+        ambiguous: bool,
     ) -> Result<(), ProjectStoreError> {
         let command_id = required_command_id(command_id)?;
         let message = message.trim().to_owned();
@@ -3530,7 +3857,7 @@ impl YardStore for SqliteProjectStore {
                 return Ok(());
             }
             let now = unix_time_ms()?;
-            if let Some(assignment_id) = command.result_assignment_id {
+            if !ambiguous && let Some(assignment_id) = command.result_assignment_id {
                 transaction.execute(
                     "UPDATE assignments
                         SET lifecycle = 'failed', version = version + 1,
@@ -3568,10 +3895,15 @@ impl YardStore for SqliteProjectStore {
             }
             transaction.execute(
                 "UPDATE command_acknowledgements
-                    SET status = 'failed', error_message = ?1,
-                        updated_at_unix_ms = ?2
-                  WHERE id = ?3 AND status = 'pending'",
-                params![message, to_i64(now)?, command_id],
+                    SET status = ?1, error_message = ?2,
+                        updated_at_unix_ms = ?3
+                  WHERE id = ?4 AND status = 'pending'",
+                params![
+                    if ambiguous { "ambiguous" } else { "failed" },
+                    message,
+                    to_i64(now)?,
+                    command_id,
+                ],
             )?;
             transaction.commit()?;
             Ok(())
@@ -3614,6 +3946,15 @@ impl YardStore for SqliteProjectStore {
                         select_confirmed_worker_allocation(&transaction, &command.command_id, true)
                             .map(Box::new)
                             .map(BeginWorkerAllocation::Replayed)
+                    }
+                    "pending" if existing.objective_delivery_confirmed => {
+                        let allocation = activate_worker_allocation_transaction(
+                            &transaction,
+                            &command.command_id,
+                            true,
+                        )?;
+                        transaction.commit()?;
+                        Ok(BeginWorkerAllocation::Replayed(Box::new(allocation)))
                     }
                     "failed" => Err(ProjectStoreError::CommandPreviouslyFailed(
                         existing
@@ -3867,6 +4208,7 @@ impl YardStore for SqliteProjectStore {
             {
                 return Err(ProjectStoreError::RuntimeWorkspaceMismatch);
             }
+            consume_provisioning_runtime_claim(&transaction, &command_id, &runtime)?;
             ensure_runtime_snapshot_current(&transaction, &runtime)?;
             ensure_worker_binding_available_for(&transaction, &command.worker_id, &runtime)?;
             let worker_version = transaction.query_row(
@@ -3923,54 +4265,36 @@ impl YardStore for SqliteProjectStore {
         command_id: &str,
     ) -> Result<ConfirmedAllocation, ProjectStoreError> {
         let command_id = required_command_id(command_id)?;
+        let delivery_command_id = command_id.clone();
         self.run(move |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let command = select_worker_allocation_command(&transaction, &command_id)?
+            let command = select_worker_allocation_command(&transaction, &delivery_command_id)?
                 .ok_or(ProjectStoreError::CommandNotFound)?;
             if command.status == "succeeded" {
-                return select_confirmed_worker_allocation(&transaction, &command_id, true);
+                return Ok(());
             }
             if command.status != "pending" {
                 return Err(ProjectStoreError::CommandNotPending);
             }
-            let assignment_id = command
-                .result_assignment_id
-                .ok_or(ProjectStoreError::RuntimeAllocationMissing)?;
-            let now = unix_time_ms()?;
-            let assignment_rows = transaction.execute(
-                "UPDATE assignments
-                    SET lifecycle = 'active', version = version + 1,
-                        updated_at_unix_ms = ?1
-                  WHERE id = ?2 AND lifecycle = 'allocating'",
-                params![to_i64(now)?, assignment_id],
+            let updated = transaction.execute(
+                "UPDATE worker_allocation_commands
+                    SET objective_delivery_confirmed = 1
+                  WHERE command_id = ?1",
+                [&delivery_command_id],
             )?;
-            let attempt_rows = transaction.execute(
-                "UPDATE assignment_attempts
-                    SET lifecycle = 'active', version = version + 1,
-                        updated_at_unix_ms = ?1
-                  WHERE assignment_id = ?2 AND lifecycle = 'starting'",
-                params![to_i64(now)?, assignment_id],
-            )?;
-            if assignment_rows != 1 || attempt_rows != 1 {
-                return Err(ProjectStoreError::CommandNotPending);
+            if updated != 1 {
+                return Err(ProjectStoreError::CommandNotFound);
             }
-            transaction.execute(
-                "UPDATE command_acknowledgements
-                    SET status = 'succeeded', updated_at_unix_ms = ?1
-                  WHERE id = ?2 AND status = 'pending'",
-                params![to_i64(now)?, command_id],
-            )?;
-            insert_lifecycle_event(
-                &transaction,
-                "assignment",
-                &assignment_id,
-                2,
-                "objective_delivered",
-                "herdr",
-                now,
-            )?;
-            let allocation = select_confirmed_worker_allocation(&transaction, &command_id, false)?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await?;
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let allocation =
+                activate_worker_allocation_transaction(&transaction, &command_id, false)?;
             transaction.commit()?;
             Ok(allocation)
         })
@@ -4054,6 +4378,280 @@ impl YardStore for SqliteProjectStore {
         .await
     }
 
+    async fn claim_provisioning_runtime(
+        &self,
+        command_id: &str,
+        runtime: WorkerRuntimeBinding,
+    ) -> Result<(), ProjectStoreError> {
+        let command_id = required_command_id(command_id)?;
+        let runtime = runtime.normalize()?;
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let status = transaction
+                .query_row(
+                    "SELECT status
+                       FROM command_acknowledgements
+                      WHERE id = ?1",
+                    [&command_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or(ProjectStoreError::CommandNotFound)?;
+            if let Some(existing) = select_provisioning_runtime_claim(&transaction, &command_id)? {
+                if existing == runtime {
+                    return Ok(());
+                }
+                return Err(ProjectStoreError::IdempotencyConflict);
+            }
+            if status != "pending" {
+                return Err(ProjectStoreError::CommandNotPending);
+            }
+            if runtime_identity_has_authoritative_binding(&transaction, &runtime)?
+                || runtime_identity_is_provisioning_claimed(
+                    &transaction,
+                    &runtime.adapter,
+                    &runtime.session,
+                    &runtime.terminal_id,
+                    runtime.provider_session.as_ref(),
+                )?
+                || runtime_identity_is_quarantined(
+                    &transaction,
+                    &runtime.adapter,
+                    &runtime.session,
+                    &runtime.terminal_id,
+                    runtime.provider_session.as_ref(),
+                )?
+            {
+                return Err(ProjectStoreError::RuntimeWorkerAlreadyBound);
+            }
+            ensure_runtime_not_pending_cleanup(&transaction, &runtime)?;
+            let now = unix_time_ms()?;
+            transaction.execute(
+                "INSERT INTO provisioning_runtime_claims (
+                    command_id, adapter, runtime_session,
+                    runtime_workspace_id, terminal_id, tab_id, pane_id,
+                    provider_session_source, provider_session_provider,
+                    provider_session_kind, provider_session_value, owns_tab,
+                    observation_state, process_state, observed_status,
+                    state_change_sequence, runtime_revision, runtime_version,
+                    last_observed_at_unix_ms, captured_at_unix_ms
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+                 )",
+                params![
+                    command_id,
+                    runtime.adapter,
+                    runtime.session,
+                    runtime.workspace_id,
+                    runtime.terminal_id,
+                    runtime.tab_id,
+                    runtime.pane_id,
+                    runtime
+                        .provider_session
+                        .as_ref()
+                        .map(|session| session.source.as_str()),
+                    runtime
+                        .provider_session
+                        .as_ref()
+                        .map(|session| session.provider.as_str()),
+                    runtime
+                        .provider_session
+                        .as_ref()
+                        .map(|session| session.kind.as_str()),
+                    runtime
+                        .provider_session
+                        .as_ref()
+                        .map(|session| session.value.as_str()),
+                    runtime.owns_tab,
+                    runtime_observation_state_value(runtime.observation_state),
+                    runtime_process_state_value(runtime.process_state),
+                    observed_status_value(runtime.status),
+                    to_i64(runtime.state_change_sequence)?,
+                    to_i64(runtime.revision)?,
+                    to_i64(runtime.version)?,
+                    to_i64(runtime.last_observed_at_unix_ms)?,
+                    to_i64(now)?,
+                ],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn release_provisioning_runtime_claim(
+        &self,
+        command_id: &str,
+    ) -> Result<(), ProjectStoreError> {
+        let command_id = required_command_id(command_id)?;
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let status = transaction
+                .query_row(
+                    "SELECT status
+                       FROM command_acknowledgements
+                      WHERE id = ?1",
+                    [&command_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or(ProjectStoreError::CommandNotFound)?;
+            if status != "pending" {
+                return Err(ProjectStoreError::CommandNotPending);
+            }
+            transaction.execute(
+                "DELETE FROM provisioning_runtime_claims WHERE command_id = ?1",
+                [&command_id],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn quarantine_provisioning_runtime(
+        &self,
+        command_id: &str,
+        runtime: WorkerRuntimeBinding,
+    ) -> Result<(), ProjectStoreError> {
+        let command_id = required_command_id(command_id)?;
+        let runtime = runtime.normalize()?;
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let status = transaction
+                .query_row(
+                    "SELECT status
+                       FROM command_acknowledgements
+                      WHERE id = ?1",
+                    [&command_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or(ProjectStoreError::CommandNotFound)?;
+            if let Some(existing) =
+                select_quarantined_provisioning_runtime(&transaction, &command_id)?
+            {
+                if existing == runtime {
+                    return Ok(());
+                }
+                return Err(ProjectStoreError::IdempotencyConflict);
+            }
+            if status != "pending" {
+                return Err(ProjectStoreError::CommandNotPending);
+            }
+            if runtime_identity_has_authoritative_binding(&transaction, &runtime)? {
+                return Err(ProjectStoreError::RuntimeWorkerAlreadyBound);
+            }
+            let now = unix_time_ms()?;
+            transaction.execute(
+                "INSERT INTO quarantined_provisioning_runtime_bindings (
+                    command_id, adapter, runtime_session,
+                    runtime_workspace_id, terminal_id, tab_id, pane_id,
+                    provider_session_source, provider_session_provider,
+                    provider_session_kind, provider_session_value, owns_tab,
+                    observation_state, process_state, observed_status,
+                    state_change_sequence, runtime_revision, runtime_version,
+                    last_observed_at_unix_ms, captured_at_unix_ms
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+                 )",
+                params![
+                    command_id,
+                    runtime.adapter,
+                    runtime.session,
+                    runtime.workspace_id,
+                    runtime.terminal_id,
+                    runtime.tab_id,
+                    runtime.pane_id,
+                    runtime
+                        .provider_session
+                        .as_ref()
+                        .map(|session| session.source.as_str()),
+                    runtime
+                        .provider_session
+                        .as_ref()
+                        .map(|session| session.provider.as_str()),
+                    runtime
+                        .provider_session
+                        .as_ref()
+                        .map(|session| session.kind.as_str()),
+                    runtime
+                        .provider_session
+                        .as_ref()
+                        .map(|session| session.value.as_str()),
+                    runtime.owns_tab,
+                    runtime_observation_state_value(runtime.observation_state),
+                    runtime_process_state_value(runtime.process_state),
+                    observed_status_value(runtime.status),
+                    to_i64(runtime.state_change_sequence)?,
+                    to_i64(runtime.revision)?,
+                    to_i64(runtime.version)?,
+                    to_i64(runtime.last_observed_at_unix_ms)?,
+                    to_i64(now)?,
+                ],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn fail_dedicated_runtime_provision(
+        &self,
+        command_id: &str,
+        message: &str,
+        ambiguous: bool,
+    ) -> Result<(), ProjectStoreError> {
+        let command_id = required_command_id(command_id)?;
+        let message = message.trim().to_owned();
+        if message.is_empty() {
+            return Err(ProjectStoreError::CommandFailureMessageRequired);
+        }
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let exists = transaction.query_row(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM dedicated_runtime_provision_intents
+                     WHERE command_id = ?1
+                )",
+                [&command_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Err(ProjectStoreError::CommandNotFound);
+            }
+            let now = unix_time_ms()?;
+            transaction.execute(
+                "UPDATE command_acknowledgements
+                    SET status = ?1, error_message = ?2,
+                        updated_at_unix_ms = ?3
+                  WHERE id = ?4 AND status = 'pending'",
+                params![
+                    if ambiguous { "ambiguous" } else { "failed" },
+                    message,
+                    to_i64(now)?,
+                    command_id,
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE dedicated_runtime_provision_intents
+                    SET updated_at_unix_ms = ?1
+                  WHERE command_id = ?2",
+                params![to_i64(now)?, command_id],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn begin_worker_handoff(
         &self,
@@ -4112,26 +4710,11 @@ impl YardStore for SqliteProjectStore {
                 });
             }
             if command.target_role == HandoffTargetRole::Orchestrator {
-                let prompt_pending = transaction.query_row(
-                    "SELECT EXISTS (
-                        SELECT 1
-                          FROM orchestrator_prompt_commands opc
-                          JOIN command_acknowledgements ca ON ca.id = opc.command_id
-                         WHERE opc.project_id = ?1 AND ca.status = 'pending'
-                        UNION ALL
-                        SELECT 1
-                          FROM yard_orchestrator_route_commands yorc
-                          JOIN command_acknowledgements ca
-                            ON ca.id = yorc.command_id
-                         WHERE yorc.target_project_id = ?1
-                           AND ca.status = 'pending'
-                     )",
-                    [&command.target_project_id],
-                    |row| row.get::<_, bool>(0),
+                reject_project_orchestrator_intervention(
+                    &transaction,
+                    &command.target_project_id,
+                    None,
                 )?;
-                if prompt_pending {
-                    return Err(ProjectStoreError::OrchestratorInterventionInProgress);
-                }
             }
 
             let mut source_record = select_assignment_record(&transaction, &source_assignment_id)?
@@ -5160,36 +5743,7 @@ impl YardStore for SqliteProjectStore {
                     current_version: current_profile_version,
                 });
             }
-            let blocked = transaction.query_row(
-                "SELECT EXISTS (
-                    SELECT 1
-                      FROM orchestrator_prompt_commands opc
-                      JOIN command_acknowledgements ca ON ca.id = opc.command_id
-                     WHERE opc.project_id = ?1 AND ca.status = 'pending'
-                    UNION ALL
-                    SELECT 1
-                      FROM yard_orchestrator_route_commands yorc
-                      JOIN command_acknowledgements ca
-                        ON ca.id = yorc.command_id
-                     WHERE yorc.target_project_id = ?1 AND ca.status = 'pending'
-                    UNION ALL
-                    SELECT 1
-                      FROM worker_handoff_commands whc
-                     WHERE whc.target_project_id = ?1
-                       AND whc.target_role = 'orchestrator'
-                       AND whc.finished_at_unix_ms IS NULL
-                    UNION ALL
-                    SELECT 1
-                      FROM project_orchestrator_replacement_commands porc
-                     WHERE porc.project_id = ?1
-                       AND porc.finished_at_unix_ms IS NULL
-                 )",
-                [&project_id],
-                |row| row.get::<_, bool>(0),
-            )?;
-            if blocked {
-                return Err(ProjectStoreError::OrchestratorInterventionInProgress);
-            }
+            reject_project_orchestrator_intervention(&transaction, &project_id, None)?;
 
             let now = unix_time_ms()?;
             let prepare_tab_label = replacement_prepare_tab_label(&command.command_id);
@@ -5429,40 +5983,11 @@ impl YardStore for SqliteProjectStore {
                 if !objective_delivery_confirmed {
                     return Err(ProjectStoreError::OrchestratorReplacementRecoveryUnconfirmed);
                 }
-                let conflicting_work = transaction.query_row(
-                    "SELECT EXISTS (
-                        SELECT 1
-                          FROM project_orchestrator_replacement_commands replacement
-                         WHERE replacement.project_id = ?1
-                           AND replacement.command_id <> ?2
-                           AND replacement.finished_at_unix_ms IS NULL
-                        UNION ALL
-                        SELECT 1
-                          FROM orchestrator_prompt_commands prompt
-                          JOIN command_acknowledgements command
-                            ON command.id = prompt.command_id
-                         WHERE prompt.project_id = ?1
-                           AND command.status = 'pending'
-                        UNION ALL
-                        SELECT 1
-                          FROM yard_orchestrator_route_commands route
-                          JOIN command_acknowledgements command
-                            ON command.id = route.command_id
-                         WHERE route.target_project_id = ?1
-                           AND command.status = 'pending'
-                        UNION ALL
-                        SELECT 1
-                          FROM worker_handoff_commands handoff
-                         WHERE handoff.target_project_id = ?1
-                           AND handoff.target_role = 'orchestrator'
-                           AND handoff.finished_at_unix_ms IS NULL
-                    )",
-                    params![command.project_id, command_id],
-                    |row| row.get::<_, bool>(0),
+                reject_project_orchestrator_intervention(
+                    &transaction,
+                    &command.project_id,
+                    Some(&command_id),
                 )?;
-                if conflicting_work {
-                    return Err(ProjectStoreError::OrchestratorInterventionInProgress);
-                }
             }
             let claimed = command
                 .started_runtime
@@ -5886,6 +6411,77 @@ impl YardStore for SqliteProjectStore {
         .await
     }
 
+    async fn recover_pending_project_orchestrator_replacement(
+        &self,
+        command_id: &str,
+        message: &str,
+    ) -> Result<(), ProjectStoreError> {
+        let command_id = required_command_id(command_id)?;
+        let message = message.trim().to_owned();
+        if message.is_empty() {
+            return Err(ProjectStoreError::CommandFailureMessageRequired);
+        }
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            recover_pending_orchestrator_replacement(
+                &transaction,
+                &command_id,
+                &message,
+                unix_time_ms()?,
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn recover_stranded_pending_project_orchestrator_replacements(
+        &self,
+        active_command_ids: Vec<String>,
+        message: &str,
+    ) -> Result<usize, ProjectStoreError> {
+        let active_command_ids = active_command_ids
+            .into_iter()
+            .map(|command_id| required_command_id(&command_id))
+            .collect::<Result<HashSet<_>, _>>()?;
+        let message = message.trim().to_owned();
+        if message.is_empty() {
+            return Err(ProjectStoreError::CommandFailureMessageRequired);
+        }
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let command_ids = {
+                let mut statement = transaction.prepare(
+                    "SELECT command.id
+                       FROM command_acknowledgements command
+                       JOIN project_orchestrator_replacement_commands replacement
+                         ON replacement.command_id = command.id
+                      WHERE command.command_type =
+                            'project_orchestrator_replacement'
+                        AND command.status = 'pending'
+                        AND replacement.finished_at_unix_ms IS NULL",
+                )?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let now = unix_time_ms()?;
+            let mut recovered = 0;
+            for command_id in command_ids {
+                if active_command_ids.contains(&command_id) {
+                    continue;
+                }
+                recover_pending_orchestrator_replacement(&transaction, &command_id, &message, now)?;
+                recovered += 1;
+            }
+            transaction.commit()?;
+            Ok(recovered)
+        })
+        .await
+    }
+
     async fn list_ambiguous_orchestrator_replacement_recoveries(
         &self,
         command_id: Option<&str>,
@@ -6099,8 +6695,10 @@ impl YardStore for SqliteProjectStore {
             let outcome_value = outcome.map(orchestrator_replacement_recovery_outcome_value);
             let expected_attempts = i64::from(expected_attempts);
             let updated = match target {
-                OrchestratorReplacementRecoveryTarget::PrepareIntent => transaction.execute(
-                    "UPDATE project_orchestrator_replacement_commands
+                OrchestratorReplacementRecoveryTarget::PrepareIntent
+                | OrchestratorReplacementRecoveryTarget::PrepareIntentStaleObservation => {
+                    transaction.execute(
+                        "UPDATE project_orchestrator_replacement_commands
                         SET prepare_recovery_outcome = COALESCE(
                                 ?1,
                                 prepare_recovery_outcome
@@ -6114,40 +6712,78 @@ impl YardStore for SqliteProjectStore {
                                 THEN prepare_absence_observations
                                 ELSE 0
                             END,
+                            prepare_last_absence_observed_at_unix_ms = CASE
+                                WHEN ?1 IS NULL
+                                THEN prepare_last_absence_observed_at_unix_ms
+                                ELSE NULL
+                            END,
                             prepare_next_recovery_at_unix_ms = ?4
                       WHERE command_id = ?5
                         AND prepare_tab_label IS NOT NULL
                         AND prepare_recovery_attempts = ?6",
-                    params![
-                        outcome_value,
-                        detail,
-                        to_i64(now)?,
-                        next_recovery_at,
-                        command_id,
-                        expected_attempts,
-                    ],
-                )?,
-                OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence => transaction
-                    .execute(
-                        "UPDATE project_orchestrator_replacement_commands
-                            SET prepare_recovery_detail = ?1,
-                                prepare_reconciled_at_unix_ms = ?2,
-                                prepare_recovery_attempts =
-                                    prepare_recovery_attempts + 1,
-                                prepare_absence_observations =
-                                    prepare_absence_observations + 1,
-                                prepare_next_recovery_at_unix_ms = ?3
-                          WHERE command_id = ?4
-                            AND prepare_tab_label IS NOT NULL
-                            AND prepare_recovery_attempts = ?5",
                         params![
+                            outcome_value,
                             detail,
                             to_i64(now)?,
                             next_recovery_at,
                             command_id,
                             expected_attempts,
                         ],
-                    )?,
+                    )?
+                }
+                OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence {
+                    observed_at_unix_ms,
+                } => transaction.execute(
+                    "UPDATE project_orchestrator_replacement_commands
+                            SET prepare_recovery_outcome = COALESCE(
+                                    ?1,
+                                    prepare_recovery_outcome
+                                ),
+                                prepare_recovery_detail = ?2,
+                                prepare_reconciled_at_unix_ms = ?3,
+                                prepare_recovery_attempts =
+                                    prepare_recovery_attempts + 1,
+                                prepare_absence_observations = CASE
+                                    WHEN ?1 IS NULL
+                                    THEN prepare_absence_observations + 1
+                                    ELSE 0
+                                END,
+                                prepare_last_absence_observed_at_unix_ms = CASE
+                                    WHEN ?1 IS NULL
+                                    THEN ?4
+                                    ELSE NULL
+                                END,
+                                prepare_next_recovery_at_unix_ms = ?5
+                          WHERE command_id = ?6
+                            AND prepare_tab_label IS NOT NULL
+                            AND prepare_recovery_attempts = ?7
+                            AND (
+                                (
+                                    ?1 IS NULL
+                                    AND prepare_absence_observations = 0
+                                    AND prepare_last_absence_observed_at_unix_ms
+                                        IS NULL
+                                )
+                                OR
+                                (
+                                    ?1 = 'absent_converged'
+                                    AND prepare_absence_observations = 1
+                                    AND prepare_last_absence_observed_at_unix_ms
+                                        IS NOT NULL
+                                    AND prepare_last_absence_observed_at_unix_ms
+                                        < ?4
+                                )
+                            )",
+                    params![
+                        outcome_value,
+                        detail,
+                        to_i64(now)?,
+                        to_i64(observed_at_unix_ms)?,
+                        next_recovery_at,
+                        command_id,
+                        expected_attempts,
+                    ],
+                )?,
                 OrchestratorReplacementRecoveryTarget::Runtime(role) => transaction.execute(
                     "UPDATE orchestrator_replacement_runtime_bindings
                         SET recovery_outcome = COALESCE(?1, recovery_outcome),
@@ -6176,6 +6812,12 @@ impl YardStore for SqliteProjectStore {
                     expected_attempts,
                 )?
             {
+                if matches!(
+                    target,
+                    OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence { .. }
+                ) {
+                    return Err(ProjectStoreError::OrchestratorReplacementFreshObservationRequired);
+                }
                 return Err(ProjectStoreError::OrchestratorReplacementRuntimeMissing);
             }
             transaction.commit()?;
@@ -7135,41 +7777,7 @@ impl YardStore for SqliteProjectStore {
                 return Err(ProjectStoreError::IdempotencyConflict);
             }
 
-            let handoff_pending = transaction.query_row(
-                "SELECT EXISTS (
-                    SELECT 1
-                      FROM worker_handoff_commands whc
-                      JOIN command_acknowledgements ca ON ca.id = whc.command_id
-                     WHERE whc.target_project_id = ?1
-                       AND whc.target_role = 'orchestrator'
-                       AND ca.status = 'pending'
-                    UNION ALL
-                    SELECT 1
-                      FROM project_orchestrator_replacement_commands porc
-                     WHERE porc.project_id = ?1
-                       AND porc.finished_at_unix_ms IS NULL
-                 )",
-                [&project_id],
-                |row| row.get::<_, bool>(0),
-            )?;
-            if handoff_pending {
-                return Err(ProjectStoreError::OrchestratorInterventionInProgress);
-            }
-            let route_pending = transaction.query_row(
-                "SELECT EXISTS (
-                    SELECT 1
-                      FROM yard_orchestrator_route_commands yorc
-                      JOIN command_acknowledgements ca
-                        ON ca.id = yorc.command_id
-                     WHERE yorc.target_project_id = ?1
-                       AND ca.status = 'pending'
-                 )",
-                [&project_id],
-                |row| row.get::<_, bool>(0),
-            )?;
-            if route_pending {
-                return Err(ProjectStoreError::OrchestratorInterventionInProgress);
-            }
+            reject_project_orchestrator_intervention(&transaction, &project_id, None)?;
             let project = select_project(&transaction, &project_id)?;
             if project.version != command.expected_project_version {
                 return Err(ProjectStoreError::ProjectVersionConflict {
@@ -7646,46 +8254,11 @@ impl YardStore for SqliteProjectStore {
                 return Err(ProjectStoreError::RuntimeBindingMissing);
             }
 
-            let handoff_pending = transaction.query_row(
-                "SELECT EXISTS (
-                    SELECT 1
-                      FROM worker_handoff_commands whc
-                      JOIN command_acknowledgements ca ON ca.id = whc.command_id
-                     WHERE whc.target_project_id = ?1
-                       AND whc.target_role = 'orchestrator'
-                       AND ca.status = 'pending'
-                    UNION ALL
-                    SELECT 1
-                      FROM project_orchestrator_replacement_commands porc
-                     WHERE porc.project_id = ?1
-                       AND porc.finished_at_unix_ms IS NULL
-                 )",
-                [&command.target_project_id],
-                |row| row.get::<_, bool>(0),
+            reject_project_orchestrator_intervention(
+                &transaction,
+                &command.target_project_id,
+                None,
             )?;
-            if handoff_pending {
-                return Err(ProjectStoreError::OrchestratorInterventionInProgress);
-            }
-            let target_intervention_pending = transaction.query_row(
-                "SELECT EXISTS (
-                    SELECT 1
-                      FROM orchestrator_prompt_commands opc
-                      JOIN command_acknowledgements ca ON ca.id = opc.command_id
-                     WHERE opc.project_id = ?1 AND ca.status = 'pending'
-                    UNION ALL
-                    SELECT 1
-                      FROM yard_orchestrator_route_commands yorc
-                      JOIN command_acknowledgements ca
-                        ON ca.id = yorc.command_id
-                     WHERE yorc.target_project_id = ?1
-                       AND ca.status = 'pending'
-                 )",
-                [&command.target_project_id],
-                |row| row.get::<_, bool>(0),
-            )?;
-            if target_intervention_pending {
-                return Err(ProjectStoreError::OrchestratorInterventionInProgress);
-            }
 
             let target_project = select_project(&transaction, &command.target_project_id)?;
             if target_project.version != command.expected_project_version {
@@ -7878,6 +8451,8 @@ fn reconcile_runtime_inventory(
         .collect();
     let mut accounted_workers = HashSet::new();
     let mut accounted_panes = HashSet::new();
+    let unknown_adoption_blocked =
+        pending_provisioning_adoption_fence(transaction, &inventory.adapter, &inventory.session)?;
 
     for binding in &bindings {
         let next = resolve_running_worker(
@@ -7903,9 +8478,14 @@ fn reconcile_runtime_inventory(
     }
 
     for worker in &inventory.workers {
+        if adopt_claimed_dedicated_runtime(transaction, inventory, worker)? {
+            result.adopted_workers += 1;
+            continue;
+        }
         if accounted_workers.contains(&worker.terminal_id)
             || accounted_panes.contains(&worker.terminal_id)
             || bound_terminals.contains_key(worker.terminal_id.as_str())
+            || unknown_adoption_blocked
             || runtime_identity_is_reserved(transaction, inventory, worker)?
         {
             continue;
@@ -7918,12 +8498,183 @@ fn reconcile_runtime_inventory(
     Ok(result)
 }
 
+fn pending_provisioning_adoption_fence(
+    connection: &Connection,
+    adapter: &str,
+    session: &str,
+) -> Result<bool, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM provisioning_runtime_claims claim
+                  JOIN command_acknowledgements command
+                    ON command.id = claim.command_id
+                 WHERE claim.adapter = ?1
+                   AND claim.runtime_session = ?2
+                   AND command.status = 'pending'
+                UNION ALL
+                SELECT 1
+                  FROM dedicated_runtime_provision_intents intent
+                  JOIN command_acknowledgements command
+                    ON command.id = intent.command_id
+                 WHERE ?1 = 'herdr'
+                   AND command.status = 'pending'
+                   AND (
+                       (intent.kind = 'yard_orchestrator'
+                        AND ?2 = 'yard-orchestrator')
+                       OR
+                       (intent.kind = 'coordination_node'
+                        AND ?2 = 'yard-coordination')
+                   )
+            )",
+            params![adapter, session],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(Into::into)
+}
+
+fn adopt_claimed_dedicated_runtime(
+    transaction: &Transaction<'_>,
+    inventory: &RuntimeInventory,
+    worker: &ObservedWorker,
+) -> Result<bool, ProjectStoreError> {
+    if !worker.interactive_ready || worker.provider_session.is_none() {
+        return Ok(false);
+    }
+    let intent = transaction
+        .query_row(
+            "SELECT intent.command_id, intent.profile_id,
+                    intent.profile_version, claim.owns_tab
+               FROM dedicated_runtime_provision_intents intent
+               JOIN command_acknowledgements command
+                 ON command.id = intent.command_id
+               JOIN provisioning_runtime_claims claim
+                 ON claim.command_id = intent.command_id
+              WHERE command.status = 'pending'
+                AND intent.runtime_start_confirmed = 1
+                AND intent.result_worker_id IS NULL
+                AND claim.adapter = ?1
+                AND claim.runtime_session = ?2
+                AND claim.runtime_workspace_id = ?3
+                AND claim.terminal_id = ?4
+                AND claim.tab_id = ?5
+                AND claim.pane_id = ?6",
+            params![
+                inventory.adapter,
+                inventory.session,
+                worker.workspace_id,
+                worker.terminal_id,
+                worker.tab_id,
+                worker.pane_id,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row_u64(row, 2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((command_id, profile_id, profile_version, owns_tab)) = intent else {
+        return Ok(false);
+    };
+    let claim = select_provisioning_runtime_claim(transaction, &command_id)?
+        .ok_or(ProjectStoreError::ProvisioningRuntimeClaimMissing)?;
+    if claim
+        .provider_session
+        .as_ref()
+        .is_some_and(|expected| worker.provider_session.as_ref() != Some(expected))
+    {
+        return Ok(false);
+    }
+    select_worker_profile_revision(transaction, &profile_id, profile_version)?;
+    let runtime = dedicated_runtime_binding_from_observation(inventory, worker, owns_tab);
+    consume_provisioning_runtime_claim(transaction, &command_id, &runtime)?;
+    ensure_worker_binding_available(transaction, &runtime)?;
+    let worker_id = Uuid::now_v7().to_string();
+    let now = inventory.observed_at_unix_ms;
+    transaction.execute(
+        "INSERT INTO workers (
+            id, profile_id, profile_version, desired_state, version,
+            created_at_unix_ms, updated_at_unix_ms
+         ) VALUES (?1, ?2, ?3, 'running', 1, ?4, ?4)",
+        params![
+            worker_id,
+            profile_id,
+            to_i64(profile_version)?,
+            to_i64(now)?
+        ],
+    )?;
+    insert_worker_runtime_binding(transaction, &worker_id, &runtime, now)?;
+    let updated = transaction.execute(
+        "UPDATE dedicated_runtime_provision_intents
+            SET result_worker_id = ?1, updated_at_unix_ms = ?2
+          WHERE command_id = ?3 AND result_worker_id IS NULL",
+        params![worker_id, to_i64(now)?, command_id],
+    )?;
+    if updated != 1 {
+        return Err(ProjectStoreError::CommandInProgress);
+    }
+    insert_lifecycle_event(
+        transaction,
+        "worker",
+        &worker_id,
+        1,
+        "dedicated_runtime_provisioned",
+        "herdr",
+        now,
+    )?;
+    Ok(true)
+}
+
+fn dedicated_runtime_binding_from_observation(
+    inventory: &RuntimeInventory,
+    worker: &ObservedWorker,
+    owns_tab: bool,
+) -> WorkerRuntimeBinding {
+    WorkerRuntimeBinding {
+        adapter: inventory.adapter.clone(),
+        session: inventory.session.clone(),
+        workspace_id: worker.workspace_id.clone(),
+        terminal_id: worker.terminal_id.clone(),
+        tab_id: Some(worker.tab_id.clone()),
+        pane_id: worker.pane_id.clone(),
+        provider_session: worker.provider_session.clone(),
+        owns_tab,
+        observation_state: RuntimeObservationState::Observed,
+        process_state: RuntimeProcessState::Running,
+        status: worker.status,
+        state_change_sequence: worker.state_change_sequence,
+        revision: worker.revision,
+        version: 1,
+        last_observed_at_unix_ms: inventory.observed_at_unix_ms,
+    }
+}
+
 fn runtime_identity_is_reserved(
     transaction: &Transaction<'_>,
     inventory: &RuntimeInventory,
     worker: &ObservedWorker,
 ) -> Result<bool, ProjectStoreError> {
     let provider = worker.provider_session.as_ref();
+    if runtime_identity_is_provisioning_claimed(
+        transaction,
+        &inventory.adapter,
+        &inventory.session,
+        &worker.terminal_id,
+        provider,
+    )? || runtime_identity_is_quarantined(
+        transaction,
+        &inventory.adapter,
+        &inventory.session,
+        &worker.terminal_id,
+        provider,
+    )? {
+        return Ok(true);
+    }
     let reserved = transaction
         .query_row(
             "SELECT
@@ -7993,6 +8744,121 @@ fn runtime_identity_is_reserved(
         return Ok(true);
     }
     orchestrator_replacement_identity_is_reserved(transaction, inventory, worker)
+}
+
+fn runtime_identity_is_provisioning_claimed(
+    connection: &Connection,
+    adapter: &str,
+    session: &str,
+    terminal_id: &str,
+    provider: Option<&ProviderSessionRef>,
+) -> Result<bool, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM provisioning_runtime_claims claim
+                 WHERE claim.adapter = ?1
+                   AND claim.runtime_session = ?2
+                   AND (
+                       claim.terminal_id = ?3
+                       OR (
+                           ?4 IS NOT NULL
+                           AND claim.provider_session_source = ?4
+                           AND claim.provider_session_provider = ?5
+                           AND claim.provider_session_kind = ?6
+                           AND claim.provider_session_value = ?7
+                       )
+                   )
+            )",
+            params![
+                adapter,
+                session,
+                terminal_id,
+                provider.map(|session| session.source.as_str()),
+                provider.map(|session| session.provider.as_str()),
+                provider.map(|session| session.kind.as_str()),
+                provider.map(|session| session.value.as_str()),
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(Into::into)
+}
+
+fn runtime_identity_is_quarantined(
+    connection: &Connection,
+    adapter: &str,
+    session: &str,
+    terminal_id: &str,
+    provider: Option<&ProviderSessionRef>,
+) -> Result<bool, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM quarantined_provisioning_runtime_bindings quarantine
+                 WHERE quarantine.adapter = ?1
+                   AND quarantine.runtime_session = ?2
+                   AND (
+                       quarantine.terminal_id = ?3
+                       OR (
+                           ?4 IS NOT NULL
+                           AND quarantine.provider_session_source = ?4
+                           AND quarantine.provider_session_provider = ?5
+                           AND quarantine.provider_session_kind = ?6
+                           AND quarantine.provider_session_value = ?7
+                       )
+                   )
+            )",
+            params![
+                adapter,
+                session,
+                terminal_id,
+                provider.map(|session| session.source.as_str()),
+                provider.map(|session| session.provider.as_str()),
+                provider.map(|session| session.kind.as_str()),
+                provider.map(|session| session.value.as_str()),
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(Into::into)
+}
+
+fn runtime_identity_has_authoritative_binding(
+    connection: &Connection,
+    runtime: &WorkerRuntimeBinding,
+) -> Result<bool, ProjectStoreError> {
+    let provider = runtime.provider_session.as_ref();
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM worker_runtime_bindings binding
+                 WHERE binding.adapter = ?1
+                   AND binding.runtime_session = ?2
+                   AND (
+                       binding.terminal_id = ?3
+                       OR (
+                           ?4 IS NOT NULL
+                           AND binding.provider_session_source = ?4
+                           AND binding.provider_session_provider = ?5
+                           AND binding.provider_session_kind = ?6
+                           AND binding.provider_session_value = ?7
+                       )
+                   )
+            )",
+            params![
+                runtime.adapter,
+                runtime.session,
+                runtime.terminal_id,
+                provider.map(|session| session.source.as_str()),
+                provider.map(|session| session.provider.as_str()),
+                provider.map(|session| session.kind.as_str()),
+                provider.map(|session| session.value.as_str()),
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(Into::into)
 }
 
 fn orchestrator_replacement_identity_is_reserved(
@@ -9235,6 +10101,13 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         transaction.execute_batch(ORCHESTRATOR_REPLACEMENT_RECOVERY_MIGRATION)?;
         ensure_foreign_keys(&transaction)?;
         transaction.commit()?;
+        current = 24;
+    }
+    if current == 24 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(FINAL_BACKEND_SAFETY_MIGRATION)?;
+        ensure_foreign_keys(&transaction)?;
+        transaction.commit()?;
     }
     ensure_foreign_keys(connection)?;
     Ok(())
@@ -9612,6 +10485,61 @@ fn map_project_insert_error(error: ProjectStoreError) -> ProjectStoreError {
             ProjectStoreError::RuntimeBindingAlreadyExists
         }
         error => error,
+    }
+}
+
+fn reject_project_orchestrator_intervention(
+    connection: &Connection,
+    project_id: &str,
+    excluded_replacement_command_id: Option<&str>,
+) -> Result<(), ProjectStoreError> {
+    let pending = connection.query_row(
+        "SELECT EXISTS (
+            SELECT 1
+              FROM orchestrator_prompt_commands prompt
+              JOIN command_acknowledgements command
+                ON command.id = prompt.command_id
+             WHERE prompt.project_id = ?1
+               AND command.status = 'pending'
+            UNION ALL
+            SELECT 1
+              FROM yard_orchestrator_route_commands route
+              JOIN command_acknowledgements command
+                ON command.id = route.command_id
+             WHERE route.target_project_id = ?1
+               AND command.status = 'pending'
+            UNION ALL
+            SELECT 1
+              FROM coordination_node_route_commands route
+              JOIN command_acknowledgements command
+                ON command.id = route.command_id
+             WHERE route.target_project_id = ?1
+               AND command.status = 'pending'
+            UNION ALL
+            SELECT 1
+              FROM coordination_snapshot_projects snapshot
+             WHERE snapshot.project_id = ?1
+               AND snapshot.delivery_status = 'pending'
+            UNION ALL
+            SELECT 1
+              FROM worker_handoff_commands handoff
+             WHERE handoff.target_project_id = ?1
+               AND handoff.target_role = 'orchestrator'
+               AND handoff.finished_at_unix_ms IS NULL
+            UNION ALL
+            SELECT 1
+              FROM project_orchestrator_replacement_commands replacement
+             WHERE replacement.project_id = ?1
+               AND replacement.finished_at_unix_ms IS NULL
+               AND (?2 IS NULL OR replacement.command_id <> ?2)
+         )",
+        params![project_id, excluded_replacement_command_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if pending {
+        Err(ProjectStoreError::OrchestratorInterventionInProgress)
+    } else {
+        Ok(())
     }
 }
 
@@ -10259,6 +11187,7 @@ struct StoredWorkerAllocationCommand {
     error_message: Option<String>,
     result_allocation_id: Option<String>,
     result_assignment_id: Option<String>,
+    objective_delivery_confirmed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10567,7 +11496,8 @@ fn select_worker_allocation_command(
                     wac.expected_project_version, wac.objective, wac.role,
                     wac.isolation_policy, wac.replace_runtime,
                     ca.actor, ca.status, ca.error_message,
-                    wac.result_allocation_id, wac.result_assignment_id
+                    wac.result_allocation_id, wac.result_assignment_id,
+                    wac.objective_delivery_confirmed
                FROM worker_allocation_commands wac
                JOIN command_acknowledgements ca ON ca.id = wac.command_id
               WHERE wac.command_id = ?1",
@@ -10589,6 +11519,7 @@ fn select_worker_allocation_command(
                     error_message: row.get(12)?,
                     result_allocation_id: row.get(13)?,
                     result_assignment_id: row.get(14)?,
+                    objective_delivery_confirmed: row.get(15)?,
                 })
             },
         )
@@ -10904,6 +11835,45 @@ fn select_orchestrator_replacement_ownership(
         .map_err(Into::into)
 }
 
+fn recover_pending_orchestrator_replacement(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    message: &str,
+    now: u64,
+) -> Result<(), ProjectStoreError> {
+    let status = transaction
+        .query_row(
+            "SELECT status
+               FROM command_acknowledgements
+              WHERE id = ?1
+                AND command_type = 'project_orchestrator_replacement'",
+            [command_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or(ProjectStoreError::CommandNotFound)?;
+    if status == "ambiguous" {
+        return Ok(());
+    }
+    if status != "pending" {
+        return Err(ProjectStoreError::CommandNotPending);
+    }
+    transaction.execute(
+        "UPDATE command_acknowledgements
+            SET status = 'ambiguous', error_message = ?1,
+                updated_at_unix_ms = ?2
+          WHERE id = ?3 AND status = 'pending'",
+        params![message, to_i64(now)?, command_id],
+    )?;
+    transaction.execute(
+        "UPDATE project_orchestrator_replacement_commands
+            SET finished_at_unix_ms = ?1
+          WHERE command_id = ?2 AND finished_at_unix_ms IS NULL",
+        params![to_i64(now)?, command_id],
+    )?;
+    Ok(())
+}
+
 fn select_orchestrator_replacement_runtime(
     connection: &Connection,
     command_id: &str,
@@ -10943,6 +11913,176 @@ fn select_orchestrator_replacement_runtime(
         )
         .optional()
         .map_err(Into::into)
+}
+
+fn select_quarantined_provisioning_runtime(
+    connection: &Connection,
+    command_id: &str,
+) -> Result<Option<WorkerRuntimeBinding>, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT adapter, runtime_session, runtime_workspace_id,
+                    terminal_id, tab_id, pane_id, provider_session_source,
+                    provider_session_provider, provider_session_kind,
+                    provider_session_value, owns_tab, observation_state,
+                    process_state, observed_status, state_change_sequence,
+                    runtime_revision, runtime_version,
+                    last_observed_at_unix_ms
+               FROM quarantined_provisioning_runtime_bindings
+              WHERE command_id = ?1",
+            [command_id],
+            |row| {
+                Ok(WorkerRuntimeBinding {
+                    adapter: row.get(0)?,
+                    session: row.get(1)?,
+                    workspace_id: row.get(2)?,
+                    terminal_id: row.get(3)?,
+                    tab_id: row.get(4)?,
+                    pane_id: row.get(5)?,
+                    provider_session: provider_session_from_columns(row, 6)?,
+                    owns_tab: row.get(10)?,
+                    observation_state: runtime_observation_state(row, 11)?,
+                    process_state: runtime_process_state(row, 12)?,
+                    status: observed_status(row, 13)?,
+                    state_change_sequence: row_u64(row, 14)?,
+                    revision: row_u64(row, 15)?,
+                    version: row_u64(row, 16)?,
+                    last_observed_at_unix_ms: row_u64(row, 17)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn select_provisioning_runtime_claim(
+    connection: &Connection,
+    command_id: &str,
+) -> Result<Option<WorkerRuntimeBinding>, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT adapter, runtime_session, runtime_workspace_id,
+                    terminal_id, tab_id, pane_id, provider_session_source,
+                    provider_session_provider, provider_session_kind,
+                    provider_session_value, owns_tab, observation_state,
+                    process_state, observed_status, state_change_sequence,
+                    runtime_revision, runtime_version,
+                    last_observed_at_unix_ms
+               FROM provisioning_runtime_claims
+              WHERE command_id = ?1",
+            [command_id],
+            |row| {
+                Ok(WorkerRuntimeBinding {
+                    adapter: row.get(0)?,
+                    session: row.get(1)?,
+                    workspace_id: row.get(2)?,
+                    terminal_id: row.get(3)?,
+                    tab_id: row.get(4)?,
+                    pane_id: row.get(5)?,
+                    provider_session: provider_session_from_columns(row, 6)?,
+                    owns_tab: row.get(10)?,
+                    observation_state: runtime_observation_state(row, 11)?,
+                    process_state: runtime_process_state(row, 12)?,
+                    status: observed_status(row, 13)?,
+                    state_change_sequence: row_u64(row, 14)?,
+                    revision: row_u64(row, 15)?,
+                    version: row_u64(row, 16)?,
+                    last_observed_at_unix_ms: row_u64(row, 17)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+struct StoredDedicatedRuntimeProvisionIntent {
+    command_type: String,
+    actor: String,
+    status: String,
+    error_message: Option<String>,
+    kind: String,
+    target_id: String,
+    profile_id: String,
+    profile_version: u64,
+    expected_target_version: u64,
+    result_worker_id: Option<String>,
+}
+
+impl StoredDedicatedRuntimeProvisionIntent {
+    fn matches(&self, intent: &DedicatedRuntimeProvisionIntent) -> bool {
+        self.command_type == intent.command_type
+            && self.actor == intent.actor
+            && self.kind == intent.kind
+            && self.target_id == intent.target_id
+            && self.profile_id == intent.profile_id
+            && self.profile_version == intent.profile_version
+            && self.expected_target_version == intent.expected_target_version
+    }
+}
+
+fn select_dedicated_runtime_provision_intent(
+    connection: &Connection,
+    command_id: &str,
+) -> Result<Option<StoredDedicatedRuntimeProvisionIntent>, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT command.command_type, command.actor, command.status,
+                    command.error_message, intent.kind, intent.target_id,
+                    intent.profile_id, intent.profile_version,
+                    intent.expected_target_version, intent.result_worker_id
+               FROM dedicated_runtime_provision_intents intent
+               JOIN command_acknowledgements command
+                 ON command.id = intent.command_id
+              WHERE intent.command_id = ?1",
+            [command_id],
+            |row| {
+                Ok(StoredDedicatedRuntimeProvisionIntent {
+                    command_type: row.get(0)?,
+                    actor: row.get(1)?,
+                    status: row.get(2)?,
+                    error_message: row.get(3)?,
+                    kind: row.get(4)?,
+                    target_id: row.get(5)?,
+                    profile_id: row.get(6)?,
+                    profile_version: row_u64(row, 7)?,
+                    expected_target_version: row_u64(row, 8)?,
+                    result_worker_id: row.get(9)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn consume_provisioning_runtime_claim(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    runtime: &WorkerRuntimeBinding,
+) -> Result<(), ProjectStoreError> {
+    let claimed = select_provisioning_runtime_claim(transaction, command_id)?
+        .ok_or(ProjectStoreError::ProvisioningRuntimeClaimMissing)?;
+    if claimed.adapter != runtime.adapter
+        || claimed.session != runtime.session
+        || claimed.workspace_id != runtime.workspace_id
+        || claimed.terminal_id != runtime.terminal_id
+        || claimed.tab_id != runtime.tab_id
+        || claimed.pane_id != runtime.pane_id
+        || claimed.owns_tab != runtime.owns_tab
+        || claimed
+            .provider_session
+            .as_ref()
+            .is_some_and(|expected| runtime.provider_session.as_ref() != Some(expected))
+    {
+        return Err(ProjectStoreError::ProvisioningRuntimeClaimMismatch);
+    }
+    let deleted = transaction.execute(
+        "DELETE FROM provisioning_runtime_claims WHERE command_id = ?1",
+        [command_id],
+    )?;
+    if deleted != 1 {
+        return Err(ProjectStoreError::ProvisioningRuntimeClaimMissing);
+    }
+    Ok(())
 }
 
 fn select_orchestrator_replacement_recovery_capture(
@@ -11001,7 +12141,8 @@ fn select_orchestrator_replacement_prepare_intent(
         .query_row(
             "SELECT prepare_tab_label, prepare_intent_at_unix_ms,
                     prepare_recovery_outcome, prepare_recovery_attempts,
-                    prepare_absence_observations
+                    prepare_absence_observations,
+                    prepare_last_absence_observed_at_unix_ms
                FROM project_orchestrator_replacement_commands replacement
               WHERE command_id = ?1
                 AND prepare_tab_label IS NOT NULL
@@ -11034,6 +12175,7 @@ fn select_orchestrator_replacement_prepare_intent(
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, u32>(3)?,
                     row.get::<_, u32>(4)?,
+                    row_optional_u64(row, 5)?,
                 ))
             },
         )
@@ -11044,6 +12186,7 @@ fn select_orchestrator_replacement_prepare_intent(
         recovery_outcome,
         recovery_attempts,
         absence_observations,
+        last_absence_observed_at_unix_ms,
     )) = intent
     else {
         return Ok(None);
@@ -11061,6 +12204,7 @@ fn select_orchestrator_replacement_prepare_intent(
             .transpose()?,
         recovery_attempts,
         absence_observations,
+        last_absence_observed_at_unix_ms,
     }))
 }
 
@@ -11072,7 +12216,8 @@ fn orchestrator_replacement_recovery_target_advanced(
 ) -> Result<bool, ProjectStoreError> {
     let attempts = match target {
         OrchestratorReplacementRecoveryTarget::PrepareIntent
-        | OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence => transaction
+        | OrchestratorReplacementRecoveryTarget::PrepareIntentStaleObservation
+        | OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence { .. } => transaction
             .query_row(
                 "SELECT prepare_recovery_attempts
                        FROM project_orchestrator_replacement_commands
@@ -11132,7 +12277,7 @@ fn ensure_worker_binding_available(
     transaction: &Transaction<'_>,
     runtime: &WorkerRuntimeBinding,
 ) -> Result<(), ProjectStoreError> {
-    let exists = transaction.query_row(
+    let unavailable = transaction.query_row(
         "SELECT EXISTS (
             SELECT 1 FROM worker_runtime_bindings
              WHERE adapter = ?1
@@ -11141,8 +12286,20 @@ fn ensure_worker_binding_available(
          )",
         params![runtime.adapter, runtime.session, runtime.terminal_id],
         |row| row.get::<_, bool>(0),
+    )? || runtime_identity_is_provisioning_claimed(
+        transaction,
+        &runtime.adapter,
+        &runtime.session,
+        &runtime.terminal_id,
+        runtime.provider_session.as_ref(),
+    )? || runtime_identity_is_quarantined(
+        transaction,
+        &runtime.adapter,
+        &runtime.session,
+        &runtime.terminal_id,
+        runtime.provider_session.as_ref(),
     )?;
-    if exists {
+    if unavailable {
         Err(ProjectStoreError::RuntimeWorkerAlreadyBound)
     } else {
         Ok(())
@@ -11153,7 +12310,7 @@ fn ensure_runtime_not_pending_cleanup(
     transaction: &Transaction<'_>,
     runtime: &WorkerRuntimeBinding,
 ) -> Result<(), ProjectStoreError> {
-    let pending = transaction.query_row(
+    let reserved = transaction.query_row(
         "SELECT EXISTS (
             SELECT 1
               FROM runtime_cleanup_jobs
@@ -11164,8 +12321,20 @@ fn ensure_runtime_not_pending_cleanup(
          )",
         params![runtime.adapter, runtime.session, runtime.terminal_id],
         |row| row.get::<_, bool>(0),
+    )? || runtime_identity_is_provisioning_claimed(
+        transaction,
+        &runtime.adapter,
+        &runtime.session,
+        &runtime.terminal_id,
+        runtime.provider_session.as_ref(),
+    )? || runtime_identity_is_quarantined(
+        transaction,
+        &runtime.adapter,
+        &runtime.session,
+        &runtime.terminal_id,
+        runtime.provider_session.as_ref(),
     )?;
-    if pending {
+    if reserved {
         Err(ProjectStoreError::RuntimeWorkerAlreadyBound)
     } else {
         Ok(())
@@ -11239,7 +12408,7 @@ fn ensure_worker_binding_available_for(
     worker_id: &str,
     runtime: &WorkerRuntimeBinding,
 ) -> Result<(), ProjectStoreError> {
-    let exists = transaction.query_row(
+    let unavailable = transaction.query_row(
         "SELECT EXISTS (
             SELECT 1 FROM worker_runtime_bindings
              WHERE adapter = ?1
@@ -11254,8 +12423,20 @@ fn ensure_worker_binding_available_for(
             worker_id,
         ],
         |row| row.get::<_, bool>(0),
+    )? || runtime_identity_is_provisioning_claimed(
+        transaction,
+        &runtime.adapter,
+        &runtime.session,
+        &runtime.terminal_id,
+        runtime.provider_session.as_ref(),
+    )? || runtime_identity_is_quarantined(
+        transaction,
+        &runtime.adapter,
+        &runtime.session,
+        &runtime.terminal_id,
+        runtime.provider_session.as_ref(),
     )?;
-    if exists {
+    if unavailable {
         Err(ProjectStoreError::RuntimeWorkerAlreadyBound)
     } else {
         Ok(())
@@ -12427,6 +13608,86 @@ fn assignment_record_from_row(row: &Row<'_>) -> rusqlite::Result<AssignmentRecor
             updated_at_unix_ms: row_u64(row, 12)?,
         },
     })
+}
+
+fn activate_profile_allocation_transaction(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    replayed: bool,
+) -> Result<ConfirmedAllocation, ProjectStoreError> {
+    let command = select_allocation_command(transaction, command_id)?
+        .ok_or(ProjectStoreError::CommandNotFound)?;
+    if command.status == "succeeded" {
+        return select_confirmed_allocation(transaction, command_id, true);
+    }
+    if command.status != "pending" {
+        return Err(ProjectStoreError::CommandNotPending);
+    }
+    let assignment_id = command
+        .result_assignment_id
+        .ok_or(ProjectStoreError::RuntimeAllocationMissing)?;
+    activate_allocation_assignment(transaction, command_id, &assignment_id)?;
+    select_confirmed_allocation(transaction, command_id, replayed)
+}
+
+fn activate_worker_allocation_transaction(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    replayed: bool,
+) -> Result<ConfirmedAllocation, ProjectStoreError> {
+    let command = select_worker_allocation_command(transaction, command_id)?
+        .ok_or(ProjectStoreError::CommandNotFound)?;
+    if command.status == "succeeded" {
+        return select_confirmed_worker_allocation(transaction, command_id, true);
+    }
+    if command.status != "pending" || !command.objective_delivery_confirmed {
+        return Err(ProjectStoreError::CommandNotPending);
+    }
+    let assignment_id = command
+        .result_assignment_id
+        .ok_or(ProjectStoreError::RuntimeAllocationMissing)?;
+    activate_allocation_assignment(transaction, command_id, &assignment_id)?;
+    select_confirmed_worker_allocation(transaction, command_id, replayed)
+}
+
+fn activate_allocation_assignment(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    assignment_id: &str,
+) -> Result<(), ProjectStoreError> {
+    let now = unix_time_ms()?;
+    let assignment_rows = transaction.execute(
+        "UPDATE assignments
+            SET lifecycle = 'active', version = version + 1,
+                updated_at_unix_ms = ?1
+          WHERE id = ?2 AND lifecycle = 'allocating'",
+        params![to_i64(now)?, assignment_id],
+    )?;
+    let attempt_rows = transaction.execute(
+        "UPDATE assignment_attempts
+            SET lifecycle = 'active', version = version + 1,
+                updated_at_unix_ms = ?1
+          WHERE assignment_id = ?2 AND lifecycle = 'starting'",
+        params![to_i64(now)?, assignment_id],
+    )?;
+    let command_rows = transaction.execute(
+        "UPDATE command_acknowledgements
+            SET status = 'succeeded', updated_at_unix_ms = ?1
+          WHERE id = ?2 AND status = 'pending'",
+        params![to_i64(now)?, command_id],
+    )?;
+    if assignment_rows != 1 || attempt_rows != 1 || command_rows != 1 {
+        return Err(ProjectStoreError::CommandNotPending);
+    }
+    insert_lifecycle_event(
+        transaction,
+        "assignment",
+        assignment_id,
+        2,
+        "objective_delivered",
+        "herdr",
+        now,
+    )
 }
 
 fn select_confirmed_allocation(
@@ -13833,6 +15094,8 @@ pub enum ProjectStoreError {
     OrchestratorReplacementTargetChanged,
     #[error("the project orchestrator transfer runtime identity changed")]
     OrchestratorTransferTargetChanged,
+    #[error("the project orchestrator has an active assignment that cannot be transferred")]
+    OrchestratorTransferActiveAssignment,
     #[error("the replacement command has not claimed a prepared runtime")]
     OrchestratorReplacementRuntimeMissing,
     #[error("the prepared replacement runtime conflicts with the verified runtime")]
@@ -13885,6 +15148,10 @@ pub enum ProjectStoreError {
     RuntimeWorkspaceMismatch,
     #[error("the worker allocation does not require runtime replacement")]
     RuntimeReplacementNotRequired,
+    #[error("the provisioning command has no durable prepared-runtime claim")]
+    ProvisioningRuntimeClaimMissing,
+    #[error("the provisioned runtime does not match the durable prepared-runtime claim")]
+    ProvisioningRuntimeClaimMismatch,
     #[error("a runtime binding was created concurrently")]
     RuntimeBindingAlreadyExists,
     #[error("the runtime snapshot is older than the durable reconciliation watermark")]
@@ -13951,7 +15218,7 @@ mod tests {
         time::Duration,
     };
 
-    use rusqlite::Connection;
+    use rusqlite::{Connection, TransactionBehavior};
     use serde_json::Value;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -13965,14 +15232,14 @@ mod tests {
         FocusObservation, HandoffTargetRole, IsolationPolicy, ObservedStatus, ObservedWorker,
         OldSessionDisposition, PaneObservation, Project, ProjectRelationshipKind,
         ProjectRuntimeBinding, ProviderSessionRef, ProvisionCoordinationNode,
-        RecordCompletionReceipt, ReplaceProjectOrchestrator, RequestCoordinationSnapshot,
-        RuntimeInventory, RuntimeObservationState, RuntimeProcessState, SendAssignmentPrompt,
-        SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
-        SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SnapshotCollectionStatus,
-        TransferProjectOrchestrator, UpdateAgentProfile, UpdateCoordinationNode,
-        UpdateCoordinationNodePlacement, UpdateProjectPlacement, UpdateTokenSpendSettings,
-        UpdateWorkerProfile, WorkerAvailability, WorkerProfile, WorkerProfileSpec,
-        WorkerRuntimeBinding, YardOrchestrator,
+        ProvisionYardOrchestrator, RecordCompletionReceipt, ReplaceProjectOrchestrator,
+        RequestCoordinationSnapshot, RuntimeInventory, RuntimeObservationState,
+        RuntimeProcessState, SendAssignmentPrompt, SendCoordinationNodePrompt,
+        SendCoordinationNodeRoute, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
+        SendYardOrchestratorRoute, SnapshotCollectionStatus, TransferProjectOrchestrator,
+        UpdateAgentProfile, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
+        UpdateProjectPlacement, UpdateTokenSpendSettings, UpdateWorkerProfile, WorkerAvailability,
+        WorkerProfile, WorkerProfileSpec, WorkerRuntimeBinding, YardOrchestrator,
     };
 
     use super::{
@@ -14032,7 +15299,22 @@ mod tests {
             .unwrap()
     }
 
+    fn downgrade_final_backend_safety_schema_to_v24(connection: &Connection) {
+        connection
+            .execute_batch(
+                "DROP TABLE dedicated_runtime_provision_intents;
+                 DROP TABLE provisioning_runtime_claims;
+                 DROP TABLE quarantined_provisioning_runtime_bindings;
+                 ALTER TABLE worker_allocation_commands
+                    DROP COLUMN objective_delivery_confirmed;
+                 ALTER TABLE project_orchestrator_replacement_commands
+                    DROP COLUMN prepare_last_absence_observed_at_unix_ms;",
+            )
+            .unwrap();
+    }
+
     fn downgrade_replacement_recovery_schema_to_v23(connection: &Connection) {
+        downgrade_final_backend_safety_schema_to_v24(connection);
         connection
             .execute_batch(
                 "DROP INDEX project_replacement_runtime_identity;
@@ -14081,6 +15363,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     fn drop_automation_schema_for_downgrade(connection: &Connection) {
+        downgrade_final_backend_safety_schema_to_v24(connection);
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = OFF;
@@ -14653,6 +15936,10 @@ mod tests {
         runtime.pane_id = "pane-2".to_owned();
         runtime.owns_tab = true;
         store
+            .claim_provisioning_runtime(&allocation.command_id, runtime.clone())
+            .await
+            .unwrap();
+        store
             .persist_runtime_allocation(&allocation.command_id, runtime)
             .await
             .unwrap();
@@ -14749,6 +16036,10 @@ mod tests {
         );
         store
             .begin_profile_project_creation(create_command.clone())
+            .await
+            .unwrap();
+        store
+            .claim_provisioning_runtime(&create_command.command_id, displaced_runtime.clone())
             .await
             .unwrap();
         let project = store
@@ -15194,6 +16485,363 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
+    async fn snapshot_delivery_reserves_orchestrator_during_replacement_recovery() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project, _profile, command, prepared, started) =
+            create_orchestrator_replacement_fixture(
+                &store,
+                "replace-recovery-snapshot-race",
+                OldSessionDisposition::RetainForInspection,
+            )
+            .await;
+        let node_id = Uuid::now_v7().to_string();
+        let node = store
+            .create_coordination_node(
+                &node_id,
+                None,
+                Some(temp.path().join("knowledge").to_string_lossy().into_owned()),
+                create_node_command(
+                    "create-recovery-snapshot-node",
+                    CoordinationNodeKind::KnowledgeStore,
+                    vec![project.id.clone()],
+                ),
+            )
+            .await
+            .unwrap()
+            .node;
+        let snapshot_id = Uuid::now_v7().to_string();
+        let snapshot_folder = temp.path().join("knowledge").join(&snapshot_id);
+        let project_folders = vec![SnapshotProjectFolder {
+            project_id: project.id.clone(),
+            folder_path: snapshot_folder
+                .join(&project.id)
+                .to_string_lossy()
+                .into_owned(),
+        }];
+        store
+            .begin_project_orchestrator_replacement(&project.id, command.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .create_coordination_snapshot(
+                    &node_id,
+                    &snapshot_id,
+                    snapshot_folder.to_string_lossy().into_owned(),
+                    project_folders.clone(),
+                    RequestCoordinationSnapshot {
+                        command_id: "request-during-pending-replacement".to_owned(),
+                        actor: "local-user".to_owned(),
+                        expected_node_version: node.version,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::OrchestratorInterventionInProgress
+        ));
+        store
+            .claim_project_orchestrator_replacement_runtime(&command.command_id, prepared)
+            .await
+            .unwrap();
+        store
+            .record_project_orchestrator_replacement_started_runtime(
+                &command.command_id,
+                started.clone(),
+                OrchestratorReplacementStartEvidence::Confirmed,
+            )
+            .await
+            .unwrap();
+        store
+            .fail_project_orchestrator_replacement(
+                &command.command_id,
+                "finalization acknowledgement was lost",
+                true,
+            )
+            .await
+            .unwrap();
+        let mut freshly_observed = started;
+        freshly_observed.last_observed_at_unix_ms += 1;
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let snapshot_store = store.clone();
+        let snapshot_barrier = Arc::clone(&barrier);
+        let snapshot_node_id = node_id.clone();
+        let racing_snapshot_id = snapshot_id.clone();
+        let racing_snapshot_folder = snapshot_folder.to_string_lossy().into_owned();
+        let recovery_store = store.clone();
+        let recovery_barrier = Arc::clone(&barrier);
+        let replacement_command_id = command.command_id.clone();
+        let racing_observed = freshly_observed.clone();
+        let (snapshot_result, recovery_result, _) = tokio::join!(
+            async move {
+                snapshot_barrier.wait().await;
+                snapshot_store
+                    .create_coordination_snapshot(
+                        &snapshot_node_id,
+                        &racing_snapshot_id,
+                        racing_snapshot_folder,
+                        project_folders,
+                        RequestCoordinationSnapshot {
+                            command_id: "request-recovery-snapshot".to_owned(),
+                            actor: "local-user".to_owned(),
+                            expected_node_version: node.version,
+                        },
+                    )
+                    .await
+            },
+            async move {
+                recovery_barrier.wait().await;
+                recovery_store
+                    .recover_project_orchestrator_replacement(
+                        &replacement_command_id,
+                        racing_observed,
+                    )
+                    .await
+            },
+            barrier.wait(),
+        );
+        let snapshot = snapshot_result.unwrap();
+        let recovery_won = recovery_result.is_ok();
+        let recovered = match recovery_result {
+            Ok(recovered) => {
+                assert_eq!(
+                    snapshot.projects[0].orchestrator_worker_id,
+                    recovered.project.orchestrator.id
+                );
+                recovered
+            }
+            Err(ProjectStoreError::OrchestratorInterventionInProgress) => {
+                assert_eq!(
+                    snapshot.projects[0].orchestrator_worker_id,
+                    project.orchestrator.id
+                );
+                store
+                    .record_snapshot_project_delivery(
+                        &snapshot_id,
+                        &project.id,
+                        SnapshotDeliveryResult::Failed {
+                            message: "snapshot race test complete".to_owned(),
+                            ambiguous: false,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .recover_project_orchestrator_replacement(&command.command_id, freshly_observed)
+                    .await
+                    .unwrap()
+            }
+            Err(error) => panic!("unexpected recovery race error: {error}"),
+        };
+        if recovery_won {
+            store
+                .record_snapshot_project_delivery(
+                    &snapshot_id,
+                    &project.id,
+                    SnapshotDeliveryResult::Failed {
+                        message: "snapshot race test complete".to_owned(),
+                        ambiguous: false,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            recovered.project.orchestrator.id,
+            recovered.assignment.worker.id
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn coordination_route_serializes_with_orchestrator_replacement_recovery() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project, profile, mut command, prepared, started) =
+            create_orchestrator_replacement_fixture(
+                &store,
+                "replace-route-recovery-race",
+                OldSessionDisposition::RetainForInspection,
+            )
+            .await;
+        let node_id = Uuid::now_v7().to_string();
+        let node = store
+            .create_coordination_node(
+                &node_id,
+                Some(
+                    temp.path()
+                        .join("coordination")
+                        .join(&node_id)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                None,
+                create_node_command(
+                    "create-route-recovery-node",
+                    CoordinationNodeKind::Workstream,
+                    vec![project.id.clone()],
+                ),
+            )
+            .await
+            .unwrap()
+            .node;
+        let displaced = project.orchestrator.runtime.as_ref().unwrap();
+        store
+            .reconcile_runtime_inventory(inventory(
+                displaced.last_observed_at_unix_ms + 1,
+                vec![
+                    observed_worker(
+                        &displaced.terminal_id,
+                        &displaced.workspace_id,
+                        displaced.tab_id.as_deref().unwrap(),
+                        &displaced.pane_id,
+                        displaced.provider_session.clone(),
+                    ),
+                    observed_worker(
+                        "route-recovery-coordination-terminal",
+                        "route-recovery-coordination-workspace",
+                        "route-recovery-coordination-tab",
+                        "route-recovery-coordination-pane",
+                        Some(provider_session("route-recovery-coordination-provider")),
+                    ),
+                ],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let candidate = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| {
+                candidate.worker.runtime.as_ref().is_some_and(|runtime| {
+                    runtime.terminal_id == "route-recovery-coordination-terminal"
+                })
+            })
+            .unwrap();
+        let pinned = store
+            .pin_worker_profile(&candidate.worker.id, &profile.id, profile.version)
+            .await
+            .unwrap();
+        let provisioned = store
+            .configure_coordination_node(
+                &node_id,
+                ProvisionCoordinationNode {
+                    command_id: "provision-route-recovery-node".to_owned(),
+                    actor: "local-user".to_owned(),
+                    profile_id: profile.id,
+                    expected_profile_version: profile.version,
+                    expected_node_version: node.version,
+                },
+                &pinned.id,
+                pinned.version,
+            )
+            .await
+            .unwrap()
+            .node;
+        let replacement_target = store.get_project(&project.id).await.unwrap();
+        command.expected_project_version = replacement_target.version;
+        command.expected_orchestrator_worker_id = replacement_target.orchestrator.id.clone();
+        command.expected_orchestrator_worker_version = replacement_target.orchestrator.version;
+        command.expected_orchestrator_runtime =
+            replacement_target.orchestrator.runtime.clone().unwrap();
+        store
+            .begin_project_orchestrator_replacement(&project.id, command.clone())
+            .await
+            .unwrap();
+        store
+            .claim_project_orchestrator_replacement_runtime(&command.command_id, prepared)
+            .await
+            .unwrap();
+        store
+            .record_project_orchestrator_replacement_started_runtime(
+                &command.command_id,
+                started.clone(),
+                OrchestratorReplacementStartEvidence::Confirmed,
+            )
+            .await
+            .unwrap();
+        store
+            .fail_project_orchestrator_replacement(
+                &command.command_id,
+                "replacement finalization acknowledgement was lost",
+                true,
+            )
+            .await
+            .unwrap();
+        let current = store.get_project(&project.id).await.unwrap();
+        let route = SendCoordinationNodeRoute {
+            command_id: "route-against-replacement-recovery".to_owned(),
+            actor: "local-user".to_owned(),
+            expected_node_version: provisioned.version,
+            worker_id: pinned.id,
+            target_project_id: current.id.clone(),
+            expected_project_version: current.version,
+            target_orchestrator_worker_id: current.orchestrator.id.clone(),
+            text: "Race this route against replacement recovery.".to_owned(),
+        };
+        let mut freshly_observed = started;
+        freshly_observed.last_observed_at_unix_ms += 1;
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let route_store = store.clone();
+        let route_barrier = Arc::clone(&barrier);
+        let route_node_id = node_id.clone();
+        let racing_route = route.clone();
+        let recovery_store = store.clone();
+        let recovery_barrier = Arc::clone(&barrier);
+        let replacement_command_id = command.command_id.clone();
+        let recovery_runtime = freshly_observed.clone();
+        let (route_result, recovery_result, _) = tokio::join!(
+            async move {
+                route_barrier.wait().await;
+                route_store
+                    .begin_coordination_node_route(&route_node_id, racing_route)
+                    .await
+            },
+            async move {
+                recovery_barrier.wait().await;
+                recovery_store
+                    .recover_project_orchestrator_replacement(
+                        &replacement_command_id,
+                        recovery_runtime,
+                    )
+                    .await
+            },
+            barrier.wait(),
+        );
+        assert_ne!(route_result.is_ok(), recovery_result.is_ok());
+        match (route_result, recovery_result) {
+            (Ok(_), Err(ProjectStoreError::OrchestratorInterventionInProgress)) => {
+                store
+                    .fail_coordination_node_route(
+                        &route.command_id,
+                        "route/recovery race complete",
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .recover_project_orchestrator_replacement(&command.command_id, freshly_observed)
+                    .await
+                    .unwrap();
+            }
+            (
+                Err(
+                    ProjectStoreError::ProjectVersionConflict { .. }
+                    | ProjectStoreError::OrchestratorNotCurrent { .. },
+                ),
+                Ok(_),
+            ) => {}
+            (route, recovery) => {
+                panic!("unexpected route/recovery race results: {route:?}, {recovery:?}");
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
     async fn recovery_outcomes_preserve_only_colliding_runtime_reservations() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
@@ -15317,6 +16965,7 @@ mod tests {
             .unwrap();
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn prepare_intent_requires_two_absence_observations_before_convergence() {
         let temp = TempDir::new().unwrap();
@@ -15353,10 +17002,29 @@ mod tests {
                 .absence_observations,
             0
         );
+        let premature = store
+            .record_orchestrator_replacement_recovery_attempt(
+                &command.command_id,
+                OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence {
+                    observed_at_unix_ms: 20,
+                },
+                0,
+                Some(OrchestratorReplacementRecoveryOutcome::AbsentConverged),
+                "one observation cannot prove the prepare intent absent",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            premature,
+            ProjectStoreError::OrchestratorReplacementFreshObservationRequired
+        ));
         store
             .record_orchestrator_replacement_recovery_attempt(
                 &command.command_id,
-                OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence,
+                OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence {
+                    observed_at_unix_ms: 20,
+                },
                 0,
                 None,
                 "first fresh inventory observation found no command-unique tab",
@@ -15376,13 +17044,32 @@ mod tests {
                 .absence_observations,
             1
         );
+        let stale = store
+            .record_orchestrator_replacement_recovery_attempt(
+                &command.command_id,
+                OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence {
+                    observed_at_unix_ms: 20,
+                },
+                1,
+                Some(OrchestratorReplacementRecoveryOutcome::AbsentConverged),
+                "cached inventory cannot confirm the prepare intent absent",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            stale,
+            ProjectStoreError::OrchestratorReplacementFreshObservationRequired
+        ));
         store
             .record_orchestrator_replacement_recovery_attempt(
                 &command.command_id,
-                OrchestratorReplacementRecoveryTarget::PrepareIntent,
+                OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence {
+                    observed_at_unix_ms: 21,
+                },
                 1,
                 Some(OrchestratorReplacementRecoveryOutcome::AbsentConverged),
-                "second fresh inventory observation confirmed the prepare intent absent",
+                "second strictly newer inventory observation confirmed the prepare intent absent",
                 None,
             )
             .await
@@ -15397,6 +17084,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stranded_pending_replacement_recovers_live_after_persistence_failure() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project, _profile, command, _prepared, _started) =
+            create_orchestrator_replacement_fixture(
+                &store,
+                "replace-persistence-failure",
+                OldSessionDisposition::RetainForInspection,
+            )
+            .await;
+        store
+            .begin_project_orchestrator_replacement(&project.id, command.clone())
+            .await
+            .unwrap();
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_replacement_ambiguity
+                 BEFORE UPDATE OF status ON command_acknowledgements
+                 WHEN OLD.id = 'replace-persistence-failure'
+                      AND NEW.status = 'ambiguous'
+                 BEGIN
+                     SELECT RAISE(FAIL, 'injected ambiguity persistence failure');
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(
+            store
+                .fail_project_orchestrator_replacement(
+                    &command.command_id,
+                    "post-mutation persistence failed",
+                    true,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .recover_stranded_pending_project_orchestrator_replacements(
+                    vec![command.command_id.clone()],
+                    "live recovery test",
+                )
+                .await
+                .unwrap(),
+            0
+        );
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let pending: (String, Option<i64>) = connection
+            .query_row(
+                "SELECT command.status, replacement.finished_at_unix_ms
+                   FROM command_acknowledgements command
+                   JOIN project_orchestrator_replacement_commands replacement
+                     ON replacement.command_id = command.id
+                  WHERE command.id = ?1",
+                [&command.command_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending, ("pending".to_owned(), None));
+        connection
+            .execute_batch("DROP TRIGGER reject_replacement_ambiguity;")
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            store
+                .recover_stranded_pending_project_orchestrator_replacements(
+                    Vec::new(),
+                    "live recovery test",
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_ambiguous_orchestrator_replacement_recoveries(Some(&command.command_id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn version_23_replacement_captures_migrate_to_recovery_state() {
         let temp = TempDir::new().unwrap();
         let database_path = temp.path().join("yard.sqlite3");
@@ -15462,6 +17237,13 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
+        let worker_allocation_columns = connection
+            .prepare("PRAGMA table_info(worker_allocation_commands)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         for column in [
             "objective_delivery_confirmed",
@@ -15481,10 +17263,108 @@ mod tests {
             "prepare_reconciled_at_unix_ms",
             "prepare_recovery_attempts",
             "prepare_absence_observations",
+            "prepare_last_absence_observed_at_unix_ms",
             "prepare_next_recovery_at_unix_ms",
         ] {
             assert!(prepare_columns.iter().any(|value| value == column));
         }
+        assert!(
+            worker_allocation_columns
+                .iter()
+                .any(|value| value == "objective_delivery_confirmed")
+        );
+        let quarantine_table: bool = connection
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM sqlite_master
+                     WHERE type = 'table'
+                       AND name = 'quarantined_provisioning_runtime_bindings'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(quarantine_table);
+        let claim_table: bool = connection
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM sqlite_master
+                     WHERE type = 'table'
+                       AND name = 'provisioning_runtime_claims'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(claim_table);
+    }
+
+    #[tokio::test]
+    async fn version_24_absent_convergence_without_timestamp_is_reset_on_migration() {
+        let temp = TempDir::new().unwrap();
+        let database_path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let (project, _profile, command, _prepared, _started) =
+            create_orchestrator_replacement_fixture(
+                &store,
+                "replace-v24-absence",
+                OldSessionDisposition::RetainForInspection,
+            )
+            .await;
+        store
+            .begin_project_orchestrator_replacement(&project.id, command.clone())
+            .await
+            .unwrap();
+        store
+            .fail_project_orchestrator_replacement(
+                &command.command_id,
+                "prepare response was lost",
+                true,
+            )
+            .await
+            .unwrap();
+        store
+            .record_orchestrator_replacement_recovery_attempt(
+                &command.command_id,
+                OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence {
+                    observed_at_unix_ms: u64::MAX / 2,
+                },
+                0,
+                None,
+                "legacy first absence",
+                Some(0),
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&database_path).unwrap();
+        downgrade_final_backend_safety_schema_to_v24(&connection);
+        connection
+            .execute(
+                "UPDATE project_orchestrator_replacement_commands
+                    SET prepare_absence_observations = 0,
+                        prepare_recovery_outcome = 'absent_converged',
+                        prepare_recovery_detail = 'legacy cached absence convergence',
+                        prepare_reconciled_at_unix_ms = 1
+                  WHERE command_id = ?1",
+                [&command.command_id],
+            )
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA user_version = 24;")
+            .unwrap();
+        drop(connection);
+
+        let migrated = SqliteProjectStore::open(database_path).await.unwrap();
+        let recoveries = migrated
+            .list_ambiguous_orchestrator_replacement_recoveries(Some(&command.command_id))
+            .await
+            .unwrap();
+        let intent = recoveries[0].prepare_intent.as_ref().unwrap();
+        assert_eq!(intent.absence_observations, 0);
+        assert_eq!(intent.last_absence_observed_at_unix_ms, None);
+        assert_eq!(intent.recovery_outcome, None);
     }
 
     #[tokio::test]
@@ -16650,6 +18530,10 @@ mod tests {
         let (_, mut runtime) = draft("workspace-1", "terminal-1");
         runtime.provider_session = Some(provider_session("orchestrator-session"));
         runtime.owns_tab = true;
+        store
+            .claim_provisioning_runtime(&command.command_id, runtime.clone())
+            .await
+            .unwrap();
         let created = store
             .finalize_profile_project_creation(&command.command_id, runtime)
             .await
@@ -16773,7 +18657,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalization_pins_a_reconciled_profileless_runtime_worker() {
+    async fn provisioning_claim_blocks_reconciliation_before_project_finalization() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
         let profile = store
@@ -16787,6 +18671,13 @@ mod tests {
             .begin_profile_project_creation(command.clone())
             .await
             .unwrap();
+        let (_, mut runtime) = draft("workspace-1", "terminal-1");
+        runtime.provider_session = Some(provider_session("orchestrator-session"));
+        runtime.last_observed_at_unix_ms = 5;
+        store
+            .claim_provisioning_runtime(&command.command_id, runtime.clone())
+            .await
+            .unwrap();
         let observed = observed_worker(
             "terminal-1",
             "workspace-1",
@@ -16798,37 +18689,33 @@ mod tests {
             .reconcile_runtime_inventory(inventory(5, vec![observed], Vec::new()))
             .await
             .unwrap();
-        let adopted = store
-            .list_worker_candidates()
-            .await
-            .unwrap()
-            .workers
-            .into_iter()
-            .find(|candidate| {
-                candidate
-                    .worker
-                    .runtime
-                    .as_ref()
-                    .is_some_and(|runtime| runtime.terminal_id == "terminal-1")
-            })
-            .unwrap()
-            .worker;
-        let (_, mut runtime) = draft("workspace-1", "terminal-1");
-        runtime.provider_session = Some(provider_session("orchestrator-session"));
-        runtime.last_observed_at_unix_ms = 5;
+        assert!(
+            store
+                .list_worker_candidates()
+                .await
+                .unwrap()
+                .workers
+                .into_iter()
+                .all(|candidate| {
+                    candidate
+                        .worker
+                        .runtime
+                        .as_ref()
+                        .is_none_or(|runtime| runtime.terminal_id != "terminal-1")
+                })
+        );
 
         let created = store
             .finalize_profile_project_creation(&command.command_id, runtime)
             .await
             .unwrap();
 
-        assert_eq!(created.project.orchestrator.id, adopted.id);
         assert_eq!(
             created.project.orchestrator.profile_id.as_deref(),
             Some(profile.id.as_str())
         );
         assert_eq!(created.project.orchestrator.profile_version, Some(1));
-        assert_eq!(created.project.orchestrator.version, 2);
+        assert_eq!(created.project.orchestrator.version, 1);
     }
 
     #[tokio::test]
@@ -16855,6 +18742,10 @@ mod tests {
         let (_, mut runtime) = draft("created-workspace-1", "terminal-1");
         runtime.provider_session = Some(provider_session("orchestrator-session"));
         runtime.owns_tab = true;
+        store
+            .claim_provisioning_runtime(&command.command_id, runtime.clone())
+            .await
+            .unwrap();
         let created = store
             .finalize_workspace_project_creation(&command.command_id, runtime)
             .await
@@ -16941,6 +18832,11 @@ mod tests {
         let command = workspace_project_command(&profile, "create-workspace-project-1");
         store
             .begin_workspace_project_creation(command.clone())
+            .await
+            .unwrap();
+        let (_, claim) = draft("created-workspace", "terminal-2");
+        store
+            .claim_provisioning_runtime(&command.command_id, claim)
             .await
             .unwrap();
 
@@ -17041,6 +18937,11 @@ mod tests {
             .begin_workspace_project_creation(command.clone())
             .await
             .unwrap();
+        let (_, claim) = draft("created-workspace", "terminal-2");
+        store
+            .claim_provisioning_runtime(&command.command_id, claim)
+            .await
+            .unwrap();
 
         let (_, mut wrong_adapter) = draft("created-workspace", "terminal-2");
         wrong_adapter.adapter = "other-adapter".to_owned();
@@ -17094,7 +18995,7 @@ mod tests {
         ));
         assert!(matches!(
             worker_error,
-            ProjectStoreError::RuntimeWorkerAlreadyBound
+            ProjectStoreError::ProvisioningRuntimeClaimMismatch
         ));
     }
 
@@ -17115,6 +19016,10 @@ mod tests {
             .await
             .unwrap();
         let (_, runtime) = draft("workspace-1", "terminal-1");
+        store
+            .claim_provisioning_runtime(&command.command_id, runtime.clone())
+            .await
+            .unwrap();
         let created = store
             .finalize_profile_project_creation(&command.command_id, runtime)
             .await
@@ -18396,6 +20301,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ambiguous_profile_allocation_reserves_project_without_a_runtime_identity() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, orchestrator) = draft("workspace-1", "terminal-1");
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Implementer"),
+            })
+            .await
+            .unwrap();
+        let command = ConfirmProfileAllocation {
+            command_id: "ambiguous-profile-allocation".to_owned(),
+            actor: "local-user".to_owned(),
+            profile_id: profile.id,
+            expected_profile_version: profile.version,
+            expected_project_version: project.version,
+            objective: "Preserve an uncertain tab creation.".to_owned(),
+            role: "implementer".to_owned(),
+            isolation_policy: IsolationPolicy::ProjectWorkspace,
+        };
+        store
+            .begin_profile_allocation(&project.id, command.clone())
+            .await
+            .unwrap();
+        store
+            .fail_profile_allocation(&command.command_id, "tab.create response was lost", true)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .begin_profile_allocation(&project.id, command.clone())
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CommandOutcomeAmbiguous(_)
+        ));
+        let mut fresh = command;
+        fresh.command_id = "fresh-after-ambiguous-profile-allocation".to_owned();
+        fresh.expected_project_version = store.get_project(&project.id).await.unwrap().version;
+        assert!(matches!(
+            store
+                .begin_profile_allocation(&project.id, fresh)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::AssignmentInterventionInProgress
+        ));
+    }
+
+    #[tokio::test]
     async fn confirmed_allocation_replays_after_reopen_without_duplicates() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
@@ -18431,13 +20389,34 @@ mod tests {
         runtime.tab_id = Some("tab-2".to_owned());
         runtime.owns_tab = true;
         store
+            .claim_provisioning_runtime(&command.command_id, runtime.clone())
+            .await
+            .unwrap();
+        let persisted = store
             .persist_runtime_allocation(&command.command_id, runtime)
             .await
             .unwrap();
-        let created = store
-            .activate_profile_allocation(&command.command_id)
-            .await
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_profile_allocation_activation
+                 BEFORE UPDATE OF status ON command_acknowledgements
+                 WHEN OLD.id = 'command-1' AND NEW.status = 'succeeded'
+                 BEGIN
+                     SELECT RAISE(FAIL, 'injected activation persistence failure');
+                 END;",
+            )
             .unwrap();
+        assert!(
+            store
+                .activate_profile_allocation(&command.command_id)
+                .await
+                .is_err()
+        );
+        connection
+            .execute_batch("DROP TRIGGER reject_profile_allocation_activation;")
+            .unwrap();
+        drop(connection);
         drop(store);
 
         let reopened = open_store(&temp).await;
@@ -18451,11 +20430,28 @@ mod tests {
             .unwrap();
 
         let BeginProfileAllocation::Replayed(replayed) = replayed else {
-            panic!("expected allocation replay");
+            panic!("expected allocation activation recovery");
         };
-        assert_eq!(replayed.assignment.id, created.assignment.id);
+        assert_eq!(replayed.assignment.id, persisted.assignment.id);
+        assert_eq!(replayed.assignment.lifecycle, AssignmentLifecycle::Active);
         assert!(replayed.replayed);
         assert_eq!(assignments.assignments.len(), 1);
+        assert_eq!(
+            assignments.assignments[0].attempt.lifecycle,
+            AttemptLifecycle::Active
+        );
+        let objective_events = Connection::open(temp.path().join("yard.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM lifecycle_events
+                  WHERE aggregate_type = 'assignment'
+                    AND aggregate_id = ?1
+                    AND event_type = 'objective_delivered'",
+                [&persisted.assignment.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(objective_events, 1);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -18491,6 +20487,10 @@ mod tests {
         let (_, mut runtime) = draft("workspace-1", "terminal-2");
         runtime.tab_id = Some("tab-2".to_owned());
         runtime.owns_tab = true;
+        store
+            .claim_provisioning_runtime(&allocation_command.command_id, runtime.clone())
+            .await
+            .unwrap();
         store
             .persist_runtime_allocation(&allocation_command.command_id, runtime)
             .await
@@ -19587,6 +21587,182 @@ mod tests {
         ));
     }
 
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn project_orchestrator_transfer_races_assignment_activation_without_mutation() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project, _profile, replacement, _prepared, _started) =
+            create_orchestrator_replacement_fixture(
+                &store,
+                "transfer-active-assignment-fixture",
+                OldSessionDisposition::RetainForInspection,
+            )
+            .await;
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let allocation_id: String = connection
+            .query_row(
+                "SELECT id
+                   FROM worker_allocations
+                  WHERE project_id = ?1 AND worker_id = ?2
+                    AND ended_at_unix_ms IS NULL",
+                rusqlite::params![project.id, project.orchestrator.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let assignment_id = Uuid::now_v7().to_string();
+        let attempt_id = Uuid::now_v7().to_string();
+        connection
+            .execute(
+                "INSERT INTO assignments (
+                    id, project_id, allocation_id, worker_id,
+                    profile_id, profile_version, objective, role,
+                    isolation_policy, lifecycle, version,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6,
+                    'Continue active orchestration.', 'orchestrator',
+                    'project_workspace', 'allocating', 1, 1, 1
+                 )",
+                rusqlite::params![
+                    assignment_id,
+                    project.id,
+                    allocation_id,
+                    project.orchestrator.id,
+                    project.orchestrator.profile_id,
+                    project
+                        .orchestrator
+                        .profile_version
+                        .map(|version| i64::try_from(version).unwrap()),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO assignment_attempts (
+                    id, assignment_id, ordinal, lifecycle, error_message,
+                    version, created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (?1, ?2, 1, 'starting', NULL, 1, 1, 1)",
+                rusqlite::params![attempt_id, assignment_id],
+            )
+            .unwrap();
+        drop(connection);
+        let displaced = replacement.expected_orchestrator_runtime;
+        store
+            .reconcile_runtime_inventory(inventory(
+                displaced.last_observed_at_unix_ms + 1,
+                vec![
+                    observed_worker(
+                        &displaced.terminal_id,
+                        &displaced.workspace_id,
+                        displaced.tab_id.as_deref().unwrap(),
+                        &displaced.pane_id,
+                        displaced.provider_session.clone(),
+                    ),
+                    observed_worker(
+                        "terminal-transfer-active-candidate",
+                        &displaced.workspace_id,
+                        "tab-transfer-active-candidate",
+                        "pane-transfer-active-candidate",
+                        Some(provider_session("session-transfer-active-candidate")),
+                    ),
+                ],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let project = store.get_project(&project.id).await.unwrap();
+        let candidate = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| {
+                candidate.worker.runtime.as_ref().is_some_and(|runtime| {
+                    runtime.terminal_id == "terminal-transfer-active-candidate"
+                })
+            })
+            .unwrap();
+        let command = TransferProjectOrchestrator {
+            command_id: "transfer-with-active-assignment".to_owned(),
+            actor: "local-user".to_owned(),
+            worker_id: candidate.worker.id.clone(),
+            expected_worker_version: candidate.worker.version,
+            expected_worker_runtime: candidate.worker.runtime.clone().unwrap(),
+            expected_project_version: project.version,
+            expected_orchestrator_worker_id: project.orchestrator.id.clone(),
+            expected_orchestrator_worker_version: project.orchestrator.version,
+            expected_orchestrator_runtime: project.orchestrator.runtime.clone().unwrap(),
+        };
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let activation_store = store.clone();
+        let activation_barrier = Arc::clone(&barrier);
+        let racing_assignment_id = assignment_id.clone();
+        let transfer_store = store.clone();
+        let transfer_barrier = Arc::clone(&barrier);
+        let transfer_project_id = project.id.clone();
+        let transfer_command = command.clone();
+        let (activation, transfer, _) = tokio::join!(
+            async move {
+                activation_barrier.wait().await;
+                activation_store
+                    .run(move |connection| {
+                        let transaction =
+                            connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                        transaction.execute(
+                            "UPDATE assignments
+                                SET lifecycle = 'active', version = version + 1,
+                                    updated_at_unix_ms = updated_at_unix_ms + 1
+                              WHERE id = ?1 AND lifecycle = 'allocating'",
+                            [&racing_assignment_id],
+                        )?;
+                        transaction.execute(
+                            "UPDATE assignment_attempts
+                                SET lifecycle = 'active', version = version + 1,
+                                    updated_at_unix_ms = updated_at_unix_ms + 1
+                              WHERE assignment_id = ?1 AND lifecycle = 'starting'",
+                            [&racing_assignment_id],
+                        )?;
+                        transaction.commit()?;
+                        Ok(())
+                    })
+                    .await
+            },
+            async move {
+                transfer_barrier.wait().await;
+                transfer_store
+                    .transfer_project_orchestrator(&transfer_project_id, transfer_command)
+                    .await
+            },
+            barrier.wait(),
+        );
+        activation.unwrap();
+        assert!(matches!(
+            transfer.unwrap_err(),
+            ProjectStoreError::OrchestratorTransferActiveAssignment
+                | ProjectStoreError::OrchestratorTransferTargetChanged
+        ));
+
+        let after = store.get_project(&project.id).await.unwrap();
+        assert_eq!(after, project);
+        let assignments = store.list_project_assignments(&project.id).await.unwrap();
+        assert_eq!(
+            assignments.assignments[0].lifecycle,
+            AssignmentLifecycle::Active
+        );
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let transfer_commands: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM project_orchestrator_transfer_commands
+                  WHERE command_id = ?1",
+                [&command.command_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(transfer_commands, 0);
+    }
+
     #[tokio::test]
     async fn project_orchestrator_transfer_keeps_providerless_displaced_worker_unassigned_live() {
         let temp = TempDir::new().unwrap();
@@ -19748,6 +21924,7 @@ mod tests {
         ));
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn live_worker_allocation_reuses_identity_and_replays() {
         let temp = TempDir::new().unwrap();
@@ -19808,23 +21985,75 @@ mod tests {
         };
         assert!(!context.replace_runtime);
         assert_eq!(context.worker.id, candidate.worker.id);
-        let activated = store
-            .activate_worker_allocation(&command.command_id)
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_worker_allocation_activation
+                 BEFORE UPDATE OF status ON command_acknowledgements
+                 WHEN OLD.id = 'assign-live-worker' AND NEW.status = 'succeeded'
+                 BEGIN
+                     SELECT RAISE(FAIL, 'injected activation persistence failure');
+                 END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .activate_worker_allocation(&command.command_id)
+                .await
+                .is_err()
+        );
+        let objective_delivery_confirmed = connection
+            .query_row(
+                "SELECT objective_delivery_confirmed
+                   FROM worker_allocation_commands
+                  WHERE command_id = ?1",
+                [&command.command_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(objective_delivery_confirmed);
+        connection
+            .execute_batch("DROP TRIGGER reject_worker_allocation_activation;")
+            .unwrap();
+        drop(connection);
+        drop(store);
+
+        let reopened = open_store(&temp).await;
+        let replayed = reopened
+            .begin_worker_allocation(&project.id, command)
             .await
             .unwrap();
-        let replayed = store
-            .begin_worker_allocation(&project.id, command)
+        let BeginWorkerAllocation::Replayed(activated) = replayed else {
+            panic!("expected allocation activation recovery");
+        };
+        let replayed = reopened
+            .begin_worker_allocation(
+                &project.id,
+                ConfirmWorkerAllocation {
+                    command_id: activated.command_id.clone(),
+                    actor: "local-user".to_owned(),
+                    worker_id: candidate.worker.id.clone(),
+                    expected_worker_version: candidate.worker.version,
+                    profile_id: None,
+                    expected_profile_version: None,
+                    expected_project_version: project.version,
+                    objective: "Implement the live worker path.".to_owned(),
+                    role: "implementer".to_owned(),
+                    isolation_policy: IsolationPolicy::ProjectWorkspace,
+                },
+            )
             .await
             .unwrap();
         let BeginWorkerAllocation::Replayed(replayed) = replayed else {
             panic!("expected allocation replay");
         };
 
+        assert_eq!(activated.assignment.lifecycle, AssignmentLifecycle::Active);
         assert_eq!(activated.assignment.worker.id, candidate.worker.id);
         assert_eq!(activated.assignment.profile_id, BLANK_WORKER_PROFILE_ID);
         assert_eq!(activated.assignment.profile_name, BLANK_WORKER_PROFILE_NAME);
         assert!(
-            store
+            reopened
                 .list_worker_profiles()
                 .await
                 .unwrap()
@@ -19836,7 +22065,133 @@ mod tests {
             yard_domain::AllocationMode::AdoptExisting
         );
         assert_eq!(replayed.assignment.id, activated.assignment.id);
+        assert!(activated.replayed);
         assert!(replayed.replayed);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn version_24_post_prompt_worker_allocation_recovers_activation_on_migration() {
+        let temp = TempDir::new().unwrap();
+        let database_path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let (project_id, active) = create_active_assignment(&store).await;
+        store
+            .record_completion_receipt(
+                &project_id,
+                &active.id,
+                RecordCompletionReceipt {
+                    command_id: "complete-before-v24-resume".to_owned(),
+                    actor: "local-user".to_owned(),
+                    attempt_id: active.attempt.id.clone(),
+                    expected_assignment_version: active.version,
+                    expected_attempt_version: active.attempt.version,
+                    outcome: CompletionOutcome::Completed,
+                    summary: "Prepare a resumable worker for migration.".to_owned(),
+                    artifact_refs: Vec::new(),
+                    artifact_ids: Vec::new(),
+                    evidence_refs: vec!["test://v24-resume".to_owned()],
+                    unresolved_blockers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let candidate = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.worker.id == active.worker.id)
+            .unwrap();
+        assert_eq!(candidate.availability, WorkerAvailability::Resumable);
+        let project = store.get_project(&project_id).await.unwrap();
+        let command = ConfirmWorkerAllocation {
+            command_id: "resume-worker-across-v25".to_owned(),
+            actor: "local-user".to_owned(),
+            worker_id: candidate.worker.id.clone(),
+            expected_worker_version: candidate.worker.version,
+            profile_id: None,
+            expected_profile_version: None,
+            expected_project_version: project.version,
+            objective: "Continue after migration.".to_owned(),
+            role: "implementer".to_owned(),
+            isolation_policy: IsolationPolicy::ProjectWorkspace,
+        };
+        let started = store
+            .begin_worker_allocation(&project_id, command.clone())
+            .await
+            .unwrap();
+        let BeginWorkerAllocation::Started(context) = started else {
+            panic!("expected a resumable worker allocation");
+        };
+        assert!(context.replace_runtime);
+        let (_, mut replacement) = draft("workspace-1", "terminal-v24-replacement");
+        replacement.tab_id = Some("tab-v24-replacement".to_owned());
+        replacement.pane_id = "pane-v24-replacement".to_owned();
+        replacement.provider_session = Some(provider_session("session-v24-replacement"));
+        replacement.owns_tab = true;
+        store
+            .claim_provisioning_runtime(&command.command_id, replacement.clone())
+            .await
+            .unwrap();
+        store
+            .replace_worker_runtime(&command.command_id, replacement.clone())
+            .await
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&database_path).unwrap();
+        let pre_migration: (String, i64) = connection
+            .query_row(
+                "SELECT command.status, worker.version
+                   FROM worker_allocation_commands allocation
+                   JOIN command_acknowledgements command
+                     ON command.id = allocation.command_id
+                   JOIN workers worker ON worker.id = allocation.worker_id
+                  WHERE allocation.command_id = ?1",
+                [&command.command_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pre_migration.0, "pending");
+        assert_eq!(
+            u64::try_from(pre_migration.1).unwrap(),
+            command.expected_worker_version + 2
+        );
+        downgrade_final_backend_safety_schema_to_v24(&connection);
+        connection
+            .execute_batch("PRAGMA user_version = 24;")
+            .unwrap();
+        drop(connection);
+
+        let migrated = SqliteProjectStore::open(&database_path).await.unwrap();
+        let replayed = migrated
+            .begin_worker_allocation(&project_id, command.clone())
+            .await
+            .unwrap();
+        let BeginWorkerAllocation::Replayed(activated) = replayed else {
+            panic!("expected migration to recover pending allocation activation");
+        };
+        assert_eq!(activated.assignment.lifecycle, AssignmentLifecycle::Active);
+        assert_eq!(
+            activated
+                .assignment
+                .worker
+                .runtime
+                .as_ref()
+                .unwrap()
+                .terminal_id,
+            replacement.terminal_id
+        );
+        assert!(activated.replayed);
+        assert!(matches!(
+            migrated
+                .begin_worker_allocation(&project_id, command)
+                .await
+                .unwrap(),
+            BeginWorkerAllocation::Replayed(_)
+        ));
     }
 
     #[allow(clippy::too_many_lines)]
@@ -20063,6 +22418,10 @@ mod tests {
         replacement.pane_id = "pane-replacement".to_owned();
         replacement.provider_session = Some(provider_session("session-replacement"));
         replacement.owns_tab = true;
+        store
+            .claim_provisioning_runtime(&command.command_id, replacement.clone())
+            .await
+            .unwrap();
         let persisted = store
             .replace_worker_runtime(&command.command_id, replacement)
             .await
@@ -20083,6 +22442,339 @@ mod tests {
                 .unwrap()
                 .terminal_id,
             "terminal-replacement"
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn post_mutation_runtime_is_quarantined_without_rebinding_resumable_worker() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, active) = create_active_assignment(&store).await;
+        store
+            .record_completion_receipt(
+                &project_id,
+                &active.id,
+                RecordCompletionReceipt {
+                    command_id: "complete-before-quarantine".to_owned(),
+                    actor: "local-user".to_owned(),
+                    attempt_id: active.attempt.id.clone(),
+                    expected_assignment_version: active.version,
+                    expected_attempt_version: active.attempt.version,
+                    outcome: CompletionOutcome::Completed,
+                    summary: "Prepare a resumable worker.".to_owned(),
+                    artifact_refs: Vec::new(),
+                    artifact_ids: Vec::new(),
+                    evidence_refs: vec!["test://quarantine-setup".to_owned()],
+                    unresolved_blockers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let candidate = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.worker.id == active.worker.id)
+            .unwrap();
+        let trusted_runtime = candidate.worker.runtime.clone().unwrap();
+        let project = store.get_project(&project_id).await.unwrap();
+        let command = ConfirmWorkerAllocation {
+            command_id: "resume-worker-quarantine".to_owned(),
+            actor: "local-user".to_owned(),
+            worker_id: candidate.worker.id.clone(),
+            expected_worker_version: candidate.worker.version,
+            profile_id: None,
+            expected_profile_version: None,
+            expected_project_version: project.version,
+            objective: "Continue after ambiguous provisioning.".to_owned(),
+            role: "implementer".to_owned(),
+            isolation_policy: IsolationPolicy::ProjectWorkspace,
+        };
+        store
+            .begin_worker_allocation(&project_id, command.clone())
+            .await
+            .unwrap();
+        let (_, mut foreign_runtime) = draft("foreign-workspace", "foreign-terminal");
+        foreign_runtime.tab_id = Some("foreign-tab".to_owned());
+        foreign_runtime.pane_id = "foreign-pane".to_owned();
+        foreign_runtime.provider_session = Some(provider_session("foreign-session"));
+        foreign_runtime.owns_tab = true;
+
+        store
+            .quarantine_provisioning_runtime(&command.command_id, foreign_runtime.clone())
+            .await
+            .unwrap();
+        store
+            .fail_worker_allocation(
+                &command.command_id,
+                "agent.start returned foreign topology",
+                true,
+            )
+            .await
+            .unwrap();
+
+        let retained = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.worker.id == active.worker.id)
+            .unwrap();
+        assert_eq!(retained.worker.runtime.as_ref(), Some(&trusted_runtime));
+        let reconciliation = store
+            .reconcile_runtime_inventory(inventory(
+                foreign_runtime.last_observed_at_unix_ms + 1,
+                vec![observed_worker(
+                    &foreign_runtime.terminal_id,
+                    &foreign_runtime.workspace_id,
+                    foreign_runtime.tab_id.as_deref().unwrap(),
+                    &foreign_runtime.pane_id,
+                    foreign_runtime.provider_session.clone(),
+                )],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reconciliation.adopted_workers, 0);
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let quarantined: (String, String, String) = connection
+            .query_row(
+                "SELECT runtime_workspace_id, terminal_id, pane_id
+                   FROM quarantined_provisioning_runtime_bindings
+                  WHERE command_id = ?1",
+                [&command.command_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            quarantined,
+            (
+                foreign_runtime.workspace_id.clone(),
+                foreign_runtime.terminal_id.clone(),
+                foreign_runtime.pane_id.clone()
+            )
+        );
+        let authoritative_bindings: i64 = connection
+            .query_row(
+                "SELECT COUNT(*)
+                   FROM worker_runtime_bindings
+                  WHERE adapter = ?1 AND runtime_session = ?2
+                    AND (
+                        terminal_id = ?3
+                        OR provider_session_value = ?4
+                    )",
+                rusqlite::params![
+                    foreign_runtime.adapter.as_str(),
+                    foreign_runtime.session.as_str(),
+                    foreign_runtime.terminal_id.as_str(),
+                    foreign_runtime
+                        .provider_session
+                        .as_ref()
+                        .unwrap()
+                        .value
+                        .as_str(),
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authoritative_bindings, 0);
+        drop(connection);
+        assert!(matches!(
+            store
+                .begin_worker_allocation(&project_id, command)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CommandOutcomeAmbiguous(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dedicated_claim_fences_foreign_adoption_during_quarantine_race() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Dedicated fence"),
+            })
+            .await
+            .unwrap();
+        let current = store.get_yard_orchestrator().await.unwrap();
+        let command = ProvisionYardOrchestrator {
+            command_id: "dedicated-claim-quarantine-race".to_owned(),
+            actor: "local-user".to_owned(),
+            profile_id: profile.id,
+            expected_profile_version: profile.version,
+            expected_orchestrator_version: current.version,
+        };
+        store
+            .begin_yard_orchestrator_runtime_provision(command.clone())
+            .await
+            .unwrap();
+        let (_, mut prepared) = draft("dedicated-workspace", "prepared-terminal");
+        prepared.session = "yard-orchestrator".to_owned();
+        prepared.tab_id = Some("prepared-tab".to_owned());
+        prepared.pane_id = "prepared-pane".to_owned();
+        prepared.process_state = RuntimeProcessState::Unknown;
+        prepared.status = ObservedStatus::Unknown;
+        prepared.owns_tab = true;
+        store
+            .claim_provisioning_runtime(&command.command_id, prepared)
+            .await
+            .unwrap();
+
+        let (_, mut foreign) = draft("foreign-workspace", "foreign-terminal");
+        foreign.session = "yard-orchestrator".to_owned();
+        foreign.tab_id = Some("foreign-tab".to_owned());
+        foreign.pane_id = "foreign-pane".to_owned();
+        foreign.provider_session = Some(provider_session("foreign-provider"));
+        foreign.owns_tab = true;
+        let mut foreign_inventory = inventory(
+            50,
+            vec![observed_worker(
+                &foreign.terminal_id,
+                &foreign.workspace_id,
+                foreign.tab_id.as_deref().unwrap(),
+                &foreign.pane_id,
+                foreign.provider_session.clone(),
+            )],
+            Vec::new(),
+        );
+        foreign_inventory.session = "yard-orchestrator".to_owned();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let reconciliation_store = store.clone();
+        let reconciliation_barrier = Arc::clone(&barrier);
+        let quarantine_store = store.clone();
+        let quarantine_barrier = Arc::clone(&barrier);
+        let quarantine_command_id = command.command_id.clone();
+        let quarantined_runtime = foreign.clone();
+        let (reconciliation, quarantine, _) = tokio::join!(
+            async move {
+                reconciliation_barrier.wait().await;
+                reconciliation_store
+                    .reconcile_runtime_inventory(foreign_inventory)
+                    .await
+            },
+            async move {
+                quarantine_barrier.wait().await;
+                quarantine_store
+                    .quarantine_provisioning_runtime(&quarantine_command_id, quarantined_runtime)
+                    .await
+            },
+            barrier.wait(),
+        );
+        assert_eq!(reconciliation.unwrap().adopted_workers, 0);
+        quarantine.unwrap();
+        store
+            .fail_dedicated_runtime_provision(
+                &command.command_id,
+                "agent.start returned foreign topology",
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_worker_candidates()
+                .await
+                .unwrap()
+                .workers
+                .iter()
+                .all(|candidate| candidate
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .is_none_or(|runtime| runtime.terminal_id != foreign.terminal_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn dedicated_adoption_requires_the_confirmed_provider_identity() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Dedicated identity"),
+            })
+            .await
+            .unwrap();
+        let current = store.get_yard_orchestrator().await.unwrap();
+        let command = ProvisionYardOrchestrator {
+            command_id: "dedicated-confirmed-provider".to_owned(),
+            actor: "local-user".to_owned(),
+            profile_id: profile.id,
+            expected_profile_version: profile.version,
+            expected_orchestrator_version: current.version,
+        };
+        store
+            .begin_yard_orchestrator_runtime_provision(command.clone())
+            .await
+            .unwrap();
+        let (_, mut prepared) = draft("dedicated-workspace", "dedicated-terminal");
+        prepared.session = "yard-orchestrator".to_owned();
+        prepared.tab_id = Some("dedicated-tab".to_owned());
+        prepared.pane_id = "dedicated-pane".to_owned();
+        prepared.process_state = RuntimeProcessState::Unknown;
+        prepared.status = ObservedStatus::Unknown;
+        prepared.owns_tab = true;
+        store
+            .claim_provisioning_runtime(&command.command_id, prepared.clone())
+            .await
+            .unwrap();
+        let mut started = prepared;
+        started.provider_session = Some(provider_session("confirmed-provider"));
+        started.process_state = RuntimeProcessState::Running;
+        started.status = ObservedStatus::Idle;
+        started.last_observed_at_unix_ms = 40;
+        store
+            .confirm_dedicated_runtime_provision(&command.command_id, started.clone())
+            .await
+            .unwrap();
+
+        let mut reused_inventory = inventory(
+            41,
+            vec![observed_worker(
+                &started.terminal_id,
+                &started.workspace_id,
+                started.tab_id.as_deref().unwrap(),
+                &started.pane_id,
+                Some(provider_session("reused-provider")),
+            )],
+            Vec::new(),
+        );
+        reused_inventory.session = "yard-orchestrator".to_owned();
+        assert_eq!(
+            store
+                .reconcile_runtime_inventory(reused_inventory)
+                .await
+                .unwrap()
+                .adopted_workers,
+            0
+        );
+
+        let mut confirmed_inventory = inventory(
+            42,
+            vec![observed_worker(
+                &started.terminal_id,
+                &started.workspace_id,
+                started.tab_id.as_deref().unwrap(),
+                &started.pane_id,
+                started.provider_session.clone(),
+            )],
+            Vec::new(),
+        );
+        confirmed_inventory.session = "yard-orchestrator".to_owned();
+        assert_eq!(
+            store
+                .reconcile_runtime_inventory(confirmed_inventory)
+                .await
+                .unwrap()
+                .adopted_workers,
+            1
         );
     }
 
@@ -20911,7 +23603,8 @@ mod tests {
     async fn workstream_worker_is_protected_and_routes_only_to_attachments() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
-        let (project_draft, runtime) = draft("route-project", "route-project-terminal");
+        let (project_draft, mut runtime) = draft("route-project", "route-project-terminal");
+        runtime.provider_session = Some(provider_session("route-project-session"));
         let project = store.create_project(project_draft, runtime).await.unwrap();
         let (other_draft, other_runtime) = draft("other-project", "other-project-terminal");
         let other = store
@@ -21065,13 +23758,236 @@ mod tests {
                 .unwrap(),
             BeginCoordinationNodeRoute::Started { .. }
         ));
+        store
+            .reconcile_runtime_inventory(inventory(
+                60,
+                vec![
+                    observed_worker(
+                        "route-project-terminal",
+                        "route-project",
+                        "tab-1",
+                        "pane-1",
+                        Some(provider_session("route-project-session")),
+                    ),
+                    observed_worker(
+                        "coordination-terminal",
+                        "coordination-workspace",
+                        "coordination-tab",
+                        "coordination-pane",
+                        Some(provider_session("coordination-session")),
+                    ),
+                    observed_worker(
+                        "route-transfer-candidate",
+                        "route-project",
+                        "route-transfer-tab",
+                        "route-transfer-pane",
+                        Some(provider_session("route-transfer-session")),
+                    ),
+                ],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let current_project = store.get_project(&project.id).await.unwrap();
+        let transfer_candidate = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| {
+                candidate
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.terminal_id == "route-transfer-candidate")
+            })
+            .unwrap();
+        let transfer = TransferProjectOrchestrator {
+            command_id: "transfer-while-coordination-route-pending".to_owned(),
+            actor: "local-user".to_owned(),
+            worker_id: transfer_candidate.worker.id.clone(),
+            expected_worker_version: transfer_candidate.worker.version,
+            expected_worker_runtime: transfer_candidate.worker.runtime.clone().unwrap(),
+            expected_project_version: current_project.version,
+            expected_orchestrator_worker_id: current_project.orchestrator.id.clone(),
+            expected_orchestrator_worker_version: current_project.orchestrator.version,
+            expected_orchestrator_runtime: current_project.orchestrator.runtime.clone().unwrap(),
+        };
+        assert!(matches!(
+            store
+                .transfer_project_orchestrator(&project.id, transfer.clone())
+                .await
+                .unwrap_err(),
+            ProjectStoreError::OrchestratorInterventionInProgress
+        ));
+        let replacement_profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Route replacement"),
+            })
+            .await
+            .unwrap();
+        let replacement = ReplaceProjectOrchestrator {
+            command_id: "replace-while-coordination-route-pending".to_owned(),
+            actor: "local-user".to_owned(),
+            expected_project_version: current_project.version,
+            expected_orchestrator_worker_id: current_project.orchestrator.id.clone(),
+            expected_orchestrator_worker_version: current_project.orchestrator.version,
+            expected_orchestrator_runtime: current_project.orchestrator.runtime.clone().unwrap(),
+            profile_id: replacement_profile.id,
+            expected_profile_version: replacement_profile.version,
+            objective: "Continue route-safe orchestration.".to_owned(),
+            role: "orchestrator".to_owned(),
+            old_session_disposition: OldSessionDisposition::RetainForInspection,
+            handoff_artifact_ref: None,
+        };
+        let route_first_error = store
+            .begin_project_orchestrator_replacement(&project.id, replacement.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                route_first_error,
+                ProjectStoreError::OrchestratorInterventionInProgress
+            ),
+            "{route_first_error:?}"
+        );
+        store
+            .fail_coordination_node_route(&route.command_id, "route race test complete", false)
+            .await
+            .unwrap();
+        let racing_route = SendCoordinationNodeRoute {
+            command_id: "racing-coordination-route".to_owned(),
+            actor: "local-user".to_owned(),
+            expected_node_version: provisioned.version,
+            worker_id: pinned.id.clone(),
+            target_project_id: project.id.clone(),
+            expected_project_version: current_project.version,
+            target_orchestrator_worker_id: current_project.orchestrator.id.clone(),
+            text: "Race this route against replacement.".to_owned(),
+        };
+        let route_command_id = racing_route.command_id.clone();
+        let replacement_command_id = replacement.command_id.clone();
+        let route_store = store.clone();
+        let replacement_store = store.clone();
+        let route_node_id = node_id.clone();
+        let replacement_project_id = project.id.clone();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let route_barrier = Arc::clone(&barrier);
+        let replacement_barrier = Arc::clone(&barrier);
+        let (route_result, replacement_result, _) = tokio::join!(
+            async move {
+                route_barrier.wait().await;
+                route_store
+                    .begin_coordination_node_route(&route_node_id, racing_route)
+                    .await
+            },
+            async move {
+                replacement_barrier.wait().await;
+                replacement_store
+                    .begin_project_orchestrator_replacement(&replacement_project_id, replacement)
+                    .await
+            },
+            barrier.wait(),
+        );
+        assert_ne!(route_result.is_ok(), replacement_result.is_ok());
+        let ((Err(losing_error), Ok(_)) | (Ok(_), Err(losing_error))) =
+            (&route_result, &replacement_result)
+        else {
+            unreachable!("exactly one reservation must succeed");
+        };
+        assert!(matches!(
+            losing_error,
+            ProjectStoreError::OrchestratorInterventionInProgress
+        ));
+        if route_result.is_ok() {
+            store
+                .fail_coordination_node_route(&route_command_id, "route race test complete", false)
+                .await
+                .unwrap();
+        } else {
+            store
+                .fail_project_orchestrator_replacement(
+                    &replacement_command_id,
+                    "replacement race test complete",
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let transfer_route = SendCoordinationNodeRoute {
+            command_id: "racing-route-against-transfer".to_owned(),
+            actor: "local-user".to_owned(),
+            expected_node_version: provisioned.version,
+            worker_id: pinned.id.clone(),
+            target_project_id: project.id.clone(),
+            expected_project_version: current_project.version,
+            target_orchestrator_worker_id: current_project.orchestrator.id.clone(),
+            text: "Race this route against orchestrator transfer.".to_owned(),
+        };
+        let transfer_route_command_id = transfer_route.command_id.clone();
+        let transfer_retry = transfer.clone();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let transfer_route_store = store.clone();
+        let transfer_route_barrier = Arc::clone(&barrier);
+        let transfer_route_node_id = node_id.clone();
+        let transfer_store = store.clone();
+        let transfer_barrier = Arc::clone(&barrier);
+        let transfer_project_id = project.id.clone();
+        let (transfer_route_result, transfer_result, _) = tokio::join!(
+            async move {
+                transfer_route_barrier.wait().await;
+                transfer_route_store
+                    .begin_coordination_node_route(&transfer_route_node_id, transfer_route)
+                    .await
+            },
+            async move {
+                transfer_barrier.wait().await;
+                transfer_store
+                    .transfer_project_orchestrator(&transfer_project_id, transfer)
+                    .await
+            },
+            barrier.wait(),
+        );
+        assert_ne!(transfer_route_result.is_ok(), transfer_result.is_ok());
+        match (transfer_route_result, transfer_result) {
+            (Ok(_), Err(ProjectStoreError::OrchestratorInterventionInProgress)) => {
+                store
+                    .fail_coordination_node_route(
+                        &transfer_route_command_id,
+                        "transfer route race test complete",
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .transfer_project_orchestrator(&project.id, transfer_retry)
+                    .await
+                    .unwrap();
+            }
+            (
+                Err(
+                    ProjectStoreError::ProjectVersionConflict { .. }
+                    | ProjectStoreError::OrchestratorNotCurrent { .. },
+                ),
+                Ok(_),
+            ) => {}
+            (route, transfer) => {
+                panic!("unexpected route/transfer race results: {route:?}, {transfer:?}");
+            }
+        }
+        let current_project = store.get_project(&project.id).await.unwrap();
+        assert_eq!(
+            current_project.orchestrator.id,
+            transfer_candidate.worker.id
+        );
         let unscoped = SendCoordinationNodeRoute {
             command_id: "route-unattached-project".to_owned(),
             target_project_id: other.id,
             expected_project_version: other.version,
             target_orchestrator_worker_id: other.orchestrator.id,
             expected_node_version: provisioned.version,
-            worker_id: pinned.id,
+            worker_id: pinned.id.clone(),
             actor: "local-user".to_owned(),
             text: "This must be rejected.".to_owned(),
         };
@@ -21082,11 +23998,25 @@ mod tests {
                 .unwrap_err(),
             ProjectStoreError::CoordinationNodeProjectNotAttached
         ));
+        let restart_route = SendCoordinationNodeRoute {
+            command_id: "route-interrupted-by-restart".to_owned(),
+            actor: "local-user".to_owned(),
+            expected_node_version: provisioned.version,
+            worker_id: pinned.id,
+            target_project_id: project.id.clone(),
+            expected_project_version: current_project.version,
+            target_orchestrator_worker_id: current_project.orchestrator.id,
+            text: "Verify restart ambiguity.".to_owned(),
+        };
+        store
+            .begin_coordination_node_route(&node_id, restart_route.clone())
+            .await
+            .unwrap();
         drop(store);
         let reopened = open_store(&temp).await;
         assert!(matches!(
             reopened
-                .begin_coordination_node_route(&node_id, route)
+                .begin_coordination_node_route(&node_id, restart_route)
                 .await
                 .unwrap_err(),
             ProjectStoreError::CommandOutcomeAmbiguous(_)

@@ -1,6 +1,11 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex, OnceLock, Weak},
+    time::Duration,
+};
 
 use thiserror::Error;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 use yard_domain::{
     ObservedWorker, Project, ReplaceProjectOrchestrator, ReplacedProjectOrchestrator,
@@ -29,6 +34,7 @@ pub struct OrchestratorReplacementService {
     runtime: Arc<dyn RuntimeControl>,
     store: Arc<dyn YardStore>,
     cleanup: RuntimeCleanupService,
+    active_operations: Arc<ReplacementOperations>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -45,6 +51,46 @@ pub struct OrchestratorReplacementRecoveryReport {
 const RECOVERY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const RECOVERY_RETRY_BASE_MS: u64 = 60_000;
 const RECOVERY_RETRY_CAP_MS: u64 = 3_600_000;
+const STRANDED_PENDING_MESSAGE: &str = "Yard lost the final persistence acknowledgement for an orchestrator replacement; \
+     captured runtimes require reconciliation";
+
+#[derive(Default)]
+struct ReplacementOperations {
+    active: Mutex<HashSet<String>>,
+    recovery_gate: AsyncMutex<()>,
+}
+
+fn replacement_operations(store: &Arc<dyn YardStore>) -> Arc<ReplacementOperations> {
+    static OPERATIONS: OnceLock<Mutex<HashMap<usize, Weak<ReplacementOperations>>>> =
+        OnceLock::new();
+    let store_id = Arc::as_ptr(store).cast::<()>() as usize;
+    let mut operations = OPERATIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    operations.retain(|_, operations| operations.strong_count() > 0);
+    if let Some(existing) = operations.get(&store_id).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let created = Arc::new(ReplacementOperations::default());
+    operations.insert(store_id, Arc::downgrade(&created));
+    created
+}
+
+struct ActiveReplacement {
+    command_id: String,
+    operations: Arc<ReplacementOperations>,
+}
+
+impl Drop for ActiveReplacement {
+    fn drop(&mut self) {
+        self.operations
+            .active
+            .lock()
+            .unwrap()
+            .remove(&self.command_id);
+    }
+}
 
 impl OrchestratorReplacementService {
     #[must_use]
@@ -53,12 +99,29 @@ impl OrchestratorReplacementService {
         runtime: Arc<dyn RuntimeControl>,
         store: Arc<dyn YardStore>,
     ) -> Self {
+        let active_operations = replacement_operations(&store);
         Self {
             cleanup: RuntimeCleanupService::new(Arc::clone(&runtime), Arc::clone(&store)),
             source,
             runtime,
             store,
+            active_operations,
         }
+    }
+
+    async fn begin_active_replacement(
+        &self,
+        command_id: &str,
+    ) -> Result<ActiveReplacement, ProjectStoreError> {
+        let _recovery = self.active_operations.recovery_gate.lock().await;
+        let mut operations = self.active_operations.active.lock().unwrap();
+        if !operations.insert(command_id.to_owned()) {
+            return Err(ProjectStoreError::CommandInProgress);
+        }
+        Ok(ActiveReplacement {
+            command_id: command_id.to_owned(),
+            operations: Arc::clone(&self.active_operations),
+        })
     }
 
     /// Reconcile every ambiguous prepared or started replacement capture once.
@@ -121,6 +184,23 @@ impl OrchestratorReplacementService {
         &self,
         command_id: Option<&str>,
     ) -> Result<OrchestratorReplacementRecoveryReport, OrchestratorReplacementServiceError> {
+        if command_id.is_none() {
+            let _recovery = self.active_operations.recovery_gate.lock().await;
+            let active_command_ids = self
+                .active_operations
+                .active
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect();
+            self.store
+                .recover_stranded_pending_project_orchestrator_replacements(
+                    active_command_ids,
+                    STRANDED_PENDING_MESSAGE,
+                )
+                .await?;
+        }
         let recoveries = self
             .store
             .list_ambiguous_orchestrator_replacement_recoveries(command_id)
@@ -203,9 +283,14 @@ impl OrchestratorReplacementService {
                         continue;
                     }
                     PrepareIntentResolution::Deferred(detail) => {
+                        let target = if intent.last_absence_observed_at_unix_ms.is_some() {
+                            OrchestratorReplacementRecoveryTarget::PrepareIntentStaleObservation
+                        } else {
+                            OrchestratorReplacementRecoveryTarget::PrepareIntent
+                        };
                         self.record_recovery_attempt(
                             &recovery.command_id,
-                            OrchestratorReplacementRecoveryTarget::PrepareIntent,
+                            target,
                             intent.recovery_attempts,
                             None,
                             detail,
@@ -215,19 +300,33 @@ impl OrchestratorReplacementService {
                         report.deferred_items += 1;
                         continue;
                     }
-                    PrepareIntentResolution::Absent(detail) if intent.absence_observations == 0 => {
+                    PrepareIntentResolution::Absent(detail) => {
+                        let converged = intent.absence_observations > 0;
+                        let persisted_detail = if converged {
+                            detail.to_owned()
+                        } else {
+                            format!(
+                                "{detail}; a second fresh absence after durable backoff is \
+                                 required because the timed-out create may still complete"
+                            )
+                        };
                         self.record_recovery_attempt(
                             &recovery.command_id,
-                            OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence,
+                            OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence {
+                                observed_at_unix_ms: inventory.observed_at_unix_ms,
+                            },
                             intent.recovery_attempts,
-                            None,
-                            &format!(
-                                "{detail}; a second fresh absence after durable backoff is required because the timed-out create may still complete"
-                            ),
-                            true,
+                            converged
+                                .then_some(OrchestratorReplacementRecoveryOutcome::AbsentConverged),
+                            &persisted_detail,
+                            !converged,
                         )
                         .await?;
-                        report.deferred_items += 1;
+                        if converged {
+                            report.absent_captures += 1;
+                        } else {
+                            report.deferred_items += 1;
+                        }
                         continue;
                     }
                     resolution => {
@@ -370,7 +469,11 @@ impl OrchestratorReplacementService {
         retry: bool,
     ) -> Result<(), ProjectStoreError> {
         let retry_after_ms = retry.then(|| {
-            if target == OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence {
+            if matches!(
+                target,
+                OrchestratorReplacementRecoveryTarget::PrepareIntentAbsence { .. }
+                    | OrchestratorReplacementRecoveryTarget::PrepareIntentStaleObservation
+            ) {
                 prepare_absence_confirmation_delay_ms()
             } else {
                 recovery_retry_after_ms(expected_attempts)
@@ -407,6 +510,7 @@ impl OrchestratorReplacementService {
     ) -> Result<ReplacedProjectOrchestrator, OrchestratorReplacementServiceError> {
         let command = command.normalize()?;
         let command_id = command.command_id.clone();
+        let _active = self.begin_active_replacement(&command_id).await?;
         let context = match self
             .store
             .begin_project_orchestrator_replacement(project_id, command)
@@ -489,27 +593,32 @@ impl OrchestratorReplacementService {
             Err(RuntimeProvisionError::AfterPreparation {
                 message, ambiguous, ..
             }) => {
-                self.store
-                    .fail_project_orchestrator_replacement(&command_id, &message, ambiguous)
-                    .await?;
                 if ambiguous {
-                    self.reconcile_after_ambiguous_failure(&command_id).await;
+                    self.fail_ambiguous_replacement(&command_id, &message)
+                        .await?;
+                } else {
+                    self.store
+                        .fail_project_orchestrator_replacement(&command_id, &message, false)
+                        .await?;
                 }
-                return Err(OrchestratorReplacementServiceError::RuntimeProvision(
-                    message,
-                ));
+                return Err(if ambiguous {
+                    OrchestratorReplacementServiceError::RuntimeProvisionAmbiguous(message)
+                } else {
+                    OrchestratorReplacementServiceError::RuntimeProvision(message)
+                });
             }
             Err(RuntimeProvisionError::PromptDelivery { runtime, message }) => {
+                let runtime = *runtime;
                 let retained = self
                     .store
-                    .claim_project_orchestrator_replacement_runtime(&command_id, (*runtime).clone())
+                    .claim_project_orchestrator_replacement_runtime(&command_id, runtime.clone())
                     .await;
                 let started = match retained {
                     Ok(()) => {
                         self.store
                             .record_project_orchestrator_replacement_started_runtime(
                                 &command_id,
-                                *runtime,
+                                runtime.clone(),
                                 OrchestratorReplacementStartEvidence::Unverified,
                             )
                             .await
@@ -518,12 +627,19 @@ impl OrchestratorReplacementService {
                 };
                 let message = match started {
                     Ok(()) => message,
-                    Err(error) => format!("{message}; started runtime capture failed: {error}"),
+                    Err(error) => {
+                        let quarantine = self
+                            .store
+                            .quarantine_provisioning_runtime(&command_id, runtime)
+                            .await;
+                        format!(
+                            "{message}; started runtime capture failed: {error}; \
+                             quarantine result: {quarantine:?}"
+                        )
+                    }
                 };
-                self.store
-                    .fail_project_orchestrator_replacement(&command_id, &message, true)
+                self.fail_ambiguous_replacement(&command_id, &message)
                     .await?;
-                self.reconcile_after_ambiguous_failure(&command_id).await;
                 return Err(OrchestratorReplacementServiceError::ObjectiveDeliveryFailed(message));
             }
         };
@@ -532,10 +648,8 @@ impl OrchestratorReplacementService {
             .claim_project_orchestrator_replacement_runtime(&command_id, prepared.clone())
             .await
         {
-            self.store
-                .fail_project_orchestrator_replacement(&command_id, &error.to_string(), true)
+            self.fail_ambiguous_replacement(&command_id, &error.to_string())
                 .await?;
-            self.reconcile_after_ambiguous_failure(&command_id).await;
             return Err(error.into());
         }
 
@@ -546,62 +660,79 @@ impl OrchestratorReplacementService {
         {
             Ok(runtime) => runtime,
             Err(RuntimeProvisionError::PromptDelivery { runtime, message }) => {
+                let runtime = *runtime;
                 let message = match self
                     .store
                     .record_project_orchestrator_replacement_started_runtime(
                         &command_id,
-                        *runtime,
+                        runtime.clone(),
                         OrchestratorReplacementStartEvidence::Unverified,
                     )
                     .await
                 {
                     Ok(()) => message,
-                    Err(error) => format!("{message}; started runtime capture failed: {error}"),
+                    Err(error) => {
+                        let quarantine = self
+                            .store
+                            .quarantine_provisioning_runtime(&command_id, runtime)
+                            .await;
+                        format!(
+                            "{message}; started runtime capture failed: {error}; \
+                             quarantine result: {quarantine:?}"
+                        )
+                    }
                 };
-                self.store
-                    .fail_project_orchestrator_replacement(&command_id, &message, true)
+                self.fail_ambiguous_replacement(&command_id, &message)
                     .await?;
-                self.reconcile_after_ambiguous_failure(&command_id).await;
                 return Err(OrchestratorReplacementServiceError::ObjectiveDeliveryFailed(message));
             }
             Err(RuntimeProvisionError::AfterPreparation {
                 mut message,
-                ambiguous,
+                mut ambiguous,
                 started_runtime,
             }) => {
                 if let Some(runtime) = started_runtime {
+                    ambiguous = true;
+                    let runtime = *runtime;
                     if let Err(error) = self
                         .store
                         .record_project_orchestrator_replacement_started_runtime(
                             &command_id,
-                            *runtime,
+                            runtime.clone(),
                             OrchestratorReplacementStartEvidence::Unverified,
                         )
                         .await
                     {
+                        let quarantine = self
+                            .store
+                            .quarantine_provisioning_runtime(&command_id, runtime)
+                            .await;
                         message = format!(
-                            "{message}; unverified started runtime capture failed: {error}"
+                            "{message}; unverified started runtime capture failed: {error}; \
+                             quarantine result: {quarantine:?}"
                         );
                     }
                 }
-                self.store
-                    .fail_project_orchestrator_replacement(&command_id, &message, ambiguous)
-                    .await?;
                 if ambiguous {
-                    self.reconcile_after_ambiguous_failure(&command_id).await;
+                    self.fail_ambiguous_replacement(&command_id, &message)
+                        .await?;
+                } else {
+                    self.store
+                        .fail_project_orchestrator_replacement(&command_id, &message, false)
+                        .await?;
                 }
-                return Err(OrchestratorReplacementServiceError::RuntimeProvision(
-                    message,
-                ));
+                return Err(if ambiguous {
+                    OrchestratorReplacementServiceError::RuntimeProvisionAmbiguous(message)
+                } else {
+                    OrchestratorReplacementServiceError::RuntimeProvision(message)
+                });
             }
             Err(RuntimeProvisionError::BeforeWorker(message)) => {
-                self.store
-                    .fail_project_orchestrator_replacement(&command_id, &message, true)
+                self.fail_ambiguous_replacement(&command_id, &message)
                     .await?;
-                self.reconcile_after_ambiguous_failure(&command_id).await;
-                return Err(OrchestratorReplacementServiceError::RuntimeProvision(
-                    message,
-                ));
+                return Err(
+                    OrchestratorReplacementServiceError::RuntimeProvisionAmbiguous(message),
+                );
             }
         };
         if let Err(error) = self
@@ -613,19 +744,20 @@ impl OrchestratorReplacementService {
             )
             .await
         {
-            self.store
-                .fail_project_orchestrator_replacement(&command_id, &error.to_string(), true)
+            let quarantine = self
+                .store
+                .quarantine_provisioning_runtime(&command_id, started)
+                .await;
+            let message = format!("{error}; quarantine result: {quarantine:?}");
+            self.fail_ambiguous_replacement(&command_id, &message)
                 .await?;
-            self.reconcile_after_ambiguous_failure(&command_id).await;
             return Err(error.into());
         }
         let replacement = match self.verify_replacement_runtime(started).await {
             Ok(runtime) => runtime,
             Err(error) => {
-                self.store
-                    .fail_project_orchestrator_replacement(&command_id, &error.to_string(), true)
+                self.fail_ambiguous_replacement(&command_id, &error.to_string())
                     .await?;
-                self.reconcile_after_ambiguous_failure(&command_id).await;
                 return Err(error);
             }
         };
@@ -636,10 +768,8 @@ impl OrchestratorReplacementService {
             )
             .await
         {
-            self.store
-                .fail_project_orchestrator_replacement(&command_id, &error.to_string(), true)
+            self.fail_ambiguous_replacement(&command_id, &error.to_string())
                 .await?;
-            self.reconcile_after_ambiguous_failure(&command_id).await;
             return Err(error);
         }
 
@@ -650,10 +780,8 @@ impl OrchestratorReplacementService {
         {
             Ok(result) => result,
             Err(error) => {
-                self.store
-                    .fail_project_orchestrator_replacement(&command_id, &error.to_string(), true)
+                self.fail_ambiguous_replacement(&command_id, &error.to_string())
                     .await?;
-                self.reconcile_after_ambiguous_failure(&command_id).await;
                 return Err(error.into());
             }
         };
@@ -764,13 +892,44 @@ impl OrchestratorReplacementService {
         Ok(runtime)
     }
 
-    async fn reconcile_after_ambiguous_failure(&self, command_id: &str) {
+    async fn reconcile_after_ambiguous_failure(
+        &self,
+        command_id: &str,
+    ) -> Result<(), ProjectStoreError> {
+        let recovered = self
+            .store
+            .recover_pending_project_orchestrator_replacement(command_id, STRANDED_PENDING_MESSAGE)
+            .await;
+        if let Err(error) = &recovered {
+            warn!(
+                command_id,
+                error = %error,
+                "Pending orchestrator replacement could not be promoted for live recovery"
+            );
+        }
         if let Err(error) = self.reconcile_ambiguous_replacement(command_id).await {
             warn!(
                 command_id,
                 error = %error,
                 "Ambiguous orchestrator replacement recovery could not be completed; durable captures remain reserved for startup reconciliation"
             );
+        }
+        recovered
+    }
+
+    async fn fail_ambiguous_replacement(
+        &self,
+        command_id: &str,
+        message: &str,
+    ) -> Result<(), ProjectStoreError> {
+        let result = self
+            .store
+            .fail_project_orchestrator_replacement(command_id, message, true)
+            .await;
+        let recovered = self.reconcile_after_ambiguous_failure(command_id).await;
+        match (result, recovered) {
+            (Ok(()), _) | (_, Ok(())) => Ok(()),
+            (Err(error), Err(_)) => Err(error),
         }
     }
 
@@ -890,9 +1049,12 @@ fn resolve_prepare_intent(
     inventory: &RuntimeInventory,
     intent: &OrchestratorReplacementPrepareIntent,
 ) -> PrepareIntentResolution {
-    if inventory.observed_at_unix_ms <= intent.intent_at_unix_ms {
+    let required_after = intent
+        .last_absence_observed_at_unix_ms
+        .unwrap_or(intent.intent_at_unix_ms);
+    if inventory.observed_at_unix_ms <= required_after {
         return PrepareIntentResolution::Deferred(
-            "Inventory observation is not newer than the durable replacement prepare intent",
+            "Inventory observation is not newer than the durable replacement prepare evidence",
         );
     }
     if inventory.adapter != intent.adapter || inventory.session != intent.session {
@@ -1257,6 +1419,8 @@ pub enum OrchestratorReplacementServiceError {
     RuntimeIdentityChanged,
     #[error("Herdr replacement provisioning failed: {0}")]
     RuntimeProvision(String),
+    #[error("Herdr replacement provisioning outcome is ambiguous: {0}")]
+    RuntimeProvisionAmbiguous(String),
     #[error("the prepared replacement runtime failed fresh provider/topology verification")]
     ReplacementUnverified,
     #[error("the replacement worker was created but objective delivery failed: {0}")]
@@ -1271,9 +1435,11 @@ mod tests {
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        time::Duration,
     };
 
     use async_trait::async_trait;
+    use rusqlite::Connection;
     use tempfile::TempDir;
     use yard_domain::{
         CanvasPlacement, CreateProject, CreateWorkerProfile, FocusObservation, ObservedStatus,
@@ -1290,7 +1456,7 @@ mod tests {
 
     use super::{
         CaptureResolution, OrchestratorReplacementService, PrepareIntentResolution,
-        resolve_prepare_intent, resolve_replacement_capture,
+        STRANDED_PENDING_MESSAGE, resolve_prepare_intent, resolve_replacement_capture,
     };
     use crate::{
         allocation_service::{
@@ -1409,6 +1575,7 @@ mod tests {
             recovery_outcome: None,
             recovery_attempts: 0,
             absence_observations: 0,
+            last_absence_observed_at_unix_ms: None,
         }
     }
 
@@ -1721,6 +1888,69 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn active_registration_waits_for_stranded_recovery_sweep() {
+        let temp = TempDir::new().unwrap();
+        let store: Arc<dyn YardStore> = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let source: Arc<dyn InventorySource> = Arc::new(SequencedInventory {
+            inventories: Mutex::new(VecDeque::new()),
+        });
+        let runtime: Arc<dyn RuntimeControl> = Arc::new(NoRetirementRuntime::default());
+        let service = OrchestratorReplacementService::new(source, runtime, store);
+        let contender = service.clone();
+        let recovery = service.active_operations.recovery_gate.lock().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut registration = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            contender
+                .begin_active_replacement("replacement-during-recovery-sweep")
+                .await
+        });
+
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut registration)
+                .await
+                .is_err()
+        );
+        assert!(
+            !service
+                .active_operations
+                .active
+                .lock()
+                .unwrap()
+                .contains("replacement-during-recovery-sweep")
+        );
+
+        drop(recovery);
+        let active = tokio::time::timeout(Duration::from_secs(1), registration)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            service
+                .active_operations
+                .active
+                .lock()
+                .unwrap()
+                .contains("replacement-during-recovery-sweep")
+        );
+        drop(active);
+        assert!(
+            !service
+                .active_operations
+                .active
+                .lock()
+                .unwrap()
+                .contains("replacement-during-recovery-sweep")
+        );
+    }
+
     fn profile_spec() -> WorkerProfileSpec {
         WorkerProfileSpec {
             name: "Replacement".to_owned(),
@@ -1739,7 +1969,7 @@ mod tests {
         }
     }
 
-    async fn ambiguous_prepared_replacement(
+    async fn pending_prepared_replacement(
         store: &SqliteProjectStore,
         command_id: &str,
         session: &str,
@@ -1812,11 +2042,76 @@ mod tests {
             )
             .await
             .unwrap();
+        command
+    }
+
+    async fn ambiguous_prepared_replacement(
+        store: &SqliteProjectStore,
+        command_id: &str,
+        session: &str,
+        workspace_id: &str,
+    ) -> ReplaceProjectOrchestrator {
+        let command = pending_prepared_replacement(store, command_id, session, workspace_id).await;
         store
             .fail_project_orchestrator_replacement(command_id, "interrupted before start", true)
             .await
             .unwrap();
         command
+    }
+
+    #[tokio::test]
+    async fn live_recovery_acknowledges_ambiguity_when_initial_persistence_fails() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let command = pending_prepared_replacement(
+            &store,
+            "replace-live-ambiguity-ack",
+            "default",
+            "workspace-1",
+        )
+        .await;
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_initial_replacement_ambiguity
+                 BEFORE UPDATE OF status ON command_acknowledgements
+                 WHEN OLD.id = 'replace-live-ambiguity-ack'
+                      AND NEW.status = 'ambiguous'
+                      AND NEW.error_message = 'lost external acknowledgement'
+                 BEGIN
+                     SELECT RAISE(FAIL, 'injected initial ambiguity persistence failure');
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let source = Arc::new(SequencedInventory {
+            inventories: Mutex::new(VecDeque::from([inventory(Vec::new())])),
+        });
+        let runtime = Arc::new(NoRetirementRuntime::default());
+        let service = OrchestratorReplacementService::new(source, runtime, store);
+
+        service
+            .fail_ambiguous_replacement(&command.command_id, "lost external acknowledgement")
+            .await
+            .unwrap();
+
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let (status, error_message): (String, String) = connection
+            .query_row(
+                "SELECT status, error_message
+                   FROM command_acknowledgements
+                  WHERE id = ?1",
+                [&command.command_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "ambiguous");
+        assert_eq!(error_message, STRANDED_PENDING_MESSAGE);
     }
 
     #[tokio::test]
@@ -1945,12 +2240,17 @@ mod tests {
         let runtime_control = Arc::new(NoRetirementRuntime::default());
         let present = prepared_intent_inventory(&prepare_tab_label);
         let mut initially_absent = present.clone();
+        initially_absent.observed_at_unix_ms -= 1;
         initially_absent.tabs.clear();
         initially_absent.panes.clear();
         initially_absent.workspaces[0].pane_count = 0;
         initially_absent.workspaces[0].tab_count = 0;
         let source = Arc::new(SequencedInventory {
-            inventories: Mutex::new(VecDeque::from([initially_absent, present])),
+            inventories: Mutex::new(VecDeque::from([
+                initially_absent.clone(),
+                initially_absent,
+                present,
+            ])),
         });
         let service =
             OrchestratorReplacementService::new(source, runtime_control.clone(), store.clone());
@@ -1962,7 +2262,12 @@ mod tests {
         assert_eq!(first.quarantined_captures, 0);
         let second = service.reconcile_ambiguous_replacements().await.unwrap();
         assert_eq!(second.prepare_intents, 1);
-        assert_eq!(second.quarantined_captures, 1);
+        assert_eq!(second.deferred_items, 1);
+        assert_eq!(second.absent_captures, 0);
+        assert_eq!(second.quarantined_captures, 0);
+        let third = service.reconcile_ambiguous_replacements().await.unwrap();
+        assert_eq!(third.prepare_intents, 1);
+        assert_eq!(third.quarantined_captures, 1);
         assert_eq!(runtime_control.retire_calls.load(Ordering::SeqCst), 0);
         let replay = service.reconcile_ambiguous_replacements().await.unwrap();
         assert_eq!(replay.prepare_intents, 0);

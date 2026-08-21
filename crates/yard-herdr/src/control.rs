@@ -54,6 +54,14 @@ pub struct PrepareAgentRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareWorkspaceAgentRequest {
+    pub command_id: String,
+    pub session: String,
+    pub workspace_label: String,
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedAgent {
     pub runtime: WorkerRuntimeBinding,
 }
@@ -132,8 +140,18 @@ pub(crate) async fn provision_agent(
     config: &HerdrConfig,
     request: ProvisionAgentRequest,
 ) -> Result<ProvisionedAgent, HerdrControlError> {
-    let prepared = prepare_agent(
+    let session = running_session(config, &request.session).await?;
+    provision_agent_at_socket(config, &session.socket_path, request).await
+}
+
+async fn provision_agent_at_socket(
+    config: &HerdrConfig,
+    socket_path: &std::path::Path,
+    request: ProvisionAgentRequest,
+) -> Result<ProvisionedAgent, HerdrControlError> {
+    let prepared = prepare_agent_at_socket(
         config,
+        socket_path,
         PrepareAgentRequest {
             command_id: request.command_id.clone(),
             session: request.session,
@@ -143,8 +161,9 @@ pub(crate) async fn provision_agent(
         },
     )
     .await?;
-    start_prepared_agent(
+    start_prepared_agent_at_socket(
         config,
+        socket_path,
         StartPreparedAgentRequest {
             command_id: request.command_id,
             prepared: prepared.runtime,
@@ -170,6 +189,45 @@ async fn bootstrap_agent_at_socket(
     socket_path: &std::path::Path,
     request: BootstrapAgentRequest,
 ) -> Result<ProvisionedAgent, HerdrControlError> {
+    let prepared = prepare_workspace_agent_at_socket(
+        config,
+        socket_path,
+        PrepareWorkspaceAgentRequest {
+            command_id: request.command_id.clone(),
+            session: request.session,
+            workspace_label: request.workspace_label,
+            cwd: request.cwd,
+        },
+    )
+    .await?;
+    start_prepared_workspace_agent_at_socket(
+        config,
+        socket_path,
+        StartPreparedAgentRequest {
+            command_id: request.command_id,
+            prepared: prepared.runtime,
+            agent_name: request.agent_name,
+            kind: request.kind,
+            args: request.args,
+            prompt: request.prompt,
+        },
+    )
+    .await
+}
+
+pub(crate) async fn prepare_workspace_agent(
+    config: &HerdrConfig,
+    request: PrepareWorkspaceAgentRequest,
+) -> Result<PreparedAgent, HerdrControlError> {
+    let session = running_session(config, &request.session).await?;
+    prepare_workspace_agent_at_socket(config, &session.socket_path, request).await
+}
+
+async fn prepare_workspace_agent_at_socket(
+    config: &HerdrConfig,
+    socket_path: &std::path::Path,
+    request: PrepareWorkspaceAgentRequest,
+) -> Result<PreparedAgent, HerdrControlError> {
     let create_result = request_command(
         config,
         socket_path,
@@ -202,30 +260,18 @@ async fn bootstrap_agent_at_socket(
     })?;
     if created.workspace.workspace_id != created.tab.workspace_id
         || created.workspace.workspace_id != created.root_pane.workspace_id
+        || created.tab.tab_id != created.root_pane.tab_id
     {
         return Err(HerdrControlError::WorkspaceCreateFailed {
             source: HerdrError::InvalidTopology(
-                "created workspace, tab, and root pane have different workspace IDs".to_owned(),
+                "created workspace, tab, and root pane have inconsistent ancestry".to_owned(),
             ),
             ambiguous: true,
         });
     }
 
     let prepared = prepared_runtime_binding(&request.session, &created.tab, &created.root_pane);
-    start_agent_at_socket(
-        config,
-        socket_path,
-        StartPreparedAgentRequest {
-            command_id: request.command_id,
-            prepared,
-            agent_name: request.agent_name,
-            kind: request.kind,
-            args: request.args,
-            prompt: request.prompt,
-        },
-        StartRollback::Workspace(created.workspace.workspace_id),
-    )
-    .await
+    Ok(PreparedAgent { runtime: prepared })
 }
 
 pub(crate) async fn prepare_agent(
@@ -272,11 +318,15 @@ async fn prepare_agent_at_socket(
             source: HerdrError::CommandDecode(source),
             ambiguous: true,
         })?;
-    if tab.tab.workspace_id != tab.root_pane.workspace_id || tab.tab.tab_id != tab.root_pane.tab_id
+    if tab.tab.workspace_id != request.workspace_id
+        || tab.root_pane.workspace_id != request.workspace_id
+        || tab.tab.workspace_id != tab.root_pane.workspace_id
+        || tab.tab.tab_id != tab.root_pane.tab_id
     {
         return Err(HerdrControlError::PrepareFailed {
             source: HerdrError::InvalidTopology(
-                "created tab and root pane have different ancestry".to_owned(),
+                "created tab and root pane do not belong to the requested workspace and ancestry"
+                    .to_owned(),
             ),
             ambiguous: true,
         });
@@ -292,6 +342,29 @@ pub(crate) async fn start_prepared_agent(
 ) -> Result<ProvisionedAgent, HerdrControlError> {
     let session = running_session(config, &request.prepared.session).await?;
     start_prepared_agent_at_socket(config, &session.socket_path, request).await
+}
+
+pub(crate) async fn start_prepared_workspace_agent(
+    config: &HerdrConfig,
+    request: StartPreparedAgentRequest,
+) -> Result<ProvisionedAgent, HerdrControlError> {
+    let session = running_session(config, &request.prepared.session).await?;
+    start_prepared_workspace_agent_at_socket(config, &session.socket_path, request).await
+}
+
+async fn start_prepared_workspace_agent_at_socket(
+    config: &HerdrConfig,
+    socket_path: &std::path::Path,
+    request: StartPreparedAgentRequest,
+) -> Result<ProvisionedAgent, HerdrControlError> {
+    let workspace_id = request.prepared.workspace_id.clone();
+    start_agent_at_socket(
+        config,
+        socket_path,
+        request,
+        StartRollback::Workspace(workspace_id),
+    )
+    .await
 }
 
 async fn start_prepared_agent_at_socket(
@@ -364,7 +437,7 @@ async fn start_agent_at_socket(
                 rollback,
                 start,
                 true,
-                None,
+                Some(request.prepared.clone()),
             )
             .await);
         }
@@ -450,6 +523,11 @@ async fn start_failure_after_rollback(
 ) -> HerdrControlError {
     let rollback_result = rollback_start(config, socket_path, command_id, rollback).await;
     let rollback_succeeded = rollback_covers_started_runtime && rollback_result.is_ok();
+    let started_runtime = if rollback_succeeded {
+        None
+    } else {
+        started_runtime
+    };
     let rollback = rollback_result.map_or_else(
         |error| error.to_string(),
         |()| {
@@ -811,10 +889,10 @@ mod tests {
 
     use super::{
         BootstrapAgentRequest, HerdrControlError, PrepareAgentRequest, PromptAgentRequest,
-        ReadPaneRequest, StartPreparedAgentRequest, bootstrap_agent_at_socket,
-        prepare_agent_at_socket, prompt_agent_at_socket, read_pane_at_socket,
-        retained_prepared_topology, runtime_creation_outcome_ambiguous,
-        start_prepared_agent_at_socket,
+        ProvisionAgentRequest, ReadPaneRequest, StartPreparedAgentRequest,
+        bootstrap_agent_at_socket, prepare_agent_at_socket, prompt_agent_at_socket,
+        provision_agent_at_socket, read_pane_at_socket, retained_prepared_topology,
+        runtime_creation_outcome_ambiguous, start_prepared_agent_at_socket,
     };
     use crate::{HerdrConfig, HerdrError};
     use yard_domain::{
@@ -956,6 +1034,60 @@ mod tests {
                 .map(|session| session.value.as_str()),
             Some("session-mismatch")
         );
+    }
+
+    #[tokio::test]
+    async fn lost_start_and_failed_rollback_preserve_prepared_runtime_identity() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            for expected_method in ["agent.start", "tab.close"] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, _writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], expected_method);
+            }
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_millis(100),
+            ..HerdrConfig::default()
+        };
+        let prepared = runtime_topology(
+            "workspace-prepared",
+            "tab-prepared",
+            "pane-prepared",
+            "terminal-prepared",
+        );
+
+        let error = start_prepared_agent_at_socket(
+            &config,
+            &socket_path,
+            StartPreparedAgentRequest {
+                command_id: "lost-start".to_owned(),
+                prepared: prepared.clone(),
+                agent_name: "yard-lost-start".to_owned(),
+                kind: "codex".to_owned(),
+                args: Vec::new(),
+                prompt: "Continue.".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        let HerdrControlError::StartFailed {
+            rollback_succeeded,
+            started_runtime: Some(captured),
+            ..
+        } = error
+        else {
+            panic!("expected failed rollback with captured prepared runtime");
+        };
+        assert!(!rollback_succeeded);
+        assert_eq!(*captured, prepared);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1225,6 +1357,201 @@ mod tests {
         assert!(matches!(
             error,
             HerdrControlError::PrepareFailed {
+                ambiguous: true,
+                ..
+            }
+        ));
+    }
+
+    async fn assert_wrong_workspace_stops_before_followup(expected_followup: &'static str) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "tab.create");
+            let id = request["id"].as_str().unwrap();
+            let result = serde_json::json!({
+                "type": "tab_created",
+                "tab": {
+                    "tab_id": "foreign-tab",
+                    "workspace_id": "foreign-workspace",
+                    "number": 1,
+                    "label": "Foreign",
+                    "focused": false,
+                    "pane_count": 1,
+                    "agent_status": "unknown"
+                },
+                "root_pane": {
+                    "pane_id": "foreign-pane",
+                    "terminal_id": "foreign-terminal",
+                    "workspace_id": "foreign-workspace",
+                    "tab_id": "foreign-tab",
+                    "focused": false,
+                    "cwd": "/tmp/foreign",
+                    "foreground_cwd": "/tmp/foreign",
+                    "label": null,
+                    "agent": null,
+                    "display_agent": null,
+                    "agent_status": "unknown",
+                    "tokens": {},
+                    "agent_session": null,
+                    "revision": 1
+                }
+            });
+            writer
+                .write_all(
+                    format!("{}\n", serde_json::json!({"id": id, "result": result})).as_bytes(),
+                )
+                .await
+                .unwrap();
+            if let Ok(Ok((stream, _))) =
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
+            {
+                let (reader, _) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                panic!(
+                    "wrong-workspace response reached {expected_followup} via {}",
+                    request["method"]
+                );
+            }
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let error = provision_agent_at_socket(
+            &config,
+            &socket_path,
+            ProvisionAgentRequest {
+                command_id: format!("wrong-workspace-{expected_followup}"),
+                session: "default".to_owned(),
+                workspace_id: "requested-workspace".to_owned(),
+                cwd: "/tmp/requested".to_owned(),
+                tab_label: "Requested".to_owned(),
+                agent_name: "yard-requested".to_owned(),
+                kind: "codex".to_owned(),
+                args: Vec::new(),
+                prompt: "Stay in the requested workspace.".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(
+            error,
+            HerdrControlError::PrepareFailed {
+                ambiguous: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn wrong_workspace_prepare_never_reaches_start_or_prompt_success_path() {
+        assert_wrong_workspace_stops_before_followup("start/prompt").await;
+    }
+
+    #[tokio::test]
+    async fn wrong_workspace_prepare_never_reaches_start_failure_rollback_path() {
+        assert_wrong_workspace_stops_before_followup("start/rollback").await;
+    }
+
+    #[tokio::test]
+    async fn workspace_bootstrap_rejects_mismatched_root_tab_before_any_followup() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "workspace.create");
+            let id = request["id"].as_str().unwrap();
+            let result = serde_json::json!({
+                "type": "workspace_created",
+                "workspace": { "workspace_id": "workspace-ancestry" },
+                "tab": {
+                    "tab_id": "tab-created",
+                    "workspace_id": "workspace-ancestry",
+                    "number": 1,
+                    "label": "Created",
+                    "focused": false,
+                    "pane_count": 1,
+                    "agent_status": "unknown"
+                },
+                "root_pane": {
+                    "pane_id": "pane-created",
+                    "terminal_id": "terminal-created",
+                    "workspace_id": "workspace-ancestry",
+                    "tab_id": "foreign-tab",
+                    "focused": false,
+                    "cwd": "/tmp/project",
+                    "foreground_cwd": "/tmp/project",
+                    "label": null,
+                    "agent": null,
+                    "display_agent": null,
+                    "agent_status": "unknown",
+                    "tokens": {},
+                    "agent_session": null,
+                    "revision": 1
+                }
+            });
+            writer
+                .write_all(
+                    format!("{}\n", serde_json::json!({"id": id, "result": result})).as_bytes(),
+                )
+                .await
+                .unwrap();
+            if let Ok(Ok((stream, _))) =
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
+            {
+                let (reader, _) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                panic!(
+                    "inconsistent workspace ancestry reached follow-up method {}",
+                    request["method"]
+                );
+            }
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let error = bootstrap_agent_at_socket(
+            &config,
+            &socket_path,
+            BootstrapAgentRequest {
+                command_id: "workspace-ancestry-mismatch".to_owned(),
+                session: "default".to_owned(),
+                workspace_label: "Project".to_owned(),
+                cwd: "/tmp/project".to_owned(),
+                agent_name: "yard-project".to_owned(),
+                kind: "codex".to_owned(),
+                args: Vec::new(),
+                prompt: "Coordinate the project.".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(
+            error,
+            HerdrControlError::WorkspaceCreateFailed {
                 ambiguous: true,
                 ..
             }
