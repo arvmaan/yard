@@ -10,7 +10,7 @@ use yard_domain::{
     ConfigureYardOrchestrator, ConfiguredYardOrchestrator, ObservedWorker,
     OrchestratorWorkflowProfile, ProvisionYardOrchestrator, RecoverYardOrchestrator,
     RecoveredYardOrchestrator, RuntimeInventory, RuntimeObservationState, RuntimeProcessState,
-    WorkerAvailability, WorkerRuntimeBinding,
+    WorkerAvailability, WorkerRuntimeBinding, YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
 };
 use yard_store::{ProjectStoreError, YardStore};
 
@@ -22,7 +22,10 @@ use crate::{
     },
     intervention_service::{RuntimeIntervention, RuntimePromptRequest},
     reconciliation_service::{ReconciliationService, ReconciliationServiceError},
-    status_protocol::{with_orchestrator_status_contract, with_orchestrator_workflow},
+    status_protocol::{
+        validate_executable_orchestrator_workflow, with_orchestrator_status_contract,
+        with_orchestrator_workflow,
+    },
 };
 
 pub const YARD_ORCHESTRATOR_SESSION: &str = "yard-orchestrator";
@@ -96,6 +99,8 @@ impl YardOrchestratorService {
         }
         let args = validated_provider_args(&profile)?;
         let active_workflow = self.store.get_orchestrator_workflow_profile().await?;
+        validate_executable_orchestrator_workflow(&active_workflow)
+            .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?;
 
         self.runtime
             .ensure_session(RuntimeSessionRequest {
@@ -175,28 +180,43 @@ impl YardOrchestratorService {
             })
             .await?;
         let workflow = self
-            .store
-            .get_orchestrator_workflow_profile_revision(
-                configured.orchestrator.workflow_profile_version,
-            )
+            .workflow_revision(configured.orchestrator.workflow_profile_version)
             .await?;
         self.deliver_provision_adoption_workflow(&command, &configured, &workflow, bootstrapped)
             .await?;
         Ok(configured)
     }
 
+    async fn workflow_revision(
+        &self,
+        version: u64,
+    ) -> Result<OrchestratorWorkflowProfile, YardOrchestratorServiceError> {
+        let workflow = self
+            .store
+            .get_orchestrator_workflow_profile_revision(
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                version,
+            )
+            .await
+            .map_err(YardOrchestratorServiceError::from)?;
+        validate_executable_orchestrator_workflow(&workflow)
+            .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?;
+        Ok(workflow)
+    }
+
     async fn replay_provision(
         &self,
         command: &ProvisionYardOrchestrator,
     ) -> Result<Option<ConfiguredYardOrchestrator>, YardOrchestratorServiceError> {
-        if self
+        let Some(replayed) = self
             .store
             .replay_yard_orchestrator_provision(command.clone())
             .await?
-            .is_none()
-        {
+        else {
             return Ok(None);
-        }
+        };
+        self.workflow_revision(replayed.orchestrator.workflow_profile_version)
+            .await?;
         self.runtime
             .ensure_session(RuntimeSessionRequest {
                 session: YARD_ORCHESTRATOR_SESSION.to_owned(),
@@ -224,10 +244,7 @@ impl YardOrchestratorService {
             return Ok(Some(configured));
         }
         let workflow = self
-            .store
-            .get_orchestrator_workflow_profile_revision(
-                configured.orchestrator.workflow_profile_version,
-            )
+            .workflow_revision(configured.orchestrator.workflow_profile_version)
             .await?;
         self.deliver_provision_adoption_workflow(command, &configured, &workflow, false)
             .await?;
@@ -246,17 +263,26 @@ impl YardOrchestratorService {
     ) -> Result<ConfiguredYardOrchestrator, YardOrchestratorServiceError> {
         command = command.normalize()?;
         let _operation = self.operation.lock().await;
+        if let Some(replayed) = self
+            .store
+            .replay_yard_orchestrator_configuration(command.clone())
+            .await?
+        {
+            return Ok(replayed);
+        }
         let current = self.store.get_yard_orchestrator().await?;
         let active_workflow = self.store.get_orchestrator_workflow_profile().await?;
         let replacing = current
             .worker
             .as_ref()
             .is_none_or(|worker| worker.id != command.worker_id);
-        command.workflow_profile_version = Some(if replacing {
+        let workflow_profile_version = if replacing {
             active_workflow.version
         } else {
             current.workflow_profile_version
-        });
+        };
+        let workflow = self.workflow_revision(workflow_profile_version).await?;
+        command.workflow_profile_version = Some(workflow_profile_version);
         let configured = self
             .store
             .configure_yard_orchestrator(command.clone())
@@ -264,12 +290,6 @@ impl YardOrchestratorService {
         // Ownership commits before external delivery. A changed result must
         // retry delivery on replay with the same command identity.
         if configured.orchestrator.version != command.expected_orchestrator_version {
-            let workflow = self
-                .store
-                .get_orchestrator_workflow_profile_revision(
-                    configured.orchestrator.workflow_profile_version,
-                )
-                .await?;
             let runtime = configured
                 .orchestrator
                 .worker
@@ -318,6 +338,9 @@ impl YardOrchestratorService {
             .as_ref()
             .filter(|runtime| runtime.session == YARD_ORCHESTRATOR_SESSION)
             .ok_or(YardOrchestratorServiceError::RecoveryNotDedicated)?;
+        let workflow = self
+            .workflow_revision(current.workflow_profile_version)
+            .await?;
 
         self.runtime
             .ensure_session(RuntimeSessionRequest {
@@ -361,10 +384,6 @@ impl YardOrchestratorService {
         {
             return Err(YardOrchestratorServiceError::RecoveryBindingAmbiguous);
         }
-        let workflow = self
-            .store
-            .get_orchestrator_workflow_profile_revision(orchestrator.workflow_profile_version)
-            .await?;
         self.deliver_lifecycle_prompt(
             &command.command_id,
             runtime,
@@ -413,7 +432,8 @@ impl YardOrchestratorService {
                         profile,
                     ),
                     workflow,
-                ),
+                )
+                .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?,
                 &command.command_id,
             ),
         };
@@ -547,7 +567,8 @@ impl YardOrchestratorService {
         workflow: &OrchestratorWorkflowProfile,
         prompt: &str,
     ) -> Result<(), YardOrchestratorServiceError> {
-        let prompt = with_orchestrator_workflow(prompt, workflow);
+        let prompt = with_orchestrator_workflow(prompt, workflow)
+            .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?;
         self.intervention
             .prompt(RuntimePromptRequest {
                 command_id: command_id.to_owned(),
@@ -784,11 +805,13 @@ mod tests {
     };
 
     use async_trait::async_trait;
+    use rusqlite::Connection;
     use tempfile::TempDir;
     use yard_domain::{
-        CreateWorkerProfile, FocusObservation, ObservedStatus, ObservedWorker, ProviderSessionRef,
-        ProvisionYardOrchestrator, RuntimeInventory, RuntimeSession, RuntimeSessions,
-        WorkerProfileSpec, WorkerRuntimeBinding, WorkspaceObservation,
+        ConfigureYardOrchestrator, CreateWorkerProfile, FocusObservation, ObservedStatus,
+        ObservedWorker, ProviderSessionRef, ProvisionYardOrchestrator, RuntimeInventory,
+        RuntimeSession, RuntimeSessions, WorkerProfileSpec, WorkerRuntimeBinding,
+        WorkspaceObservation, yard_standard_orchestrator_commands,
     };
     use yard_store::{SqliteProjectStore, YardStore};
 
@@ -1173,10 +1196,35 @@ mod tests {
         assert_eq!(request.args, ["--yolo", "-m", "gpt-5.4"]);
         assert!(request.prompt.contains("Coordinate all Yard projects"));
         assert!(request.prompt.contains("Role: central orchestrator"));
-        assert!(request.prompt.contains("one Yard/Herdr worker per lane"));
+        assert!(request.prompt.contains("Allocate independent workers"));
+        assert!(
+            request
+                .prompt
+                .contains("originating central orchestrator pane")
+        );
+        assert!(
+            request
+                .prompt
+                .contains("exact captured orchestrator workspace")
+        );
+        assert!(request.prompt.contains("isolated Git worktree"));
+        assert!(
+            request
+                .prompt
+                .contains("plain tab for read-only investigation")
+        );
         assert!(request.prompt.contains("every 10 minutes"));
-        assert!(request.prompt.contains("concrete push-forward prompt"));
-        assert!(request.prompt.contains("commit SHA"));
+        assert!(request.prompt.contains("configured cadence"));
+        assert!(request.prompt.contains("concrete observation"));
+        assert!(request.prompt.contains("coherent commit IDs"));
+        assert!(
+            request
+                .prompt
+                .contains("deterministic artifacts at named paths")
+        );
+        assert!(request.prompt.contains("independent quality review"));
+        assert!(request.prompt.contains("integrate accepted commits"));
+        assert!(request.prompt.contains("retaining branches, worktrees"));
         assert!(
             request
                 .prompt
@@ -1189,17 +1237,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_configuration_replays_historical_explicit_workflow_without_runtime_call() {
+        let runtime = Arc::new(DedicatedRuntime::default());
+        let (service, store, temp, profile_id) = service(runtime.clone()).await;
+        let provisioned = service.provision(command(&profile_id)).await.unwrap();
+        let worker = provisioned.orchestrator.worker.as_ref().unwrap();
+        let prompt_count = runtime.prompt_requests.lock().unwrap().len();
+        let mut incomplete_commands = yard_standard_orchestrator_commands();
+        incomplete_commands.retain(|command| command.id != "result.integrate");
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO orchestrator_workflow_profile_revisions (
+                    profile_id, version, name, description,
+                    instructions_markdown, monitor_interval_ms,
+                    commands_json, adapter_context_files_json,
+                    source, updated_by, created_at_unix_ms
+                 )
+                 SELECT profile_id, 2, name, description,
+                        instructions_markdown, monitor_interval_ms,
+                        ?1, adapter_context_files_json,
+                        source, 'historical-replay-fixture', created_at_unix_ms
+                   FROM orchestrator_workflow_profile_revisions
+                  WHERE profile_id = 'yard:standard-orchestrator'
+                    AND version = 1",
+                [serde_json::to_string(&incomplete_commands).unwrap()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE yard_orchestrator_configure_commands
+                    SET workflow_profile_version = 2
+                  WHERE command_id = 'provision-yard-orchestrator'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let replayed = service
+            .configure(ConfigureYardOrchestrator {
+                command_id: "provision-yard-orchestrator".to_owned(),
+                actor: "local-user".to_owned(),
+                worker_id: worker.id.clone(),
+                expected_worker_version: worker.version,
+                expected_orchestrator_version: 1,
+                workflow_profile_version: Some(2),
+            })
+            .await
+            .unwrap();
+
+        assert!(replayed.replayed);
+        assert_eq!(replayed.orchestrator.workflow_profile_version, 2);
+        assert_eq!(runtime.prompt_requests.lock().unwrap().len(), prompt_count);
+        assert_eq!(
+            store
+                .get_yard_orchestrator()
+                .await
+                .unwrap()
+                .workflow_profile_version,
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn fresh_provision_uses_and_pins_the_active_workflow_revision() {
         let runtime = Arc::new(DedicatedRuntime::default());
         let (service, store, _temp, profile_id) = service(runtime.clone()).await;
         let factory = store.get_orchestrator_workflow_profile().await.unwrap();
         let edited = store
-            .update_orchestrator_workflow_profile(yard_domain::UpdateOrchestratorWorkflowProfile {
-                actor: "local-user".to_owned(),
-                expected_version: factory.version,
-                instructions_markdown: "# Current workflow\n\nUse current lanes.".to_owned(),
-                monitor_interval_ms: 900_000,
-            })
+            .update_orchestrator_workflow_profile(
+                yard_domain::YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                yard_domain::UpdateOrchestratorWorkflowProfile {
+                    actor: "local-user".to_owned(),
+                    expected_version: factory.version,
+                    instructions_markdown: "# Current workflow\n\nUse current lanes.".to_owned(),
+                    monitor_interval_ms: 900_000,
+                    commands: Some(yard_domain::yard_standard_orchestrator_commands()),
+                    adapter_context_files: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -1211,12 +1327,79 @@ mod tests {
         );
         let request = &runtime.bootstrap_requests.lock().unwrap()[0];
         assert!(
-            request
-                .prompt
-                .contains("Yard orchestrator workflow profile revision 2")
+            request.prompt.contains(
+                "Yard orchestrator workflow profile yard:standard-orchestrator revision 2",
+            )
         );
         assert!(request.prompt.contains("# Current workflow"));
         assert!(request.prompt.contains("monitor interval: 900000 ms"));
+        assert!(request.prompt.contains("\"id\":\"result.integrate\""));
+        assert!(
+            request.prompt.find("\"id\":\"work.decompose\"").unwrap()
+                < request.prompt.find("\"id\":\"worker.allocate\"").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_persisted_workflow_capability_fails_before_runtime_mutation() {
+        let runtime = Arc::new(DedicatedRuntime::default());
+        let (service, _store, temp, profile_id) = service(runtime.clone()).await;
+        let mut commands = yard_domain::yard_standard_orchestrator_commands();
+        commands[0].capability = "orchestration.unsupported".to_owned();
+        let commands = serde_json::to_string(&commands).unwrap();
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO orchestrator_workflow_profile_revisions (
+                    profile_id, version, name, description, instructions_markdown,
+                    monitor_interval_ms, commands_json, adapter_context_files_json,
+                    source, updated_by, created_at_unix_ms
+                 )
+                 SELECT profile_id, 2, name, description, instructions_markdown,
+                        monitor_interval_ms, ?1, adapter_context_files_json,
+                        'user', 'corrupt-fixture', 2
+                   FROM orchestrator_workflow_profile_revisions
+                  WHERE profile_id = 'yard:standard-orchestrator' AND version = 1",
+                [commands],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE orchestrator_workflow_profiles
+                    SET current_version = 2
+                  WHERE id = 'yard:standard-orchestrator'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE orchestrator_workflow_profile_current
+                    SET current_version = 2
+                  WHERE singleton_id = 1",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = service.provision(command(&profile_id)).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::YardOrchestratorServiceError::Store(
+                yard_store::ProjectStoreError::InvalidOrchestratorWorkflowProfile(_)
+            )
+        ));
+        assert_eq!(runtime.ensure_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.bootstrap_calls.load(Ordering::SeqCst), 0);
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let intents: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM dedicated_runtime_provision_intents",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(intents, 0);
     }
 
     #[tokio::test]
@@ -1240,7 +1423,7 @@ mod tests {
                 .text
                 .contains("Assume ownership of central Yard orchestration")
         );
-        assert!(prompts[0].text.contains("one Yard/Herdr worker per lane"));
+        assert!(prompts[0].text.contains("Allocate independent workers"));
     }
 
     #[tokio::test]
@@ -1279,13 +1462,18 @@ mod tests {
             .unwrap();
         let active_workflow = store.get_orchestrator_workflow_profile().await.unwrap();
         store
-            .update_orchestrator_workflow_profile(yard_domain::UpdateOrchestratorWorkflowProfile {
-                actor: "local-user".to_owned(),
-                expected_version: active_workflow.version,
-                instructions_markdown: "# Replacement workflow\n\nDo not use this for the replay."
-                    .to_owned(),
-                monitor_interval_ms: 300_000,
-            })
+            .update_orchestrator_workflow_profile(
+                yard_domain::YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                yard_domain::UpdateOrchestratorWorkflowProfile {
+                    actor: "local-user".to_owned(),
+                    expected_version: active_workflow.version,
+                    instructions_markdown:
+                        "# Replacement workflow\n\nDo not use this for the replay.".to_owned(),
+                    monitor_interval_ms: 300_000,
+                    commands: None,
+                    adapter_context_files: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -1303,12 +1491,12 @@ mod tests {
         assert!(
             prompts
                 .iter()
-                .all(|prompt| prompt.text.contains("one Yard/Herdr worker per lane"))
+                .all(|prompt| prompt.text.contains("Allocate independent workers"))
         );
         assert!(prompts.iter().all(|prompt| {
-            prompt
-                .text
-                .contains("Yard orchestrator workflow profile revision 1")
+            prompt.text.contains(
+                "Yard orchestrator workflow profile yard:standard-orchestrator revision 1",
+            )
         }));
         assert!(
             prompts
@@ -1348,7 +1536,7 @@ mod tests {
             (prompts[0].command_id.clone(), prompts[0].text.clone())
         };
         assert_eq!(prompt_command_id, "recover-yard-orchestrator");
-        assert!(prompt_text.contains("one Yard/Herdr worker per lane"));
+        assert!(prompt_text.contains("Allocate independent workers"));
         assert!(prompt_text.contains("Resume central Yard orchestration after runtime recovery"));
         assert_eq!(
             store

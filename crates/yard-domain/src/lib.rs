@@ -81,9 +81,13 @@ pub use orchestrator_transfer::{
 };
 pub use orchestrator_workflow_profile::{
     FACTORY_ORCHESTRATOR_WORKFLOW_INSTRUCTIONS, FACTORY_ORCHESTRATOR_WORKFLOW_MONITOR_INTERVAL_MS,
+    OrchestratorWorkflowAdapterContextFile, OrchestratorWorkflowCommand,
     OrchestratorWorkflowProfile, OrchestratorWorkflowProfileSource,
-    OrchestratorWorkflowProfileValidationError, ResetOrchestratorWorkflowProfile,
-    UpdateOrchestratorWorkflowProfile,
+    OrchestratorWorkflowProfileValidationError, OrchestratorWorkflowProfiles,
+    ResetOrchestratorWorkflowProfile, UpdateOrchestratorWorkflowProfile,
+    YARD_STANDARD_ORCHESTRATOR_PROFILE_DESCRIPTION, YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+    YARD_STANDARD_ORCHESTRATOR_PROFILE_NAME, validate_orchestrator_workflow_commands,
+    validate_stored_orchestrator_workflow_commands, yard_standard_orchestrator_commands,
 };
 pub use profile::{
     CreateWorkerProfile, ProfileValidationError, UpdateWorkerProfile, WorkerProfile,
@@ -92,8 +96,9 @@ pub use profile::{
 pub use project::{
     CanvasPlacement, ConfirmedProjectCreation, CreateProject, CreateProjectFromProfile,
     CreateWorkspaceProjectFromProfile, Project, ProjectPlacement, ProjectRuntimeBinding,
-    ProjectValidationError, Projects, RuntimeObservationState, RuntimeProcessState,
-    UpdateProjectPlacement, Worker, WorkerRuntimeBinding,
+    ProjectValidationError, ProjectWorkflowProfilePin, Projects, RuntimeObservationState,
+    RuntimeProcessState, UpdateProjectPlacement, UpdateProjectWorkflowProfile, Worker,
+    WorkerRuntimeBinding,
 };
 pub use status_report::{
     MAX_STATUS_BLOCKER_BYTES, MAX_STATUS_BLOCKERS, MAX_STATUS_COMMAND_ID_BYTES,

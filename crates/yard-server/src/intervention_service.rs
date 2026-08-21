@@ -7,8 +7,8 @@ use yard_domain::{
     OrchestratorPromptAcknowledgement, OrchestratorStatusReport, OrchestratorTerminalOutput,
     Project, PromptAcknowledgement, SendAssignmentPrompt, SendOrchestratorPrompt,
     SendYardOrchestratorPrompt, SendYardOrchestratorRoute, TerminalOutput, Worker,
-    WorkerRuntimeBinding, YardOrchestrator, YardOrchestratorPromptAcknowledgement,
-    YardOrchestratorRoute, YardOrchestratorTerminalOutput,
+    WorkerRuntimeBinding, YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator,
+    YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute, YardOrchestratorTerminalOutput,
 };
 use yard_store::{
     BeginAssignmentPrompt, BeginOrchestratorPrompt, BeginYardOrchestratorPrompt,
@@ -16,7 +16,10 @@ use yard_store::{
 };
 
 use crate::inventory_service::{InventoryServiceError, InventorySource};
-use crate::status_protocol::{with_orchestrator_status_contract, with_orchestrator_workflow};
+use crate::status_protocol::{
+    validate_executable_orchestrator_workflow, with_orchestrator_status_contract,
+    with_orchestrator_workflow,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePromptRequest {
@@ -258,6 +261,16 @@ impl InterventionService {
         if let Some(policy) = automatic_policy {
             self.ensure_automatic_token_spend_enabled(policy).await?;
         }
+        let initial_project = self.store.get_project(project_id).await?;
+        let initial_workflow = self
+            .store
+            .get_orchestrator_workflow_profile_revision(
+                &initial_project.workflow_profile.profile_id,
+                initial_project.workflow_profile.profile_version,
+            )
+            .await?;
+        validate_executable_orchestrator_workflow(&initial_workflow)
+            .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?;
         let (command, project) = match self
             .store
             .begin_orchestrator_prompt(
@@ -292,13 +305,22 @@ impl InterventionService {
                 .await?;
             return Err(error);
         }
+        let workflow = self
+            .store
+            .get_orchestrator_workflow_profile_revision(
+                &project.workflow_profile.profile_id,
+                project.workflow_profile.profile_version,
+            )
+            .await?;
+        let prompt = with_orchestrator_workflow(&command.text, &workflow)
+            .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?;
         let result = self
             .runtime
             .prompt(RuntimePromptRequest {
                 command_id: command.command_id.clone(),
                 session: runtime.session.clone(),
                 pane_id: runtime.pane_id.clone(),
-                text: with_orchestrator_status_contract(&command.text, &command.command_id),
+                text: with_orchestrator_status_contract(&prompt, &command.command_id),
             })
             .await;
         match result {
@@ -352,6 +374,7 @@ impl InterventionService {
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn prompt_yard_orchestrator_with_automatic_policy(
         &self,
         command: SendYardOrchestratorPrompt,
@@ -360,6 +383,16 @@ impl InterventionService {
         if let Some(policy) = automatic_policy {
             self.ensure_automatic_token_spend_enabled(policy).await?;
         }
+        let initial_orchestrator = self.store.get_yard_orchestrator().await?;
+        let initial_workflow = self
+            .store
+            .get_orchestrator_workflow_profile_revision(
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                initial_orchestrator.workflow_profile_version,
+            )
+            .await?;
+        validate_executable_orchestrator_workflow(&initial_workflow)
+            .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?;
         let (command, orchestrator) = match self
             .store
             .begin_yard_orchestrator_prompt(
@@ -400,9 +433,13 @@ impl InterventionService {
         }
         let workflow = self
             .store
-            .get_orchestrator_workflow_profile_revision(orchestrator.workflow_profile_version)
+            .get_orchestrator_workflow_profile_revision(
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                orchestrator.workflow_profile_version,
+            )
             .await?;
-        let prompt = with_orchestrator_workflow(&command.text, &workflow);
+        let prompt = with_orchestrator_workflow(&command.text, &workflow)
+            .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?;
         let result = self
             .runtime
             .prompt(RuntimePromptRequest {
@@ -474,6 +511,7 @@ impl InterventionService {
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn route_yard_orchestrator_with_automatic_policy(
         &self,
         command: SendYardOrchestratorRoute,
@@ -482,6 +520,16 @@ impl InterventionService {
         if let Some(policy) = automatic_policy {
             self.ensure_automatic_token_spend_enabled(policy).await?;
         }
+        let initial_project = self.store.get_project(&command.target_project_id).await?;
+        let initial_workflow = self
+            .store
+            .get_orchestrator_workflow_profile_revision(
+                &initial_project.workflow_profile.profile_id,
+                initial_project.workflow_profile.profile_version,
+            )
+            .await?;
+        validate_executable_orchestrator_workflow(&initial_workflow)
+            .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?;
         let (command, orchestrator, target_project) = match self
             .store
             .begin_yard_orchestrator_route(
@@ -522,13 +570,22 @@ impl InterventionService {
                 .await?;
             return Err(error);
         }
+        let workflow = self
+            .store
+            .get_orchestrator_workflow_profile_revision(
+                &target_project.workflow_profile.profile_id,
+                target_project.workflow_profile.profile_version,
+            )
+            .await?;
+        let prompt = with_orchestrator_workflow(&command.text, &workflow)
+            .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?;
         let result = self
             .runtime
             .prompt(RuntimePromptRequest {
                 command_id: command.command_id.clone(),
                 session: runtime.session.clone(),
                 pane_id: runtime.pane_id.clone(),
-                text: with_orchestrator_status_contract(&command.text, &command.command_id),
+                text: with_orchestrator_status_contract(&prompt, &command.command_id),
             })
             .await;
         match result {
@@ -800,7 +857,11 @@ impl InterventionService {
         expected: &Project,
     ) -> Result<Project, InterventionServiceError> {
         let current = self.project(&expected.id).await?;
-        if current.orchestrator.id != expected.orchestrator.id {
+        if current.version != expected.version
+            || current.workflow_profile.profile_id != expected.workflow_profile.profile_id
+            || current.workflow_profile.profile_version != expected.workflow_profile.profile_version
+            || current.orchestrator.id != expected.orchestrator.id
+        {
             return Err(InterventionServiceError::OrchestratorChanged);
         }
         let expected_runtime = expected

@@ -185,12 +185,20 @@ export interface ProjectPlacement {
   updated_at_unix_ms: number
 }
 
+export interface ProjectWorkflowProfilePin {
+  profile_id: string
+  profile_version: string
+  pinned_by: string
+  pinned_at_unix_ms: number
+}
+
 export interface Project {
   id: string
   name: string
   runtime: ProjectRuntimeBinding
   orchestrator: Worker
   placement: ProjectPlacement
+  workflow_profile: ProjectWorkflowProfilePin
   version: string
   created_at_unix_ms: number
   updated_at_unix_ms: number
@@ -914,10 +922,25 @@ export interface TokenSpendSettings {
 
 export type OrchestratorWorkflowProfileSource = 'factory' | 'user' | 'reset'
 
+export interface OrchestratorWorkflowCommand {
+  id: string
+  capability: string
+}
+
+export interface OrchestratorWorkflowAdapterContextFile {
+  adapter_id: string
+  path: string
+}
+
 export interface OrchestratorWorkflowProfile {
+  id: string
+  name: string
+  description: string
   version: string
   instructions_markdown: string
   monitor_interval_ms: string
+  commands: OrchestratorWorkflowCommand[]
+  adapter_context_files: OrchestratorWorkflowAdapterContextFile[]
   source: OrchestratorWorkflowProfileSource
   updated_by: string
   created_at_unix_ms: number
@@ -928,6 +951,8 @@ export interface UpdateOrchestratorWorkflowProfileInput {
   expected_version: string
   instructions_markdown: string
   monitor_interval_ms: string
+  commands?: OrchestratorWorkflowCommand[]
+  adapter_context_files?: OrchestratorWorkflowAdapterContextFile[]
 }
 
 export interface ResetOrchestratorWorkflowProfileInput {

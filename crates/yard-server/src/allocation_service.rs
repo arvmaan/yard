@@ -17,7 +17,7 @@ use crate::intervention_service::{
 };
 use crate::inventory_service::{InventoryServiceError, InventorySource};
 use crate::runtime_cleanup_service::RuntimeCleanupService;
-use crate::status_protocol::with_orchestrator_status_contract;
+use crate::status_protocol::{with_orchestrator_status_contract, with_orchestrator_workflow};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeProvisionRequest {
@@ -864,6 +864,8 @@ impl AllocationService {
             &context.profile,
         );
         let prompt = if context.command.target_role == HandoffTargetRole::Orchestrator {
+            let prompt = with_orchestrator_workflow(&prompt, &context.workflow_profile)
+                .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?;
             with_orchestrator_status_contract(&prompt, &context.command.command_id)
         } else {
             prompt

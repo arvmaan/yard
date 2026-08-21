@@ -21,6 +21,19 @@ pub struct TokenSpendSettings {
     pub updated_at_unix_ms: u64,
 }
 
+impl Default for TokenSpendSettings {
+    fn default() -> Self {
+        Self {
+            superintendent_auto_requests_project_summaries: false,
+            project_orchestrators_auto_request_worker_summaries: false,
+            scheduled_automatic_summaries: false,
+            version: 1,
+            updated_by: "yard:default".to_owned(),
+            updated_at_unix_ms: 0,
+        }
+    }
+}
+
 impl TokenSpendSettings {
     #[must_use]
     pub const fn automatic_summary_enabled(&self, kind: AutomaticSummaryRequestKind) -> bool {
@@ -80,7 +93,16 @@ pub enum TokenSpendSettingsValidationError {
 
 #[cfg(test)]
 mod tests {
-    use super::{TokenSpendSettingsValidationError, UpdateTokenSpendSettings};
+    use super::{TokenSpendSettings, TokenSpendSettingsValidationError, UpdateTokenSpendSettings};
+
+    #[test]
+    fn automatic_token_spend_permissions_default_off_independently() {
+        let settings = TokenSpendSettings::default();
+
+        assert!(!settings.superintendent_auto_requests_project_summaries);
+        assert!(!settings.project_orchestrators_auto_request_worker_summaries);
+        assert!(!settings.scheduled_automatic_summaries);
+    }
 
     #[test]
     fn normalizes_settings_update_actor() {

@@ -548,9 +548,19 @@ async function mockApi(
   const initialProfileState = [profile()]
   const state: MockState = {
     orchestratorWorkflowProfile: {
+      id: 'yard:standard-orchestrator',
+      name: 'Yard Standard Orchestrator',
+      description: 'Provider-neutral orchestration.',
       version: '1',
       instructions_markdown: factoryWorkflowInstructions,
       monitor_interval_ms: '600000',
+      commands: [
+        {
+          id: 'work.decompose',
+          capability: 'orchestration.work.decompose',
+        },
+      ],
+      adapter_context_files: [],
       source: 'factory',
       updated_by: 'yard:factory',
       created_at_unix_ms: 0,
@@ -757,6 +767,7 @@ async function mockApi(
           return
         }
         state.orchestratorWorkflowProfile = {
+          ...state.orchestratorWorkflowProfile,
           version: String(
             Number(state.orchestratorWorkflowProfile.version) + 1,
           ),
@@ -786,6 +797,7 @@ async function mockApi(
         return
       }
       state.orchestratorWorkflowProfile = {
+        ...state.orchestratorWorkflowProfile,
         version: String(
           Number(state.orchestratorWorkflowProfile.version) + 1,
         ),

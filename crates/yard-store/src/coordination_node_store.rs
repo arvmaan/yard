@@ -929,6 +929,12 @@ pub(super) async fn begin_route(
                     current_version: project.version,
                 });
             }
+            let workflow_profile =
+                super::orchestrator_workflow_profile_store::select_executable_revision(
+                    &transaction,
+                    &project.workflow_profile.profile_id,
+                    project.workflow_profile.profile_version,
+                )?;
             if project.orchestrator.id != command.target_orchestrator_worker_id {
                 return Err(ProjectStoreError::OrchestratorNotCurrent {
                     current_worker_id: project.orchestrator.id,
@@ -978,6 +984,7 @@ pub(super) async fn begin_route(
                 command,
                 node: Box::new(node),
                 target_project: Box::new(project),
+                workflow_profile: Box::new(workflow_profile),
             })
         })
         .await

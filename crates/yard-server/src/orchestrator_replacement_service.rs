@@ -25,7 +25,7 @@ use crate::{
     },
     inventory_service::{InventoryServiceError, InventorySource},
     runtime_cleanup_service::RuntimeCleanupService,
-    status_protocol::with_orchestrator_status_contract,
+    status_protocol::{with_orchestrator_status_contract, with_orchestrator_workflow},
 };
 
 #[derive(Clone)]
@@ -557,6 +557,13 @@ impl OrchestratorReplacementService {
                 return Err(error);
             }
         };
+        let objective = assignment_prompt(
+            &context.command.objective,
+            &context.command.role,
+            &context.profile,
+        );
+        let objective = with_orchestrator_workflow(&objective, &context.workflow_profile)
+            .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?;
         let provision = RuntimeProvisionRequest {
             command_id: command_id.clone(),
             session: context.project.runtime.session.clone(),
@@ -566,14 +573,7 @@ impl OrchestratorReplacementService {
             agent_name: agent_name(&command_id),
             kind: context.profile.spec.provider.clone(),
             args,
-            prompt: with_orchestrator_status_contract(
-                &assignment_prompt(
-                    &context.command.objective,
-                    &context.command.role,
-                    &context.profile,
-                ),
-                &command_id,
-            ),
+            prompt: with_orchestrator_status_contract(&objective, &command_id),
         };
 
         let prepared = match self

@@ -22,16 +22,17 @@ use yard_domain::{
     CreateWorkspaceProjectFromProfile, CreatedProjectRelationship, DeleteProjectRelationship,
     DeletedProjectRelationship, EndWorkerSession, EndedWorkerSession,
     OrchestratorPromptAcknowledgement, OrchestratorTerminalOutput, OrchestratorWorkflowProfile,
-    Project, ProjectRelationships, Projects, PromptAcknowledgement, ProvisionCoordinationNode,
-    ProvisionYardOrchestrator, RecordCompletionReceipt, RecordedCompletionReceipt,
-    RecoverYardOrchestrator, RecoveredYardOrchestrator, ReplaceProjectOrchestrator,
-    ReplacedProjectOrchestrator, RequestCoordinationSnapshot, ResetOrchestratorWorkflowProfile,
-    RunAutomationNow, RuntimeInventory, RuntimeSessions, SendAssignmentPrompt,
-    SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
-    SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SetAutomationPaused, TerminalOutput,
-    TokenSpendSettings, TransferProjectOrchestrator, TransferredProjectOrchestrator,
-    UpdateAgentProfile, UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
-    UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
+    OrchestratorWorkflowProfiles, Project, ProjectRelationships, Projects, PromptAcknowledgement,
+    ProvisionCoordinationNode, ProvisionYardOrchestrator, RecordCompletionReceipt,
+    RecordedCompletionReceipt, RecoverYardOrchestrator, RecoveredYardOrchestrator,
+    ReplaceProjectOrchestrator, ReplacedProjectOrchestrator, RequestCoordinationSnapshot,
+    ResetOrchestratorWorkflowProfile, RunAutomationNow, RuntimeInventory, RuntimeSessions,
+    SendAssignmentPrompt, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
+    SendOrchestratorPrompt, SendYardOrchestratorPrompt, SendYardOrchestratorRoute,
+    SetAutomationPaused, TerminalOutput, TokenSpendSettings, TransferProjectOrchestrator,
+    TransferredProjectOrchestrator, UpdateAgentProfile, UpdateAutomation,
+    UpdateAutomationPlacement, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
+    UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
     UpdateTokenSpendSettings, UpdateWorkerProfile, UploadArtifact, WorkerCandidates, WorkerProfile,
     WorkerProfiles, YardOrchestrator, YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute,
     YardOrchestratorRoutes, YardOrchestratorTerminalOutput,
@@ -226,6 +227,18 @@ pub(crate) fn router_with_reconciliation_and_shutdown(
             axum::routing::post(reset_orchestrator_workflow_profile),
         )
         .route(
+            "/api/v1/orchestrator-workflow-profiles",
+            get(list_orchestrator_workflow_profiles),
+        )
+        .route(
+            "/api/v1/orchestrator-workflow-profiles/{profile_id}",
+            get(get_orchestrator_workflow_profile_by_id),
+        )
+        .route(
+            "/api/v1/orchestrator-workflow-profiles/{profile_id}/revisions/{version}",
+            get(get_orchestrator_workflow_profile_revision),
+        )
+        .route(
             "/api/v1/token-spend-settings",
             get(get_token_spend_settings).put(update_token_spend_settings),
         )
@@ -360,6 +373,10 @@ pub(crate) fn router_with_reconciliation_and_shutdown(
             put(update_project_placement),
         )
         .route(
+            "/api/v1/projects/{project_id}/workflow-profile",
+            put(update_project_workflow_profile),
+        )
+        .route(
             "/api/v1/projects/{project_id}/assignments",
             get(list_project_assignments).post(confirm_allocation),
         )
@@ -492,6 +509,41 @@ async fn reset_orchestrator_workflow_profile(
     state
         .orchestrator_workflow_profiles
         .reset(command)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn list_orchestrator_workflow_profiles(
+    State(state): State<AppState>,
+) -> Result<NoStoreJson<OrchestratorWorkflowProfiles>, ApiError> {
+    state
+        .orchestrator_workflow_profiles
+        .list()
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn get_orchestrator_workflow_profile_by_id(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+) -> Result<NoStoreJson<OrchestratorWorkflowProfile>, ApiError> {
+    state
+        .orchestrator_workflow_profiles
+        .get_by_id(&profile_id)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn get_orchestrator_workflow_profile_revision(
+    State(state): State<AppState>,
+    Path((profile_id, version)): Path<(String, u64)>,
+) -> Result<NoStoreJson<OrchestratorWorkflowProfile>, ApiError> {
+    state
+        .orchestrator_workflow_profiles
+        .get_revision(&profile_id, version)
         .await
         .map(NoStoreJson)
         .map_err(ApiError::from)
@@ -1127,6 +1179,19 @@ async fn update_project_placement(
     state
         .projects
         .update_placement(&project_id, update)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn update_project_workflow_profile(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(command): Json<UpdateProjectWorkflowProfile>,
+) -> Result<NoStoreJson<Project>, ApiError> {
+    state
+        .projects
+        .update_workflow_profile(&project_id, command)
         .await
         .map(NoStoreJson)
         .map_err(ApiError::from)
@@ -1774,6 +1839,13 @@ impl From<ProjectServiceError> for ApiError {
                 code: "invalid_project",
                 message: error.to_string(),
             },
+            ProjectServiceError::Store(ProjectStoreError::InvalidOrchestratorWorkflowProfile(
+                error,
+            )) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid_orchestrator_workflow_profile",
+                message: error.to_string(),
+            },
             ProjectServiceError::UnsupportedRuntimeAdapter(adapter) => Self {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "unsupported_runtime_adapter",
@@ -1839,6 +1911,22 @@ impl From<ProjectServiceError> for ApiError {
                 code: "project_not_found",
                 message: "Yard project was not found".to_owned(),
             },
+            ProjectServiceError::Store(ProjectStoreError::OrchestratorWorkflowProfileNotFound) => {
+                Self {
+                    status: StatusCode::NOT_FOUND,
+                    code: "orchestrator_workflow_profile_not_found",
+                    message: "Orchestrator workflow profile revision was not found".to_owned(),
+                }
+            }
+            ProjectServiceError::Store(ProjectStoreError::ProjectVersionConflict {
+                current_version,
+            }) => Self {
+                status: StatusCode::CONFLICT,
+                code: "project_version_conflict",
+                message: format!(
+                    "Project changed concurrently; current version is {current_version}"
+                ),
+            },
             ProjectServiceError::Store(ProjectStoreError::VersionConflict { current_version }) => {
                 Self {
                     status: StatusCode::CONFLICT,
@@ -1882,6 +1970,14 @@ impl From<ProjectServiceError> for ApiError {
                     message,
                 }
             }
+            ProjectServiceError::Store(ProjectStoreError::OrchestratorInterventionInProgress) => {
+                Self {
+                    status: StatusCode::CONFLICT,
+                    code: "orchestrator_intervention_in_progress",
+                    message: "Wait for the pending orchestrator intervention or replacement"
+                        .to_owned(),
+                }
+            }
             ProjectServiceError::Store(ProjectStoreError::RuntimeWorkspaceMismatch) => Self {
                 status: StatusCode::CONFLICT,
                 code: "runtime_workspace_mismatch",
@@ -1908,6 +2004,13 @@ impl From<OrchestratorReplacementServiceError> for ApiError {
             OrchestratorReplacementServiceError::InvalidCommand(error) => Self {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "invalid_orchestrator_replacement",
+                message: error.to_string(),
+            },
+            OrchestratorReplacementServiceError::Store(
+                ProjectStoreError::InvalidOrchestratorWorkflowProfile(error),
+            ) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid_orchestrator_workflow_profile",
                 message: error.to_string(),
             },
             OrchestratorReplacementServiceError::UnsupportedProfile(message) => Self {
@@ -2326,6 +2429,13 @@ impl From<YardOrchestratorServiceError> for ApiError {
                 code: "invalid_yard_orchestrator_command",
                 message: error.to_string(),
             },
+            YardOrchestratorServiceError::Store(
+                ProjectStoreError::InvalidOrchestratorWorkflowProfile(error),
+            ) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid_orchestrator_workflow_profile",
+                message: error.to_string(),
+            },
             YardOrchestratorServiceError::UnsupportedProfile(message) => Self {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "unsupported_worker_profile",
@@ -2335,6 +2445,13 @@ impl From<YardOrchestratorServiceError> for ApiError {
                 status: StatusCode::NOT_FOUND,
                 code: "worker_profile_not_found",
                 message: "Worker profile was not found".to_owned(),
+            },
+            YardOrchestratorServiceError::Store(ProjectStoreError::CommandPreviouslyFailed(
+                message,
+            )) => Self {
+                status: StatusCode::CONFLICT,
+                code: "command_previously_failed",
+                message,
             },
             YardOrchestratorServiceError::Store(
                 error @ (ProjectStoreError::ProfileVersionConflict { .. }
@@ -2353,7 +2470,10 @@ impl From<YardOrchestratorServiceError> for ApiError {
                 code: "yard_orchestrator_provision_failed",
                 message,
             },
-            YardOrchestratorServiceError::RuntimeProvisionAmbiguous(message)
+            YardOrchestratorServiceError::Store(ProjectStoreError::CommandOutcomeAmbiguous(
+                message,
+            ))
+            | YardOrchestratorServiceError::RuntimeProvisionAmbiguous(message)
             | YardOrchestratorServiceError::ObjectiveDeliveryFailed(message) => Self {
                 status: StatusCode::CONFLICT,
                 code: "command_outcome_ambiguous",
@@ -2564,6 +2684,11 @@ fn runtime_intervention_error(error: RuntimeInterventionError) -> ApiError {
 
 fn yard_orchestrator_store_error(error: ProjectStoreError) -> ApiError {
     match error {
+        ProjectStoreError::InvalidOrchestratorWorkflowProfile(error) => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "invalid_orchestrator_workflow_profile",
+            message: error.to_string(),
+        },
         ProjectStoreError::InvalidYardOrchestrator(error) => ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "invalid_yard_orchestrator_command",
@@ -2660,6 +2785,11 @@ fn coordination_store_error(error: ProjectStoreError) -> ApiError {
 
 fn coordination_node_store_error(error: ProjectStoreError) -> ApiError {
     match error {
+        ProjectStoreError::InvalidOrchestratorWorkflowProfile(error) => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "invalid_orchestrator_workflow_profile",
+            message: error.to_string(),
+        },
         ProjectStoreError::InvalidCoordinationNode(error) => ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "invalid_coordination_node_command",
@@ -2797,6 +2927,11 @@ fn automation_store_error(error: ProjectStoreError) -> ApiError {
 #[allow(clippy::too_many_lines)]
 fn intervention_store_error(error: ProjectStoreError) -> ApiError {
     match error {
+        ProjectStoreError::InvalidOrchestratorWorkflowProfile(error) => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "invalid_orchestrator_workflow_profile",
+            message: error.to_string(),
+        },
         ProjectStoreError::InvalidIntervention(error) => ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "invalid_intervention",
@@ -2906,6 +3041,11 @@ fn intervention_store_error(error: ProjectStoreError) -> ApiError {
 
 fn allocation_store_error(error: ProjectStoreError) -> ApiError {
     match error {
+        ProjectStoreError::InvalidOrchestratorWorkflowProfile(error) => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "invalid_orchestrator_workflow_profile",
+            message: error.to_string(),
+        },
         ProjectStoreError::InvalidAssignment(error) => ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "invalid_assignment",
@@ -3154,25 +3294,27 @@ mod tests {
     use yard_domain::{
         AutomationScope, CanvasPlacement, CoordinationNodeKind, CreateAutomation,
         CreateCoordinationNode, CreateWorkerProfile, DailySchedule, FocusObservation,
-        ObservedStatus, ObservedWorker, ProviderSessionRef, ProvisionCoordinationNode,
-        RunAutomationNow, RuntimeInventory, RuntimeSession, RuntimeSessions,
-        UpdateTokenSpendSettings, WorkerProfileSpec, WorkerRuntimeBinding, WorkspaceObservation,
-        WorktreeObservation,
+        ObservedStatus, ObservedWorker, OrchestratorWorkflowProfileValidationError,
+        ProviderSessionRef, ProvisionCoordinationNode, RunAutomationNow, RuntimeInventory,
+        RuntimeSession, RuntimeSessions, UpdateTokenSpendSettings, WorkerProfileSpec,
+        WorkerRuntimeBinding, WorkspaceObservation, WorktreeObservation,
     };
     use yard_herdr::HerdrError;
-    use yard_store::{SqliteProjectStore, YardStore};
+    use yard_store::{ProjectStoreError, SqliteProjectStore, YardStore};
 
     use super::{ApiError, router, runtime_intervention_error, test_router_with_shutdown};
     use crate::allocation_service::{
         AllocationServiceError, RuntimeControl, RuntimeProvisionError, RuntimeProvisionRequest,
-        RuntimeRetirementError, RuntimeRetirementRequest, RuntimeWorkspaceProvisionRequest,
+        RuntimeRetirementError, RuntimeRetirementRequest, RuntimeSessionRequest,
+        RuntimeWorkspaceProvisionRequest,
     };
     use crate::artifact_service::ArtifactService;
     use crate::automation_service::AutomationService;
     use crate::coordination_node_service::{CoordinationNodeService, CoordinationNodeServiceError};
     use crate::intervention_service::{
-        InterventionService, RuntimeIntervention, RuntimeInterventionError, RuntimeOutputRequest,
-        RuntimeOutputResult, RuntimePromptRequest, RuntimePromptResult,
+        InterventionService, InterventionServiceError, RuntimeIntervention,
+        RuntimeInterventionError, RuntimeOutputRequest, RuntimeOutputResult, RuntimePromptRequest,
+        RuntimePromptResult,
     };
     use crate::inventory_service::{InventoryServiceError, InventorySource};
     use crate::orchestrator_replacement_service::OrchestratorReplacementServiceError;
@@ -3221,6 +3363,29 @@ mod tests {
         for error in errors {
             assert_eq!(error.status, StatusCode::CONFLICT);
             assert_eq!(error.code, "command_outcome_ambiguous");
+        }
+    }
+
+    #[test]
+    fn invalid_structured_workflow_profiles_map_to_unprocessable_entity() {
+        fn invalid_profile() -> ProjectStoreError {
+            ProjectStoreError::InvalidOrchestratorWorkflowProfile(
+                OrchestratorWorkflowProfileValidationError::InvalidCommand,
+            )
+        }
+
+        let errors = [
+            ApiError::from(ProjectServiceError::Store(invalid_profile())),
+            ApiError::from(OrchestratorReplacementServiceError::Store(invalid_profile())),
+            ApiError::from(YardOrchestratorServiceError::Store(invalid_profile())),
+            ApiError::from(InterventionServiceError::Store(invalid_profile())),
+            ApiError::from(AllocationServiceError::Store(invalid_profile())),
+            ApiError::from(CoordinationNodeServiceError::Store(invalid_profile())),
+        ];
+
+        for error in errors {
+            assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(error.code, "invalid_orchestrator_workflow_profile");
         }
     }
 
@@ -3721,6 +3886,13 @@ mod tests {
 
     #[async_trait]
     impl RuntimeControl for AmbiguousBootstrapRuntime {
+        async fn ensure_session(
+            &self,
+            _request: RuntimeSessionRequest,
+        ) -> Result<(), RuntimeProvisionError> {
+            Ok(())
+        }
+
         async fn bootstrap_worker(
             &self,
             _request: RuntimeWorkspaceProvisionRequest,
@@ -3731,6 +3903,38 @@ mod tests {
                 ambiguous: true,
                 started_runtime: None,
             })
+        }
+
+        async fn provision_worker(
+            &self,
+            request: RuntimeProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            FakeRuntime.provision_worker(request).await
+        }
+    }
+
+    #[derive(Default)]
+    struct FailedPreparationRuntime {
+        preparation_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RuntimeControl for FailedPreparationRuntime {
+        async fn ensure_session(
+            &self,
+            _request: RuntimeSessionRequest,
+        ) -> Result<(), RuntimeProvisionError> {
+            Ok(())
+        }
+
+        async fn bootstrap_worker(
+            &self,
+            _request: RuntimeWorkspaceProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            self.preparation_calls.fetch_add(1, Ordering::SeqCst);
+            Err(RuntimeProvisionError::BeforeWorker(
+                "Herdr rejected the workspace preparation".to_owned(),
+            ))
         }
 
         async fn provision_worker(
@@ -4684,6 +4888,31 @@ mod tests {
         assert_eq!(settings["scheduled_automatic_summaries"], false);
     }
 
+    async fn update_standard_workflow(app: &Router, expected_version: &str) -> serde_json::Value {
+        response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri("/api/v1/orchestrator-workflow-profile")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "actor": "local-user",
+                                "expected_version": expected_version,
+                                "instructions_markdown": "# Custom workflow\n\nUse two lanes.",
+                                "monitor_interval_ms": "900000"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await
+    }
+
     async fn create_active_assignment(app: &Router) -> (String, String) {
         let project = response_json(
             app.clone()
@@ -5012,6 +5241,17 @@ mod tests {
             "replacement start was reached before the prepared snapshot committed"
         );
         assert_eq!(runtime.start_calls.load(Ordering::SeqCst), 1);
+        {
+            let requests = runtime.start_requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                requests[0]
+                    .prompt
+                    .contains("Yard orchestrator workflow profile yard:standard-orchestrator")
+            );
+            assert!(requests[0].prompt.contains("Allocate independent workers"));
+            assert!(requests[0].prompt.contains("command \"replace-command-1\""));
+        }
         {
             let retirements = runtime.retirement_calls.lock().unwrap();
             assert_eq!(retirements.len(), 1);
@@ -5610,6 +5850,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         let requests = runtime.start_requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .prompt
+                .contains("Yard orchestrator workflow profile yard:standard-orchestrator")
+        );
+        assert!(requests[0].prompt.contains("Allocate independent workers"));
         assert!(requests[0].prompt.contains("command \"handoff-command-1\""));
         assert!(requests[0].prompt.contains("There is no completed state"));
         assert!(
@@ -6384,6 +6630,12 @@ mod tests {
                     .prompt
                     .contains("command \"profile-project-command\"")
             );
+            assert!(
+                requests[0]
+                    .prompt
+                    .contains("workflow profile yard:standard-orchestrator revision 1")
+            );
+            assert!(requests[0].prompt.contains("Allocate independent workers"));
             assert!(requests[0].prompt.contains("There is no completed state"));
             assert!(
                 yard_domain::OrchestratorStatusReport::scan_terminal_output(&requests[0].prompt)
@@ -6792,6 +7044,12 @@ mod tests {
                     .prompt
                     .contains("command \"workspace-project-command\"")
             );
+            assert!(
+                requests[0]
+                    .prompt
+                    .contains("workflow profile yard:standard-orchestrator revision 1")
+            );
+            assert!(requests[0].prompt.contains("Allocate independent workers"));
             assert!(requests[0].prompt.contains("There is no completed state"));
             assert!(
                 yard_domain::OrchestratorStatusReport::scan_terminal_output(&requests[0].prompt)
@@ -7580,7 +7838,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gets_updates_resets_and_conflicts_orchestrator_workflow_profile() {
+    #[allow(clippy::too_many_lines)]
+    async fn gets_updates_and_repins_orchestrator_workflow_profile() {
         let (app, _temp) = test_router().await;
         let factory = response_json(
             app.clone()
@@ -7595,27 +7854,103 @@ mod tests {
         )
         .await;
         assert_eq!(factory["version"], "1");
+        assert_eq!(factory["id"], "yard:standard-orchestrator");
+        assert_eq!(factory["name"], "Yard Standard Orchestrator");
         assert_eq!(factory["monitor_interval_ms"], "600000");
+        assert_eq!(
+            factory["commands"],
+            serde_json::json!([
+                {
+                    "id": "work.decompose",
+                    "capability": "orchestration.work.decompose"
+                },
+                {
+                    "id": "worker.allocate",
+                    "capability": "orchestration.worker.allocate"
+                },
+                {
+                    "id": "worker.observe",
+                    "capability": "orchestration.worker.observe"
+                },
+                {
+                    "id": "worker.intervene",
+                    "capability": "orchestration.worker.prompt"
+                },
+                {
+                    "id": "result.collect",
+                    "capability": "orchestration.result.collect"
+                },
+                {
+                    "id": "quality.review",
+                    "capability": "orchestration.quality.review"
+                },
+                {
+                    "id": "result.reconcile",
+                    "capability": "orchestration.result.reconcile"
+                },
+                {
+                    "id": "result.integrate",
+                    "capability": "orchestration.result.integrate"
+                },
+                {
+                    "id": "result.verify",
+                    "capability": "orchestration.result.verify"
+                }
+            ])
+        );
+        assert_eq!(factory["adapter_context_files"], serde_json::json!([]));
         assert!(
             factory["instructions_markdown"]
                 .as_str()
                 .unwrap()
-                .contains("one Yard/Herdr worker per lane")
+                .contains("Allocate independent workers")
         );
+        let catalog = get_json(&app, "/api/v1/orchestrator-workflow-profiles").await;
+        assert_eq!(catalog["profiles"].as_array().unwrap().len(), 1);
+        assert_eq!(catalog["profiles"][0]["id"], "yard:standard-orchestrator");
 
-        let edited = response_json(
+        let created = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/projects")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(create_body("terminal-1")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let project_id = created["id"].as_str().unwrap();
+        assert_eq!(created["workflow_profile"]["profile_version"], "1");
+
+        let edited = update_standard_workflow(&app, factory["version"].as_str().unwrap()).await;
+        assert_eq!(edited["version"], "2");
+        assert_eq!(edited["source"], "user");
+        let pinned = get_json(&app, &format!("/api/v1/projects/{project_id}")).await;
+        assert_eq!(pinned["workflow_profile"]["profile_version"], "1");
+        let revision = get_json(
+            &app,
+            "/api/v1/orchestrator-workflow-profiles/yard:standard-orchestrator/revisions/1",
+        )
+        .await;
+        assert_eq!(revision["source"], "factory");
+
+        let repinned = response_json(
             app.clone()
                 .oneshot(
                     Request::builder()
                         .method(Method::PUT)
-                        .uri("/api/v1/orchestrator-workflow-profile")
+                        .uri(format!("/api/v1/projects/{project_id}/workflow-profile"))
                         .header(header::CONTENT_TYPE, "application/json")
                         .body(Body::from(
                             serde_json::json!({
                                 "actor": "local-user",
-                                "expected_version": factory["version"],
-                                "instructions_markdown": "# Custom workflow\n\nUse two lanes.",
-                                "monitor_interval_ms": "900000"
+                                "expected_project_version": pinned["version"],
+                                "profile_id": "yard:standard-orchestrator",
+                                "profile_version": edited["version"]
                             })
                             .to_string(),
                         ))
@@ -7625,8 +7960,16 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(edited["version"], "2");
-        assert_eq!(edited["source"], "user");
+        assert_eq!(repinned["workflow_profile"]["profile_version"], "2");
+        assert_eq!(repinned["workflow_profile"]["pinned_by"], "local-user");
+        assert_automatic_token_spend_defaults_off(&app).await;
+    }
+
+    #[tokio::test]
+    async fn resets_and_conflicts_orchestrator_workflow_profile() {
+        let (app, _temp) = test_router().await;
+        let factory = get_json(&app, "/api/v1/orchestrator-workflow-profile").await;
+        let edited = update_standard_workflow(&app, factory["version"].as_str().unwrap()).await;
 
         let stale = app
             .clone()
@@ -7679,7 +8022,7 @@ mod tests {
             reset["instructions_markdown"]
                 .as_str()
                 .unwrap()
-                .contains("Automatic token-spending behavior remains opt-in")
+                .contains("independent durable settings")
         );
         assert_automatic_token_spend_defaults_off(&app).await;
     }
@@ -9389,6 +9732,148 @@ mod tests {
         assert_eq!(replayed["replayed"], true);
     }
 
+    #[tokio::test]
+    async fn ambiguous_yard_provision_replay_stays_a_fail_closed_conflict() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(AmbiguousBootstrapRuntime::default());
+        let interactive = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            Arc::new(FakeInventory),
+            runtime.clone(),
+            interactive.clone(),
+            interactive,
+            store,
+            artifacts,
+        );
+        let profile = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/worker-profiles")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(profile_body("Central coordinator")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let command = serde_json::json!({
+            "command_id": "ambiguous-yard-provision",
+            "actor": "local-user",
+            "profile_id": profile["id"],
+            "expected_profile_version": profile["version"],
+            "expected_orchestrator_version": "1",
+        });
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/yard/orchestrator")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(command.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                response_json(response).await["error"]["code"],
+                "command_outcome_ambiguous"
+            );
+        }
+        assert_eq!(runtime.bootstrap_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_yard_provision_replay_stays_a_terminal_conflict() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(FailedPreparationRuntime::default());
+        let interactive = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            Arc::new(FakeInventory),
+            runtime.clone(),
+            interactive.clone(),
+            interactive,
+            store,
+            artifacts,
+        );
+        let profile = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/worker-profiles")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(profile_body("Central coordinator")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let command = serde_json::json!({
+            "command_id": "failed-yard-provision",
+            "actor": "local-user",
+            "profile_id": profile["id"],
+            "expected_profile_version": profile["version"],
+            "expected_orchestrator_version": "1",
+        });
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/yard/orchestrator")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response_json(first).await["error"]["code"],
+            "yard_orchestrator_provision_failed"
+        );
+        assert_eq!(runtime.preparation_calls.load(Ordering::SeqCst), 1);
+
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/yard/orchestrator")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(replay).await["error"]["code"],
+            "command_previously_failed"
+        );
+        assert_eq!(runtime.preparation_calls.load(Ordering::SeqCst), 1);
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn delivers_runtime_only_contract_and_exposes_observational_status_reports() {
@@ -9720,13 +10205,17 @@ mod tests {
                     .text
                     .contains("Assume ownership of central Yard orchestration")
             );
-            assert!(prompts[0].text.contains("one Yard/Herdr worker per lane"));
+            assert!(prompts[0].text.contains("Allocate independent workers"));
             for (request, command_id, raw) in [
                 (&prompts[1], "runtime-project-prompt", project_prompt_text),
                 (&prompts[3], "runtime-yard-route", route_prompt_text),
             ] {
                 assert_eq!(request.command_id, command_id);
-                assert!(request.text.starts_with(raw));
+                assert!(request.text.starts_with(
+                    "Yard orchestrator workflow profile yard:standard-orchestrator revision 1"
+                ));
+                assert!(request.text.contains(raw));
+                assert!(request.text.contains("Allocate independent workers"));
                 assert!(request.text.contains(&format!("command \"{command_id}\"")));
                 assert!(request.text.contains("There is no completed state"));
                 assert!(
@@ -9736,13 +10225,11 @@ mod tests {
             }
             let yard_prompt = &prompts[2];
             assert_eq!(yard_prompt.command_id, "runtime-yard-prompt");
-            assert!(
-                yard_prompt
-                    .text
-                    .starts_with("Yard orchestrator workflow profile revision 1")
-            );
+            assert!(yard_prompt.text.starts_with(
+                "Yard orchestrator workflow profile yard:standard-orchestrator revision 1",
+            ));
             assert!(yard_prompt.text.contains(yard_prompt_text));
-            assert!(yard_prompt.text.contains("one Yard/Herdr worker per lane"));
+            assert!(yard_prompt.text.contains("Allocate independent workers"));
             assert!(!yard_prompt.text.contains("# New-current workflow"));
             assert!(yard_prompt.text.contains("command \"runtime-yard-prompt\""));
             assert!(yard_prompt.text.contains("There is no completed state"));
@@ -9908,6 +10395,267 @@ mod tests {
             )
             .unwrap();
         assert_eq!(prompt_count, 1);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn project_workflow_repin_maps_pending_prompt_guard_to_conflict() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let source = Arc::new(FakeInventory);
+        let control = Arc::new(FakeRuntime);
+        let (reporting, prompt_entered, release_prompt) = ReportingRuntime::blocked();
+        let reporting = Arc::new(reporting);
+        let terminal = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            source,
+            control,
+            reporting.clone(),
+            terminal,
+            store,
+            artifacts,
+        );
+        let project = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/projects")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(create_body("terminal-1")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let project_id = project["id"].as_str().unwrap().to_owned();
+        let workflow = get_json(&app, "/api/v1/orchestrator-workflow-profile").await;
+        let updated = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri("/api/v1/orchestrator-workflow-profile")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "actor": "local-user",
+                                "expected_version": workflow["version"],
+                                "instructions_markdown": "# Guarded repin target",
+                                "monitor_interval_ms": "900000"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let prompt = serde_json::json!({
+            "command_id": "prompt-holds-workflow-repin",
+            "actor": "local-user",
+            "expected_project_version": project["version"],
+            "orchestrator_worker_id": project["orchestrator"]["id"],
+            "text": "Hold this workflow pin."
+        });
+        let prompt_app = app.clone();
+        let prompt_project_id = project_id.clone();
+        let request = tokio::spawn(async move {
+            prompt_app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!(
+                            "/api/v1/projects/{prompt_project_id}/orchestrator/prompts"
+                        ))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(prompt.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        prompt_entered.notified().await;
+
+        let repin = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/api/v1/projects/{project_id}/workflow-profile"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "actor": "local-user",
+                            "expected_project_version": project["version"],
+                            "profile_id": updated["id"],
+                            "profile_version": updated["version"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repin.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(repin).await["error"]["code"],
+            "orchestrator_intervention_in_progress"
+        );
+
+        release_prompt.notify_one();
+        assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(reporting.prompts.lock().unwrap().len(), 1);
+        assert_eq!(
+            get_json(&app, &format!("/api/v1/projects/{project_id}")).await["workflow_profile"]["profile_version"],
+            project["workflow_profile"]["profile_version"]
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn acknowledged_project_prompt_fails_ambiguous_after_workflow_pin_changes() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let source = Arc::new(FakeInventory);
+        let control = Arc::new(FakeRuntime);
+        let (reporting, prompt_entered, release_prompt) = ReportingRuntime::blocked();
+        let reporting = Arc::new(reporting);
+        let terminal = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            source,
+            control,
+            reporting.clone(),
+            terminal,
+            store,
+            artifacts,
+        );
+        let project = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/projects")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(create_body("terminal-1")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let project_id = project["id"].as_str().unwrap().to_owned();
+        let workflow = get_json(&app, "/api/v1/orchestrator-workflow-profile").await;
+        let updated = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri("/api/v1/orchestrator-workflow-profile")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "actor": "local-user",
+                                "expected_version": workflow["version"],
+                                "instructions_markdown": "# Concurrent repin target",
+                                "monitor_interval_ms": "900000"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let updated_version = updated["version"]
+            .as_str()
+            .map(str::parse::<i64>)
+            .transpose()
+            .unwrap()
+            .or_else(|| updated["version"].as_i64())
+            .unwrap();
+        let prompt = serde_json::json!({
+            "command_id": "prompt-crossing-workflow-repin",
+            "actor": "local-user",
+            "expected_project_version": project["version"],
+            "orchestrator_worker_id": project["orchestrator"]["id"],
+            "text": "Do not record old workflow success."
+        });
+        let prompt_app = app.clone();
+        let prompt_uri = format!("/api/v1/projects/{project_id}/orchestrator/prompts");
+        let request = tokio::spawn(async move {
+            prompt_app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(prompt_uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(prompt.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        prompt_entered.notified().await;
+
+        let mut connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "UPDATE project_workflow_profile_pins
+                    SET profile_version = ?1,
+                        pinned_by = 'audit-race',
+                        pinned_at_unix_ms = pinned_at_unix_ms + 1
+                  WHERE project_id = ?2",
+                rusqlite::params![updated_version, project_id],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE projects
+                    SET version = version + 1,
+                        updated_at_unix_ms = updated_at_unix_ms + 1
+                  WHERE id = ?1",
+                [&project_id],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        release_prompt.notify_one();
+
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "command_outcome_ambiguous"
+        );
+        assert_eq!(reporting.prompts.lock().unwrap().len(), 1);
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status
+                       FROM command_acknowledgements
+                      WHERE id = 'prompt-crossing-workflow-repin'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "ambiguous"
+        );
     }
 
     #[allow(clippy::too_many_lines)]
@@ -10492,7 +11240,7 @@ mod tests {
                     .text
                     .contains("Assume ownership of central Yard orchestration")
             );
-            assert!(prompts[0].text.contains("one Yard/Herdr worker per lane"));
+            assert!(prompts[0].text.contains("Allocate independent workers"));
             prompts.clear();
         }
 

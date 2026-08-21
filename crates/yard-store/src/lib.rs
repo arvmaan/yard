@@ -35,9 +35,10 @@ use yard_domain::{
     CreatedProjectRelationship, DeleteProjectRelationship, DeletedProjectRelationship,
     EndWorkerSession, EndedWorkerSession, HandoffTargetRole, IsolationPolicy, ObservedStatus,
     ObservedWorker, OldSessionDisposition, OrchestratorPromptAcknowledgement,
-    OrchestratorWorkflowProfile, PaneObservation, PreparedAgentProfile, Project, ProjectPlacement,
-    ProjectRelationship, ProjectRelationshipKind, ProjectRelationships, ProjectRuntimeBinding,
-    Projects, ProviderSessionRef, ProvisionCoordinationNode, ProvisionYardOrchestrator,
+    OrchestratorWorkflowProfile, OrchestratorWorkflowProfiles, PaneObservation,
+    PreparedAgentProfile, Project, ProjectPlacement, ProjectRelationship, ProjectRelationshipKind,
+    ProjectRelationships, ProjectRuntimeBinding, ProjectWorkflowProfilePin, Projects,
+    ProviderSessionRef, ProvisionCoordinationNode, ProvisionYardOrchestrator,
     RecordCompletionReceipt, RecordedCompletionReceipt, ReplaceProjectOrchestrator,
     ReplacedProjectOrchestrator, RequestCoordinationSnapshot, ResetOrchestratorWorkflowProfile,
     RunAutomationNow, RuntimeInventory, RuntimeObservationState, RuntimeProcessState,
@@ -47,9 +48,10 @@ use yard_domain::{
     TransferProjectOrchestrator, TransferredProjectOrchestrator, UpdateAgentProfile,
     UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
     UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
-    UpdateTokenSpendSettings, UpdateWorkerProfile, Worker, WorkerAllocation, WorkerAvailability,
-    WorkerCandidate, WorkerCandidates, WorkerDesiredState, WorkerProfile, WorkerProfileSpec,
-    WorkerProfiles, WorkerRuntimeBinding, YardOrchestrator, YardOrchestratorPromptAcknowledgement,
+    UpdateProjectWorkflowProfile, UpdateTokenSpendSettings, UpdateWorkerProfile, Worker,
+    WorkerAllocation, WorkerAvailability, WorkerCandidate, WorkerCandidates, WorkerDesiredState,
+    WorkerProfile, WorkerProfileSpec, WorkerProfiles, WorkerRuntimeBinding,
+    YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator, YardOrchestratorPromptAcknowledgement,
     YardOrchestratorRoute, YardOrchestratorRoutes,
 };
 
@@ -58,7 +60,7 @@ mod coordination_node_store;
 mod orchestrator_workflow_profile_store;
 mod token_spend_store;
 
-const SCHEMA_VERSION: i64 = 25;
+const SCHEMA_VERSION: i64 = 26;
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_projects.sql");
 const PROFILE_ASSIGNMENT_MIGRATION: &str =
     include_str!("../migrations/0002_profiles_assignments.sql");
@@ -101,6 +103,10 @@ const ORCHESTRATOR_REPLACEMENT_RECOVERY_MIGRATION: &str =
     include_str!("../migrations/0024_orchestrator_replacement_recovery.sql");
 const FINAL_BACKEND_SAFETY_MIGRATION: &str =
     include_str!("../migrations/0025_final_backend_safety.sql");
+const PROVIDER_NEUTRAL_WORKFLOW_PROFILES_MIGRATION: &str =
+    include_str!("../migrations/0026_provider_neutral_workflow_profiles.sql");
+const PROVIDER_NEUTRAL_WORKFLOW_PROFILE_INTEGRITY_MIGRATION: &str =
+    include_str!("../migrations/0026_provider_neutral_workflow_profile_integrity.sql");
 const BLANK_WORKER_PROFILE_ID: &str = "yard:managed-blank-profile";
 const BLANK_WORKER_PROFILE_NAME: &str = "Blank profile";
 const MAX_ROUTE_LIST_LIMIT: usize = 500;
@@ -109,19 +115,29 @@ const CLEANUP_OWNERSHIP_RETRY_CAP_MS: u64 = 60 * 60_000;
 
 #[async_trait]
 pub trait YardStore: Send + Sync {
+    async fn list_orchestrator_workflow_profiles(
+        &self,
+    ) -> Result<OrchestratorWorkflowProfiles, ProjectStoreError>;
     async fn get_orchestrator_workflow_profile(
         &self,
     ) -> Result<OrchestratorWorkflowProfile, ProjectStoreError>;
+    async fn get_orchestrator_workflow_profile_by_id(
+        &self,
+        profile_id: &str,
+    ) -> Result<OrchestratorWorkflowProfile, ProjectStoreError>;
     async fn get_orchestrator_workflow_profile_revision(
         &self,
+        profile_id: &str,
         version: u64,
     ) -> Result<OrchestratorWorkflowProfile, ProjectStoreError>;
     async fn update_orchestrator_workflow_profile(
         &self,
+        profile_id: &str,
         command: UpdateOrchestratorWorkflowProfile,
     ) -> Result<OrchestratorWorkflowProfile, ProjectStoreError>;
     async fn reset_orchestrator_workflow_profile(
         &self,
+        profile_id: &str,
         command: ResetOrchestratorWorkflowProfile,
     ) -> Result<OrchestratorWorkflowProfile, ProjectStoreError>;
     async fn get_token_spend_settings(&self) -> Result<TokenSpendSettings, ProjectStoreError>;
@@ -318,6 +334,10 @@ pub trait YardStore: Send + Sync {
         &self,
         command: ProvisionYardOrchestrator,
     ) -> Result<(), ProjectStoreError>;
+    async fn replay_yard_orchestrator_configuration(
+        &self,
+        command: ConfigureYardOrchestrator,
+    ) -> Result<Option<ConfiguredYardOrchestrator>, ProjectStoreError>;
     async fn configure_yard_orchestrator(
         &self,
         command: ConfigureYardOrchestrator,
@@ -334,6 +354,11 @@ pub trait YardStore: Send + Sync {
         command: DeleteProjectRelationship,
     ) -> Result<DeletedProjectRelationship, ProjectStoreError>;
     async fn get_project(&self, project_id: &str) -> Result<Project, ProjectStoreError>;
+    async fn update_project_workflow_profile(
+        &self,
+        project_id: &str,
+        command: UpdateProjectWorkflowProfile,
+    ) -> Result<Project, ProjectStoreError>;
     async fn replay_project_orchestrator_transfer(
         &self,
         project_id: &str,
@@ -714,6 +739,7 @@ pub enum BeginProfileProjectCreation {
 pub struct ProfileProjectCreationContext {
     pub command: CreateProjectFromProfile,
     pub profile: WorkerProfile,
+    pub workflow_profile: OrchestratorWorkflowProfile,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -726,6 +752,7 @@ pub enum BeginWorkspaceProjectCreation {
 pub struct WorkspaceProjectCreationContext {
     pub command: CreateWorkspaceProjectFromProfile,
     pub profile: WorkerProfile,
+    pub workflow_profile: OrchestratorWorkflowProfile,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -756,6 +783,7 @@ pub struct WorkerHandoffContext {
     pub target_project: Project,
     pub source_assignment: Assignment,
     pub profile: WorkerProfile,
+    pub workflow_profile: OrchestratorWorkflowProfile,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -769,6 +797,7 @@ pub struct ProjectOrchestratorReplacementContext {
     pub command: ReplaceProjectOrchestrator,
     pub project: Project,
     pub profile: WorkerProfile,
+    pub workflow_profile: OrchestratorWorkflowProfile,
     pub prepare_tab_label: String,
 }
 
@@ -914,6 +943,7 @@ pub enum BeginCoordinationNodeRoute {
         command: SendCoordinationNodeRoute,
         node: Box<CoordinationNode>,
         target_project: Box<Project>,
+        workflow_profile: Box<OrchestratorWorkflowProfile>,
     },
     Replayed(CoordinationNodeRoute),
 }
@@ -1310,31 +1340,47 @@ impl SqliteProjectStore {
 #[allow(clippy::too_many_lines)]
 #[async_trait]
 impl YardStore for SqliteProjectStore {
+    async fn list_orchestrator_workflow_profiles(
+        &self,
+    ) -> Result<OrchestratorWorkflowProfiles, ProjectStoreError> {
+        orchestrator_workflow_profile_store::list(self).await
+    }
+
     async fn get_orchestrator_workflow_profile(
         &self,
     ) -> Result<OrchestratorWorkflowProfile, ProjectStoreError> {
         orchestrator_workflow_profile_store::get_current(self).await
     }
 
+    async fn get_orchestrator_workflow_profile_by_id(
+        &self,
+        profile_id: &str,
+    ) -> Result<OrchestratorWorkflowProfile, ProjectStoreError> {
+        orchestrator_workflow_profile_store::get_current_by_id(self, profile_id).await
+    }
+
     async fn get_orchestrator_workflow_profile_revision(
         &self,
+        profile_id: &str,
         version: u64,
     ) -> Result<OrchestratorWorkflowProfile, ProjectStoreError> {
-        orchestrator_workflow_profile_store::get_revision(self, version).await
+        orchestrator_workflow_profile_store::get_revision(self, profile_id, version).await
     }
 
     async fn update_orchestrator_workflow_profile(
         &self,
+        profile_id: &str,
         command: UpdateOrchestratorWorkflowProfile,
     ) -> Result<OrchestratorWorkflowProfile, ProjectStoreError> {
-        orchestrator_workflow_profile_store::update(self, command).await
+        orchestrator_workflow_profile_store::update(self, profile_id, command).await
     }
 
     async fn reset_orchestrator_workflow_profile(
         &self,
+        profile_id: &str,
         command: ResetOrchestratorWorkflowProfile,
     ) -> Result<OrchestratorWorkflowProfile, ProjectStoreError> {
-        orchestrator_workflow_profile_store::reset(self, command).await
+        orchestrator_workflow_profile_store::reset(self, profile_id, command).await
     }
 
     async fn get_token_spend_settings(&self) -> Result<TokenSpendSettings, ProjectStoreError> {
@@ -1907,14 +1953,18 @@ impl YardStore for SqliteProjectStore {
                     .unwrap_or(current.workflow_profile_version)
             } else {
                 command.workflow_profile_version.unwrap_or(
-                    orchestrator_workflow_profile_store::select_current_version(&transaction)?,
+                    orchestrator_workflow_profile_store::select_current_version(
+                        &transaction,
+                        YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                    )?,
                 )
             };
             if is_current && workflow_profile_version != current.workflow_profile_version {
                 return Err(ProjectStoreError::IdempotencyConflict);
             }
-            orchestrator_workflow_profile_store::select_revision(
+            orchestrator_workflow_profile_store::select_executable_revision(
                 &transaction,
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
                 workflow_profile_version,
             )?;
             if !is_current && candidate.availability != WorkerAvailability::UnassignedLive {
@@ -2058,6 +2108,66 @@ impl YardStore for SqliteProjectStore {
                 select_configured_yard_orchestrator(&transaction, &command.command_id, false)?;
             transaction.commit()?;
             Ok(configured)
+        })
+        .await
+    }
+
+    async fn replay_yard_orchestrator_configuration(
+        &self,
+        command: ConfigureYardOrchestrator,
+    ) -> Result<Option<ConfiguredYardOrchestrator>, ProjectStoreError> {
+        let command = command.normalize()?;
+        self.run(move |connection| {
+            let existing = connection
+                .query_row(
+                    "SELECT yocc.worker_id, yocc.expected_worker_version,
+                            yocc.expected_orchestrator_version,
+                            yocc.workflow_profile_version, ca.actor
+                       FROM yard_orchestrator_configure_commands yocc
+                       JOIN command_acknowledgements ca
+                         ON ca.id = yocc.command_id
+                      WHERE yocc.command_id = ?1",
+                    [&command.command_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row_u64(row, 1)?,
+                            row_u64(row, 2)?,
+                            row_u64(row, 3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                worker_id,
+                expected_worker_version,
+                expected_orchestrator_version,
+                workflow_profile_version,
+                actor,
+            )) = existing
+            else {
+                if command_id_exists(connection, &command.command_id)? {
+                    return Err(ProjectStoreError::IdempotencyConflict);
+                }
+                return Ok(None);
+            };
+            let expected_worker_version_matches = expected_worker_version
+                == command.expected_worker_version
+                || select_worker_candidate(connection, &worker_id)?.is_some_and(|candidate| {
+                    candidate.worker.version == command.expected_worker_version
+                });
+            if worker_id != command.worker_id
+                || !expected_worker_version_matches
+                || expected_orchestrator_version != command.expected_orchestrator_version
+                || command
+                    .workflow_profile_version
+                    .is_some_and(|version| version != workflow_profile_version)
+                || actor != command.actor
+            {
+                return Err(ProjectStoreError::IdempotencyConflict);
+            }
+            select_configured_yard_orchestrator(connection, &command.command_id, true).map(Some)
         })
         .await
     }
@@ -2293,6 +2403,73 @@ impl YardStore for SqliteProjectStore {
         let project_id = required_id(project_id)?;
         self.run(move |connection| select_project(connection, &project_id))
             .await
+    }
+
+    async fn update_project_workflow_profile(
+        &self,
+        project_id: &str,
+        command: UpdateProjectWorkflowProfile,
+    ) -> Result<Project, ProjectStoreError> {
+        let project_id = required_id(project_id)?;
+        let command = command.normalize()?;
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = select_project(&transaction, &project_id)?;
+            if current.version != command.expected_project_version {
+                return Err(ProjectStoreError::ProjectVersionConflict {
+                    current_version: current.version,
+                });
+            }
+            reject_project_orchestrator_intervention(&transaction, &project_id, None)?;
+            orchestrator_workflow_profile_store::select_executable_revision(
+                &transaction,
+                &command.profile_id,
+                command.profile_version,
+            )?;
+            let next_version = current
+                .version
+                .checked_add(1)
+                .ok_or(ProjectStoreError::VersionOverflow)?;
+            let now = unix_time_ms()?;
+            transaction.execute(
+                "UPDATE project_workflow_profile_pins
+                    SET profile_id = ?1, profile_version = ?2,
+                        pinned_by = ?3, pinned_at_unix_ms = ?4
+                  WHERE project_id = ?5",
+                params![
+                    command.profile_id,
+                    to_i64(command.profile_version)?,
+                    command.actor,
+                    to_i64(now)?,
+                    project_id,
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE projects
+                    SET version = ?1, updated_at_unix_ms = ?2
+                  WHERE id = ?3 AND version = ?4",
+                params![
+                    to_i64(next_version)?,
+                    to_i64(now)?,
+                    project_id,
+                    to_i64(current.version)?,
+                ],
+            )?;
+            insert_lifecycle_event(
+                &transaction,
+                "project",
+                &project_id,
+                next_version,
+                "workflow_profile_pinned",
+                &command.actor,
+                now,
+            )?;
+            let project = select_project(&transaction, &project_id)?;
+            transaction.commit()?;
+            Ok(project)
+        })
+        .await
     }
 
     async fn replay_project_orchestrator_transfer(
@@ -2663,6 +2840,11 @@ impl YardStore for SqliteProjectStore {
                 select_reusable_runtime_worker(&transaction, &orchestrator_runtime)?;
             let create_worker = reusable_worker_id.is_none();
             let worker_id = reusable_worker_id.unwrap_or_else(|| Uuid::now_v7().to_string());
+            let workflow_profile_version =
+                orchestrator_workflow_profile_store::select_current_version(
+                    &transaction,
+                    YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                )?;
             let now = unix_time_ms()?;
             insert_project_aggregate(
                 &transaction,
@@ -2674,6 +2856,11 @@ impl YardStore for SqliteProjectStore {
                 None,
                 "adopt_existing",
                 None,
+                (
+                    YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                    workflow_profile_version,
+                    "yard:project-adoption",
+                ),
                 now,
             )
             .map_err(map_project_insert_error)?;
@@ -2734,6 +2921,16 @@ impl YardStore for SqliteProjectStore {
                 &command.profile_id,
                 command.expected_profile_version,
             )?;
+            let workflow_profile_version =
+                orchestrator_workflow_profile_store::select_current_version(
+                    &transaction,
+                    YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                )?;
+            let workflow_profile = orchestrator_workflow_profile_store::select_executable_revision(
+                &transaction,
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                workflow_profile_version,
+            )?;
             let now = unix_time_ms()?;
             transaction.execute(
                 "INSERT INTO command_acknowledgements (
@@ -2750,10 +2947,11 @@ impl YardStore for SqliteProjectStore {
                     runtime_workspace_id, profile_id, profile_version,
                     orchestrator_objective, canvas_x, canvas_y, canvas_width,
                     canvas_height, result_project_id, result_worker_id,
-                    finished_at_unix_ms
+                    finished_at_unix_ms, workflow_profile_id,
+                    workflow_profile_version
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    NULL, NULL, NULL
+                    NULL, NULL, NULL, ?13, ?14
                  )",
                 params![
                     command.command_id,
@@ -2768,11 +2966,17 @@ impl YardStore for SqliteProjectStore {
                     command.placement.y,
                     command.placement.width,
                     command.placement.height,
+                    YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                    to_i64(workflow_profile_version)?,
                 ],
             )?;
             transaction.commit()?;
             Ok(BeginProfileProjectCreation::Started(Box::new(
-                ProfileProjectCreationContext { command, profile },
+                ProfileProjectCreationContext {
+                    command,
+                    profile,
+                    workflow_profile,
+                },
             )))
         })
         .await
@@ -2802,6 +3006,11 @@ impl YardStore for SqliteProjectStore {
             {
                 return Err(ProjectStoreError::RuntimeWorkspaceMismatch);
             }
+            orchestrator_workflow_profile_store::select_executable_revision(
+                &transaction,
+                &command.workflow_profile_id,
+                command.workflow_profile_version,
+            )?;
 
             ensure_project_workspace_unbound(&transaction, &command.runtime)?;
             ensure_runtime_snapshot_current(&transaction, &orchestrator_runtime)?;
@@ -2828,6 +3037,11 @@ impl YardStore for SqliteProjectStore {
                 Some((&command.profile_id, command.profile_version)),
                 "create_new",
                 Some(&command_id),
+                (
+                    &command.workflow_profile_id,
+                    command.workflow_profile_version,
+                    &command.actor,
+                ),
                 now,
             )
             .map_err(map_project_insert_error)?;
@@ -2962,6 +3176,16 @@ impl YardStore for SqliteProjectStore {
                 &command.profile_id,
                 command.expected_profile_version,
             )?;
+            let workflow_profile_version =
+                orchestrator_workflow_profile_store::select_current_version(
+                    &transaction,
+                    YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                )?;
+            let workflow_profile = orchestrator_workflow_profile_store::select_executable_revision(
+                &transaction,
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                workflow_profile_version,
+            )?;
             let now = unix_time_ms()?;
             transaction.execute(
                 "INSERT INTO command_acknowledgements (
@@ -2978,10 +3202,11 @@ impl YardStore for SqliteProjectStore {
                     workspace_label, cwd, profile_id, profile_version,
                     orchestrator_objective, canvas_x, canvas_y, canvas_width,
                     canvas_height, result_runtime_workspace_id,
-                    result_project_id, result_worker_id, finished_at_unix_ms
+                    result_project_id, result_worker_id, finished_at_unix_ms,
+                    workflow_profile_id, workflow_profile_version
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, NULL, NULL, NULL, NULL
+                    ?13, NULL, NULL, NULL, NULL, ?14, ?15
                  )",
                 params![
                     command.command_id,
@@ -2997,11 +3222,17 @@ impl YardStore for SqliteProjectStore {
                     command.placement.y,
                     command.placement.width,
                     command.placement.height,
+                    YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                    to_i64(workflow_profile_version)?,
                 ],
             )?;
             transaction.commit()?;
             Ok(BeginWorkspaceProjectCreation::Started(Box::new(
-                WorkspaceProjectCreationContext { command, profile },
+                WorkspaceProjectCreationContext {
+                    command,
+                    profile,
+                    workflow_profile,
+                },
             )))
         })
         .await
@@ -3034,6 +3265,11 @@ impl YardStore for SqliteProjectStore {
             {
                 return Err(ProjectStoreError::RuntimeWorkspaceMismatch);
             }
+            orchestrator_workflow_profile_store::select_executable_revision(
+                &transaction,
+                &command.workflow_profile_id,
+                command.workflow_profile_version,
+            )?;
 
             let project_runtime = ProjectRuntimeBinding {
                 adapter: command.runtime_adapter,
@@ -3065,6 +3301,11 @@ impl YardStore for SqliteProjectStore {
                 Some((&command.profile_id, command.profile_version)),
                 "create_new",
                 Some(&command_id),
+                (
+                    &command.workflow_profile_id,
+                    command.workflow_profile_version,
+                    &command.actor,
+                ),
                 now,
             )
             .map_err(map_project_insert_error)?;
@@ -4709,6 +4950,11 @@ impl YardStore for SqliteProjectStore {
                     current_version: target_project.version,
                 });
             }
+            let workflow_profile = orchestrator_workflow_profile_store::select_executable_revision(
+                &transaction,
+                &target_project.workflow_profile.profile_id,
+                target_project.workflow_profile.profile_version,
+            )?;
             if command.target_role == HandoffTargetRole::Orchestrator {
                 reject_project_orchestrator_intervention(
                     &transaction,
@@ -4993,6 +5239,7 @@ impl YardStore for SqliteProjectStore {
                     target_project,
                     source_assignment: context_assignment,
                     profile,
+                    workflow_profile,
                 },
             )))
         })
@@ -5645,6 +5892,11 @@ impl YardStore for SqliteProjectStore {
                     current_version: project.version,
                 });
             }
+            let workflow_profile = orchestrator_workflow_profile_store::select_executable_revision(
+                &transaction,
+                &project.workflow_profile.profile_id,
+                project.workflow_profile.profile_version,
+            )?;
             if project.orchestrator.id != command.expected_orchestrator_worker_id {
                 return Err(ProjectStoreError::OrchestratorNotCurrent {
                     current_worker_id: project.orchestrator.id,
@@ -5797,6 +6049,16 @@ impl YardStore for SqliteProjectStore {
                         error.into()
                     }
                 })?;
+            transaction.execute(
+                "INSERT INTO project_orchestrator_replacement_workflow_pins (
+                    command_id, profile_id, profile_version
+                 ) VALUES (?1, ?2, ?3)",
+                params![
+                    command.command_id,
+                    project.workflow_profile.profile_id,
+                    to_i64(project.workflow_profile.profile_version)?,
+                ],
+            )?;
             insert_orchestrator_replacement_runtime(
                 &transaction,
                 &command.command_id,
@@ -5813,6 +6075,7 @@ impl YardStore for SqliteProjectStore {
                     command,
                     project,
                     profile,
+                    workflow_profile,
                     prepare_tab_label,
                 },
             )))
@@ -6009,6 +6272,8 @@ impl YardStore for SqliteProjectStore {
 
             let project = select_project(&transaction, &command.project_id)?;
             if project.version != command.expected_project_version
+                || project.workflow_profile.profile_id != command.workflow_profile_id
+                || project.workflow_profile.profile_version != command.workflow_profile_version
                 || project.orchestrator.id != command.expected_orchestrator_worker_id
                 || project.orchestrator.version != command.expected_orchestrator_worker_version
                 || project.orchestrator.runtime.as_ref() != Some(&command.expected_runtime)
@@ -9482,10 +9747,13 @@ const PROJECT_SELECT: &str = "
            wrb.owns_tab, wrb.observation_state, wrb.process_state,
            wrb.observed_status, wrb.state_change_sequence,
            wrb.runtime_revision, wrb.version,
-           wrb.last_observed_at_unix_ms
+           wrb.last_observed_at_unix_ms,
+           pwpp.profile_id, pwpp.profile_version,
+           pwpp.pinned_by, pwpp.pinned_at_unix_ms
       FROM projects p
       JOIN project_workspace_bindings pwb ON pwb.project_id = p.id
       JOIN project_placements pp ON pp.project_id = p.id
+      JOIN project_workflow_profile_pins pwpp ON pwpp.project_id = p.id
       JOIN workers w ON w.id = p.orchestrator_worker_id
       LEFT JOIN worker_runtime_bindings wrb ON wrb.worker_id = w.id";
 
@@ -10108,9 +10376,1274 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         transaction.execute_batch(FINAL_BACKEND_SAFETY_MIGRATION)?;
         ensure_foreign_keys(&transaction)?;
         transaction.commit()?;
+        current = 25;
+    }
+    if current == 25 {
+        connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let migration = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let lineage = classify_schema_v25(&transaction)?;
+            ensure_schema_v25_common_rebuild_shapes(&transaction)?;
+            match lineage {
+                SchemaV25Lineage::BackendSafety => {
+                    transaction.execute_batch(PROVIDER_NEUTRAL_WORKFLOW_PROFILES_MIGRATION)?;
+                    orchestrator_workflow_profile_store::upgrade_provider_neutral_profile(
+                        &transaction,
+                        false,
+                    )?;
+                }
+                SchemaV25Lineage::ProviderNeutralWorkflow => {
+                    transaction.execute_batch(FINAL_BACKEND_SAFETY_MIGRATION)?;
+                }
+                SchemaV25Lineage::Combined => {}
+            }
+            if classify_schema_v25(&transaction)? != SchemaV25Lineage::Combined {
+                return invalid_schema_v25(
+                    "migration did not produce the complete combined schema",
+                );
+            }
+            ensure_schema_v25_component_shapes(&transaction)?;
+            ensure_schema_v25_workflow_invariants(&transaction)?;
+            transaction.execute_batch(PROVIDER_NEUTRAL_WORKFLOW_PROFILE_INTEGRITY_MIGRATION)?;
+            orchestrator_workflow_profile_store::activate_complete_provider_neutral_profile(
+                &transaction,
+            )?;
+            ensure_foreign_keys(&transaction)?;
+            transaction.commit()?;
+            Ok::<(), ProjectStoreError>(())
+        })();
+        let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
+        migration?;
+        foreign_keys?;
     }
     ensure_foreign_keys(connection)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaV25Lineage {
+    BackendSafety,
+    ProviderNeutralWorkflow,
+    Combined,
+}
+
+const BACKEND_V25_TABLES: &[&str] = &[
+    "provisioning_runtime_claims",
+    "quarantined_provisioning_runtime_bindings",
+    "dedicated_runtime_provision_intents",
+];
+const BACKEND_V25_INDEXES: &[&str] = &[
+    "provisioning_runtime_claim_identity",
+    "quarantined_provisioning_runtime_identity",
+];
+const BACKEND_V25_COLUMNS: &[(&str, &str)] = &[
+    (
+        "project_orchestrator_replacement_commands",
+        "prepare_last_absence_observed_at_unix_ms",
+    ),
+    ("worker_allocation_commands", "objective_delivery_confirmed"),
+    ("provisioning_runtime_claims", "command_id"),
+    ("provisioning_runtime_claims", "runtime_workspace_id"),
+    ("provisioning_runtime_claims", "terminal_id"),
+    ("provisioning_runtime_claims", "captured_at_unix_ms"),
+    ("quarantined_provisioning_runtime_bindings", "command_id"),
+    (
+        "quarantined_provisioning_runtime_bindings",
+        "runtime_workspace_id",
+    ),
+    ("quarantined_provisioning_runtime_bindings", "terminal_id"),
+    (
+        "quarantined_provisioning_runtime_bindings",
+        "captured_at_unix_ms",
+    ),
+    ("dedicated_runtime_provision_intents", "command_id"),
+    ("dedicated_runtime_provision_intents", "kind"),
+    ("dedicated_runtime_provision_intents", "target_id"),
+    ("dedicated_runtime_provision_intents", "profile_id"),
+    ("dedicated_runtime_provision_intents", "profile_version"),
+    (
+        "dedicated_runtime_provision_intents",
+        "expected_target_version",
+    ),
+    (
+        "dedicated_runtime_provision_intents",
+        "runtime_start_confirmed",
+    ),
+    ("dedicated_runtime_provision_intents", "result_worker_id"),
+];
+const WORKFLOW_V25_TABLES: &[&str] = &[
+    "orchestrator_workflow_profiles",
+    "project_workflow_profile_pins",
+];
+const WORKFLOW_V25_INDEXES: &[&str] = &["orchestrator_workflow_profile_revision_identity"];
+const WORKFLOW_V25_COLUMNS: &[(&str, &str)] = &[
+    ("orchestrator_workflow_profile_revisions", "profile_id"),
+    ("orchestrator_workflow_profile_revisions", "name"),
+    ("orchestrator_workflow_profile_revisions", "description"),
+    ("orchestrator_workflow_profile_revisions", "commands_json"),
+    (
+        "orchestrator_workflow_profile_revisions",
+        "adapter_context_files_json",
+    ),
+    ("orchestrator_workflow_profiles", "id"),
+    ("orchestrator_workflow_profiles", "current_version"),
+    ("orchestrator_workflow_profiles", "updated_at_unix_ms"),
+    ("project_workflow_profile_pins", "project_id"),
+    ("project_workflow_profile_pins", "profile_id"),
+    ("project_workflow_profile_pins", "profile_version"),
+    ("project_workflow_profile_pins", "pinned_by"),
+    ("project_workflow_profile_pins", "pinned_at_unix_ms"),
+    ("profile_project_creation_commands", "workflow_profile_id"),
+    (
+        "profile_project_creation_commands",
+        "workflow_profile_version",
+    ),
+    ("workspace_project_creation_commands", "workflow_profile_id"),
+    (
+        "workspace_project_creation_commands",
+        "workflow_profile_version",
+    ),
+];
+
+fn classify_schema_v25(connection: &Connection) -> Result<SchemaV25Lineage, ProjectStoreError> {
+    let backend = count_schema_v25_markers(
+        connection,
+        BACKEND_V25_TABLES,
+        BACKEND_V25_INDEXES,
+        BACKEND_V25_COLUMNS,
+    )?;
+    let workflow = count_schema_v25_markers(
+        connection,
+        WORKFLOW_V25_TABLES,
+        WORKFLOW_V25_INDEXES,
+        WORKFLOW_V25_COLUMNS,
+    )?;
+    let expected_backend =
+        BACKEND_V25_TABLES.len() + BACKEND_V25_INDEXES.len() + BACKEND_V25_COLUMNS.len();
+    let expected_workflow =
+        WORKFLOW_V25_TABLES.len() + WORKFLOW_V25_INDEXES.len() + WORKFLOW_V25_COLUMNS.len();
+    match (backend, workflow) {
+        (value, 0) if value == expected_backend => Ok(SchemaV25Lineage::BackendSafety),
+        (0, value) if value == expected_workflow => Ok(SchemaV25Lineage::ProviderNeutralWorkflow),
+        (backend, workflow) if backend == expected_backend && workflow == expected_workflow => {
+            Ok(SchemaV25Lineage::Combined)
+        }
+        _ => Err(ProjectStoreError::InvalidSchemaV25Lineage {
+            detail: format!(
+                "found {backend}/{expected_backend} backend-safety markers and \
+                 {workflow}/{expected_workflow} provider-neutral workflow markers"
+            ),
+        }),
+    }
+}
+
+fn count_schema_v25_markers(
+    connection: &Connection,
+    tables: &[&str],
+    indexes: &[&str],
+    columns: &[(&str, &str)],
+) -> Result<usize, ProjectStoreError> {
+    let mut count = 0;
+    for table in tables {
+        count += usize::from(table_exists(connection, table)?);
+    }
+    for index in indexes {
+        count += usize::from(index_exists(connection, index)?);
+    }
+    for (table, column) in columns {
+        count += usize::from(table_has_column(connection, table, column)?);
+    }
+    Ok(count)
+}
+
+#[allow(clippy::too_many_lines)]
+fn ensure_schema_v25_component_shapes(connection: &Connection) -> Result<(), ProjectStoreError> {
+    const RUNTIME_CLAIM_COLUMNS: &[&str] = &[
+        "command_id",
+        "adapter",
+        "runtime_session",
+        "runtime_workspace_id",
+        "terminal_id",
+        "tab_id",
+        "pane_id",
+        "provider_session_source",
+        "provider_session_provider",
+        "provider_session_kind",
+        "provider_session_value",
+        "owns_tab",
+        "observation_state",
+        "process_state",
+        "observed_status",
+        "state_change_sequence",
+        "runtime_revision",
+        "runtime_version",
+        "last_observed_at_unix_ms",
+        "captured_at_unix_ms",
+    ];
+    const PROVISION_INTENT_COLUMNS: &[&str] = &[
+        "command_id",
+        "kind",
+        "target_id",
+        "profile_id",
+        "profile_version",
+        "expected_target_version",
+        "runtime_start_confirmed",
+        "result_worker_id",
+        "created_at_unix_ms",
+        "updated_at_unix_ms",
+    ];
+    const WORKFLOW_REVISION_COLUMNS: &[&str] = &[
+        "version",
+        "instructions_markdown",
+        "monitor_interval_ms",
+        "source",
+        "updated_by",
+        "created_at_unix_ms",
+        "profile_id",
+        "name",
+        "description",
+        "commands_json",
+        "adapter_context_files_json",
+    ];
+    const PROFILE_CREATION_COLUMNS: &[&str] = &[
+        "command_id",
+        "project_name",
+        "runtime_adapter",
+        "runtime_session",
+        "runtime_workspace_id",
+        "profile_id",
+        "profile_version",
+        "orchestrator_objective",
+        "canvas_x",
+        "canvas_y",
+        "canvas_width",
+        "canvas_height",
+        "result_project_id",
+        "result_worker_id",
+        "finished_at_unix_ms",
+        "workflow_profile_id",
+        "workflow_profile_version",
+    ];
+    const WORKSPACE_CREATION_COLUMNS: &[&str] = &[
+        "command_id",
+        "project_name",
+        "runtime_adapter",
+        "runtime_session",
+        "workspace_label",
+        "cwd",
+        "profile_id",
+        "profile_version",
+        "orchestrator_objective",
+        "canvas_x",
+        "canvas_y",
+        "canvas_width",
+        "canvas_height",
+        "result_runtime_workspace_id",
+        "result_project_id",
+        "result_worker_id",
+        "finished_at_unix_ms",
+        "workflow_profile_id",
+        "workflow_profile_version",
+    ];
+
+    ensure_table_columns(
+        connection,
+        "provisioning_runtime_claims",
+        RUNTIME_CLAIM_COLUMNS,
+    )?;
+    ensure_table_columns(
+        connection,
+        "quarantined_provisioning_runtime_bindings",
+        RUNTIME_CLAIM_COLUMNS,
+    )?;
+    ensure_table_columns(
+        connection,
+        "dedicated_runtime_provision_intents",
+        PROVISION_INTENT_COLUMNS,
+    )?;
+    ensure_table_columns(
+        connection,
+        "orchestrator_workflow_profile_revisions",
+        WORKFLOW_REVISION_COLUMNS,
+    )?;
+    ensure_table_columns(
+        connection,
+        "orchestrator_workflow_profiles",
+        &["id", "current_version", "updated_at_unix_ms"],
+    )?;
+    ensure_table_columns(
+        connection,
+        "project_workflow_profile_pins",
+        &[
+            "project_id",
+            "profile_id",
+            "profile_version",
+            "pinned_by",
+            "pinned_at_unix_ms",
+        ],
+    )?;
+    ensure_table_columns(
+        connection,
+        "profile_project_creation_commands",
+        PROFILE_CREATION_COLUMNS,
+    )?;
+    ensure_table_columns(
+        connection,
+        "workspace_project_creation_commands",
+        WORKSPACE_CREATION_COLUMNS,
+    )?;
+    for table in [
+        "provisioning_runtime_claims",
+        "quarantined_provisioning_runtime_bindings",
+        "dedicated_runtime_provision_intents",
+    ] {
+        ensure_strict_table(connection, table)?;
+    }
+    ensure_schema_v25_common_rebuild_shapes(connection)?;
+    ensure_workflow_v25_rebuild_shapes(connection)?;
+    ensure_index_columns(
+        connection,
+        "provisioning_runtime_claim_identity",
+        false,
+        &["adapter", "runtime_session", "terminal_id"],
+    )?;
+    ensure_index_columns(
+        connection,
+        "quarantined_provisioning_runtime_identity",
+        false,
+        &["adapter", "runtime_session", "terminal_id"],
+    )?;
+    ensure_index_columns(
+        connection,
+        "orchestrator_workflow_profile_revision_identity",
+        true,
+        &["profile_id", "version"],
+    )?;
+    Ok(())
+}
+
+fn ensure_schema_v25_common_rebuild_shapes(
+    connection: &Connection,
+) -> Result<(), ProjectStoreError> {
+    ensure_exact_table_shape(
+        connection,
+        "orchestrator_workflow_profile_current",
+        &[
+            ("singleton_id", "INTEGER", true, None, 1),
+            ("current_version", "INTEGER", true, None, 0),
+            ("updated_at_unix_ms", "INTEGER", true, None, 0),
+        ],
+    )?;
+    ensure_exact_table_shape(
+        connection,
+        "yard_orchestrator",
+        &[
+            ("singleton_id", "INTEGER", true, None, 1),
+            ("worker_id", "TEXT", false, None, 0),
+            ("version", "INTEGER", true, None, 0),
+            ("created_at_unix_ms", "INTEGER", true, None, 0),
+            ("updated_at_unix_ms", "INTEGER", true, None, 0),
+            ("workflow_profile_version", "INTEGER", false, None, 0),
+        ],
+    )?;
+    ensure_exact_table_shape(
+        connection,
+        "yard_orchestrator_configure_commands",
+        &[
+            ("command_id", "TEXT", true, None, 1),
+            ("worker_id", "TEXT", true, None, 0),
+            ("expected_worker_version", "INTEGER", true, None, 0),
+            ("expected_orchestrator_version", "INTEGER", true, None, 0),
+            ("replaced_worker_id", "TEXT", false, None, 0),
+            ("result_orchestrator_version", "INTEGER", true, None, 0),
+            ("finished_at_unix_ms", "INTEGER", true, None, 0),
+            ("workflow_profile_version", "INTEGER", false, None, 0),
+        ],
+    )?;
+    ensure_exact_table_indexes(connection, "orchestrator_workflow_profile_current", &[])?;
+    ensure_exact_table_indexes(
+        connection,
+        "yard_orchestrator",
+        &[(
+            "sqlite_autoindex_yard_orchestrator_1",
+            true,
+            "u",
+            false,
+            &["worker_id"],
+        )],
+    )?;
+    ensure_exact_table_indexes(
+        connection,
+        "yard_orchestrator_configure_commands",
+        &[(
+            "sqlite_autoindex_yard_orchestrator_configure_commands_1",
+            true,
+            "pk",
+            false,
+            &["command_id"],
+        )],
+    )?;
+    ensure_exact_foreign_keys(
+        connection,
+        "orchestrator_workflow_profile_current",
+        &[
+            "orchestrator_workflow_profile_revisions|current_version|version|NO ACTION|RESTRICT|NONE",
+        ],
+    )?;
+    ensure_exact_foreign_keys(
+        connection,
+        "yard_orchestrator",
+        &[
+            "orchestrator_workflow_profile_revisions|workflow_profile_version|version|NO ACTION|RESTRICT|NONE",
+            "workers|worker_id|id|NO ACTION|RESTRICT|NONE",
+        ],
+    )?;
+    ensure_exact_foreign_keys(
+        connection,
+        "yard_orchestrator_configure_commands",
+        &[
+            "command_acknowledgements|command_id|id|NO ACTION|RESTRICT|NONE",
+            "orchestrator_workflow_profile_revisions|workflow_profile_version|version|NO ACTION|RESTRICT|NONE",
+            "workers|replaced_worker_id|id|NO ACTION|RESTRICT|NONE",
+            "workers|worker_id|id|NO ACTION|RESTRICT|NONE",
+        ],
+    )?;
+    for table in [
+        "orchestrator_workflow_profile_current",
+        "yard_orchestrator",
+        "yard_orchestrator_configure_commands",
+    ] {
+        ensure_exact_table_triggers(connection, table, &[])?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn ensure_workflow_v25_rebuild_shapes(connection: &Connection) -> Result<(), ProjectStoreError> {
+    ensure_exact_table_shape(
+        connection,
+        "orchestrator_workflow_profile_revisions",
+        &[
+            ("version", "INTEGER", true, None, 1),
+            ("instructions_markdown", "TEXT", true, None, 0),
+            ("monitor_interval_ms", "INTEGER", true, None, 0),
+            ("source", "TEXT", true, None, 0),
+            ("updated_by", "TEXT", true, None, 0),
+            ("created_at_unix_ms", "INTEGER", true, None, 0),
+            (
+                "profile_id",
+                "TEXT",
+                true,
+                Some("'yard:standard-orchestrator'"),
+                0,
+            ),
+            (
+                "name",
+                "TEXT",
+                true,
+                Some("'Legacy Yard Orchestrator Workflow'"),
+                0,
+            ),
+            (
+                "description",
+                "TEXT",
+                true,
+                Some("'Workflow revision migrated from the singleton orchestrator profile.'"),
+                0,
+            ),
+            ("commands_json", "TEXT", true, Some("'[]'"), 0),
+            ("adapter_context_files_json", "TEXT", true, Some("'[]'"), 0),
+        ],
+    )?;
+    ensure_exact_table_shape(
+        connection,
+        "orchestrator_workflow_profiles",
+        &[
+            ("id", "TEXT", true, None, 1),
+            ("current_version", "INTEGER", true, None, 0),
+            ("updated_at_unix_ms", "INTEGER", true, None, 0),
+        ],
+    )?;
+    ensure_exact_table_shape(
+        connection,
+        "project_workflow_profile_pins",
+        &[
+            ("project_id", "TEXT", true, None, 1),
+            ("profile_id", "TEXT", true, None, 0),
+            ("profile_version", "INTEGER", true, None, 0),
+            ("pinned_by", "TEXT", true, None, 0),
+            ("pinned_at_unix_ms", "INTEGER", true, None, 0),
+        ],
+    )?;
+    ensure_exact_table_indexes(
+        connection,
+        "orchestrator_workflow_profile_revisions",
+        &[(
+            "orchestrator_workflow_profile_revision_identity",
+            true,
+            "c",
+            false,
+            &["profile_id", "version"],
+        )],
+    )?;
+    ensure_exact_table_indexes(
+        connection,
+        "orchestrator_workflow_profiles",
+        &[(
+            "sqlite_autoindex_orchestrator_workflow_profiles_1",
+            true,
+            "pk",
+            false,
+            &["id"],
+        )],
+    )?;
+    ensure_exact_table_indexes(
+        connection,
+        "project_workflow_profile_pins",
+        &[(
+            "sqlite_autoindex_project_workflow_profile_pins_1",
+            true,
+            "pk",
+            false,
+            &["project_id"],
+        )],
+    )?;
+    ensure_exact_foreign_keys(connection, "orchestrator_workflow_profile_revisions", &[])?;
+    ensure_exact_foreign_keys(
+        connection,
+        "orchestrator_workflow_profiles",
+        &[
+            "orchestrator_workflow_profile_revisions|id,current_version|profile_id,version|NO ACTION|RESTRICT|NONE",
+        ],
+    )?;
+    ensure_exact_foreign_keys(
+        connection,
+        "project_workflow_profile_pins",
+        &[
+            "orchestrator_workflow_profile_revisions|profile_id,profile_version|profile_id,version|NO ACTION|RESTRICT|NONE",
+            "projects|project_id|id|NO ACTION|CASCADE|NONE",
+        ],
+    )?;
+    for table in [
+        "orchestrator_workflow_profile_revisions",
+        "orchestrator_workflow_profiles",
+        "project_workflow_profile_pins",
+    ] {
+        ensure_exact_table_triggers(connection, table, &[])?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TableColumnShape {
+    name: String,
+    data_type: String,
+    not_null: bool,
+    default_value: Option<String>,
+    primary_key_position: i64,
+    hidden: i64,
+}
+
+fn ensure_exact_table_shape(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, bool, Option<&str>, i64)],
+) -> Result<(), ProjectStoreError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_xinfo({table})"))?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok(TableColumnShape {
+                name: row.get(1)?,
+                data_type: row.get(2)?,
+                not_null: row.get(3)?,
+                default_value: row.get(4)?,
+                primary_key_position: row.get(5)?,
+                hidden: row.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected = expected
+        .iter()
+        .map(
+            |(name, data_type, not_null, default_value, primary_key_position)| TableColumnShape {
+                name: (*name).to_owned(),
+                data_type: (*data_type).to_owned(),
+                not_null: *not_null,
+                default_value: default_value.map(str::to_owned),
+                primary_key_position: *primary_key_position,
+                hidden: 0,
+            },
+        )
+        .collect::<Vec<_>>();
+    if actual != expected {
+        return invalid_schema_v25(&format!(
+            "table {table} has shape {actual:?}, expected {expected:?}"
+        ));
+    }
+    let strict_and_rowid = connection
+        .query_row(
+            "SELECT strict, wr
+               FROM pragma_table_list
+              WHERE name = ?1 AND type = 'table'",
+            [table],
+            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()?;
+    if strict_and_rowid != Some((true, false)) {
+        return invalid_schema_v25(&format!("table {table} must be a STRICT rowid table"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TableIndexShape {
+    name: String,
+    unique: bool,
+    origin: String,
+    partial: bool,
+    terms: Vec<IndexTermShape>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct IndexTermShape {
+    sequence: i64,
+    column_id: i64,
+    name: Option<String>,
+    descending: bool,
+    collation: Option<String>,
+    key: bool,
+}
+
+fn ensure_exact_table_indexes(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, bool, &str, bool, &[&str])],
+) -> Result<(), ProjectStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT name, \"unique\", origin, partial
+           FROM pragma_index_list(?1)
+          ORDER BY name",
+    )?;
+    let index_metadata = statement
+        .query_map([table], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut actual = Vec::with_capacity(index_metadata.len());
+    for (name, unique, origin, partial) in index_metadata {
+        let terms = collect_index_terms(connection, &name)?;
+        actual.push(TableIndexShape {
+            name,
+            unique,
+            origin,
+            partial,
+            terms,
+        });
+    }
+    let mut expected = expected
+        .iter()
+        .map(
+            |(name, unique, origin, partial, columns)| -> Result<_, ProjectStoreError> {
+                Ok(TableIndexShape {
+                    name: (*name).to_owned(),
+                    unique: *unique,
+                    origin: (*origin).to_owned(),
+                    partial: *partial,
+                    terms: expected_index_terms(connection, table, columns)?,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+    expected.sort_by(|left, right| left.name.cmp(&right.name));
+    if actual != expected {
+        return invalid_schema_v25(&format!(
+            "table {table} has indexes {actual:?}, expected {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn collect_index_terms(
+    connection: &Connection,
+    index: &str,
+) -> Result<Vec<IndexTermShape>, ProjectStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT seqno, cid, name, desc, coll, key
+           FROM pragma_index_xinfo(?1)
+          ORDER BY seqno",
+    )?;
+    statement
+        .query_map([index], |row| {
+            Ok(IndexTermShape {
+                sequence: row.get(0)?,
+                column_id: row.get(1)?,
+                name: row.get(2)?,
+                descending: row.get(3)?,
+                collation: row.get(4)?,
+                key: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn expected_index_terms(
+    connection: &Connection,
+    table: &str,
+    columns: &[&str],
+) -> Result<Vec<IndexTermShape>, ProjectStoreError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_xinfo({table})"))?;
+    let column_ids = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
+        })?
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    let mut terms = columns
+        .iter()
+        .enumerate()
+        .map(|(sequence, name)| {
+            let column_id = column_ids.get(*name).copied().ok_or_else(|| {
+                ProjectStoreError::InvalidSchemaV25Lineage {
+                    detail: format!("index column {table}.{name} is missing"),
+                }
+            })?;
+            Ok(IndexTermShape {
+                sequence: i64::try_from(sequence)?,
+                column_id,
+                name: Some((*name).to_owned()),
+                descending: false,
+                collation: Some("BINARY".to_owned()),
+                key: true,
+            })
+        })
+        .collect::<Result<Vec<_>, ProjectStoreError>>()?;
+    terms.push(IndexTermShape {
+        sequence: i64::try_from(columns.len())?,
+        column_id: -1,
+        name: None,
+        descending: false,
+        collation: Some("BINARY".to_owned()),
+        key: false,
+    });
+    Ok(terms)
+}
+
+fn ensure_exact_foreign_keys(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), ProjectStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT id, seq, \"table\", \"from\", \"to\", on_update, on_delete, \"match\"
+           FROM pragma_foreign_key_list(?1)
+          ORDER BY id, seq",
+    )?;
+    let rows = statement
+        .query_map([table], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut grouped = std::collections::BTreeMap::<
+        i64,
+        (String, Vec<String>, Vec<String>, String, String, String),
+    >::new();
+    for (id, _sequence, target, from, to, on_update, on_delete, match_type) in rows {
+        let entry = grouped.entry(id).or_insert_with(|| {
+            (
+                target,
+                Vec::new(),
+                Vec::new(),
+                on_update,
+                on_delete,
+                match_type,
+            )
+        });
+        entry.1.push(from);
+        entry.2.push(to);
+    }
+    let mut actual = grouped
+        .into_values()
+        .map(|(target, from, to, on_update, on_delete, match_type)| {
+            format!(
+                "{target}|{}|{}|{on_update}|{on_delete}|{match_type}",
+                from.join(","),
+                to.join(",")
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.sort();
+    let mut expected = expected
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    expected.sort();
+    if actual != expected {
+        return invalid_schema_v25(&format!(
+            "table {table} has foreign keys {actual:?}, expected {expected:?}"
+        ));
+    }
+    ensure_exact_foreign_key_clauses(connection, table, actual.len())?;
+    Ok(())
+}
+
+fn ensure_exact_foreign_key_clauses(
+    connection: &Connection,
+    table: &str,
+    expected_count: usize,
+) -> Result<(), ProjectStoreError> {
+    let sql = connection.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+        [table],
+        |row| row.get::<_, String>(0),
+    )?;
+    let tokens = sqlite_schema_tokens(&sql);
+    let definitions = sql_table_definitions(&tokens).ok_or_else(|| {
+        ProjectStoreError::InvalidSchemaV25Lineage {
+            detail: format!("table {table} has an invalid CREATE TABLE definition"),
+        }
+    })?;
+    let mut reference_count = 0_usize;
+    for (start, end) in definitions {
+        reference_count = reference_count
+            .checked_add(inspect_foreign_keys_in_definition(
+                &tokens, start, end, table,
+            )?)
+            .ok_or(ProjectStoreError::VersionOverflow)?;
+    }
+    if reference_count != expected_count {
+        return invalid_schema_v25(&format!(
+            "table {table} has {reference_count} REFERENCES clauses, expected {expected_count}"
+        ));
+    }
+    Ok(())
+}
+
+fn inspect_foreign_keys_in_definition(
+    tokens: &[SqlSchemaToken],
+    start: usize,
+    end: usize,
+    table: &str,
+) -> Result<usize, ProjectStoreError> {
+    let mut top_level = Vec::new();
+    let mut depth = 0_u64;
+    for (index, token) in tokens.iter().enumerate().take(end).skip(start) {
+        match token {
+            SqlSchemaToken::LeftParen => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or(ProjectStoreError::VersionOverflow)?;
+            }
+            SqlSchemaToken::RightParen => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    ProjectStoreError::InvalidSchemaV25Lineage {
+                        detail: format!("table {table} has unbalanced constraint parentheses"),
+                    }
+                })?;
+            }
+            _ if depth == 0 => top_level.push(index),
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return invalid_schema_v25(&format!(
+            "table {table} has unbalanced constraint parentheses"
+        ));
+    }
+
+    let mut references = 0_usize;
+    let mut seen_reference = false;
+    let mut skip_identifier = false;
+    for (position, index) in top_level.iter().copied().enumerate() {
+        let token = &tokens[index];
+        if skip_identifier && token.is_identifier() {
+            skip_identifier = false;
+            continue;
+        }
+        if token.is_word("REFERENCES") {
+            references = references
+                .checked_add(1)
+                .ok_or(ProjectStoreError::VersionOverflow)?;
+            seen_reference = true;
+            skip_identifier = true;
+            continue;
+        }
+        if token.is_word("CONSTRAINT") || token.is_word("COLLATE") {
+            skip_identifier = true;
+            continue;
+        }
+        if !seen_reference {
+            continue;
+        }
+        if token.is_word("MATCH") {
+            return invalid_schema_v25(&format!(
+                "table {table} contains an explicit foreign-key MATCH clause"
+            ));
+        }
+        if token.is_word("DEFERRABLE")
+            && !position
+                .checked_sub(1)
+                .and_then(|previous| top_level.get(previous))
+                .is_some_and(|previous| tokens[*previous].is_word("NOT"))
+        {
+            return invalid_schema_v25(&format!("table {table} contains a deferrable foreign key"));
+        }
+        if token.is_word("INITIALLY")
+            && !top_level
+                .get(position + 1)
+                .is_some_and(|next| tokens[*next].is_word("IMMEDIATE"))
+        {
+            return invalid_schema_v25(&format!(
+                "table {table} contains a non-immediate foreign key"
+            ));
+        }
+    }
+    if skip_identifier {
+        return invalid_schema_v25(&format!(
+            "table {table} has a constraint without an identifier"
+        ));
+    }
+    Ok(references)
+}
+
+fn sql_table_definitions(tokens: &[SqlSchemaToken]) -> Option<Vec<(usize, usize)>> {
+    let opening = tokens
+        .iter()
+        .position(|token| *token == SqlSchemaToken::LeftParen)?;
+    let mut definitions = Vec::new();
+    let mut start = opening + 1;
+    let mut depth = 0_u64;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        match token {
+            SqlSchemaToken::LeftParen => depth = depth.checked_add(1)?,
+            SqlSchemaToken::RightParen if depth == 0 => {
+                definitions.push((start, index));
+                return Some(definitions);
+            }
+            SqlSchemaToken::RightParen => depth = depth.checked_sub(1)?,
+            SqlSchemaToken::Comma if depth == 0 => {
+                definitions.push((start, index));
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SqlSchemaToken {
+    Word(String),
+    QuotedIdentifier,
+    Literal,
+    LeftParen,
+    RightParen,
+    Comma,
+}
+
+impl SqlSchemaToken {
+    fn is_word(&self, expected: &str) -> bool {
+        matches!(self, Self::Word(word) if word == expected)
+    }
+
+    fn is_identifier(&self) -> bool {
+        matches!(self, Self::Word(_) | Self::QuotedIdentifier | Self::Literal)
+    }
+}
+
+fn sqlite_schema_tokens(sql: &str) -> Vec<SqlSchemaToken> {
+    let mut tokens = Vec::new();
+    let mut characters = sql.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\'' => {
+                while let Some(quoted) = characters.next() {
+                    if quoted == '\'' {
+                        if characters.peek() == Some(&'\'') {
+                            characters.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                tokens.push(SqlSchemaToken::Literal);
+            }
+            '"' | '`' => {
+                let closing = character;
+                while let Some(quoted) = characters.next() {
+                    if quoted == closing {
+                        if characters.peek() == Some(&closing) {
+                            characters.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                tokens.push(SqlSchemaToken::QuotedIdentifier);
+            }
+            '[' => {
+                for quoted in characters.by_ref() {
+                    if quoted == ']' {
+                        break;
+                    }
+                }
+                tokens.push(SqlSchemaToken::QuotedIdentifier);
+            }
+            '-' if characters.peek() == Some(&'-') => {
+                characters.next();
+                for comment in characters.by_ref() {
+                    if comment == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if characters.peek() == Some(&'*') => {
+                characters.next();
+                let mut previous = '\0';
+                for comment in characters.by_ref() {
+                    if previous == '*' && comment == '/' {
+                        break;
+                    }
+                    previous = comment;
+                }
+            }
+            '(' => tokens.push(SqlSchemaToken::LeftParen),
+            ')' => tokens.push(SqlSchemaToken::RightParen),
+            ',' => tokens.push(SqlSchemaToken::Comma),
+            value if value.is_ascii_alphanumeric() || value == '_' => {
+                let mut token = String::from(value);
+                while let Some(next) = characters.peek() {
+                    if next.is_ascii_alphanumeric() || *next == '_' {
+                        token.push(*next);
+                        characters.next();
+                    } else {
+                        break;
+                    }
+                }
+                tokens.push(SqlSchemaToken::Word(token.to_ascii_uppercase()));
+            }
+            _ => {}
+        }
+    }
+    tokens
+}
+
+fn ensure_exact_table_triggers(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), ProjectStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT name
+           FROM sqlite_master
+          WHERE type = 'trigger' AND tbl_name = ?1
+          ORDER BY name",
+    )?;
+    let actual = statement
+        .query_map([table], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if actual
+        .iter()
+        .map(String::as_str)
+        .eq(expected.iter().copied())
+    {
+        return Ok(());
+    }
+    invalid_schema_v25(&format!(
+        "table {table} has triggers {actual:?}, expected {expected:?}"
+    ))
+}
+
+fn ensure_table_columns(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), ProjectStoreError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let actual = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if actual
+        .iter()
+        .map(String::as_str)
+        .eq(expected.iter().copied())
+    {
+        return Ok(());
+    }
+    invalid_schema_v25(&format!(
+        "table {table} has columns {actual:?}, expected {expected:?}"
+    ))
+}
+
+fn ensure_strict_table(connection: &Connection, table: &str) -> Result<(), ProjectStoreError> {
+    let strict = connection.query_row(
+        "SELECT EXISTS (
+            SELECT 1
+              FROM pragma_table_list
+             WHERE name = ?1 AND type = 'table' AND strict = 1
+         )",
+        [table],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if strict {
+        return Ok(());
+    }
+    invalid_schema_v25(&format!("table {table} is not STRICT"))
+}
+
+fn ensure_index_columns(
+    connection: &Connection,
+    index: &str,
+    expected_unique: bool,
+    expected_columns: &[&str],
+) -> Result<(), ProjectStoreError> {
+    let table = connection
+        .query_row(
+            "SELECT tbl_name
+               FROM sqlite_master
+              WHERE type = 'index' AND name = ?1",
+            [index],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(table) = table else {
+        return invalid_schema_v25(&format!("index {index} is missing"));
+    };
+    let unique = connection.query_row(
+        "SELECT \"unique\" FROM pragma_index_list(?1) WHERE name = ?2",
+        params![table, index],
+        |row| row.get::<_, bool>(0),
+    )?;
+    let terms = collect_index_terms(connection, index)?;
+    let expected_terms = expected_index_terms(connection, &table, expected_columns)?;
+    if unique == expected_unique && terms == expected_terms {
+        return Ok(());
+    }
+    invalid_schema_v25(&format!(
+        "index {index} has unique={unique} and terms {terms:?}, expected {expected_terms:?}"
+    ))
+}
+
+fn ensure_schema_v25_workflow_invariants(connection: &Connection) -> Result<(), ProjectStoreError> {
+    let catalog_invalid = connection.query_row(
+        "SELECT NOT EXISTS (
+            SELECT 1
+              FROM orchestrator_workflow_profiles profile
+              JOIN orchestrator_workflow_profile_revisions revision
+                ON revision.profile_id = profile.id
+               AND revision.version = profile.current_version
+              JOIN orchestrator_workflow_profile_current legacy
+                ON legacy.singleton_id = 1
+               AND legacy.current_version = profile.current_version
+             WHERE profile.id = 'yard:standard-orchestrator'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if catalog_invalid {
+        return invalid_schema_v25("the standard workflow catalog pointer is invalid");
+    }
+    let invalid_revisions = connection.query_row(
+        "SELECT EXISTS (
+            SELECT 1
+              FROM orchestrator_workflow_profile_revisions
+             WHERE length(profile_id) = 0
+                OR json_valid(commands_json) = 0
+                OR json_type(commands_json) <> 'array'
+                OR json_valid(adapter_context_files_json) = 0
+                OR json_type(adapter_context_files_json) <> 'array'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if invalid_revisions {
+        return invalid_schema_v25("workflow revision metadata is invalid");
+    }
+    let invalid_project_pins = connection.query_row(
+        "SELECT EXISTS (
+            SELECT 1
+              FROM projects project
+              LEFT JOIN project_workflow_profile_pins pin
+                ON pin.project_id = project.id
+              LEFT JOIN orchestrator_workflow_profile_revisions revision
+                ON revision.profile_id = pin.profile_id
+               AND revision.version = pin.profile_version
+             WHERE pin.project_id IS NULL OR revision.version IS NULL
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if invalid_project_pins {
+        return invalid_schema_v25("project workflow pins are missing or invalid");
+    }
+    let invalid_creation_pins = connection.query_row(
+        "SELECT EXISTS (
+            SELECT 1
+              FROM (
+                  SELECT workflow_profile_id AS profile_id,
+                         workflow_profile_version AS profile_version
+                    FROM profile_project_creation_commands
+                  UNION ALL
+                  SELECT workflow_profile_id, workflow_profile_version
+                    FROM workspace_project_creation_commands
+              ) command
+              LEFT JOIN orchestrator_workflow_profile_revisions revision
+                ON revision.profile_id = command.profile_id
+               AND revision.version = command.profile_version
+             WHERE revision.version IS NULL
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if invalid_creation_pins {
+        return invalid_schema_v25("project-creation workflow pins are invalid");
+    }
+    let invalid_transfer_results = connection.query_row(
+        "SELECT EXISTS (
+            SELECT 1
+              FROM project_orchestrator_transfer_commands transfer
+              LEFT JOIN orchestrator_workflow_profile_revisions revision
+                ON revision.profile_id = json_extract(
+                    transfer.result_project_json,
+                    '$.workflow_profile.profile_id'
+                )
+               AND revision.version = CAST(json_extract(
+                    transfer.result_project_json,
+                    '$.workflow_profile.profile_version'
+               ) AS INTEGER)
+             WHERE transfer.result_project_json IS NOT NULL
+               AND (
+                   json_type(transfer.result_project_json, '$.workflow_profile') IS NULL
+                   OR revision.version IS NULL
+               )
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if invalid_transfer_results {
+        return invalid_schema_v25("legacy transfer replay workflow pins are invalid");
+    }
+    Ok(())
+}
+
+fn invalid_schema_v25<T>(detail: &str) -> Result<T, ProjectStoreError> {
+    Err(ProjectStoreError::InvalidSchemaV25Lineage {
+        detail: detail.to_owned(),
+    })
 }
 
 fn backfill_agent_profile_revisions(connection: &Connection) -> Result<(), ProjectStoreError> {
@@ -10197,6 +11730,20 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool, ProjectSto
                  WHERE type = 'table' AND name = ?1
              )",
             [table],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn index_exists(connection: &Connection, index: &str) -> Result<bool, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM sqlite_master
+                 WHERE type = 'index' AND name = ?1
+             )",
+            [index],
             |row| row.get(0),
         )
         .map_err(Into::into)
@@ -10363,6 +11910,7 @@ fn insert_project_aggregate(
     profile: Option<(&str, u64)>,
     allocation_mode: &str,
     started_by_command_id: Option<&str>,
+    workflow_profile: (&str, u64, &str),
     now: u64,
 ) -> Result<(), ProjectStoreError> {
     let now_i64 = to_i64(now)?;
@@ -10417,6 +11965,18 @@ fn insert_project_aggregate(
             created_at_unix_ms, updated_at_unix_ms
          ) VALUES (?1, ?2, ?3, 1, ?4, ?4)",
         params![project_id, project.name, worker_id, now_i64],
+    )?;
+    transaction.execute(
+        "INSERT INTO project_workflow_profile_pins (
+            project_id, profile_id, profile_version, pinned_by, pinned_at_unix_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            project_id,
+            workflow_profile.0,
+            to_i64(workflow_profile.1)?,
+            workflow_profile.2,
+            now_i64,
+        ],
     )?;
     transaction.execute(
         "INSERT INTO project_workspace_bindings (
@@ -10816,6 +12376,12 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
             version: row_u64(row, 12)?,
             updated_at_unix_ms: row_u64(row, 13)?,
         },
+        workflow_profile: ProjectWorkflowProfilePin {
+            profile_id: row.get(39)?,
+            profile_version: row_u64(row, 40)?,
+            pinned_by: row.get(41)?,
+            pinned_at_unix_ms: row_u64(row, 42)?,
+        },
         orchestrator: Worker {
             id: row.get(14)?,
             profile_id: row.get(15)?,
@@ -11108,6 +12674,8 @@ struct StoredProfileProjectCreationCommand {
     status: String,
     error_message: Option<String>,
     result_project_id: Option<String>,
+    workflow_profile_id: String,
+    workflow_profile_version: u64,
 }
 
 impl StoredProfileProjectCreationCommand {
@@ -11138,6 +12706,8 @@ struct StoredWorkspaceProjectCreationCommand {
     error_message: Option<String>,
     result_runtime_workspace_id: Option<String>,
     result_project_id: Option<String>,
+    workflow_profile_id: String,
+    workflow_profile_version: u64,
 }
 
 impl StoredWorkspaceProjectCreationCommand {
@@ -11242,6 +12812,8 @@ struct StoredWorkerHandoffCommand {
 struct StoredProjectOrchestratorReplacement {
     project_id: String,
     expected_project_version: u64,
+    workflow_profile_id: String,
+    workflow_profile_version: u64,
     expected_orchestrator_worker_id: String,
     expected_orchestrator_worker_version: u64,
     expected_runtime: WorkerRuntimeBinding,
@@ -11406,7 +12978,8 @@ fn select_profile_project_creation_command(
                     ppcc.profile_id, ppcc.profile_version,
                     ppcc.orchestrator_objective, ppcc.canvas_x, ppcc.canvas_y,
                     ppcc.canvas_width, ppcc.canvas_height, ca.actor, ca.status,
-                    ca.error_message, ppcc.result_project_id
+                    ca.error_message, ppcc.result_project_id,
+                    ppcc.workflow_profile_id, ppcc.workflow_profile_version
                FROM profile_project_creation_commands ppcc
                JOIN command_acknowledgements ca ON ca.id = ppcc.command_id
               WHERE ppcc.command_id = ?1",
@@ -11432,6 +13005,8 @@ fn select_profile_project_creation_command(
                     status: row.get(12)?,
                     error_message: row.get(13)?,
                     result_project_id: row.get(14)?,
+                    workflow_profile_id: row.get(15)?,
+                    workflow_profile_version: row_u64(row, 16)?,
                 })
             },
         )
@@ -11451,7 +13026,8 @@ fn select_workspace_project_creation_command(
                     wpcc.orchestrator_objective, wpcc.canvas_x, wpcc.canvas_y,
                     wpcc.canvas_width, wpcc.canvas_height, ca.actor, ca.status,
                     ca.error_message, wpcc.result_runtime_workspace_id,
-                    wpcc.result_project_id
+                    wpcc.result_project_id, wpcc.workflow_profile_id,
+                    wpcc.workflow_profile_version
                FROM workspace_project_creation_commands wpcc
                JOIN command_acknowledgements ca ON ca.id = wpcc.command_id
               WHERE wpcc.command_id = ?1",
@@ -11477,6 +13053,8 @@ fn select_workspace_project_creation_command(
                     error_message: row.get(14)?,
                     result_runtime_workspace_id: row.get(15)?,
                     result_project_id: row.get(16)?,
+                    workflow_profile_id: row.get(17)?,
+                    workflow_profile_version: row_u64(row, 18)?,
                 })
             },
         )
@@ -11623,6 +13201,7 @@ fn select_project_orchestrator_replacement_command(
     let stored = connection
         .query_row(
             "SELECT porc.project_id, porc.expected_project_version,
+                    workflow.profile_id, workflow.profile_version,
                     porc.expected_orchestrator_worker_id,
                     porc.expected_orchestrator_worker_version,
                     porc.profile_id, porc.profile_version, porc.objective,
@@ -11632,6 +13211,8 @@ fn select_project_orchestrator_replacement_command(
                     ca.error_message
                FROM project_orchestrator_replacement_commands porc
                JOIN command_acknowledgements ca ON ca.id = porc.command_id
+               JOIN project_orchestrator_replacement_workflow_pins workflow
+                 ON workflow.command_id = porc.command_id
               WHERE porc.command_id = ?1",
             [command_id],
             |row| {
@@ -11643,14 +13224,16 @@ fn select_project_orchestrator_replacement_command(
                     row.get::<_, String>(4)?,
                     row_u64(row, 5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                    old_session_disposition_from_row(row, 8)?,
-                    row.get::<_, Option<String>>(9)?,
-                    row.get::<_, Option<String>>(10)?,
+                    row_u64(row, 7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    old_session_disposition_from_row(row, 10)?,
                     row.get::<_, Option<String>>(11)?,
-                    row.get::<_, String>(12)?,
-                    row.get::<_, String>(13)?,
-                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, String>(15)?,
+                    row.get::<_, Option<String>>(16)?,
                 ))
             },
         )
@@ -11658,6 +13241,8 @@ fn select_project_orchestrator_replacement_command(
     let Some((
         project_id,
         expected_project_version,
+        workflow_profile_id,
+        workflow_profile_version,
         expected_orchestrator_worker_id,
         expected_orchestrator_worker_version,
         profile_id,
@@ -11688,6 +13273,8 @@ fn select_project_orchestrator_replacement_command(
     Ok(Some(StoredProjectOrchestratorReplacement {
         project_id,
         expected_project_version,
+        workflow_profile_id,
+        workflow_profile_version,
         expected_orchestrator_worker_id,
         expected_orchestrator_worker_version,
         expected_runtime,
@@ -15190,6 +16777,8 @@ pub enum ProjectStoreError {
     CommandFailureMessageRequired,
     #[error("database foreign key validation failed after migration")]
     ForeignKeyCheckFailed,
+    #[error("database schema version 25 lineage is invalid: {detail}")]
+    InvalidSchemaV25Lineage { detail: String },
     #[error("database schema version {found} is newer than supported version {supported}")]
     UnsupportedSchema { found: i64, supported: i64 },
 }
@@ -15218,7 +16807,7 @@ mod tests {
         time::Duration,
     };
 
-    use rusqlite::{Connection, TransactionBehavior};
+    use rusqlite::{Connection, TransactionBehavior, params};
     use serde_json::Value;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -15238,8 +16827,10 @@ mod tests {
         SendCoordinationNodeRoute, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
         SendYardOrchestratorRoute, SnapshotCollectionStatus, TransferProjectOrchestrator,
         UpdateAgentProfile, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
-        UpdateProjectPlacement, UpdateTokenSpendSettings, UpdateWorkerProfile, WorkerAvailability,
-        WorkerProfile, WorkerProfileSpec, WorkerRuntimeBinding, YardOrchestrator,
+        UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
+        UpdateTokenSpendSettings, UpdateWorkerProfile, WorkerAvailability, WorkerProfile,
+        WorkerProfileSpec, WorkerRuntimeBinding, YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+        YardOrchestrator,
     };
 
     use super::{
@@ -15248,13 +16839,16 @@ mod tests {
         BeginOrchestratorPrompt, BeginProfileAllocation, BeginProfileProjectCreation,
         BeginProjectOrchestratorReplacement, BeginWorkerAllocation, BeginWorkerHandoff,
         BeginWorkspaceProjectCreation, BeginYardOrchestratorPrompt, BeginYardOrchestratorRoute,
-        COMPLETION_RECEIPT_MIGRATION, INITIAL_MIGRATION, OrchestratorReplacementRecoveryOutcome,
-        OrchestratorReplacementRecoveryTarget, OrchestratorReplacementRuntimeRole,
-        OrchestratorReplacementStartEvidence, PROFILE_ASSIGNMENT_MIGRATION, ProjectStoreError,
-        SCHEMA_VERSION, SnapshotDeliveryResult, SnapshotProjectFolder, SqliteProjectStore,
-        TokenSpendCommandSource, YardStore, insert_worker_runtime_binding,
-        insert_worker_runtime_binding_unchecked,
+        COMPLETION_RECEIPT_MIGRATION, FINAL_BACKEND_SAFETY_MIGRATION, INITIAL_MIGRATION,
+        OrchestratorReplacementRecoveryOutcome, OrchestratorReplacementRecoveryTarget,
+        OrchestratorReplacementRuntimeRole, OrchestratorReplacementStartEvidence,
+        PROFILE_ASSIGNMENT_MIGRATION, ProjectStoreError, SCHEMA_VERSION, SnapshotDeliveryResult,
+        SnapshotProjectFolder, SqliteProjectStore, TokenSpendCommandSource, YardStore,
+        insert_worker_runtime_binding, insert_worker_runtime_binding_unchecked,
     };
+
+    const HISTORICAL_PROVIDER_NEUTRAL_WORKFLOW_V25_MIGRATION: &str =
+        include_str!("../tests/fixtures/0025_provider_neutral_workflow_profiles.sql");
 
     fn draft(workspace_id: &str, terminal_id: &str) -> (CreateProject, WorkerRuntimeBinding) {
         (
@@ -15299,7 +16893,159 @@ mod tests {
             .unwrap()
     }
 
+    fn install_historical_provider_neutral_workflow_v25(connection: &mut Connection) {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute_batch(HISTORICAL_PROVIDER_NEUTRAL_WORKFLOW_V25_MIGRATION)
+            .unwrap();
+        super::orchestrator_workflow_profile_store::upgrade_provider_neutral_profile(
+            &transaction,
+            true,
+        )
+        .unwrap();
+        transaction
+            .execute(
+                "UPDATE orchestrator_workflow_profile_revisions
+                    SET name = 'Custom historical orchestrator',
+                        description = 'Custom workflow-source v25 metadata',
+                        instructions_markdown = '# Historical workflow-source v25 factory',
+                        monitor_interval_ms = 720000,
+                        commands_json = ?1,
+                        adapter_context_files_json = ?2,
+                        source = 'user',
+                        updated_by = 'workflow-source:v25-custom'
+                  WHERE profile_id = 'yard:standard-orchestrator'
+                    AND version = (
+                        SELECT current_version
+                          FROM orchestrator_workflow_profiles
+                         WHERE id = 'yard:standard-orchestrator'
+                    )",
+                params![
+                    r#"[{"id":"work.decompose","capability":"orchestration.work.decompose"},{"id":"worker.allocate","capability":"orchestration.worker.allocate"},{"id":"worker.observe","capability":"orchestration.worker.observe"},{"id":"worker.intervene","capability":"orchestration.worker.prompt"},{"id":"result.collect","capability":"orchestration.result.collect"},{"id":"quality.review","capability":"orchestration.quality.review"},{"id":"result.reconcile","capability":"orchestration.result.reconcile"},{"id":"result.verify","capability":"orchestration.result.verify"}]"#,
+                    r#"[{"adapter_id":"herdr","path":"AGENTS.md"}]"#,
+                ],
+            )
+            .unwrap();
+        super::ensure_foreign_keys(&transaction).unwrap();
+        transaction.commit().unwrap();
+    }
+
+    async fn populated_combined_workflow_v25_connection(temp: &TempDir) -> Connection {
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(temp).await;
+        configure_yard_orchestrator_for_routes(&store).await;
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_final_backend_safety_schema_to_v24(&connection);
+        drop(connection);
+        let mut connection = Connection::open(path).unwrap();
+        install_historical_provider_neutral_workflow_v25(&mut connection);
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute_batch(FINAL_BACKEND_SAFETY_MIGRATION)
+            .unwrap();
+        transaction.commit().unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        connection
+    }
+
+    fn table_snapshot(connection: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .unwrap();
+        let column_count = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..column_count)
+                    .map(|index| row.get(index))
+                    .collect::<Result<Vec<rusqlite::types::Value>, _>>()
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn schema_snapshot(connection: &Connection) -> Vec<(String, String, String, Option<String>)> {
+        connection
+            .prepare(
+                "SELECT type, name, tbl_name, sql
+                   FROM sqlite_schema
+                  ORDER BY type, name, tbl_name",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn table_snapshots(
+        connection: &Connection,
+        tables: &[&str],
+    ) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+        tables
+            .iter()
+            .map(|table| ((*table).to_owned(), table_snapshot(connection, table)))
+            .collect()
+    }
+
+    fn assert_invalid_v25_migration_rolled_back(connection: &Connection) {
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            25
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM sqlite_master
+                      WHERE name GLOB '*_v26*'
+                         OR tbl_name GLOB '*_v26*'
+                         OR instr(COALESCE(sql, ''), '_v26') > 0
+                         OR name IN (
+                            'project_orchestrator_replacement_workflow_pins',
+                            'orchestrator_workflow_profile_revision_immutable_update',
+                            'orchestrator_workflow_profile_revision_immutable_delete',
+                            'profile_project_creation_workflow_pin_insert',
+                            'profile_project_creation_workflow_pin_update',
+                            'workspace_project_creation_workflow_pin_insert',
+                            'workspace_project_creation_workflow_pin_update'
+                         )",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM sqlite_temp_schema", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
     fn downgrade_final_backend_safety_schema_to_v24(connection: &Connection) {
+        downgrade_provider_neutral_workflow_schema_to_v25(connection);
         connection
             .execute_batch(
                 "DROP TABLE dedicated_runtime_provision_intents;
@@ -15308,7 +17054,8 @@ mod tests {
                  ALTER TABLE worker_allocation_commands
                     DROP COLUMN objective_delivery_confirmed;
                  ALTER TABLE project_orchestrator_replacement_commands
-                    DROP COLUMN prepare_last_absence_observed_at_unix_ms;",
+                    DROP COLUMN prepare_last_absence_observed_at_unix_ms;
+                 PRAGMA user_version = 24;",
             )
             .unwrap();
     }
@@ -15357,6 +17104,118 @@ mod tests {
                         'replacement_prepared',
                         'replacement_started'
                     );",
+            )
+            .unwrap();
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn downgrade_provider_neutral_workflow_schema_to_v25(connection: &Connection) {
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TRIGGER orchestrator_workflow_profile_revision_immutable_update;
+                 DROP TRIGGER orchestrator_workflow_profile_revision_immutable_delete;
+                 DROP TRIGGER profile_project_creation_workflow_pin_insert;
+                 DROP TRIGGER profile_project_creation_workflow_pin_update;
+                 DROP TRIGGER workspace_project_creation_workflow_pin_insert;
+                 DROP TRIGGER workspace_project_creation_workflow_pin_update;
+                 DROP TABLE project_orchestrator_replacement_workflow_pins;
+
+                 CREATE TABLE orchestrator_workflow_profile_revisions_v25 (
+                    version INTEGER PRIMARY KEY NOT NULL CHECK (version > 0),
+                    instructions_markdown TEXT NOT NULL
+                        CHECK (length(instructions_markdown) > 0),
+                    monitor_interval_ms INTEGER NOT NULL
+                        CHECK (monitor_interval_ms > 0),
+                    source TEXT NOT NULL
+                        CHECK (source IN ('factory', 'user', 'reset')),
+                    updated_by TEXT NOT NULL CHECK (length(updated_by) > 0),
+                    created_at_unix_ms INTEGER NOT NULL
+                 ) STRICT;
+                 INSERT INTO orchestrator_workflow_profile_revisions_v25
+                 SELECT version, instructions_markdown, monitor_interval_ms,
+                        source, updated_by, created_at_unix_ms
+                   FROM orchestrator_workflow_profile_revisions
+                  WHERE profile_id = 'yard:standard-orchestrator';
+
+                 CREATE TABLE orchestrator_workflow_profile_current_v25 (
+                    singleton_id INTEGER PRIMARY KEY NOT NULL
+                        CHECK (singleton_id = 1),
+                    current_version INTEGER NOT NULL
+                        REFERENCES orchestrator_workflow_profile_revisions_v25(version)
+                        ON DELETE RESTRICT,
+                    updated_at_unix_ms INTEGER NOT NULL
+                 ) STRICT;
+                 INSERT INTO orchestrator_workflow_profile_current_v25
+                 SELECT singleton_id, current_version, updated_at_unix_ms
+                   FROM orchestrator_workflow_profile_current;
+
+                 CREATE TABLE yard_orchestrator_v25 (
+                    singleton_id INTEGER PRIMARY KEY NOT NULL
+                        CHECK (singleton_id = 1),
+                    worker_id TEXT UNIQUE
+                        REFERENCES workers(id) ON DELETE RESTRICT,
+                    version INTEGER NOT NULL CHECK (version > 0),
+                    created_at_unix_ms INTEGER NOT NULL,
+                    updated_at_unix_ms INTEGER NOT NULL,
+                    workflow_profile_version INTEGER
+                        REFERENCES orchestrator_workflow_profile_revisions_v25(version)
+                        ON DELETE RESTRICT
+                 ) STRICT;
+                 INSERT INTO yard_orchestrator_v25
+                 SELECT singleton_id, worker_id, version, created_at_unix_ms,
+                        updated_at_unix_ms, workflow_profile_version
+                   FROM yard_orchestrator;
+
+                 CREATE TABLE yard_orchestrator_configure_commands_v25 (
+                    command_id TEXT PRIMARY KEY NOT NULL
+                        REFERENCES command_acknowledgements(id) ON DELETE RESTRICT,
+                    worker_id TEXT NOT NULL
+                        REFERENCES workers(id) ON DELETE RESTRICT,
+                    expected_worker_version INTEGER NOT NULL
+                        CHECK (expected_worker_version > 0),
+                    expected_orchestrator_version INTEGER NOT NULL
+                        CHECK (expected_orchestrator_version > 0),
+                    replaced_worker_id TEXT
+                        REFERENCES workers(id) ON DELETE RESTRICT,
+                    result_orchestrator_version INTEGER NOT NULL
+                        CHECK (result_orchestrator_version > 0),
+                    finished_at_unix_ms INTEGER NOT NULL,
+                    workflow_profile_version INTEGER
+                        REFERENCES orchestrator_workflow_profile_revisions_v25(version)
+                        ON DELETE RESTRICT
+                 ) STRICT;
+                 INSERT INTO yard_orchestrator_configure_commands_v25
+                 SELECT command_id, worker_id, expected_worker_version,
+                        expected_orchestrator_version, replaced_worker_id,
+                        result_orchestrator_version, finished_at_unix_ms,
+                        workflow_profile_version
+                   FROM yard_orchestrator_configure_commands;
+
+                 DROP TABLE project_workflow_profile_pins;
+                 DROP TABLE orchestrator_workflow_profiles;
+                 ALTER TABLE profile_project_creation_commands
+                    DROP COLUMN workflow_profile_version;
+                 ALTER TABLE profile_project_creation_commands
+                    DROP COLUMN workflow_profile_id;
+                 ALTER TABLE workspace_project_creation_commands
+                    DROP COLUMN workflow_profile_version;
+                 ALTER TABLE workspace_project_creation_commands
+                    DROP COLUMN workflow_profile_id;
+                 DROP TABLE orchestrator_workflow_profile_current;
+                 DROP TABLE yard_orchestrator_configure_commands;
+                 DROP TABLE yard_orchestrator;
+                 DROP TABLE orchestrator_workflow_profile_revisions;
+
+                 ALTER TABLE orchestrator_workflow_profile_revisions_v25
+                    RENAME TO orchestrator_workflow_profile_revisions;
+                 ALTER TABLE orchestrator_workflow_profile_current_v25
+                    RENAME TO orchestrator_workflow_profile_current;
+                 ALTER TABLE yard_orchestrator_v25 RENAME TO yard_orchestrator;
+                 ALTER TABLE yard_orchestrator_configure_commands_v25
+                    RENAME TO yard_orchestrator_configure_commands;
+                 PRAGMA user_version = 25;
+                 PRAGMA foreign_keys = ON;",
             )
             .unwrap();
     }
@@ -15845,7 +17704,7 @@ mod tests {
     ) -> YardOrchestrator {
         store
             .reconcile_runtime_inventory(inventory(
-                20,
+                30,
                 vec![observed_worker(
                     "terminal-yard-routes",
                     "workspace-yard-routes",
@@ -16090,10 +17949,17 @@ mod tests {
             .begin_project_orchestrator_replacement(project_id, command.clone())
             .await
             .unwrap();
-        assert!(matches!(
-            begun,
-            BeginProjectOrchestratorReplacement::Started(_)
-        ));
+        let BeginProjectOrchestratorReplacement::Started(context) = begun else {
+            panic!("expected a new orchestrator replacement");
+        };
+        assert_eq!(
+            context.workflow_profile.version,
+            context.project.workflow_profile.profile_version
+        );
+        assert_eq!(
+            context.workflow_profile.id,
+            context.project.workflow_profile.profile_id
+        );
         store
             .claim_project_orchestrator_replacement_runtime(&command.command_id, prepared.clone())
             .await
@@ -16331,6 +18197,88 @@ mod tests {
                 .unwrap(),
             BeginProjectOrchestratorReplacement::Started(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn replacement_finalization_and_recovery_revalidate_captured_workflow_pin() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project, _profile, command, prepared, started) =
+            create_orchestrator_replacement_fixture(
+                &store,
+                "replace-workflow-pin-change",
+                OldSessionDisposition::RetainForInspection,
+            )
+            .await;
+        store
+            .begin_project_orchestrator_replacement(&project.id, command.clone())
+            .await
+            .unwrap();
+        let current = store.get_orchestrator_workflow_profile().await.unwrap();
+        let updated = store
+            .update_orchestrator_workflow_profile(
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                UpdateOrchestratorWorkflowProfile {
+                    actor: "local-user".to_owned(),
+                    expected_version: current.version,
+                    instructions_markdown: "# Replacement workflow changed".to_owned(),
+                    monitor_interval_ms: 900_000,
+                    commands: None,
+                    adapter_context_files: None,
+                },
+            )
+            .await
+            .unwrap();
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE project_workflow_profile_pins
+                    SET profile_version = ?1
+                  WHERE project_id = ?2",
+                params![i64::try_from(updated.version).unwrap(), project.id],
+            )
+            .unwrap();
+        drop(connection);
+        store
+            .claim_project_orchestrator_replacement_runtime(&command.command_id, prepared)
+            .await
+            .unwrap();
+        store
+            .record_project_orchestrator_replacement_started_runtime(
+                &command.command_id,
+                started.clone(),
+                OrchestratorReplacementStartEvidence::Confirmed,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .finalize_project_orchestrator_replacement(&command.command_id, started.clone())
+                .await
+                .unwrap_err(),
+            ProjectStoreError::OrchestratorReplacementTargetChanged
+        ));
+        store
+            .fail_project_orchestrator_replacement(
+                &command.command_id,
+                "workflow pin changed after objective delivery",
+                true,
+            )
+            .await
+            .unwrap();
+        let mut fresh = started;
+        fresh.last_observed_at_unix_ms += 1;
+        assert!(matches!(
+            store
+                .recover_project_orchestrator_replacement(&command.command_id, fresh)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::OrchestratorReplacementTargetChanged
+        ));
+        let persisted = store.get_project(&project.id).await.unwrap();
+        assert_eq!(persisted.orchestrator.id, project.orchestrator.id);
+        assert_eq!(persisted.workflow_profile.profile_version, updated.version);
     }
 
     #[tokio::test]
@@ -17838,6 +19786,14 @@ mod tests {
             context.source_assignment.attempt.lifecycle,
             AttemptLifecycle::HandingOff
         );
+        assert_eq!(
+            context.workflow_profile.version,
+            target_project.workflow_profile.profile_version
+        );
+        assert_eq!(
+            context.workflow_profile.id,
+            target_project.workflow_profile.profile_id
+        );
 
         let runtime = handoff_runtime("workspace-2", "terminal-handed-off");
         store
@@ -18654,6 +20610,129 @@ mod tests {
             .unwrap();
 
         assert!(matches!(next, BeginProfileProjectCreation::Started(_)));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn pending_creation_pins_reject_orphans_and_finalization_revalidates_corruption() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Orchestrator"),
+            })
+            .await
+            .unwrap();
+        let profile_command =
+            profile_project_command(&profile, "profile-workspace", "profile-pin-command");
+        let workspace_command = workspace_project_command(&profile, "workspace-pin-command");
+        store
+            .begin_profile_project_creation(profile_command.clone())
+            .await
+            .unwrap();
+        store
+            .begin_workspace_project_creation(workspace_command.clone())
+            .await
+            .unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let profile_orphan = connection.execute(
+            "UPDATE profile_project_creation_commands
+                SET workflow_profile_id = 'yard:missing'
+              WHERE command_id = ?1",
+            [&profile_command.command_id],
+        );
+        let workspace_orphan = connection.execute(
+            "UPDATE workspace_project_creation_commands
+                SET workflow_profile_version = 999
+              WHERE command_id = ?1",
+            [&workspace_command.command_id],
+        );
+        assert!(profile_orphan.is_err());
+        assert!(workspace_orphan.is_err());
+
+        connection
+            .execute_batch(
+                "DROP TRIGGER profile_project_creation_workflow_pin_update;
+                 DROP TRIGGER workspace_project_creation_workflow_pin_update;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE profile_project_creation_commands
+                    SET workflow_profile_id = 'yard:missing'
+                  WHERE command_id = ?1",
+                [&profile_command.command_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE workspace_project_creation_commands
+                    SET workflow_profile_version = 999
+                  WHERE command_id = ?1",
+                [&workspace_command.command_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let (_, profile_runtime) = draft("profile-workspace", "profile-terminal");
+        store
+            .claim_provisioning_runtime(&profile_command.command_id, profile_runtime.clone())
+            .await
+            .unwrap();
+        let (_, workspace_runtime) = draft("created-workspace", "workspace-terminal");
+        store
+            .claim_provisioning_runtime(&workspace_command.command_id, workspace_runtime.clone())
+            .await
+            .unwrap();
+
+        let profile_error = store
+            .finalize_profile_project_creation(&profile_command.command_id, profile_runtime)
+            .await
+            .unwrap_err();
+        let workspace_error = store
+            .finalize_workspace_project_creation(&workspace_command.command_id, workspace_runtime)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            profile_error,
+            ProjectStoreError::OrchestratorWorkflowProfileNotFound
+        ));
+        assert!(matches!(
+            workspace_error,
+            ProjectStoreError::OrchestratorWorkflowProfileNotFound
+        ));
+
+        let connection = Connection::open(path).unwrap();
+        let retained_claims: i64 = connection
+            .query_row(
+                "SELECT COUNT(*)
+                   FROM provisioning_runtime_claims
+                  WHERE command_id IN (?1, ?2)",
+                params![profile_command.command_id, workspace_command.command_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let created_projects: i64 = connection
+            .query_row(
+                "SELECT COUNT(*)
+                   FROM projects
+                  WHERE id IN (
+                    SELECT result_project_id
+                      FROM profile_project_creation_commands
+                     WHERE command_id = 'profile-pin-command'
+                    UNION ALL
+                    SELECT result_project_id
+                      FROM workspace_project_creation_commands
+                     WHERE command_id = 'workspace-pin-command'
+                  )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_claims, 2);
+        assert_eq!(created_projects, 0);
     }
 
     #[tokio::test]
@@ -20242,6 +22321,1654 @@ mod tests {
         assert_eq!(revisions, 1);
         assert_eq!(current_rows, 1);
         assert_eq!(foreign_key_errors, 0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn version_25_database_upgrades_to_workflow_v26() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let current = store.get_orchestrator_workflow_profile().await.unwrap();
+        let active = store
+            .update_orchestrator_workflow_profile(
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                UpdateOrchestratorWorkflowProfile {
+                    actor: "local-user".to_owned(),
+                    expected_version: current.version,
+                    instructions_markdown: "# Active before migration".to_owned(),
+                    monitor_interval_ms: 900_000,
+                    commands: None,
+                    adapter_context_files: None,
+                },
+            )
+            .await
+            .unwrap();
+        let (project_draft, orchestrator) = draft("workspace-v25", "terminal-v25");
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+        let worker_profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Pending project orchestrator"),
+            })
+            .await
+            .unwrap();
+        let profile_creation = profile_project_command(
+            &worker_profile,
+            "pending-profile-workspace",
+            "pending-profile",
+        );
+        let workspace_creation = workspace_project_command(&worker_profile, "pending-workspace");
+        let BeginProfileProjectCreation::Started(profile_context) = store
+            .begin_profile_project_creation(profile_creation)
+            .await
+            .unwrap()
+        else {
+            panic!("expected pending profile project creation");
+        };
+        let BeginWorkspaceProjectCreation::Started(workspace_context) = store
+            .begin_workspace_project_creation(workspace_creation)
+            .await
+            .unwrap()
+        else {
+            panic!("expected pending workspace project creation");
+        };
+        assert_eq!(profile_context.workflow_profile.version, active.version);
+        assert_eq!(workspace_context.workflow_profile.version, active.version);
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_provider_neutral_workflow_schema_to_v25(&connection);
+        let version = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        let backend_safety_table: bool = connection
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM sqlite_master
+                     WHERE type = 'table'
+                       AND name = 'provisioning_runtime_claims'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 25);
+        assert!(backend_safety_table);
+        drop(connection);
+
+        let migrated = SqliteProjectStore::open(&path).await.unwrap();
+        let persisted = migrated.get_project(&project.id).await.unwrap();
+        let preserved = migrated
+            .get_orchestrator_workflow_profile_revision(
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                active.version,
+            )
+            .await
+            .unwrap();
+        let current = migrated.get_orchestrator_workflow_profile().await.unwrap();
+        assert_eq!(
+            persisted.workflow_profile.profile_id,
+            YARD_STANDARD_ORCHESTRATOR_PROFILE_ID
+        );
+        assert_eq!(persisted.workflow_profile.profile_version, current.version);
+        assert_eq!(persisted.workflow_profile.pinned_by, "yard:migration");
+        assert_eq!(preserved.instructions_markdown, "# Active before migration");
+        assert_eq!(preserved.monitor_interval_ms, 900_000);
+        assert_eq!(
+            preserved.commands,
+            yard_domain::yard_standard_orchestrator_commands()
+        );
+        assert_eq!(current.version, active.version);
+        assert_eq!(current.instructions_markdown, "# Active before migration");
+        assert_eq!(current.monitor_interval_ms, 900_000);
+        assert_eq!(
+            current.commands,
+            yard_domain::yard_standard_orchestrator_commands()
+        );
+        assert_eq!(current.updated_by, active.updated_by);
+        drop(migrated);
+
+        let connection = Connection::open(path).unwrap();
+        let version = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        let foreign_key_errors: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let pending_creation_pins: i64 = connection
+            .query_row(
+                "SELECT COUNT(*)
+                   FROM (
+                       SELECT workflow_profile_id, workflow_profile_version
+                         FROM profile_project_creation_commands
+                        WHERE command_id = 'pending-profile'
+                       UNION ALL
+                       SELECT workflow_profile_id, workflow_profile_version
+                         FROM workspace_project_creation_commands
+                        WHERE command_id = 'pending-workspace'
+                   )
+                  WHERE workflow_profile_id = 'yard:standard-orchestrator'
+                    AND workflow_profile_version = ?1",
+                [i64::try_from(current.version).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 26);
+        assert_eq!(foreign_key_errors, 0);
+        assert_eq!(pending_creation_pins, 2);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn exact_workflow_source_v25_preserves_revisions_pins_and_replay_while_adding_backend() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let factory = store.get_orchestrator_workflow_profile().await.unwrap();
+        let (factory_project_draft, factory_orchestrator) =
+            draft("workspace-factory-pin", "terminal-factory-pin");
+        let factory_project = store
+            .create_project(factory_project_draft, factory_orchestrator)
+            .await
+            .unwrap();
+        let active = store
+            .update_orchestrator_workflow_profile(
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                UpdateOrchestratorWorkflowProfile {
+                    actor: "local-user".to_owned(),
+                    expected_version: factory.version,
+                    instructions_markdown: "# Historical user workflow".to_owned(),
+                    monitor_interval_ms: 900_000,
+                    commands: None,
+                    adapter_context_files: None,
+                },
+            )
+            .await
+            .unwrap();
+        let (project, transfer) =
+            create_project_orchestrator_transfer_fixture(&store, "workspace-transfer").await;
+        let transfer_command_id = transfer.command_id.clone();
+        store
+            .transfer_project_orchestrator(&project.id, transfer.clone())
+            .await
+            .unwrap();
+        let configured_orchestrator = configure_yard_orchestrator_for_routes(&store).await;
+        let worker_profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Pending project orchestrator"),
+            })
+            .await
+            .unwrap();
+        let profile_creation = profile_project_command(
+            &worker_profile,
+            "workflow-v25-pending",
+            "workflow-v25-profile",
+        );
+        let workspace_creation =
+            workspace_project_command(&worker_profile, "workflow-v25-workspace");
+        store
+            .begin_profile_project_creation(profile_creation)
+            .await
+            .unwrap();
+        store
+            .begin_workspace_project_creation(workspace_creation)
+            .await
+            .unwrap();
+        drop(store);
+
+        let mut connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE project_orchestrator_transfer_commands
+                    SET result_project_json =
+                        json_remove(result_project_json, '$.workflow_profile')
+                  WHERE command_id = ?1",
+                [&transfer.command_id],
+            )
+            .unwrap();
+        downgrade_final_backend_safety_schema_to_v24(&connection);
+        install_historical_provider_neutral_workflow_v25(&mut connection);
+        connection
+            .execute(
+                "UPDATE project_workflow_profile_pins
+                    SET profile_version = ?1,
+                        pinned_by = 'factory-pin-before-v26',
+                        pinned_at_unix_ms = 41
+                  WHERE project_id = ?2",
+                params![i64::try_from(factory.version).unwrap(), factory_project.id],
+            )
+            .unwrap();
+        let historical_source_version = active.version + 1;
+        let transfer_replay_json_before_v26: String = connection
+            .query_row(
+                "SELECT result_project_json
+                   FROM project_orchestrator_transfer_commands
+                  WHERE command_id = ?1",
+                [&transfer_command_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let configure_replay_before_v26: String = connection
+            .query_row(
+                "SELECT json_object(
+                    'command_id', command_id,
+                    'worker_id', worker_id,
+                    'expected_worker_version', expected_worker_version,
+                    'expected_orchestrator_version', expected_orchestrator_version,
+                    'replaced_worker_id', replaced_worker_id,
+                    'result_orchestrator_version', result_orchestrator_version,
+                    'finished_at_unix_ms', finished_at_unix_ms,
+                    'workflow_profile_version', workflow_profile_version
+                 )
+                   FROM yard_orchestrator_configure_commands
+                  WHERE command_id = 'configure-yard-for-routes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let backend_marker: bool = connection
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'provisioning_runtime_claims'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!backend_marker);
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            25
+        );
+        drop(connection);
+
+        let migrated = SqliteProjectStore::open(&path).await.unwrap();
+        let replayed = migrated
+            .replay_project_orchestrator_transfer(&project.id, transfer)
+            .await
+            .unwrap()
+            .unwrap();
+        let current = migrated.get_orchestrator_workflow_profile().await.unwrap();
+        let preserved = migrated
+            .get_orchestrator_workflow_profile_revision(
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                active.version,
+            )
+            .await
+            .unwrap();
+        let preserved_factory = migrated
+            .get_orchestrator_workflow_profile_revision(
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                factory.version,
+            )
+            .await
+            .unwrap();
+        let historical_source = migrated
+            .get_orchestrator_workflow_profile_revision(
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                historical_source_version,
+            )
+            .await
+            .unwrap();
+        let live_project = migrated.get_project(&project.id).await.unwrap();
+        let live_factory_project = migrated.get_project(&factory_project.id).await.unwrap();
+        let project_successor = migrated
+            .get_orchestrator_workflow_profile_revision(
+                &live_project.workflow_profile.profile_id,
+                live_project.workflow_profile.profile_version,
+            )
+            .await
+            .unwrap();
+        let factory_successor = migrated
+            .get_orchestrator_workflow_profile_revision(
+                &live_factory_project.workflow_profile.profile_id,
+                live_factory_project.workflow_profile.profile_version,
+            )
+            .await
+            .unwrap();
+        let migrated_orchestrator = migrated.get_yard_orchestrator().await.unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(
+            replayed.project.workflow_profile.profile_version,
+            active.version
+        );
+        assert_eq!(
+            preserved.instructions_markdown,
+            "# Historical user workflow"
+        );
+        assert!(preserved.commands.is_empty());
+        assert_eq!(historical_source.version, historical_source_version);
+        assert_eq!(historical_source.commands.len(), 8);
+        assert_eq!(
+            historical_source.instructions_markdown,
+            "# Historical workflow-source v25 factory"
+        );
+        assert_eq!(historical_source.name, "Custom historical orchestrator");
+        assert_eq!(
+            historical_source.description,
+            "Custom workflow-source v25 metadata"
+        );
+        assert_eq!(historical_source.monitor_interval_ms, 720_000);
+        assert_eq!(historical_source.adapter_context_files.len(), 1);
+        assert_eq!(historical_source.adapter_context_files[0].path, "AGENTS.md");
+        assert_eq!(historical_source.updated_by, "workflow-source:v25-custom");
+        assert_eq!(current.version, historical_source_version + 3);
+        assert_eq!(
+            current.instructions_markdown,
+            "# Historical workflow-source v25 factory"
+        );
+        assert_eq!(current.name, historical_source.name);
+        assert_eq!(current.description, historical_source.description);
+        assert_eq!(
+            current.monitor_interval_ms,
+            historical_source.monitor_interval_ms
+        );
+        assert_eq!(
+            current.adapter_context_files,
+            historical_source.adapter_context_files
+        );
+        assert_eq!(
+            current.commands,
+            yard_domain::yard_standard_orchestrator_commands()
+        );
+        assert_eq!(current.updated_by, "yard:v26-complete-command-matrix");
+        assert_eq!(
+            live_project.workflow_profile.profile_version,
+            historical_source_version + 2
+        );
+        assert_ne!(
+            live_project.workflow_profile.profile_version,
+            current.version
+        );
+        assert_eq!(
+            project_successor.instructions_markdown,
+            preserved.instructions_markdown
+        );
+        assert_eq!(project_successor.name, preserved.name);
+        assert_eq!(project_successor.description, preserved.description);
+        assert_eq!(
+            project_successor.monitor_interval_ms,
+            preserved.monitor_interval_ms
+        );
+        assert_eq!(
+            project_successor.adapter_context_files,
+            preserved.adapter_context_files
+        );
+        assert_eq!(
+            project_successor.commands,
+            yard_domain::yard_standard_orchestrator_commands()
+        );
+        assert_eq!(
+            project_successor.updated_by,
+            "yard:v26-complete-command-matrix"
+        );
+        assert_eq!(
+            live_factory_project.workflow_profile.profile_version,
+            historical_source_version + 1
+        );
+        assert_eq!(
+            factory_successor.instructions_markdown,
+            preserved_factory.instructions_markdown
+        );
+        assert_eq!(factory_successor.name, preserved_factory.name);
+        assert_eq!(factory_successor.description, preserved_factory.description);
+        assert_eq!(
+            factory_successor.commands,
+            yard_domain::yard_standard_orchestrator_commands()
+        );
+        assert_ne!(factory_successor.version, project_successor.version);
+        assert_ne!(factory_successor.version, current.version);
+        assert_eq!(
+            live_project.workflow_profile.pinned_by,
+            "yard:v26-complete-command-matrix"
+        );
+        assert_eq!(
+            migrated_orchestrator.workflow_profile_version,
+            project_successor.version
+        );
+        assert_eq!(
+            configured_orchestrator.workflow_profile_version,
+            active.version
+        );
+        let replayed_configure = migrated
+            .configure_yard_orchestrator(ConfigureYardOrchestrator {
+                command_id: "configure-yard-for-routes".to_owned(),
+                actor: "local-user".to_owned(),
+                worker_id: configured_orchestrator.worker.as_ref().unwrap().id.clone(),
+                expected_worker_version: configured_orchestrator.worker.as_ref().unwrap().version,
+                expected_orchestrator_version: configured_orchestrator.version - 1,
+                workflow_profile_version: Some(active.version),
+            })
+            .await
+            .unwrap();
+        assert!(replayed_configure.replayed);
+        assert_eq!(
+            replayed_configure.orchestrator.workflow_profile_version,
+            active.version
+        );
+        drop(migrated);
+        let reopened = SqliteProjectStore::open(&path).await.unwrap();
+        assert_eq!(
+            reopened.get_orchestrator_workflow_profile().await.unwrap(),
+            current
+        );
+        assert_eq!(
+            reopened
+                .get_orchestrator_workflow_profile_revision(
+                    YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                    historical_source_version,
+                )
+                .await
+                .unwrap(),
+            historical_source
+        );
+        drop(reopened);
+
+        let connection = Connection::open(path).unwrap();
+        let (
+            version,
+            backend_marker,
+            pending_pins,
+            executable_yard_reference,
+            configure_replay_version,
+            revisions,
+            foreign_key_errors,
+        ): (i64, bool, i64, i64, i64, i64, i64) = (
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = 'provisioning_runtime_claims'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM (
+                         SELECT workflow_profile_id, workflow_profile_version
+                           FROM profile_project_creation_commands
+                          WHERE command_id = 'workflow-v25-profile'
+                         UNION ALL
+                         SELECT workflow_profile_id, workflow_profile_version
+                           FROM workspace_project_creation_commands
+                          WHERE command_id = 'workflow-v25-workspace'
+                       )
+                      WHERE workflow_profile_id = 'yard:standard-orchestrator'
+                        AND workflow_profile_version = ?1",
+                    [i64::try_from(project_successor.version).unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT workflow_profile_version
+                       FROM yard_orchestrator
+                      WHERE singleton_id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT workflow_profile_version
+                       FROM yard_orchestrator_configure_commands
+                      WHERE command_id = 'configure-yard-for-routes'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM orchestrator_workflow_profile_revisions
+                      WHERE profile_id = 'yard:standard-orchestrator'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+        );
+        assert_eq!(version, 26);
+        assert!(backend_marker);
+        assert_eq!(pending_pins, 2);
+        assert_eq!(
+            executable_yard_reference,
+            i64::try_from(project_successor.version).unwrap()
+        );
+        assert_eq!(
+            configure_replay_version,
+            i64::try_from(active.version).unwrap()
+        );
+        assert_eq!(revisions, 6);
+        assert_eq!(foreign_key_errors, 0);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT result_project_json
+                       FROM project_orchestrator_transfer_commands
+                      WHERE command_id = ?1",
+                    [&transfer_command_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            transfer_replay_json_before_v26
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT json_object(
+                        'command_id', command_id,
+                        'worker_id', worker_id,
+                        'expected_worker_version', expected_worker_version,
+                        'expected_orchestrator_version', expected_orchestrator_version,
+                        'replaced_worker_id', replaced_worker_id,
+                        'result_orchestrator_version', result_orchestrator_version,
+                        'finished_at_unix_ms', finished_at_unix_ms,
+                        'workflow_profile_version', workflow_profile_version
+                     )
+                       FROM yard_orchestrator_configure_commands
+                      WHERE command_id = 'configure-yard-for-routes'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            configure_replay_before_v26
+        );
+        assert!(
+            connection
+                .execute(
+                    "UPDATE orchestrator_workflow_profile_revisions
+                        SET instructions_markdown = '# Rewritten'
+                      WHERE profile_id = 'yard:standard-orchestrator'
+                        AND version = ?1",
+                    [i64::try_from(current.version).unwrap()],
+                )
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn workflow_v25_migration_rejects_ambiguous_prepare_intent_without_mutation() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let current = store.get_orchestrator_workflow_profile().await.unwrap();
+        store
+            .update_orchestrator_workflow_profile(
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                UpdateOrchestratorWorkflowProfile {
+                    actor: "local-user".to_owned(),
+                    expected_version: current.version,
+                    instructions_markdown: "# Workflow used by pending replacement".to_owned(),
+                    monitor_interval_ms: 900_000,
+                    commands: None,
+                    adapter_context_files: None,
+                },
+            )
+            .await
+            .unwrap();
+        let (project, _profile, command, _prepared, _started) =
+            create_orchestrator_replacement_fixture(
+                &store,
+                "replace-before-v26-migration",
+                OldSessionDisposition::RetainForInspection,
+            )
+            .await;
+        store
+            .begin_project_orchestrator_replacement(&project.id, command.clone())
+            .await
+            .unwrap();
+        store
+            .fail_project_orchestrator_replacement(
+                &command.command_id,
+                "prepare tab creation outcome is unknown",
+                true,
+            )
+            .await
+            .unwrap();
+        let recoveries = store
+            .list_ambiguous_orchestrator_replacement_recoveries(Some(&command.command_id))
+            .await
+            .unwrap();
+        assert_eq!(recoveries.len(), 1);
+        assert!(recoveries[0].prepare_intent.is_some());
+        assert!(recoveries[0].captures.is_empty());
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_final_backend_safety_schema_to_v24(&connection);
+        drop(connection);
+        let mut connection = Connection::open(&path).unwrap();
+        install_historical_provider_neutral_workflow_v25(&mut connection);
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute_batch(FINAL_BACKEND_SAFETY_MIGRATION)
+            .unwrap();
+        transaction.commit().unwrap();
+        let project_before = table_snapshot(&connection, "projects");
+        let pin_before = table_snapshot(&connection, "project_workflow_profile_pins");
+        let replacement_before =
+            table_snapshot(&connection, "project_orchestrator_replacement_commands");
+        let acknowledgement_before = table_snapshot(&connection, "command_acknowledgements");
+        let runtime_before =
+            table_snapshot(&connection, "orchestrator_replacement_runtime_bindings");
+
+        let error = super::migrate(&mut connection).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProjectStoreError::InvalidSchemaV25Lineage { .. }
+        ));
+        assert_eq!(table_snapshot(&connection, "projects"), project_before);
+        assert_eq!(
+            table_snapshot(&connection, "project_workflow_profile_pins"),
+            pin_before
+        );
+        assert_eq!(
+            table_snapshot(&connection, "project_orchestrator_replacement_commands"),
+            replacement_before
+        );
+        assert_eq!(
+            table_snapshot(&connection, "command_acknowledgements"),
+            acknowledgement_before
+        );
+        assert_eq!(
+            table_snapshot(&connection, "orchestrator_replacement_runtime_bindings"),
+            runtime_before
+        );
+        assert_invalid_v25_migration_rolled_back(&connection);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn both_marker_v25_converges_once_and_reopens_idempotently() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let (project_draft, orchestrator) =
+            draft("workspace-independent-pin", "terminal-independent-pin");
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_final_backend_safety_schema_to_v24(&connection);
+        drop(connection);
+        let mut connection = Connection::open(&path).unwrap();
+        install_historical_provider_neutral_workflow_v25(&mut connection);
+        connection
+            .execute_batch(
+                "INSERT INTO orchestrator_workflow_profile_revisions (
+                    version, instructions_markdown, monitor_interval_ms,
+                    source, updated_by, created_at_unix_ms, profile_id,
+                    name, description, commands_json,
+                    adapter_context_files_json
+                 )
+                 SELECT 3, '# Independent historical workflow',
+                        monitor_interval_ms, 'user', 'independent-user', 42,
+                        'yard:independent', 'Independent workflow',
+                        'Independent historical profile', commands_json,
+                        adapter_context_files_json
+                   FROM orchestrator_workflow_profile_revisions
+                  WHERE profile_id = 'yard:standard-orchestrator'
+                    AND version = 2;
+                 INSERT INTO orchestrator_workflow_profiles (
+                    id, current_version, updated_at_unix_ms
+                 ) VALUES ('yard:independent', 3, 42);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE project_workflow_profile_pins
+                    SET profile_id = 'yard:independent',
+                        profile_version = 3,
+                        pinned_by = 'independent-user',
+                        pinned_at_unix_ms = 42
+                  WHERE project_id = ?1",
+                [&project.id],
+            )
+            .unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute_batch(FINAL_BACKEND_SAFETY_MIGRATION)
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let migrated = SqliteProjectStore::open(&path).await.unwrap();
+        let current = migrated.get_orchestrator_workflow_profile().await.unwrap();
+        let historical = migrated
+            .get_orchestrator_workflow_profile_revision(YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, 2)
+            .await
+            .unwrap();
+        let independent = migrated
+            .get_orchestrator_workflow_profile_by_id("yard:independent")
+            .await
+            .unwrap();
+        let migrated_project = migrated.get_project(&project.id).await.unwrap();
+        assert_eq!(historical.commands.len(), 8);
+        assert_eq!(historical.updated_by, "workflow-source:v25-custom");
+        assert_eq!(independent.version, 4);
+        assert_eq!(
+            independent.instructions_markdown,
+            "# Independent historical workflow"
+        );
+        assert_eq!(independent.updated_by, "yard:v26-complete-command-matrix");
+        assert_eq!(
+            independent.commands,
+            yard_domain::yard_standard_orchestrator_commands()
+        );
+        assert_eq!(
+            migrated_project.workflow_profile.profile_id,
+            "yard:independent"
+        );
+        assert_eq!(
+            migrated_project.workflow_profile.profile_version,
+            independent.version
+        );
+        assert_eq!(
+            migrated_project.workflow_profile.pinned_by,
+            "yard:v26-complete-command-matrix"
+        );
+        assert_eq!(migrated_project.version, project.version + 1);
+        assert_eq!(current.version, 4);
+        assert_eq!(
+            current.instructions_markdown,
+            "# Historical workflow-source v25 factory"
+        );
+        assert_eq!(current.name, historical.name);
+        assert_eq!(current.description, historical.description);
+        assert_eq!(current.monitor_interval_ms, historical.monitor_interval_ms);
+        assert_eq!(
+            current.adapter_context_files,
+            historical.adapter_context_files
+        );
+        assert_eq!(
+            current.commands,
+            yard_domain::yard_standard_orchestrator_commands()
+        );
+        assert_eq!(current.updated_by, "yard:v26-complete-command-matrix");
+        drop(migrated);
+        let reopened = SqliteProjectStore::open(&path).await.unwrap();
+        assert_eq!(
+            reopened.get_orchestrator_workflow_profile().await.unwrap(),
+            current
+        );
+        assert_eq!(
+            reopened
+                .get_orchestrator_workflow_profile_revision(
+                    YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                    2,
+                )
+                .await
+                .unwrap(),
+            historical
+        );
+        assert_eq!(
+            reopened
+                .get_orchestrator_workflow_profile_by_id("yard:independent")
+                .await
+                .unwrap(),
+            independent
+        );
+        drop(reopened);
+
+        let connection = Connection::open(path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM orchestrator_workflow_profile_revisions",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn contradictory_both_marker_v25_fails_without_mutation() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        drop(open_store(&temp).await);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_final_backend_safety_schema_to_v24(&connection);
+        drop(connection);
+        let mut connection = Connection::open(&path).unwrap();
+        install_historical_provider_neutral_workflow_v25(&mut connection);
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute_batch(FINAL_BACKEND_SAFETY_MIGRATION)
+            .unwrap();
+        transaction.commit().unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 UPDATE orchestrator_workflow_profiles
+                    SET current_version = 999
+                  WHERE id = 'yard:standard-orchestrator';",
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = SqliteProjectStore::open(&path).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectStoreError::InvalidSchemaV25Lineage { .. }
+        ));
+
+        let connection = Connection::open(path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            25
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT current_version
+                       FROM orchestrator_workflow_profiles
+                      WHERE id = 'yard:standard-orchestrator'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            999
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM sqlite_master
+                      WHERE type = 'trigger'
+                        AND name =
+                            'orchestrator_workflow_profile_revision_immutable_update'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn populated_extra_columns_in_rebuilt_v25_tables_fail_closed_without_mutation() {
+        for table in [
+            "orchestrator_workflow_profile_current",
+            "yard_orchestrator",
+            "yard_orchestrator_configure_commands",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let mut connection = populated_combined_workflow_v25_connection(&temp).await;
+            connection
+                .execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN branched_state TEXT;
+                     UPDATE {table} SET branched_state = 'preserve-me';"
+                ))
+                .unwrap();
+            let before = table_snapshot(&connection, table);
+            assert!(!before.is_empty());
+
+            let error = super::migrate(&mut connection).unwrap_err();
+
+            assert!(matches!(
+                error,
+                ProjectStoreError::InvalidSchemaV25Lineage { .. }
+            ));
+            assert_eq!(table_snapshot(&connection, table), before);
+            assert_invalid_v25_migration_rolled_back(&connection);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_columns_in_rebuilt_v25_tables_fail_closed_without_mutation() {
+        for (table, column) in [
+            (
+                "orchestrator_workflow_profile_current",
+                "updated_at_unix_ms",
+            ),
+            ("yard_orchestrator", "created_at_unix_ms"),
+            (
+                "yard_orchestrator_configure_commands",
+                "finished_at_unix_ms",
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let mut connection = populated_combined_workflow_v25_connection(&temp).await;
+            connection
+                .execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column};"))
+                .unwrap();
+            let before = table_snapshot(&connection, table);
+            assert!(!before.is_empty());
+
+            let error = super::migrate(&mut connection).unwrap_err();
+
+            assert!(matches!(
+                error,
+                ProjectStoreError::InvalidSchemaV25Lineage { .. }
+            ));
+            assert_eq!(table_snapshot(&connection, table), before);
+            assert_invalid_v25_migration_rolled_back(&connection);
+        }
+    }
+
+    #[tokio::test]
+    async fn behavior_changing_v25_index_metadata_fails_closed_without_mutation() {
+        for index_terms in [
+            "profile_id COLLATE NOCASE, version",
+            "profile_id, version DESC",
+            "profile_id, (version + 0)",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let mut connection = populated_combined_workflow_v25_connection(&temp).await;
+            connection
+                .execute_batch(&format!(
+                    "PRAGMA foreign_keys = OFF;
+                     DROP INDEX orchestrator_workflow_profile_revision_identity;
+                     CREATE UNIQUE INDEX orchestrator_workflow_profile_revision_identity
+                     ON orchestrator_workflow_profile_revisions ({index_terms});
+                     PRAGMA foreign_keys = ON;"
+                ))
+                .unwrap();
+            let rows_before =
+                table_snapshot(&connection, "orchestrator_workflow_profile_revisions");
+            let schema_before: String = connection
+                .query_row(
+                    "SELECT sql
+                       FROM sqlite_schema
+                      WHERE type = 'index'
+                        AND name = 'orchestrator_workflow_profile_revision_identity'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            let error = super::migrate(&mut connection).unwrap_err();
+
+            assert!(matches!(
+                error,
+                ProjectStoreError::InvalidSchemaV25Lineage { .. }
+            ));
+            assert_eq!(
+                table_snapshot(&connection, "orchestrator_workflow_profile_revisions"),
+                rows_before
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT sql
+                           FROM sqlite_schema
+                          WHERE type = 'index'
+                            AND name =
+                                'orchestrator_workflow_profile_revision_identity'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                schema_before
+            );
+            assert_invalid_v25_migration_rolled_back(&connection);
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_v25_foreign_key_fails_closed_without_mutation() {
+        let temp = TempDir::new().unwrap();
+        let mut connection = populated_combined_workflow_v25_connection(&temp).await;
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 ALTER TABLE orchestrator_workflow_profile_current
+                    RENAME TO orchestrator_workflow_profile_current_immediate;
+                 CREATE TABLE orchestrator_workflow_profile_current (
+                    singleton_id INTEGER PRIMARY KEY NOT NULL
+                        CHECK (singleton_id = 1),
+                    current_version INTEGER NOT NULL
+                        REFERENCES orchestrator_workflow_profile_revisions(version)
+                        ON DELETE RESTRICT
+                        DEFERRABLE INITIALLY DEFERRED,
+                    updated_at_unix_ms INTEGER NOT NULL
+                 ) STRICT;
+                 INSERT INTO orchestrator_workflow_profile_current
+                 SELECT * FROM orchestrator_workflow_profile_current_immediate;
+                 DROP TABLE orchestrator_workflow_profile_current_immediate;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+        let rows_before = table_snapshot(&connection, "orchestrator_workflow_profile_current");
+        let schema_before: String = connection
+            .query_row(
+                "SELECT sql
+                   FROM sqlite_schema
+                  WHERE type = 'table'
+                    AND name = 'orchestrator_workflow_profile_current'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let error = super::migrate(&mut connection).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProjectStoreError::InvalidSchemaV25Lineage { .. }
+        ));
+        assert_eq!(
+            table_snapshot(&connection, "orchestrator_workflow_profile_current"),
+            rows_before
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT sql
+                       FROM sqlite_schema
+                      WHERE type = 'table'
+                        AND name = 'orchestrator_workflow_profile_current'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            schema_before
+        );
+        assert_invalid_v25_migration_rolled_back(&connection);
+    }
+
+    #[test]
+    fn foreign_key_clause_parser_ignores_identifiers_literals_and_comments() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY) STRICT;
+                 CREATE TABLE child (
+                    \"MATCH\" TEXT NOT NULL
+                        DEFAULT 'REFERENCES parent(id) MATCH FULL DEFERRABLE',
+                    parent_id INTEGER
+                        REFERENCES parent(id)
+                        /* MATCH PARTIAL INITIALLY DEFERRED */
+                        ON DELETE RESTRICT
+                        CONSTRAINT match NOT NULL,
+                    CHECK (match <> 'MATCH SIMPLE')
+                 ) STRICT;",
+            )
+            .unwrap();
+
+        super::ensure_exact_foreign_keys(
+            &connection,
+            "child",
+            &["parent|parent_id|id|NO ACTION|RESTRICT|NONE"],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn foreign_key_clause_parser_covers_table_level_match_and_separated_deferrability() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY) STRICT;
+                 CREATE TABLE child_table_match (
+                    parent_id INTEGER NOT NULL,
+                    FOREIGN KEY (parent_id)
+                        REFERENCES parent(id) MATCH FULL
+                        ON DELETE RESTRICT
+                 ) STRICT;
+                 CREATE TABLE child_separated_deferred (
+                    parent_id INTEGER
+                        REFERENCES parent(id)
+                        ON DELETE RESTRICT
+                        NOT NULL DEFERRABLE INITIALLY DEFERRED
+                 ) STRICT;",
+            )
+            .unwrap();
+        let expected = ["parent|parent_id|id|NO ACTION|RESTRICT|NONE"];
+
+        for table in ["child_table_match", "child_separated_deferred"] {
+            assert!(matches!(
+                super::ensure_exact_foreign_keys(&connection, table, &expected),
+                Err(ProjectStoreError::InvalidSchemaV25Lineage { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_v25_foreign_key_match_clauses_fail_closed_without_mutation() {
+        for match_name in [
+            "FULL",
+            "PARTIAL",
+            "SIMPLE",
+            "NONE",
+            "\"FULL\"",
+            "[PARTIAL]",
+            "'SIMPLE'",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let mut connection = populated_combined_workflow_v25_connection(&temp).await;
+            connection
+                .execute_batch(&format!(
+                    "PRAGMA foreign_keys = OFF;
+                     ALTER TABLE orchestrator_workflow_profile_current
+                        RENAME TO orchestrator_workflow_profile_current_match_source;
+                     CREATE TABLE orchestrator_workflow_profile_current (
+                        singleton_id INTEGER PRIMARY KEY NOT NULL
+                            CHECK (singleton_id = 1),
+                        current_version INTEGER NOT NULL
+                            REFERENCES orchestrator_workflow_profile_revisions(version)
+                            MATCH {match_name}
+                            ON DELETE RESTRICT,
+                        updated_at_unix_ms INTEGER NOT NULL
+                     ) STRICT;
+                     INSERT INTO orchestrator_workflow_profile_current
+                     SELECT * FROM orchestrator_workflow_profile_current_match_source;
+                     DROP TABLE orchestrator_workflow_profile_current_match_source;
+                     PRAGMA foreign_keys = ON;"
+                ))
+                .unwrap();
+            let tables = [
+                "projects",
+                "orchestrator_workflow_profile_revisions",
+                "orchestrator_workflow_profile_current",
+                "orchestrator_workflow_profiles",
+                "project_workflow_profile_pins",
+                "yard_orchestrator",
+                "yard_orchestrator_configure_commands",
+                "profile_project_creation_commands",
+                "workspace_project_creation_commands",
+            ];
+            let rows_before = table_snapshots(&connection, &tables);
+            let schema_before = schema_snapshot(&connection);
+            let match_before: String = connection
+                .query_row(
+                    "SELECT \"match\"
+                       FROM pragma_foreign_key_list(
+                           'orchestrator_workflow_profile_current'
+                       )",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(match_before, "NONE");
+
+            let error = super::migrate(&mut connection).unwrap_err();
+
+            assert!(matches!(
+                error,
+                ProjectStoreError::InvalidSchemaV25Lineage { .. }
+            ));
+            assert_eq!(schema_snapshot(&connection), schema_before);
+            assert_eq!(table_snapshots(&connection, &tables), rows_before);
+            assert_invalid_v25_migration_rolled_back(&connection);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_partial_and_markerless_v25_schemas_fail_without_mutation() {
+        for partial in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("yard.sqlite3");
+            drop(open_store(&temp).await);
+            let connection = Connection::open(&path).unwrap();
+            downgrade_final_backend_safety_schema_to_v24(&connection);
+            if partial {
+                connection
+                    .execute_batch(
+                        "ALTER TABLE orchestrator_workflow_profile_revisions
+                            ADD COLUMN profile_id TEXT NOT NULL
+                            DEFAULT 'yard:standard-orchestrator';
+                         PRAGMA user_version = 25;",
+                    )
+                    .unwrap();
+            } else {
+                connection
+                    .execute_batch("PRAGMA user_version = 25;")
+                    .unwrap();
+            }
+            drop(connection);
+
+            let error = SqliteProjectStore::open(&path).await.unwrap_err();
+            assert!(matches!(
+                error,
+                ProjectStoreError::InvalidSchemaV25Lineage { .. }
+            ));
+            let connection = Connection::open(path).unwrap();
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                25
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*)
+                           FROM sqlite_master
+                          WHERE type = 'table'
+                            AND name IN (
+                                'provisioning_runtime_claims',
+                                'orchestrator_workflow_profiles'
+                            )",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn version_24_database_upgrades_through_backend_v25_and_workflow_v26() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let current = store.get_orchestrator_workflow_profile().await.unwrap();
+        let active = store
+            .update_orchestrator_workflow_profile(
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                UpdateOrchestratorWorkflowProfile {
+                    actor: "local-user".to_owned(),
+                    expected_version: current.version,
+                    instructions_markdown: "# Durable workflow before v24 upgrade".to_owned(),
+                    monitor_interval_ms: 900_000,
+                    commands: None,
+                    adapter_context_files: None,
+                },
+            )
+            .await
+            .unwrap();
+        let (project, command) =
+            create_project_orchestrator_transfer_fixture(&store, "workspace-transfer").await;
+        store
+            .transfer_project_orchestrator(&project.id, command.clone())
+            .await
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE project_orchestrator_transfer_commands
+                    SET result_project_json =
+                        json_remove(result_project_json, '$.workflow_profile')
+                  WHERE command_id = ?1",
+                [&command.command_id],
+            )
+            .unwrap();
+        downgrade_final_backend_safety_schema_to_v24(&connection);
+        let version = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(version, 24);
+        drop(connection);
+
+        let migrated = SqliteProjectStore::open(&path).await.unwrap();
+        let replayed = migrated
+            .replay_project_orchestrator_transfer(&project.id, command)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(replayed.replayed);
+        assert_eq!(
+            replayed.project.workflow_profile.profile_id,
+            YARD_STANDARD_ORCHESTRATOR_PROFILE_ID
+        );
+        assert_eq!(
+            replayed.project.workflow_profile.profile_version,
+            active.version
+        );
+        assert_eq!(
+            replayed.project.workflow_profile.pinned_by,
+            "yard:migration"
+        );
+        let preserved = migrated
+            .get_orchestrator_workflow_profile_revision(
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                active.version,
+            )
+            .await
+            .unwrap();
+        let current = migrated.get_orchestrator_workflow_profile().await.unwrap();
+        let live_project = migrated.get_project(&project.id).await.unwrap();
+        assert_eq!(
+            preserved.instructions_markdown,
+            "# Durable workflow before v24 upgrade"
+        );
+        assert_eq!(preserved.monitor_interval_ms, 900_000);
+        assert_eq!(
+            preserved.commands,
+            yard_domain::yard_standard_orchestrator_commands()
+        );
+        assert_eq!(current.version, active.version);
+        assert_eq!(
+            current.commands,
+            yard_domain::yard_standard_orchestrator_commands()
+        );
+        assert_eq!(
+            live_project.workflow_profile.profile_version,
+            current.version
+        );
+        assert_eq!(live_project.workflow_profile.pinned_by, "yard:migration");
+        drop(migrated);
+
+        let connection = Connection::open(path).unwrap();
+        let (version, projects, transfer_results, profile_revisions, foreign_key_errors): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = (
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap(),
+            connection
+                .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM project_orchestrator_transfer_commands
+                      WHERE result_project_json IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM orchestrator_workflow_profile_revisions
+                      WHERE profile_id = 'yard:standard-orchestrator'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+        );
+        assert_eq!(version, 26);
+        assert!(projects >= 1);
+        assert_eq!(transfer_results, 1);
+        assert_eq!(profile_revisions, 2);
+        assert_eq!(foreign_key_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn fresh_v26_database_reopens_idempotently() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let initial = store.get_orchestrator_workflow_profile().await.unwrap();
+        assert_eq!(initial.version, 1);
+        drop(store);
+
+        let reopened = SqliteProjectStore::open(&path).await.unwrap();
+        let after_reopen = reopened.get_orchestrator_workflow_profile().await.unwrap();
+        assert_eq!(after_reopen, initial);
+        drop(reopened);
+
+        let connection = Connection::open(path).unwrap();
+        let (version, revisions, catalog_rows, foreign_key_errors): (i64, i64, i64, i64) = (
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM orchestrator_workflow_profile_revisions",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM orchestrator_workflow_profiles",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+        );
+        assert_eq!(version, 26);
+        assert_eq!(revisions, 1);
+        assert_eq!(catalog_rows, 1);
+        assert_eq!(foreign_key_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn project_workflow_revision_pin_survives_profile_update_and_reopen() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let (project_draft, orchestrator) = draft("workspace-pin", "terminal-pin");
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+        assert_eq!(
+            project.workflow_profile.profile_id,
+            YARD_STANDARD_ORCHESTRATOR_PROFILE_ID
+        );
+        assert_eq!(project.workflow_profile.profile_version, 1);
+
+        let current = store.get_orchestrator_workflow_profile().await.unwrap();
+        let updated = store
+            .update_orchestrator_workflow_profile(
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                UpdateOrchestratorWorkflowProfile {
+                    actor: "local-user".to_owned(),
+                    expected_version: current.version,
+                    instructions_markdown: "# Revised workflow".to_owned(),
+                    monitor_interval_ms: 900_000,
+                    commands: None,
+                    adapter_context_files: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_project(&project.id)
+                .await
+                .unwrap()
+                .workflow_profile
+                .profile_version,
+            1
+        );
+
+        let pinned = store
+            .update_project_workflow_profile(
+                &project.id,
+                UpdateProjectWorkflowProfile {
+                    actor: "local-user".to_owned(),
+                    expected_project_version: project.version,
+                    profile_id: YARD_STANDARD_ORCHESTRATOR_PROFILE_ID.to_owned(),
+                    profile_version: updated.version,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(pinned.workflow_profile.profile_version, 2);
+        drop(store);
+
+        let reopened = SqliteProjectStore::open(path).await.unwrap();
+        let persisted = reopened.get_project(&project.id).await.unwrap();
+        assert_eq!(persisted.workflow_profile.profile_version, 2);
+        assert_eq!(persisted.workflow_profile.pinned_by, "local-user");
+    }
+
+    #[tokio::test]
+    async fn project_workflow_repin_waits_for_pending_orchestrator_prompt() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, orchestrator) = draft("workspace-repin-lock", "terminal-repin-lock");
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+        let current = store.get_orchestrator_workflow_profile().await.unwrap();
+        let updated = store
+            .update_orchestrator_workflow_profile(
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                UpdateOrchestratorWorkflowProfile {
+                    actor: "local-user".to_owned(),
+                    expected_version: current.version,
+                    instructions_markdown: "# Repin target".to_owned(),
+                    monitor_interval_ms: 900_000,
+                    commands: None,
+                    adapter_context_files: None,
+                },
+            )
+            .await
+            .unwrap();
+        let prompt = SendOrchestratorPrompt {
+            command_id: "repin-lock-prompt".to_owned(),
+            actor: "local-user".to_owned(),
+            expected_project_version: project.version,
+            orchestrator_worker_id: project.orchestrator.id.clone(),
+            text: "Hold the workflow pin.".to_owned(),
+        };
+        store
+            .begin_orchestrator_prompt(&project.id, prompt.clone(), TokenSpendCommandSource::Manual)
+            .await
+            .unwrap();
+
+        let repin = UpdateProjectWorkflowProfile {
+            actor: "local-user".to_owned(),
+            expected_project_version: project.version,
+            profile_id: updated.id.clone(),
+            profile_version: updated.version,
+        };
+        assert!(matches!(
+            store
+                .update_project_workflow_profile(&project.id, repin.clone())
+                .await
+                .unwrap_err(),
+            ProjectStoreError::OrchestratorInterventionInProgress
+        ));
+        store
+            .fail_orchestrator_prompt(&prompt.command_id, "lock test complete", false)
+            .await
+            .unwrap();
+        let repinned = store
+            .update_project_workflow_profile(&project.id, repin)
+            .await
+            .unwrap();
+        assert_eq!(repinned.workflow_profile.profile_version, updated.version);
+        assert_eq!(repinned.version, project.version + 1);
+    }
+
+    #[tokio::test]
+    async fn project_workflow_repin_and_prompt_reservation_are_linearizable() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, orchestrator) = draft("workspace-repin-race", "terminal-repin-race");
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+        let current = store.get_orchestrator_workflow_profile().await.unwrap();
+        let updated = store
+            .update_orchestrator_workflow_profile(
+                YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
+                UpdateOrchestratorWorkflowProfile {
+                    actor: "local-user".to_owned(),
+                    expected_version: current.version,
+                    instructions_markdown: "# Race target".to_owned(),
+                    monitor_interval_ms: 900_000,
+                    commands: None,
+                    adapter_context_files: None,
+                },
+            )
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let prompt_store = store.clone();
+        let prompt_barrier = Arc::clone(&barrier);
+        let prompt_project = project.clone();
+        let repin_store = store.clone();
+        let repin_barrier = Arc::clone(&barrier);
+        let repin_project = project.clone();
+        let (prompt_result, repin_result, _) = tokio::join!(
+            async move {
+                prompt_barrier.wait().await;
+                prompt_store
+                    .begin_orchestrator_prompt(
+                        &prompt_project.id,
+                        SendOrchestratorPrompt {
+                            command_id: "repin-race-prompt".to_owned(),
+                            actor: "local-user".to_owned(),
+                            expected_project_version: prompt_project.version,
+                            orchestrator_worker_id: prompt_project.orchestrator.id,
+                            text: "Race the repin.".to_owned(),
+                        },
+                        TokenSpendCommandSource::Manual,
+                    )
+                    .await
+            },
+            async move {
+                repin_barrier.wait().await;
+                repin_store
+                    .update_project_workflow_profile(
+                        &repin_project.id,
+                        UpdateProjectWorkflowProfile {
+                            actor: "local-user".to_owned(),
+                            expected_project_version: repin_project.version,
+                            profile_id: updated.id,
+                            profile_version: updated.version,
+                        },
+                    )
+                    .await
+            },
+            barrier.wait(),
+        );
+        assert_ne!(prompt_result.is_ok(), repin_result.is_ok());
+        match (prompt_result, repin_result) {
+            (Ok(_), Err(ProjectStoreError::OrchestratorInterventionInProgress))
+            | (Err(ProjectStoreError::ProjectVersionConflict { .. }), Ok(_)) => {}
+            (prompt, repin) => panic!("unexpected repin/prompt race: {prompt:?}, {repin:?}"),
+        }
     }
 
     #[tokio::test]
@@ -23751,13 +27478,26 @@ mod tests {
             target_orchestrator_worker_id: project.orchestrator.id.clone(),
             text: "Write the integration status.".to_owned(),
         };
-        assert!(matches!(
-            store
-                .begin_coordination_node_route(&node_id, route.clone())
-                .await
-                .unwrap(),
-            BeginCoordinationNodeRoute::Started { .. }
-        ));
+        let started = store
+            .begin_coordination_node_route(&node_id, route.clone())
+            .await
+            .unwrap();
+        let BeginCoordinationNodeRoute::Started {
+            target_project,
+            workflow_profile,
+            ..
+        } = started
+        else {
+            panic!("expected a new coordination route");
+        };
+        assert_eq!(
+            workflow_profile.version,
+            target_project.workflow_profile.profile_version
+        );
+        assert_eq!(
+            workflow_profile.id,
+            target_project.workflow_profile.profile_id
+        );
         store
             .reconcile_runtime_inventory(inventory(
                 60,

@@ -37,7 +37,10 @@ use crate::{
     },
     inventory_service::{InventoryServiceError, InventorySource},
     reconciliation_service::{ReconciliationService, ReconciliationServiceError},
-    status_protocol::with_orchestrator_status_contract,
+    status_protocol::{
+        validate_executable_orchestrator_workflow, with_orchestrator_status_contract,
+        with_orchestrator_workflow,
+    },
 };
 
 pub const COORDINATION_SESSION: &str = "yard-coordination";
@@ -520,7 +523,17 @@ impl CoordinationNodeService {
         node_id: &str,
         command: SendCoordinationNodeRoute,
     ) -> Result<CoordinationNodeRoute, CoordinationNodeServiceError> {
-        let (command, node, project) = match self
+        let initial_project = self.store.get_project(&command.target_project_id).await?;
+        let initial_workflow = self
+            .store
+            .get_orchestrator_workflow_profile_revision(
+                &initial_project.workflow_profile.profile_id,
+                initial_project.workflow_profile.profile_version,
+            )
+            .await?;
+        validate_executable_orchestrator_workflow(&initial_workflow)
+            .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?;
+        let (command, node, project, workflow_profile) = match self
             .store
             .begin_coordination_node_route(node_id, command)
             .await?
@@ -530,7 +543,8 @@ impl CoordinationNodeService {
                 command,
                 node,
                 target_project,
-            } => (command, *node, *target_project),
+                workflow_profile,
+            } => (command, *node, *target_project, *workflow_profile),
         };
         let runtime = project
             .orchestrator
@@ -543,13 +557,15 @@ impl CoordinationNodeService {
                 .await?;
             return Err(error);
         }
+        let prompt = with_orchestrator_workflow(&command.text, &workflow_profile)
+            .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?;
         let result = self
             .interventions
             .prompt(RuntimePromptRequest {
                 command_id: command.command_id.clone(),
                 session: runtime.session.clone(),
                 pane_id: runtime.pane_id.clone(),
-                text: with_orchestrator_status_contract(&command.text, &command.command_id),
+                text: with_orchestrator_status_contract(&prompt, &command.command_id),
             })
             .await;
         match result {
@@ -875,6 +891,15 @@ impl CoordinationNodeService {
             collection.project_version,
             &collection.folder_path,
         );
+        let workflow = self
+            .store
+            .get_orchestrator_workflow_profile_revision(
+                &project.workflow_profile.profile_id,
+                project.workflow_profile.profile_version,
+            )
+            .await?;
+        let prompt = with_orchestrator_workflow(&prompt, &workflow)
+            .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?;
         let result = self
             .interventions
             .prompt(RuntimePromptRequest {
@@ -1685,6 +1710,12 @@ mod tests {
             }
             assert!(prompts[0].text.contains("source references"));
             assert!(prompts[0].text.contains("Do not"));
+            assert!(
+                prompts[0]
+                    .text
+                    .contains("Yard orchestrator workflow profile yard:standard-orchestrator")
+            );
+            assert!(prompts[0].text.contains("Allocate independent workers"));
             assert!(prompts[0].text.contains("There is no completed state"));
         }
 

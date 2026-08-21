@@ -144,6 +144,15 @@ pub struct ProjectPlacement {
     pub updated_at_unix_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectWorkflowProfilePin {
+    pub profile_id: String,
+    #[serde(with = "crate::serde_u64")]
+    pub profile_version: u64,
+    pub pinned_by: String,
+    pub pinned_at_unix_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -151,6 +160,7 @@ pub struct Project {
     pub runtime: ProjectRuntimeBinding,
     pub orchestrator: Worker,
     pub placement: ProjectPlacement,
+    pub workflow_profile: ProjectWorkflowProfilePin,
     #[serde(with = "crate::serde_u64")]
     pub version: u64,
     pub created_at_unix_ms: u64,
@@ -307,6 +317,34 @@ pub struct UpdateProjectPlacement {
     pub expected_version: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateProjectWorkflowProfile {
+    pub actor: String,
+    #[serde(with = "crate::serde_u64")]
+    pub expected_project_version: u64,
+    pub profile_id: String,
+    #[serde(with = "crate::serde_u64")]
+    pub profile_version: u64,
+}
+
+impl UpdateProjectWorkflowProfile {
+    /// Normalize and validate an immutable workflow-profile revision pin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectValidationError`] when a required value is blank or an
+    /// optimistic/profile version is zero.
+    pub fn normalize(mut self) -> Result<Self, ProjectValidationError> {
+        self.actor = bounded_required("actor", &self.actor, MAX_PROJECT_COMMAND_BYTES)?;
+        self.profile_id =
+            bounded_required("profile_id", &self.profile_id, MAX_PROJECT_COMMAND_BYTES)?;
+        if self.expected_project_version == 0 || self.profile_version == 0 {
+            return Err(ProjectValidationError::InvalidVersion);
+        }
+        Ok(self)
+    }
+}
+
 impl UpdateProjectPlacement {
     /// Validate a full placement replacement.
     ///
@@ -373,7 +411,7 @@ mod tests {
     use super::{
         CanvasPlacement, CreateProject, CreateProjectFromProfile,
         CreateWorkspaceProjectFromProfile, MAX_PROJECT_CWD_BYTES, ProjectRuntimeBinding,
-        ProjectValidationError, UpdateProjectPlacement,
+        ProjectValidationError, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
     };
 
     fn placement() -> CanvasPlacement {
@@ -532,5 +570,20 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, ProjectValidationError::InvalidVersion);
+    }
+
+    #[test]
+    fn normalizes_project_workflow_revision_pin() {
+        let pin = UpdateProjectWorkflowProfile {
+            actor: " local-user ".to_owned(),
+            expected_project_version: 2,
+            profile_id: " yard:standard-orchestrator ".to_owned(),
+            profile_version: 1,
+        }
+        .normalize()
+        .unwrap();
+
+        assert_eq!(pin.actor, "local-user");
+        assert_eq!(pin.profile_id, "yard:standard-orchestrator");
     }
 }

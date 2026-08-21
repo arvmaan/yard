@@ -5,7 +5,8 @@ use tokio::time::{Instant, sleep};
 use yard_domain::{
     ConfirmedProjectCreation, CreateProject, CreateProjectFromProfile,
     CreateWorkspaceProjectFromProfile, Project, Projects, RuntimeObservationState,
-    RuntimeProcessState, UpdateProjectPlacement, WorkerRuntimeBinding,
+    RuntimeProcessState, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
+    WorkerRuntimeBinding,
 };
 use yard_store::{
     BeginProfileProjectCreation, BeginWorkspaceProjectCreation, ProjectStoreError, YardStore,
@@ -17,7 +18,7 @@ use crate::allocation_service::{
     validate_supported_profile,
 };
 use crate::inventory_service::{InventoryServiceError, InventorySource};
-use crate::status_protocol::with_orchestrator_status_contract;
+use crate::status_protocol::{with_orchestrator_status_contract, with_orchestrator_workflow};
 
 const RUNTIME_IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -59,6 +60,24 @@ impl ProjectService {
     /// project store cannot be read.
     pub async fn get(&self, project_id: &str) -> Result<Project, ProjectServiceError> {
         self.store.get_project(project_id).await.map_err(Into::into)
+    }
+
+    /// Pin a project to one immutable workflow-profile revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectServiceError`] for invalid input, stale project state,
+    /// a missing workflow revision, or persistence failure.
+    pub async fn update_workflow_profile(
+        &self,
+        project_id: &str,
+        command: UpdateProjectWorkflowProfile,
+    ) -> Result<Project, ProjectServiceError> {
+        let command = command.normalize()?;
+        self.store
+            .update_project_workflow_profile(project_id, command)
+            .await
+            .map_err(Into::into)
     }
 
     /// Create a project after proving its Herdr workspace and orchestrator
@@ -231,6 +250,13 @@ impl ProjectService {
                 .await?;
             return Err(error);
         };
+        let objective = assignment_prompt(
+            &context.command.orchestrator_objective,
+            "orchestrator",
+            &context.profile,
+        );
+        let objective = with_orchestrator_workflow(&objective, &context.workflow_profile)
+            .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?;
         let provision = RuntimeProvisionRequest {
             command_id: command_id.clone(),
             session: context.command.runtime.session.clone(),
@@ -240,14 +266,7 @@ impl ProjectService {
             agent_name: agent_name(&command_id),
             kind: context.profile.spec.provider.clone(),
             args,
-            prompt: with_orchestrator_status_contract(
-                &assignment_prompt(
-                    &context.command.orchestrator_objective,
-                    "orchestrator",
-                    &context.profile,
-                ),
-                &command_id,
-            ),
+            prompt: with_orchestrator_status_contract(&objective, &command_id),
         };
 
         let prepared = match self.runtime.prepare_worker(provision.clone()).await {
@@ -438,6 +457,13 @@ impl ProjectService {
                 return Err(ProjectServiceError::UnsupportedProfile(message));
             }
         };
+        let objective = assignment_prompt(
+            &context.command.orchestrator_objective,
+            "orchestrator",
+            &context.profile,
+        );
+        let objective = with_orchestrator_workflow(&objective, &context.workflow_profile)
+            .map_err(ProjectStoreError::InvalidOrchestratorWorkflowProfile)?;
         let provision = RuntimeWorkspaceProvisionRequest {
             command_id: command_id.clone(),
             session: context.command.runtime_session.clone(),
@@ -446,14 +472,7 @@ impl ProjectService {
             agent_name: agent_name(&command_id),
             kind: context.profile.spec.provider.clone(),
             args,
-            prompt: with_orchestrator_status_contract(
-                &assignment_prompt(
-                    &context.command.orchestrator_objective,
-                    "orchestrator",
-                    &context.profile,
-                ),
-                &command_id,
-            ),
+            prompt: with_orchestrator_status_contract(&objective, &command_id),
         };
 
         let prepared = match self
