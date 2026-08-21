@@ -189,6 +189,11 @@ function durableWorker(
   > = {},
 ): Worker {
   const now = 1_786_400_000_000
+  const observedIndex = terminalId?.match(/^terminal-(\d+)$/)?.[1]
+  const topologyId = observedIndex ?? terminalId
+  const observedIndexNumber = observedIndex
+    ? Number(observedIndex)
+    : null
   return {
     id,
     profile_id: workerProfile?.id ?? null,
@@ -200,9 +205,18 @@ function durableWorker(
           session,
           workspace_id: workspaceId,
           terminal_id: terminalId,
-          tab_id: `${workspaceId}:tab-${terminalId}`,
-          pane_id: `${workspaceId}:pane-${terminalId}`,
-          provider_session: null,
+          tab_id: `${workspaceId}:tab-${topologyId}`,
+          pane_id: `${workspaceId}:pane-${topologyId}`,
+          provider_session:
+            observedIndexNumber === null
+              ? null
+              : {
+                  source: 'synthetic',
+                  provider:
+                    observedIndexNumber % 2 === 0 ? 'claude' : 'codex',
+                  kind: 'id',
+                  value: `synthetic-session-${observedIndexNumber}`,
+                },
           owns_tab: ownsTab,
           observation_state: 'observed',
           process_state: 'running',
@@ -411,6 +425,7 @@ interface MockState {
   projectRelationships: ProjectRelationship[]
   projects: ReturnType<typeof initialProjects>
   projectRequests: number
+  projectDetailRequests: number
   projectOrchestratorCommands: ChangeProjectOrchestratorInput[]
   assignmentRequests: number
   profiles: ReturnType<typeof profile>[]
@@ -425,6 +440,16 @@ interface MockState {
   }>
   inventoryFailure: boolean
   inventoryRequests: number
+  inventoryRequestSessions: string[]
+  inventoryResponsePlans: Map<
+    string,
+    Array<{
+      observedAtUnixMs: number
+      reconcileRuntimeTimestamps?: boolean
+      wait?: Promise<void>
+    }>
+  >
+  requestLog: string[]
   completionCommands: RecordCompletionReceiptInput[]
   completionRequestCommandIds: string[]
   artifacts: Map<string, { artifact: Artifact; content: string }>
@@ -463,6 +488,82 @@ interface MockState {
   placementUpdates: number
   automationPlacementUpdates: number
   conflictNextPlacement: boolean
+}
+
+function reconcileTransferRuntimeTimestamps(
+  state: MockState,
+  session: string,
+  observedAtUnixMs: number,
+) {
+  state.runtimeInventory.observed_at_unix_ms = Math.max(
+    state.runtimeInventory.observed_at_unix_ms,
+    observedAtUnixMs,
+  )
+  state.projects = state.projects.map((project) =>
+    project.runtime.session === session && project.orchestrator.runtime
+      ? {
+          ...project,
+          orchestrator: {
+            ...project.orchestrator,
+            runtime: {
+              ...project.orchestrator.runtime,
+              last_observed_at_unix_ms: observedAtUnixMs,
+            },
+          },
+        }
+      : project,
+  )
+  state.workerCandidates = state.workerCandidates.map((candidate) =>
+    candidate.worker.runtime?.session === session
+      ? {
+          ...candidate,
+          worker: {
+            ...candidate.worker,
+            runtime: {
+              ...candidate.worker.runtime,
+              last_observed_at_unix_ms: observedAtUnixMs,
+            },
+          },
+        }
+      : candidate,
+  )
+}
+
+function moveProjectTransferFixtureToSession(
+  state: MockState,
+  session: string,
+) {
+  const project = state.projects[0]
+  project.runtime = { ...project.runtime, session }
+  project.orchestrator = {
+    ...project.orchestrator,
+    runtime: {
+      ...project.orchestrator.runtime!,
+      session,
+    },
+  }
+  const candidate = state.workerCandidates.find(
+    ({ worker: candidateWorker }) =>
+      candidateWorker.id === 'worker-unassigned',
+  )
+  if (!candidate?.worker.runtime) {
+    throw new Error('Project transfer fixture is incomplete')
+  }
+  candidate.worker = {
+    ...candidate.worker,
+    runtime: {
+      ...candidate.worker.runtime,
+      session,
+    },
+  }
+}
+
+function deferred() {
+  let resolve!: () => void
+  const promise = new Promise<void>((complete) => {
+    resolve = complete
+  })
+  return { promise, resolve }
 }
 
 function assignment(
@@ -612,6 +713,7 @@ async function mockApi(
     projectRelationships: [],
     projects: initialProjectState,
     projectRequests: 0,
+    projectDetailRequests: 0,
     projectOrchestratorCommands: [],
     assignmentRequests: 0,
     profiles: initialProfileState,
@@ -635,6 +737,9 @@ async function mockApi(
     runtimeSessions: sessions.sessions.map((session) => ({ ...session })),
     inventoryFailure: false,
     inventoryRequests: 0,
+    inventoryRequestSessions: [],
+    inventoryResponsePlans: new Map(),
+    requestLog: [],
     completionCommands: [],
     completionRequestCommandIds: [],
     artifacts: new Map(),
@@ -1129,6 +1234,7 @@ async function mockApi(
   await page.route('**/api/v1/workers', async (route) => {
     if (route.request().method() === 'GET') {
       state.workerRequests += 1
+      state.requestLog.push('workers')
       await route.fulfill({ json: { workers: state.workerCandidates } })
       return
     }
@@ -1606,6 +1712,24 @@ async function mockApi(
     const orchestratorTerminalOutputMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)\/orchestrator\/terminal-output$/,
     )
+    const projectDetailMatch = url.pathname.match(
+      /^\/api\/v1\/projects\/([^/]+)$/,
+    )
+
+    if (projectDetailMatch && request.method() === 'GET') {
+      const projectId = decodeURIComponent(projectDetailMatch[1])
+      const selectedProject = state.projects.find(
+        (candidate) => candidate.id === projectId,
+      )
+      state.projectDetailRequests += 1
+      state.requestLog.push(`project:${projectId}`)
+      if (!selectedProject) {
+        await route.fulfill({ status: 404 })
+        return
+      }
+      await route.fulfill({ json: selectedProject })
+      return
+    }
 
     if (orchestratorTransferMatch && request.method() === 'PUT') {
       const projectId = decodeURIComponent(orchestratorTransferMatch[1])
@@ -3052,6 +3176,16 @@ async function mockApi(
       return
     }
     state.inventoryRequests += 1
+    const sessionMatch = path.match(/\/sessions\/([^/]+)\/inventory$/)
+    const session = sessionMatch
+      ? decodeURIComponent(sessionMatch[1])
+      : state.runtimeInventory.session
+    state.inventoryRequestSessions.push(session)
+    const responsePlan = state.inventoryResponsePlans.get(session)?.shift()
+    const observedAtUnixMs =
+      responsePlan?.observedAtUnixMs ??
+      state.runtimeInventory.observed_at_unix_ms
+    state.requestLog.push(`inventory:${session}:start:${observedAtUnixMs}`)
     if (state.inventoryFailure) {
       await route.fulfill({
         status: 502,
@@ -3064,6 +3198,14 @@ async function mockApi(
       })
       return
     }
+    if (responsePlan?.reconcileRuntimeTimestamps) {
+      reconcileTransferRuntimeTimestamps(
+        state,
+        session,
+        observedAtUnixMs,
+      )
+    }
+    await responsePlan?.wait
     if (
       options.reconcileWorkerOnInventory &&
       !state.workerCandidates.some(
@@ -3083,13 +3225,14 @@ async function mockApi(
         reason: 'Discovered during runtime reconciliation.',
       })
     }
-    const sessionMatch = path.match(/\/sessions\/([^/]+)\/inventory$/)
+    state.requestLog.push(
+      `inventory:${session}:complete:${observedAtUnixMs}`,
+    )
     await route.fulfill({
       json: {
         ...state.runtimeInventory,
-        session: sessionMatch
-          ? decodeURIComponent(sessionMatch[1])
-          : state.runtimeInventory.session,
+        observed_at_unix_ms: observedAtUnixMs,
+        session,
       },
     })
   })
@@ -3136,6 +3279,123 @@ async function setAppTheme(page: Page, theme: 'Dark' | 'Light') {
   const dialog = await openSettings(page)
   await dialog.getByRole('button', { name: theme, exact: true }).click()
   await dialog.getByRole('button', { name: 'Close settings' }).click()
+}
+
+async function navigatorMetadataContrasts(navigator: Locator) {
+  return navigator.evaluate((element) => {
+    const selector = [
+      ':scope > header small',
+      '.agent-window-workspace__identity code',
+      '.agent-window-workspace__identity small',
+      '.agent-window-workspace__state span',
+      '.agent-window-workspace__state b',
+      '.agent-window-workspace__summary',
+      '.agent-window-workspace__topology span',
+      '.agent-window-workspace__worktree span',
+      '.agent-window-workspace__worktree code',
+      '.agent-window-row small',
+      '.agent-window-row code',
+      '[data-contrast-probe]',
+    ].join(', ')
+    const canvas = document.createElement('canvas')
+    canvas.width = 1
+    canvas.height = 1
+    const context = canvas.getContext('2d', {
+      willReadFrequently: true,
+    })
+    if (!context) throw new Error('Canvas color decoder is unavailable')
+
+    const decode = (color: string) => {
+      context.clearRect(0, 0, 1, 1)
+      context.fillStyle = color
+      context.fillRect(0, 0, 1, 1)
+      const [red, green, blue, alpha] = context.getImageData(0, 0, 1, 1).data
+      return [red, green, blue, alpha / 255] as const
+    }
+    const over = (
+      foreground: readonly [number, number, number, number],
+      background: readonly [number, number, number, number],
+    ) => {
+      const alpha =
+        foreground[3] + background[3] * (1 - foreground[3])
+      if (alpha === 0) return [0, 0, 0, 0] as const
+      return [
+        (foreground[0] * foreground[3] +
+          background[0] * background[3] * (1 - foreground[3])) /
+          alpha,
+        (foreground[1] * foreground[3] +
+          background[1] * background[3] * (1 - foreground[3])) /
+          alpha,
+        (foreground[2] * foreground[3] +
+          background[2] * background[3] * (1 - foreground[3])) /
+          alpha,
+        alpha,
+      ] as const
+    }
+    const compositedBackground = (node: Element) => {
+      const ancestors: Element[] = []
+      let current: Element | null = node
+      while (current) {
+        ancestors.push(current)
+        current = current.parentElement
+      }
+      return ancestors
+        .reverse()
+        .reduce<readonly [number, number, number, number]>(
+          (background, ancestor) =>
+            over(
+              decode(getComputedStyle(ancestor).backgroundColor),
+              background,
+            ),
+          [255, 255, 255, 1],
+        )
+    }
+    const luminance = (
+      color: readonly [number, number, number, number],
+    ) => {
+      const channels = color.slice(0, 3).map((value) => value / 255)
+      const [red, green, blue] = channels.map((channel) =>
+        channel <= 0.04045
+          ? channel / 12.92
+          : ((channel + 0.055) / 1.055) ** 2.4,
+      )
+      return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    }
+    const contrast = (
+      foreground: readonly [number, number, number, number],
+      background: readonly [number, number, number, number],
+    ) => {
+      const foregroundLuminance = luminance(foreground)
+      const backgroundLuminance = luminance(background)
+      return (
+        (Math.max(foregroundLuminance, backgroundLuminance) + 0.05) /
+        (Math.min(foregroundLuminance, backgroundLuminance) + 0.05)
+      )
+    }
+
+    return Array.from(element.querySelectorAll<HTMLElement>(selector))
+      .filter((node) => {
+        const style = getComputedStyle(node)
+        return (
+          style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          node.getClientRects().length > 0
+        )
+      })
+      .map((node) => {
+        const authoredForeground = decode(getComputedStyle(node).color)
+        const background = compositedBackground(node)
+        const foreground = over(authoredForeground, background)
+        return {
+          background: background.slice(0, 3),
+          contrast: contrast(foreground, background),
+          foreground: foreground.slice(0, 3),
+          foregroundAlpha: authoredForeground[3],
+          label: `${node.className || node.tagName}: ${node.textContent?.trim()}`,
+          sourceForeground: authoredForeground.slice(0, 3),
+        }
+      })
+  })
 }
 
 async function openRuntimeHealth(page: Page) {
@@ -6075,7 +6335,10 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
 }, testInfo) => {
   const state = await mockApi(page)
   const implementer = seedActiveAssignment(state)
-  const reviewerProfile = profile('profile-reviewer', 'Reviewer')
+  const reviewerProfile = profile(
+    'profile-reviewer',
+    'Implementer',
+  )
   const reviewer = assignment(
     'assignment-reviewer',
     'project-1',
@@ -6292,6 +6555,34 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
       element.matches(':focus-visible'),
     ),
   ).toBe(true)
+  await navigator.evaluate((element) => {
+    const probe = document.createElement('span')
+    probe.dataset.contrastProbe = 'alpha'
+    probe.textContent = 'Alpha contrast probe'
+    probe.style.cssText =
+      'position:fixed;left:0;top:0;display:block;color:rgba(0,0,0,0.5);background:rgb(255,255,255)'
+    element.append(probe)
+  })
+  const alphaContrasts = await navigatorMetadataContrasts(navigator)
+  const alphaSample = alphaContrasts.find((sample) =>
+    sample.label.includes('Alpha contrast probe'),
+  )
+  expect(alphaSample).toBeDefined()
+  expect(alphaSample?.foregroundAlpha).toBeCloseTo(128 / 255, 5)
+  expect(alphaSample?.sourceForeground).toEqual([0, 0, 0])
+  expect(alphaSample?.foreground[0]).toBeCloseTo(127, 0)
+  expect(alphaSample?.foreground[1]).toBeCloseTo(127, 0)
+  expect(alphaSample?.foreground[2]).toBeCloseTo(127, 0)
+  expect(alphaSample?.contrast).toBeCloseTo(4.004, 2)
+  expect(alphaSample?.contrast ?? Infinity).toBeLessThan(4.5)
+  await navigator
+    .locator('[data-contrast-probe]')
+    .evaluate((element) => element.remove())
+  const lightContrasts = await navigatorMetadataContrasts(navigator)
+  expect(lightContrasts.length).toBeGreaterThan(10)
+  expect(
+    Math.min(...lightContrasts.map((sample) => sample.contrast)),
+  ).toBeGreaterThanOrEqual(4.5)
   await page.screenshot({
     path: testInfo.outputPath('workspace-navigator-light-desktop.png'),
     fullPage: true,
@@ -6300,6 +6591,11 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   await reviewerRow.focus()
   await page.keyboard.press('Tab')
   await expect(keyboardFocusRow).toBeFocused()
+  const darkContrasts = await navigatorMetadataContrasts(navigator)
+  expect(darkContrasts.length).toBe(lightContrasts.length)
+  expect(
+    Math.min(...darkContrasts.map((sample) => sample.contrast)),
+  ).toBeGreaterThanOrEqual(4.5)
   await page.screenshot({
     path: testInfo.outputPath('workspace-navigator-dark-desktop.png'),
     fullPage: true,
@@ -6371,6 +6667,143 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
     path: testInfo.outputPath('workspace-navigator-light-mobile.png'),
     fullPage: true,
   })
+
+  await page.setViewportSize({ width: 320, height: 844 })
+  const implementerDetails = navigator.getByRole('button', {
+    name: 'Show runtime details for Implementer, API migration, workspace workspace-1, alpha terminal assignment-1-terminal',
+    exact: true,
+  })
+  const reviewerDetails = navigator.getByRole('button', {
+    name: 'Show runtime details for Implementer, API migration, workspace workspace-2, alpha terminal terminal-reviewer',
+    exact: true,
+  })
+  await expect(implementerRow.locator('strong')).toHaveText('Implementer')
+  await expect(reviewerRow.locator('strong')).toHaveText('Implementer')
+  await expect(implementerDetails).toBeVisible()
+  await expect(reviewerDetails).toBeVisible()
+  expect(await implementerDetails.getAttribute('aria-label')).not.toBe(
+    await reviewerDetails.getAttribute('aria-label'),
+  )
+  await expect(reviewerDetails).toHaveAttribute('aria-haspopup', 'dialog')
+  const detailsBounds = await reviewerDetails.boundingBox()
+  expect(detailsBounds?.width ?? 0).toBeGreaterThanOrEqual(32)
+  expect(detailsBounds?.height ?? 0).toBeGreaterThanOrEqual(44)
+  const activeKeyBeforeDetails = await navigator
+    .locator('.agent-window-row[aria-current="page"]')
+    .getAttribute('data-target-key')
+  await page.screenshot({
+    path: testInfo.outputPath(
+      'workspace-navigator-light-320-duplicate-groups.png',
+    ),
+    fullPage: true,
+  })
+
+  await implementerDetails.click()
+  const implementerDetailsDialog = page.getByRole('dialog', {
+    name: 'Implementer',
+  })
+  await expect(implementerDetailsDialog).toContainText('workspace-1')
+  await expect(implementerDetailsDialog).toContainText(
+    'assignment-1-terminal',
+  )
+  await page.getByRole('button', { name: 'Close runtime details' }).click()
+  await expect(implementerDetails).toBeFocused()
+
+  await reviewerDetails.click()
+  const detailsDialog = page.getByRole('dialog', {
+    name: 'Implementer',
+  })
+  await expect(detailsDialog).toBeVisible()
+  await expect(detailsDialog).toContainText('workspace-2')
+  await expect(detailsDialog).toContainText('terminal-reviewer')
+  await expect(detailsDialog).toContainText(
+    'workspace-2:tab-terminal-reviewer',
+  )
+  await expect(detailsDialog).toContainText(
+    'workspace-2:pane-terminal-reviewer',
+  )
+  await expect(
+    navigator.locator('.agent-window-row[aria-current="page"]'),
+  ).toHaveAttribute('data-target-key', activeKeyBeforeDetails ?? '')
+  const detailsBackdrop = page.locator(
+    'body > .agent-window-details-backdrop',
+  )
+  const commandBar = page.locator('.command-bar')
+  await expect(detailsBackdrop).toBeVisible()
+  const stacking = await page.evaluate(() => {
+    const backdrop = document.querySelector<HTMLElement>(
+      'body > .agent-window-details-backdrop',
+    )
+    const commandBar = document.querySelector<HTMLElement>('.command-bar')
+    if (!backdrop || !commandBar) return null
+    const bounds = commandBar.getBoundingClientRect()
+    const hit = document.elementFromPoint(
+      bounds.left + bounds.width / 2,
+      bounds.top + bounds.height / 2,
+    )
+    return {
+      backdropZIndex: Number(getComputedStyle(backdrop).zIndex),
+      commandBarZIndex: Number(getComputedStyle(commandBar).zIndex),
+      hitBackdrop: hit === backdrop,
+      outsideAriaHidden: Boolean(commandBar.closest('[aria-hidden="true"]')),
+      outsideInert: Boolean(commandBar.closest('[inert]')),
+    }
+  })
+  expect(stacking).toEqual({
+    backdropZIndex: 150,
+    commandBarZIndex: 130,
+    hitBackdrop: true,
+    outsideAriaHidden: true,
+    outsideInert: true,
+  })
+  const detailsOverflow = await detailsDialog.evaluate((element) => ({
+    dialog: element.scrollWidth - element.clientWidth,
+    document:
+      document.documentElement.scrollWidth -
+      document.documentElement.clientWidth,
+    shell:
+      (document.querySelector<HTMLElement>('.agent-workspace-shell')
+        ?.scrollWidth ?? 1) -
+      (document.querySelector<HTMLElement>('.agent-workspace-shell')
+        ?.clientWidth ?? 0),
+  }))
+  expect(detailsOverflow.dialog).toBeLessThanOrEqual(0)
+  expect(detailsOverflow.document).toBeLessThanOrEqual(0)
+  expect(detailsOverflow.shell).toBeLessThanOrEqual(0)
+  await page.screenshot({
+    path: testInfo.outputPath(
+      'workspace-navigator-light-320-runtime-details.png',
+    ),
+    fullPage: true,
+  })
+  await page.keyboard.press('Escape')
+  await expect(detailsDialog).toHaveCount(0)
+  await expect(reviewerDetails).toBeFocused()
+  await expect(commandBar).not.toHaveAttribute('aria-hidden', 'true')
+  expect(
+    await commandBar.evaluate((element) =>
+      Boolean(element.closest('[inert], [aria-hidden="true"]')),
+    ),
+  ).toBe(false)
+
+  const narrowLayout = await page.evaluate(() => ({
+    document:
+      document.documentElement.scrollWidth -
+      document.documentElement.clientWidth,
+    navigator:
+      (document.querySelector<HTMLElement>('.agent-window-navigator')
+        ?.scrollWidth ?? 1) -
+      (document.querySelector<HTMLElement>('.agent-window-navigator')
+        ?.clientWidth ?? 0),
+    shell:
+      (document.querySelector<HTMLElement>('.agent-workspace-shell')
+        ?.scrollWidth ?? 1) -
+      (document.querySelector<HTMLElement>('.agent-workspace-shell')
+        ?.clientWidth ?? 0),
+  }))
+  expect(narrowLayout.document).toBeLessThanOrEqual(0)
+  expect(narrowLayout.navigator).toBeLessThanOrEqual(0)
+  expect(narrowLayout.shell).toBeLessThanOrEqual(0)
   await shell.getByRole('button', { name: 'Close chat' }).click()
   await expect(shell).toBeHidden()
   await expect(openChat).toBeFocused()
@@ -8482,6 +8915,689 @@ test('changes a project orchestrator only to an eligible live workspace worker',
   ).toBeVisible()
 })
 
+test('loads transfer inventory from the project session without changing the global session', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  moveProjectTransferFixtureToSession(state, 'beta')
+
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  state.requestLog = []
+  await page
+    .locator('.orchestrator-marker[data-project-id="project-1"]')
+    .click()
+
+  const inspector = page.locator('.inspector')
+  const transfer = inspector.getByRole('button', {
+    name: 'Change orchestrator',
+  })
+  await expect(transfer).toBeEnabled()
+  await expect
+    .poll(() => state.inventoryRequestSessions.includes('beta'))
+    .toBe(true)
+  const betaInventoryComplete = state.requestLog.findIndex((entry) =>
+    entry.startsWith('inventory:beta:complete:'),
+  )
+  expect(betaInventoryComplete).toBeGreaterThanOrEqual(0)
+  expect(
+    state.requestLog.findIndex(
+      (entry, index) => index > betaInventoryComplete && entry === 'workers',
+    ),
+  ).toBeGreaterThan(betaInventoryComplete)
+  expect(
+    state.requestLog.findIndex(
+      (entry, index) =>
+        index > betaInventoryComplete && entry === 'project:project-1',
+    ),
+  ).toBeGreaterThan(betaInventoryComplete)
+
+  const runtimeHealth = await openRuntimeHealth(page)
+  await expect(runtimeHealth.getByLabel('Herdr session')).toHaveValue('alpha')
+  await page.keyboard.press('Escape')
+
+  await transfer.click()
+  const dialog = page.getByRole('dialog', {
+    name: 'Change orchestrator',
+  })
+  await expect(dialog.getByLabel('Next orchestrator')).toHaveValue(
+    'worker-unassigned',
+  )
+  await dialog
+    .getByRole('button', { name: 'Change orchestrator' })
+    .click()
+  await expect.poll(() => state.projectOrchestratorCommands.length).toBe(1)
+  expect(
+    state.projectOrchestratorCommands[0].expected_worker_runtime.session,
+  ).toBe('beta')
+  expect(
+    state.projectOrchestratorCommands[0].expected_orchestrator_runtime.session,
+  ).toBe('beta')
+})
+
+test('submits full runtimes from a timestamp-reconciled transfer snapshot', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  moveProjectTransferFixtureToSession(state, 'beta')
+  const initialObservedAt =
+    state.runtimeInventory.observed_at_unix_ms + 1_000
+  const initialGate = deferred()
+  state.inventoryResponsePlans.set(
+    'beta',
+    Array.from({ length: 4 }, () => ({
+      observedAtUnixMs: initialObservedAt,
+      reconcileRuntimeTimestamps: true,
+      wait: initialGate.promise,
+    })),
+  )
+
+  await page.goto('/')
+  state.requestLog = []
+  await page
+    .locator('.orchestrator-marker[data-project-id="project-1"]')
+    .click()
+  const inspector = page.locator('.inspector')
+  const transfer = inspector.getByRole('button', {
+    name: 'Change orchestrator',
+  })
+  await expect
+    .poll(() =>
+      state.requestLog.some((entry) =>
+        entry.startsWith('inventory:beta:start:'),
+      ),
+    )
+    .toBe(true)
+  await expect(transfer).toBeDisabled()
+  await expect(inspector.getByRole('status')).toContainText(
+    'Checking live workers in Herdr session beta',
+  )
+
+  initialGate.resolve()
+  await expect(transfer).toBeEnabled()
+  const initialCompleteIndex = state.requestLog.findIndex(
+    (entry) =>
+      entry === `inventory:beta:complete:${initialObservedAt}`,
+  )
+  expect(initialCompleteIndex).toBeGreaterThanOrEqual(0)
+  expect(
+    state.requestLog.findIndex(
+      (entry, index) => index > initialCompleteIndex && entry === 'workers',
+    ),
+  ).toBeGreaterThan(initialCompleteIndex)
+  expect(
+    state.requestLog.findIndex(
+      (entry, index) =>
+        index > initialCompleteIndex && entry === 'project:project-1',
+    ),
+  ).toBeGreaterThan(initialCompleteIndex)
+
+  const dialogRefreshGate = deferred()
+  state.requestLog = []
+  state.inventoryResponsePlans.set(
+    'beta',
+    Array.from({ length: 4 }, () => ({
+      observedAtUnixMs: initialObservedAt,
+      reconcileRuntimeTimestamps: true,
+      wait: dialogRefreshGate.promise,
+    })),
+  )
+  await transfer.click()
+  const dialog = page.getByRole('dialog', {
+    name: 'Change orchestrator',
+  })
+  const confirm = dialog.getByRole('button', {
+    name: 'Change orchestrator',
+  })
+  await expect
+    .poll(() =>
+      state.requestLog.includes(
+        `inventory:beta:start:${initialObservedAt}`,
+      ),
+    )
+    .toBe(true)
+  await expect(confirm).toBeDisabled()
+  dialogRefreshGate.resolve()
+  await expect(dialog.getByLabel('Next orchestrator')).toHaveValue(
+    'worker-unassigned',
+  )
+  await expect(confirm).toBeEnabled()
+
+  const submitObservedAt = initialObservedAt + 1_000
+  const submitGate = deferred()
+  state.requestLog = []
+  state.inventoryResponsePlans.set('beta', [
+    {
+      observedAtUnixMs: submitObservedAt,
+      reconcileRuntimeTimestamps: true,
+      wait: submitGate.promise,
+    },
+  ])
+  await confirm.click()
+  await expect(confirm).toBeDisabled()
+  await expect
+    .poll(() =>
+      state.requestLog.includes(
+        `inventory:beta:start:${submitObservedAt}`,
+      ),
+    )
+    .toBe(true)
+  expect(state.projectOrchestratorCommands).toHaveLength(0)
+  const reconciledProject = structuredClone(state.projects[0])
+  const reconciledCandidate = structuredClone(
+    state.workerCandidates.find(
+      ({ worker: candidateWorker }) =>
+        candidateWorker.id === 'worker-unassigned',
+    ),
+  )
+  if (!reconciledCandidate?.worker.runtime) {
+    throw new Error('Reconciled transfer candidate is missing')
+  }
+
+  submitGate.resolve()
+  await expect
+    .poll(() => state.projectOrchestratorCommands.length)
+    .toBe(1)
+  const command = state.projectOrchestratorCommands[0]
+  expect(command.expected_project_version).toBe(
+    reconciledProject.version,
+  )
+  expect(command.expected_worker_version).toBe(
+    reconciledCandidate.worker.version,
+  )
+  expect(command.expected_worker_runtime).toEqual(
+    reconciledCandidate.worker.runtime,
+  )
+  expect(command.expected_orchestrator_worker_version).toBe(
+    reconciledProject.orchestrator.version,
+  )
+  expect(command.expected_orchestrator_runtime).toEqual(
+    reconciledProject.orchestrator.runtime,
+  )
+  expect(
+    command.expected_worker_runtime.last_observed_at_unix_ms,
+  ).toBe(submitObservedAt)
+  expect(
+    command.expected_orchestrator_runtime.last_observed_at_unix_ms,
+  ).toBe(submitObservedAt)
+})
+
+test('keeps transfer dialog focus contained during initial and polling refreshes', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  moveProjectTransferFixtureToSession(state, 'beta')
+
+  await page.goto('/')
+  await page
+    .locator('.orchestrator-marker[data-project-id="project-1"]')
+    .click()
+  const transfer = page
+    .locator('.inspector')
+    .getByRole('button', { name: 'Change orchestrator' })
+  await expect(transfer).toBeEnabled()
+
+  const initialRefreshGate = deferred()
+  const initialObservedAt = state.runtimeInventory.observed_at_unix_ms
+  state.requestLog = []
+  state.inventoryResponsePlans.set('beta', [
+    {
+      observedAtUnixMs: initialObservedAt,
+      reconcileRuntimeTimestamps: true,
+      wait: initialRefreshGate.promise,
+    },
+  ])
+  await transfer.click()
+  const dialog = page.getByRole('dialog', {
+    name: 'Change orchestrator',
+  })
+  const close = dialog.getByRole('button', {
+    name: 'Close orchestrator change',
+  })
+  const select = dialog.getByLabel('Next orchestrator')
+  await expect
+    .poll(() =>
+      state.requestLog.includes(
+        `inventory:beta:start:${initialObservedAt}`,
+      ),
+    )
+    .toBe(true)
+  await expect(select).toBeDisabled()
+  await expect(close).toBeFocused()
+  expect(
+    await dialog.evaluate((element) =>
+      element.contains(document.activeElement),
+    ),
+  ).toBe(true)
+
+  initialRefreshGate.resolve()
+  await expect(select).toBeEnabled()
+  await select.focus()
+  await expect(select).toBeFocused()
+
+  const pollingObservedAt = initialObservedAt + 1_000
+  const pollingRefreshGate = deferred()
+  state.requestLog = []
+  state.inventoryResponsePlans.set('beta', [
+    {
+      observedAtUnixMs: pollingObservedAt,
+      reconcileRuntimeTimestamps: true,
+      wait: pollingRefreshGate.promise,
+    },
+  ])
+  await expect
+    .poll(() =>
+      state.requestLog.includes(
+        `inventory:beta:start:${pollingObservedAt}`,
+      ),
+      { timeout: 3_000 },
+    )
+    .toBe(true)
+  await expect(select).toBeDisabled()
+  await expect(close).toBeFocused()
+  expect(
+    await dialog.evaluate((element) =>
+      element.contains(document.activeElement),
+    ),
+  ).toBe(true)
+
+  pollingRefreshGate.resolve()
+  await expect(select).toBeEnabled()
+  await expect(close).toBeFocused()
+})
+
+test('keeps transfer disabled across abort, reopen, and out-of-order inventory completion', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  moveProjectTransferFixtureToSession(state, 'beta')
+  const olderObservedAt =
+    state.runtimeInventory.observed_at_unix_ms + 1_000
+  const newerObservedAt = olderObservedAt + 1_000
+  const olderGate = deferred()
+  state.inventoryResponsePlans.set(
+    'beta',
+    Array.from({ length: 4 }, () => ({
+      observedAtUnixMs: olderObservedAt,
+      reconcileRuntimeTimestamps: true,
+      wait: olderGate.promise,
+    })),
+  )
+
+  await page.goto('/')
+  state.requestLog = []
+  const marker = page.locator(
+    '.orchestrator-marker[data-project-id="project-1"]',
+  )
+  await marker.click()
+  const transfer = page
+    .locator('.inspector')
+    .getByRole('button', { name: 'Change orchestrator' })
+  await expect
+    .poll(() =>
+      state.requestLog.includes(
+        `inventory:beta:start:${olderObservedAt}`,
+      ),
+    )
+    .toBe(true)
+  await expect(transfer).toBeDisabled()
+
+  await page.getByRole('button', { name: 'Close details' }).click()
+  await expect(page.locator('.inspector')).toHaveCount(0)
+  state.inventoryResponsePlans.set('beta', [
+    {
+      observedAtUnixMs: newerObservedAt,
+      reconcileRuntimeTimestamps: true,
+    },
+  ])
+  await marker.click()
+  const reopenedTransfer = page
+    .locator('.inspector')
+    .getByRole('button', { name: 'Change orchestrator' })
+  await expect(reopenedTransfer).toBeEnabled()
+  expect(state.requestLog).toContain(
+    `inventory:beta:complete:${newerObservedAt}`,
+  )
+
+  olderGate.resolve()
+  await expect
+    .poll(() =>
+      state.requestLog.includes(
+        `inventory:beta:complete:${olderObservedAt}`,
+      ),
+    )
+    .toBe(true)
+  expect(
+    state.requestLog.indexOf(
+      `inventory:beta:complete:${olderObservedAt}`,
+    ),
+  ).toBeGreaterThan(
+    state.requestLog.indexOf(
+      `inventory:beta:complete:${newerObservedAt}`,
+    ),
+  )
+  await expect(reopenedTransfer).toBeEnabled()
+  expect(state.projectOrchestratorCommands).toHaveLength(0)
+})
+
+test('delivers and ignores an older transfer response after a newer generation', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  moveProjectTransferFixtureToSession(state, 'beta')
+
+  await page.goto('/')
+  await page
+    .locator('.orchestrator-marker[data-project-id="project-1"]')
+    .click()
+  const transfer = page
+    .locator('.inspector')
+    .getByRole('button', { name: 'Change orchestrator' })
+  await expect(transfer).toBeEnabled()
+  await transfer.click()
+  const dialog = page.getByRole('dialog', {
+    name: 'Change orchestrator',
+  })
+  await expect(dialog.getByLabel('Next orchestrator')).toHaveValue(
+    'worker-unassigned',
+  )
+
+  const olderObservedAt =
+    state.runtimeInventory.observed_at_unix_ms + 1_000
+  const newerObservedAt = olderObservedAt + 1_000
+  const olderGate = deferred()
+  state.requestLog = []
+  state.inventoryResponsePlans.set('beta', [
+    {
+      observedAtUnixMs: olderObservedAt,
+      reconcileRuntimeTimestamps: true,
+      wait: olderGate.promise,
+    },
+  ])
+  await expect
+    .poll(() =>
+      state.requestLog.includes(
+        `inventory:beta:start:${olderObservedAt}`,
+      ),
+      { timeout: 3_000 },
+    )
+    .toBe(true)
+  await expect(dialog.getByLabel('Next orchestrator')).toBeDisabled()
+
+  state.inventoryResponsePlans.set('beta', [
+    {
+      observedAtUnixMs: newerObservedAt,
+      reconcileRuntimeTimestamps: true,
+    },
+  ])
+  await dialog.locator('form').evaluate((form) => {
+    if (!(form instanceof HTMLFormElement)) {
+      throw new Error('Transfer form is unavailable')
+    }
+    form.requestSubmit()
+  })
+  await expect
+    .poll(() => state.projectOrchestratorCommands.length)
+    .toBe(1)
+  await expect(dialog).toHaveCount(0)
+  const newerCompleteIndex = state.requestLog.findIndex(
+    (entry) =>
+      entry === `inventory:beta:complete:${newerObservedAt}`,
+  )
+  expect(newerCompleteIndex).toBeGreaterThanOrEqual(0)
+
+  olderGate.resolve()
+  await expect
+    .poll(() =>
+      state.requestLog.includes(
+        `inventory:beta:complete:${olderObservedAt}`,
+      ),
+    )
+    .toBe(true)
+  const olderCompleteIndex = state.requestLog.findIndex(
+    (entry) =>
+      entry === `inventory:beta:complete:${olderObservedAt}`,
+  )
+  expect(olderCompleteIndex).toBeGreaterThan(newerCompleteIndex)
+  await expect
+    .poll(() =>
+      state.requestLog.findIndex(
+        (entry, index) =>
+          index > olderCompleteIndex &&
+          entry.startsWith('inventory:beta:start:'),
+      ),
+      { timeout: 3_000 },
+    )
+    .toBeGreaterThan(olderCompleteIndex)
+  const nextBetaInventoryIndex = state.requestLog.findIndex(
+    (entry, index) =>
+      index > olderCompleteIndex &&
+      entry.startsWith('inventory:beta:start:'),
+  )
+  const deliveredProjectReadIndex = state.requestLog.findIndex(
+    (entry, index) =>
+      index > olderCompleteIndex && entry === 'project:project-1',
+  )
+  const deliveredWorkerReadIndex = state.requestLog.findIndex(
+    (entry, index) =>
+      index > olderCompleteIndex && entry === 'workers',
+  )
+  expect(deliveredProjectReadIndex).toBeGreaterThan(olderCompleteIndex)
+  expect(deliveredProjectReadIndex).toBeLessThan(nextBetaInventoryIndex)
+  expect(deliveredWorkerReadIndex).toBeGreaterThan(olderCompleteIndex)
+  expect(deliveredWorkerReadIndex).toBeLessThan(nextBetaInventoryIndex)
+  expect(state.projectOrchestratorCommands).toHaveLength(1)
+  await expect(
+    page
+      .locator('.inspector')
+      .getByRole('region', { name: 'Orchestrator runtime' })
+      .locator('.detail-row')
+      .filter({ hasText: 'Worker ID' }),
+  ).toContainText('worker-unassigned')
+})
+
+test('rejects a lower transfer timestamp until an equal observation completes', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  moveProjectTransferFixtureToSession(state, 'beta')
+  const currentObservedAt =
+    state.runtimeInventory.observed_at_unix_ms + 2_000
+  state.inventoryResponsePlans.set('beta', [
+    {
+      observedAtUnixMs: currentObservedAt,
+      reconcileRuntimeTimestamps: true,
+    },
+  ])
+
+  await page.goto('/')
+  await page
+    .locator('.orchestrator-marker[data-project-id="project-1"]')
+    .click()
+  const inspector = page.locator('.inspector')
+  const transfer = inspector.getByRole('button', {
+    name: 'Change orchestrator',
+  })
+  await expect(transfer).toBeEnabled()
+
+  const lowerObservedAt = currentObservedAt - 1_000
+  const lowerGate = deferred()
+  const equalGate = deferred()
+  state.inventoryResponsePlans.set('beta', [
+    {
+      observedAtUnixMs: lowerObservedAt,
+      wait: lowerGate.promise,
+    },
+    {
+      observedAtUnixMs: currentObservedAt,
+      reconcileRuntimeTimestamps: true,
+      wait: equalGate.promise,
+    },
+  ])
+  await expect
+    .poll(() =>
+      state.requestLog.includes(
+        `inventory:beta:start:${lowerObservedAt}`,
+      ),
+      { timeout: 3_000 },
+    )
+    .toBe(true)
+  await expect(transfer).toBeDisabled()
+  lowerGate.resolve()
+  await expect(inspector.getByRole('status')).toContainText(
+    'Runtime inventory is older than the current transfer snapshot',
+  )
+  await expect(transfer).toBeDisabled()
+
+  await expect
+    .poll(() =>
+      state.requestLog.includes(
+        `inventory:beta:start:${currentObservedAt}`,
+      ),
+      { timeout: 3_000 },
+    )
+    .toBe(true)
+  await expect(transfer).toBeDisabled()
+  equalGate.resolve()
+  await expect
+    .poll(() =>
+      state.requestLog.includes(
+        `inventory:beta:complete:${currentObservedAt}`,
+      ),
+    )
+    .toBe(true)
+  await expect(transfer).toBeEnabled()
+  expect(state.projectOrchestratorCommands).toHaveLength(0)
+})
+
+test('rejects a transfer candidate with the current orchestrator worker id', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const candidate = state.workerCandidates.find(
+    ({ worker: candidateWorker }) =>
+      candidateWorker.id === 'worker-unassigned',
+  )
+  if (!candidate) throw new Error('Same-worker fixture is incomplete')
+  candidate.worker = {
+    ...candidate.worker,
+    id: state.projects[0].orchestrator.id,
+  }
+
+  await page.goto('/')
+  await page
+    .locator('.orchestrator-marker[data-project-id="project-1"]')
+    .click()
+  const inspector = page.locator('.inspector')
+  await expect(
+    inspector.getByRole('button', { name: 'Change orchestrator' }),
+  ).toBeDisabled()
+  await expect(inspector.getByRole('status')).toContainText(
+    'Start or free a live worker in this project workspace',
+  )
+  expect(state.projectOrchestratorCommands).toHaveLength(0)
+})
+
+test('disables transfer for stale candidate topology and exposes an associated action', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  state.runtimeInventory.workers = state.runtimeInventory.workers.map(
+    (observed) =>
+      observed.terminal_id === 'terminal-2'
+        ? { ...observed, pane_id: 'workspace-1:pane-stale' }
+        : observed,
+  )
+
+  await page.setViewportSize({ width: 320, height: 844 })
+  await page.goto('/')
+  await page
+    .locator('.orchestrator-marker[data-project-id="project-1"]')
+    .click()
+
+  const inspector = page.locator('.inspector')
+  const transfer = inspector.getByRole('button', {
+    name: 'Change orchestrator',
+  })
+  const status = inspector.getByRole('status')
+  await expect(transfer).toBeDisabled()
+  await expect(status).toContainText(
+    'Start or free a live worker in this project workspace, then refresh',
+  )
+  const statusId = await status.getAttribute('id')
+  expect(statusId).not.toBeNull()
+  await expect(transfer).toHaveAttribute(
+    'aria-describedby',
+    statusId ?? '',
+  )
+  await status.focus()
+  await expect(status).toBeFocused()
+  const overflow = await page.evaluate(() => ({
+    document:
+      document.documentElement.scrollWidth -
+      document.documentElement.clientWidth,
+    inspector:
+      (document.querySelector<HTMLElement>('.inspector')?.scrollWidth ?? 1) -
+      (document.querySelector<HTMLElement>('.inspector')?.clientWidth ?? 0),
+  }))
+  expect(overflow.document).toBeLessThanOrEqual(0)
+  expect(overflow.inspector).toBeLessThanOrEqual(0)
+})
+
+test('disables transfer for stale current orchestrator topology', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  state.runtimeInventory.workers = state.runtimeInventory.workers.map(
+    (observed) =>
+      observed.terminal_id === 'terminal-1'
+        ? { ...observed, tab_id: 'workspace-1:tab-stale' }
+        : observed,
+  )
+
+  await page.goto('/')
+  await page
+    .locator('.orchestrator-marker[data-project-id="project-1"]')
+    .click()
+
+  const inspector = page.locator('.inspector')
+  await expect(
+    inspector.getByRole('button', { name: 'Change orchestrator' }),
+  ).toBeDisabled()
+  await expect(inspector.getByRole('status')).toContainText(
+    'current orchestrator runtime topology is stale or unavailable',
+  )
+})
+
+test('disables transfer for ambiguous provider identity', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const candidateObservation = state.runtimeInventory.workers.find(
+    (observed) => observed.terminal_id === 'terminal-2',
+  )
+  if (!candidateObservation?.provider_session) {
+    throw new Error('Provider ambiguity fixture is incomplete')
+  }
+  state.runtimeInventory.workers.push({
+    ...worker(42, 'workspace-1'),
+    provider_session: { ...candidateObservation.provider_session },
+  })
+
+  await page.goto('/')
+  await page
+    .locator('.orchestrator-marker[data-project-id="project-1"]')
+    .click()
+
+  const inspector = page.locator('.inspector')
+  await expect(
+    inspector.getByRole('button', { name: 'Change orchestrator' }),
+  ).toBeDisabled()
+  await expect(inspector.getByRole('status')).toContainText(
+    'Start or free a live worker in this project workspace',
+  )
+})
+
 test('recovers a stale project orchestrator transfer on mobile', async ({
   page,
 }, testInfo) => {
@@ -8496,7 +9612,7 @@ test('recovers a stale project orchestrator transfer on mobile', async ({
     ...state.workerCandidates[eligibleIndex],
     profile_name: 'Ready worker',
   }
-  await page.setViewportSize({ width: 390, height: 844 })
+  await page.setViewportSize({ width: 320, height: 844 })
   await page.goto('/')
 
   await page
@@ -8511,7 +9627,7 @@ test('recovers a stale project orchestrator transfer on mobile', async ({
   expect(dialogBounds?.x ?? -1).toBeGreaterThanOrEqual(0)
   expect(
     dialogBounds ? dialogBounds.x + dialogBounds.width : Infinity,
-  ).toBeLessThanOrEqual(390)
+  ).toBeLessThanOrEqual(320)
 
   await dialog
     .getByRole('button', { name: 'Change orchestrator' })
@@ -8525,6 +9641,14 @@ test('recovers a stale project orchestrator transfer on mobile', async ({
     'worker-unassigned',
   )
   await expect.poll(() => state.projectOrchestratorCommands.length).toBe(1)
+  const mountedOverflow = await dialog.evaluate((element) => ({
+    dialog: element.scrollWidth - element.clientWidth,
+    document:
+      document.documentElement.scrollWidth -
+      document.documentElement.clientWidth,
+  }))
+  expect(mountedOverflow.dialog).toBeLessThanOrEqual(0)
+  expect(mountedOverflow.document).toBeLessThanOrEqual(0)
   await page.screenshot({
     path: testInfo.outputPath('project-orchestrator-transfer-mobile.png'),
     fullPage: true,
@@ -8550,9 +9674,6 @@ test('recovers a stale project orchestrator transfer on mobile', async ({
       .filter({ hasText: 'Worker ID' }),
   ).toContainText('worker-unassigned')
   const overflow = await page.evaluate(() => ({
-    dialog:
-      document.querySelector<HTMLElement>('.orchestrator-transfer-dialog')
-        ?.scrollWidth ?? 0,
     document:
       document.documentElement.scrollWidth -
       document.documentElement.clientWidth,

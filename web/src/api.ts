@@ -145,6 +145,16 @@ export function fetchProjects(signal?: AbortSignal): Promise<Projects> {
   return requestJson('/api/v1/projects', { signal })
 }
 
+export function fetchProject(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<Project> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}`,
+    { signal },
+  )
+}
+
 export function changeProjectOrchestrator(
   projectId: string,
   command: ChangeProjectOrchestratorInput,

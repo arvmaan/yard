@@ -2545,6 +2545,18 @@ html[data-yard-allocation-dragging="true"]
   margin-top: 12px;
 }
 
+.project-orchestrator-transfer-status {
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.project-orchestrator-transfer-status:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
 .intervention-section {
   min-width: 0;
   margin-top: 18px;
@@ -3474,6 +3486,11 @@ html[data-yard-allocation-dragging="true"]
   background: var(--mineral);
 }
 
+:root[data-theme="light"] .agent-window-navigator {
+  --muted: #5e6965;
+  --blue: #346a9f;
+}
+
 .agent-window-navigator > header {
   display: grid;
   min-width: 0;
@@ -3677,6 +3694,11 @@ html[data-yard-allocation-dragging="true"]
   color: var(--teal);
 }
 
+.agent-window-row-frame {
+  position: relative;
+  min-width: 0;
+}
+
 .agent-window-row {
   display: grid;
   width: calc(100% - 10px);
@@ -3692,6 +3714,10 @@ html[data-yard-allocation-dragging="true"]
   color: var(--ink);
   cursor: pointer;
   text-align: left;
+}
+
+.agent-window-row__details {
+  display: none;
 }
 
 .agent-window-row:hover {
@@ -3832,6 +3858,45 @@ html[data-yard-allocation-dragging="true"]
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.agent-window-details-backdrop {
+  z-index: 150;
+}
+
+.agent-window-details-dialog {
+  width: min(420px, 100%);
+}
+
+.agent-window-details-list {
+  display: grid;
+  margin: 0;
+  padding: 6px 16px 16px;
+}
+
+.agent-window-details-list > div {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.agent-window-details-list > div:last-child {
+  border-bottom: 0;
+}
+
+.agent-window-details-list dt {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.agent-window-details-list dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  font: 10px/1.4 "IBM Plex Mono", monospace;
 }
 
 .agent-workspace-toolbar {
@@ -5373,6 +5438,22 @@ html[data-yard-allocation-dragging="true"]
     padding: 5px 4px;
   }
 
+  .agent-window-row__details {
+    position: absolute;
+    top: 3px;
+    right: 5px;
+    z-index: 1;
+    display: grid;
+    width: 32px;
+    height: 44px;
+    border-color: var(--line);
+    background: var(--mineral);
+  }
+
+  .agent-window-row__body {
+    padding-right: 30px;
+  }
+
   .agent-window-row__icon {
     width: 20px;
     height: 20px;
@@ -5407,6 +5488,11 @@ html[data-yard-allocation-dragging="true"]
   .agent-window-row__topology,
   .agent-window-row__path {
     display: none;
+  }
+
+  .agent-window-details-list > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
   }
 
   .agent-workspace-toolbar {

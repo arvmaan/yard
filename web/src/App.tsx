@@ -59,6 +59,7 @@ import {
   fetchCoordinationSnapshots,
   fetchOrchestratorWorkflowProfile,
   fetchOrchestratorStatusOutput,
+  fetchProject,
   fetchProjectAssignments,
   fetchProjectRelationships,
   fetchProjects,
@@ -161,6 +162,18 @@ import {
   reconcileInventorySnapshot,
   reconcileRuntimeProjectionSnapshot,
 } from './inventoryState'
+import {
+  projectOrchestratorEligibility,
+  type ProjectOrchestratorEligibilityReason,
+} from './projectOrchestratorEligibility'
+import {
+  beginProjectTransferRefresh,
+  emptyProjectTransferContext,
+  failProjectTransferRefresh,
+  resolveProjectTransferRefresh,
+  type ProjectTransferContextEntry,
+  type ProjectTransferSnapshot,
+} from './projectTransferContext'
 import {
   readMapVisualMode,
   writeMapVisualMode,
@@ -398,37 +411,6 @@ function agentTargetRuntimeMetadata(
   }
 }
 
-function eligibleProjectOrchestratorCandidates(
-  inventory: RuntimeInventory | null,
-  project: Project,
-  candidates: WorkerCandidate[],
-) {
-  if (!project.orchestrator.runtime) return []
-
-  return candidates.filter((candidate) => {
-    const runtime = candidate.worker.runtime
-    if (
-      candidate.availability !== 'unassigned_live' ||
-      candidate.worker.desired_state !== 'running' ||
-      !runtime ||
-      runtime.adapter !== project.runtime.adapter ||
-      runtime.session !== project.runtime.session ||
-      runtime.workspace_id !== project.runtime.workspace_id ||
-      runtime.observation_state !== 'observed' ||
-      runtime.process_state !== 'running'
-    ) {
-      return false
-    }
-
-    const observed = findObservedWorker(inventory, runtime)
-    return Boolean(
-      observed?.interactive_ready &&
-      !observed.launch_pending &&
-      observed.workspace_id === project.runtime.workspace_id,
-    )
-  })
-}
-
 function findCandidateForObservedWorker(
   candidates: WorkerCandidate[],
   inventory: RuntimeInventory | null,
@@ -444,6 +426,34 @@ function findCandidateForObservedWorker(
     )
   })
   return matches.length === 1 ? matches[0] : undefined
+}
+
+function projectOrchestratorTransferStatus(
+  project: Project,
+  reason: ProjectOrchestratorEligibilityReason,
+  loading: boolean,
+  error: string | null,
+) {
+  const session = project.runtime.session
+  if (loading && reason === 'inventory_unavailable') {
+    return `Checking live workers in Herdr session ${session}.`
+  }
+  if (error && reason === 'inventory_unavailable') {
+    return `Could not load Herdr session ${session}: ${error}. Check that the session is running, then refresh.`
+  }
+  if (reason === 'inventory_identity_changed') {
+    return `Live inventory no longer matches Herdr session ${session}. Refresh the session before changing ownership.`
+  }
+  if (reason === 'project_workspace_unavailable') {
+    return 'The project workspace is missing or ambiguous in live inventory. Refresh the session before changing ownership.'
+  }
+  if (reason === 'current_orchestrator_unavailable') {
+    return 'The current orchestrator runtime topology is stale or unavailable. Refresh the session before changing ownership.'
+  }
+  if (reason === 'no_eligible_workers') {
+    return 'Start or free a live worker in this project workspace, then refresh to change ownership.'
+  }
+  return 'A live unassigned worker is ready to take project ownership.'
 }
 
 function resolvedRuntimeState(
@@ -1093,11 +1103,12 @@ function ProjectOrchestratorTransferDialog({
   })
 
   useEffect(() => {
-    setWorkerId((current) =>
-      candidates.some((candidate) => candidate.worker.id === current)
+    setWorkerId((current) => {
+      if (candidates.length === 0) return current
+      return candidates.some((candidate) => candidate.worker.id === current)
         ? current
-        : (candidates[0]?.worker.id ?? ''),
-    )
+        : candidates[0].worker.id
+    })
   }, [candidates])
 
   const submit = (event: FormEvent) => {
@@ -1113,6 +1124,7 @@ function ProjectOrchestratorTransferDialog({
         className="control-dialog orchestrator-transfer-dialog"
         ref={dialogRef}
         role="dialog"
+        tabIndex={-1}
       >
         <header className="dialog-heading">
           <div>
@@ -1214,13 +1226,19 @@ function ProjectOrchestratorTransferDialog({
 
 function ProjectOrchestratorInspector({
   candidates,
+  eligibilityReason,
   inventory,
+  inventoryError,
+  inventoryLoading,
   onChange,
   project,
   statusReport,
 }: {
   candidates: WorkerCandidate[]
+  eligibilityReason: ProjectOrchestratorEligibilityReason
   inventory: RuntimeInventory | null
+  inventoryError: string | null
+  inventoryLoading: boolean
   onChange: (trigger: HTMLButtonElement) => void
   project: Project
   statusReport: StatusReport | undefined
@@ -1228,6 +1246,13 @@ function ProjectOrchestratorInspector({
   const runtime = project.orchestrator.runtime
   const observed = findObservedWorker(inventory, runtime)
   const runtimeState = resolvedRuntimeState(runtime, observed)
+  const transferStatusId = `project-orchestrator-transfer-status-${project.id}`
+  const transferStatus = projectOrchestratorTransferStatus(
+    project,
+    eligibilityReason,
+    inventoryLoading,
+    inventoryError,
+  )
 
   return (
     <>
@@ -1259,19 +1284,23 @@ function ProjectOrchestratorInspector({
           <DetailRow label="Terminal" value={runtime?.terminal_id} mono />
         </dl>
         <button
+          aria-describedby={transferStatusId}
           className="secondary-button project-orchestrator-transfer"
           disabled={candidates.length === 0}
           onClick={(event) => onChange(event.currentTarget)}
-          title={
-            candidates.length === 0
-              ? 'No eligible live unassigned workers in this project workspace'
-              : 'Transfer project orchestration'
-          }
           type="button"
         >
           <ArrowRightLeft aria-hidden="true" size={15} />
           Change orchestrator
         </button>
+        <p
+          className="project-orchestrator-transfer-status"
+          id={transferStatusId}
+          role="status"
+          tabIndex={candidates.length === 0 ? 0 : undefined}
+        >
+          {transferStatus}
+        </p>
       </section>
       <WorkerInterventions
         key={[
@@ -2138,6 +2167,9 @@ function App() {
   const [sessions, setSessions] = useState<RuntimeSession[]>([])
   const [selectedSession, setSelectedSession] = useState('')
   const [inventory, setInventory] = useState<RuntimeInventory | null>(null)
+  const [projectTransferContexts, setProjectTransferContexts] = useState<
+    Record<string, ProjectTransferContextEntry>
+  >({})
   const [yardOrchestrator, setYardOrchestrator] =
     useState<YardOrchestrator | null>(null)
   const [projects, setProjects] = useState<Project[]>([])
@@ -2268,6 +2300,11 @@ function App() {
   const placementUpdates = useRef(new Set<string>())
   const pendingPlacements = useRef(new Map<string, CanvasPlacement>())
   const projectsRef = useRef<Project[]>([])
+  const projectTransferContextsRef = useRef<
+    Record<string, ProjectTransferContextEntry>
+  >({})
+  const projectTransferGenerations = useRef(new Map<string, number>())
+  const projectOrchestratorTransferBusyRef = useRef(false)
   const coordinationNodesRef = useRef<CoordinationNode[]>([])
   const coordinationPlacementUpdates = useRef(new Set<string>())
   const pendingCoordinationPlacements = useRef(
@@ -2497,6 +2534,127 @@ function App() {
     [loadWorkers, loadYardOrchestrator],
   )
 
+  const writeProjectTransferContext = useCallback(
+    (projectId: string, entry: ProjectTransferContextEntry) => {
+      const next = {
+        ...projectTransferContextsRef.current,
+        [projectId]: entry,
+      }
+      projectTransferContextsRef.current = next
+      setProjectTransferContexts(next)
+    },
+    [],
+  )
+
+  const clearProjectTransferContext = useCallback((projectId: string) => {
+    const nextGeneration =
+      (projectTransferGenerations.current.get(projectId) ?? 0) + 1
+    projectTransferGenerations.current.set(projectId, nextGeneration)
+    const next = { ...projectTransferContextsRef.current }
+    delete next[projectId]
+    projectTransferContextsRef.current = next
+    setProjectTransferContexts(next)
+  }, [])
+
+  const refreshProjectTransferContext = useCallback(
+    async (
+      target: {
+        adapter: string
+        projectId: string
+        session: string
+      },
+      signal?: AbortSignal,
+    ): Promise<ProjectTransferSnapshot | null> => {
+      const { projectId } = target
+      const generation =
+        (projectTransferGenerations.current.get(projectId) ?? 0) + 1
+      projectTransferGenerations.current.set(projectId, generation)
+      const current =
+        projectTransferContextsRef.current[projectId] ??
+        emptyProjectTransferContext()
+      writeProjectTransferContext(
+        projectId,
+        beginProjectTransferRefresh(current, generation),
+      )
+
+      try {
+        let adapter = target.adapter
+        let session = target.session
+        let snapshot: ProjectTransferSnapshot | null = null
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          if (adapter !== 'herdr') {
+            throw new Error(
+              `Runtime adapter ${adapter} does not expose Herdr inventory`,
+            )
+          }
+          const transferInventory = await fetchInventory(session, signal)
+          const [workerResult, refreshedProject] = await Promise.all([
+            fetchWorkers(signal),
+            fetchProject(projectId, signal),
+          ])
+          if (
+            refreshedProject.runtime.adapter === adapter &&
+            refreshedProject.runtime.session === session
+          ) {
+            snapshot = {
+              candidates: workerResult.workers,
+              inventory: transferInventory,
+              project: refreshedProject,
+            }
+            break
+          }
+          adapter = refreshedProject.runtime.adapter
+          session = refreshedProject.runtime.session
+        }
+        if (!snapshot) {
+          throw new Error(
+            'Project runtime changed during transfer refresh. Retry the transfer.',
+          )
+        }
+        if (
+          projectTransferGenerations.current.get(projectId) !== generation
+        ) {
+          return null
+        }
+        const active =
+          projectTransferContextsRef.current[projectId] ??
+          emptyProjectTransferContext()
+        const resolved = resolveProjectTransferRefresh(
+          active,
+          generation,
+          snapshot,
+        )
+        writeProjectTransferContext(projectId, resolved.entry)
+        return resolved.snapshot
+      } catch (caught) {
+        if (
+          projectTransferGenerations.current.get(projectId) !== generation
+        ) {
+          return null
+        }
+        const active =
+          projectTransferContextsRef.current[projectId] ??
+          emptyProjectTransferContext()
+        const aborted =
+          caught instanceof DOMException && caught.name === 'AbortError'
+        writeProjectTransferContext(
+          projectId,
+          failProjectTransferRefresh(
+            active,
+            generation,
+            aborted
+              ? null
+              : caught instanceof Error
+                ? caught.message
+                : 'Project transfer context request failed',
+          ),
+        )
+        return null
+      }
+    },
+    [writeProjectTransferContext],
+  )
+
   useEffect(() => {
     const controller = new AbortController()
     setRuntimeLoading(true)
@@ -2599,6 +2757,76 @@ function App() {
       controller.abort()
     }
   }, [loadInventory, selectedSession])
+
+  const activeProjectTransferProjectId =
+    projectOrchestratorTransfer?.projectId ??
+    (selection?.kind === 'orchestrator' ? selection.projectId : null)
+  const activeProjectTransferProject = activeProjectTransferProjectId
+    ? projects.find(
+        (candidate) => candidate.id === activeProjectTransferProjectId,
+      )
+    : undefined
+  const activeProjectTransferAdapter =
+    activeProjectTransferProject?.runtime.adapter
+  const activeProjectTransferSession =
+    activeProjectTransferProject?.runtime.session
+  const activeProjectTransferTarget = useMemo(
+    () =>
+      activeProjectTransferProjectId &&
+      activeProjectTransferAdapter &&
+      activeProjectTransferSession
+      ? {
+          adapter: activeProjectTransferAdapter,
+          projectId: activeProjectTransferProjectId,
+          session: activeProjectTransferSession,
+        }
+      : null,
+    [
+      activeProjectTransferAdapter,
+      activeProjectTransferProjectId,
+      activeProjectTransferSession,
+    ],
+  )
+
+  useEffect(() => {
+    if (!activeProjectTransferTarget) return
+    const controller = new AbortController()
+    let inFlight = false
+    const target = activeProjectTransferTarget
+
+    const refreshTransferContext = async () => {
+      if (inFlight || projectOrchestratorTransferBusyRef.current) return
+      inFlight = true
+      try {
+        await refreshProjectTransferContext(target, controller.signal)
+      } finally {
+        inFlight = false
+      }
+    }
+
+    void refreshTransferContext()
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshTransferContext()
+      }
+    }
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void refreshTransferContext()
+      }
+    }, INVENTORY_REFRESH_INTERVAL_MS)
+    document.addEventListener('visibilitychange', refreshWhenVisible)
+    return () => {
+      window.clearInterval(interval)
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
+      controller.abort()
+      clearProjectTransferContext(target.projectId)
+    }
+  }, [
+    activeProjectTransferTarget,
+    clearProjectTransferContext,
+    refreshProjectTransferContext,
+  ])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -2821,32 +3049,65 @@ function App() {
     selection?.kind === 'orchestrator'
       ? projects.find((project) => project.id === selection.projectId)
       : undefined
-  const selectedProjectOrchestratorCandidates = useMemo(
-    () =>
-      selectedProjectOrchestrator
-        ? eligibleProjectOrchestratorCandidates(
-            inventory,
-            selectedProjectOrchestrator,
-            workerCandidates,
-          )
-        : [],
-    [inventory, selectedProjectOrchestrator, workerCandidates],
-  )
-  const projectOrchestratorTransferProject = projectOrchestratorTransfer
-    ? projects.find(
-        (project) => project.id === projectOrchestratorTransfer.projectId,
-      )
+  const selectedProjectTransferContext = selectedProjectOrchestrator
+    ? projectTransferContexts[selectedProjectOrchestrator.id]
     : undefined
-  const projectOrchestratorTransferCandidates = useMemo(
+  const selectedProjectTransferSnapshot =
+    selectedProjectTransferContext?.snapshot
+  const selectedProjectOrchestratorContextProject =
+    selectedProjectTransferSnapshot?.project ??
+    selectedProjectOrchestrator
+  const selectedProjectOrchestratorEligibility = useMemo(
     () =>
-      projectOrchestratorTransferProject
-        ? eligibleProjectOrchestratorCandidates(
-            inventory,
-            projectOrchestratorTransferProject,
-            workerCandidates,
+      selectedProjectTransferSnapshot &&
+      !selectedProjectTransferContext?.loading &&
+      !selectedProjectTransferContext.error
+        ? projectOrchestratorEligibility(
+            selectedProjectTransferSnapshot.inventory,
+            selectedProjectTransferSnapshot.project,
+            selectedProjectTransferSnapshot.candidates,
           )
-        : [],
-    [inventory, projectOrchestratorTransferProject, workerCandidates],
+        : {
+            candidates: [],
+            reason: 'inventory_unavailable' as const,
+          },
+    [
+      selectedProjectTransferContext?.error,
+      selectedProjectTransferContext?.loading,
+      selectedProjectTransferSnapshot,
+    ],
+  )
+  const projectOrchestratorTransferContext = projectOrchestratorTransfer
+    ? projectTransferContexts[projectOrchestratorTransfer.projectId]
+    : undefined
+  const projectOrchestratorTransferSnapshot =
+    projectOrchestratorTransferContext?.snapshot
+  const projectOrchestratorTransferProject =
+    projectOrchestratorTransferSnapshot?.project ??
+    (projectOrchestratorTransfer
+      ? projects.find(
+          (project) => project.id === projectOrchestratorTransfer.projectId,
+        )
+      : undefined)
+  const projectOrchestratorTransferEligibility = useMemo(
+    () =>
+      projectOrchestratorTransferSnapshot &&
+      !projectOrchestratorTransferContext?.loading &&
+      !projectOrchestratorTransferContext.error
+        ? projectOrchestratorEligibility(
+            projectOrchestratorTransferSnapshot.inventory,
+            projectOrchestratorTransferSnapshot.project,
+            projectOrchestratorTransferSnapshot.candidates,
+          )
+        : {
+            candidates: [],
+            reason: 'inventory_unavailable' as const,
+          },
+    [
+      projectOrchestratorTransferContext?.error,
+      projectOrchestratorTransferContext?.loading,
+      projectOrchestratorTransferSnapshot,
+    ],
   )
   const selectedYardOrchestrator =
     selection?.kind === 'yard-orchestrator'
@@ -3389,48 +3650,58 @@ function App() {
         projectId: project.id,
         returnFocus,
       })
+      void refreshProjectTransferContext({
+        adapter: project.runtime.adapter,
+        projectId: project.id,
+        session: project.runtime.session,
+      })
     },
-    [],
+    [refreshProjectTransferContext],
   )
 
   const transferProjectOrchestrator = useCallback(
     async (workerId: string) => {
       if (!projectOrchestratorTransfer) return
-      const project = projects.find(
-        (candidate) =>
-          candidate.id === projectOrchestratorTransfer.projectId,
-      )
-      const candidate = workerCandidates.find(
-        ({ worker }) => worker.id === workerId,
-      )
-      const workerRuntime = candidate?.worker.runtime
-      const orchestratorRuntime = project?.orchestrator.runtime
-      if (
-        !project ||
-        !candidate ||
-        !workerRuntime ||
-        !orchestratorRuntime ||
-        !eligibleProjectOrchestratorCandidates(
-          inventory,
-          project,
-          [candidate],
-        ).length
-      ) {
-        setProjectOrchestratorTransferError(
-          'The selected worker is no longer eligible. Choose a refreshed candidate.',
-        )
-        await Promise.all([
-          loadProjects(),
-          loadWorkers(),
-          loadInventory(selectedSession),
-        ]).catch(() => undefined)
-        return
-      }
+      const projectId = projectOrchestratorTransfer.projectId
+      const currentProject =
+        projectOrchestratorTransferSnapshot?.project ??
+        projects.find((candidate) => candidate.id === projectId)
+      if (!currentProject) return
 
+      projectOrchestratorTransferBusyRef.current = true
       setProjectOrchestratorTransferBusy(true)
       setProjectOrchestratorTransferError(null)
       setActionError(null)
       try {
+        const snapshot = await refreshProjectTransferContext({
+          adapter: currentProject.runtime.adapter,
+          projectId,
+          session: currentProject.runtime.session,
+        })
+        const project = snapshot?.project
+        const candidate = snapshot?.candidates.find(
+          ({ worker }) => worker.id === workerId,
+        )
+        const workerRuntime = candidate?.worker.runtime
+        const orchestratorRuntime = project?.orchestrator.runtime
+        if (
+          !snapshot ||
+          !project ||
+          !candidate ||
+          !workerRuntime ||
+          !orchestratorRuntime ||
+          !projectOrchestratorEligibility(
+            snapshot.inventory,
+            project,
+            [candidate],
+          ).candidates.length
+        ) {
+          setProjectOrchestratorTransferError(
+            'The selected worker is no longer eligible. Review the refreshed runtime state and retry.',
+          )
+          return
+        }
+
         const result = await changeProjectOrchestrator(project.id, {
           command_id: projectOrchestratorTransfer.commandId,
           actor: 'local-user',
@@ -3453,6 +3724,11 @@ function App() {
             loadWorkers(),
             loadInventory(selectedSession),
           ])
+          await refreshProjectTransferContext({
+            adapter: result.project.runtime.adapter,
+            projectId,
+            session: result.project.runtime.session,
+          })
         } catch (caught) {
           setActionError(
             caught instanceof Error
@@ -3464,17 +3740,20 @@ function App() {
       } catch (caught) {
         let reconciledProject: Project | undefined
         try {
-          const [projectResult] = await Promise.all([
-            fetchProjects(),
+          await Promise.all([
+            loadProjects(),
             loadWorkers(),
             loadInventory(selectedSession),
           ])
-          setProjects(projectResult.projects)
+          const reconciledSnapshot = await refreshProjectTransferContext({
+            adapter: currentProject.runtime.adapter,
+            projectId,
+            session: currentProject.runtime.session,
+          })
+          reconciledProject = reconciledSnapshot?.project
+          const loadedProjects = await fetchProjects()
           await loadAssignments(
-            projectResult.projects.map((item) => item.id),
-          )
-          reconciledProject = projectResult.projects.find(
-            (item) => item.id === project.id,
+            loadedProjects.projects.map((item) => item.id),
           )
         } catch {
           // Keep the original command ID when the outcome cannot be reconciled.
@@ -3505,19 +3784,20 @@ function App() {
           }
         }
       } finally {
+        projectOrchestratorTransferBusyRef.current = false
         setProjectOrchestratorTransferBusy(false)
       }
     },
     [
-      inventory,
       loadInventory,
       loadAssignments,
       loadProjects,
       loadWorkers,
       projectOrchestratorTransfer,
+      projectOrchestratorTransferSnapshot,
       projects,
+      refreshProjectTransferContext,
       selectedSession,
-      workerCandidates,
     ],
   )
 
@@ -5262,15 +5542,28 @@ function App() {
           />
         ) : selectedProjectOrchestrator ? (
           <ProjectOrchestratorInspector
-            candidates={selectedProjectOrchestratorCandidates}
-            inventory={inventory}
+            candidates={selectedProjectOrchestratorEligibility.candidates}
+            eligibilityReason={
+              selectedProjectOrchestratorEligibility.reason
+            }
+            inventory={selectedProjectTransferSnapshot?.inventory ?? null}
+            inventoryError={
+              selectedProjectTransferContext?.error ?? null
+            }
+            inventoryLoading={
+              selectedProjectTransferContext?.loading ?? true
+            }
             onChange={(trigger) =>
+              selectedProjectOrchestratorContextProject &&
               proposeProjectOrchestratorTransfer(
-                selectedProjectOrchestrator,
+                selectedProjectOrchestratorContextProject,
                 trigger,
               )
             }
-            project={selectedProjectOrchestrator}
+            project={
+              selectedProjectOrchestratorContextProject ??
+              selectedProjectOrchestrator
+            }
             statusReport={
               projectStatusReports[selectedProjectOrchestrator.id]
             }
@@ -5559,7 +5852,7 @@ function App() {
       projectOrchestratorTransferProject ? (
         <ProjectOrchestratorTransferDialog
           busy={projectOrchestratorTransferBusy}
-          candidates={projectOrchestratorTransferCandidates}
+          candidates={projectOrchestratorTransferEligibility.candidates}
           error={projectOrchestratorTransferError}
           onClose={() => {
             if (projectOrchestratorTransferBusy) return

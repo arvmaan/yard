@@ -29,8 +29,23 @@ function focusableElements(dialog: HTMLElement) {
   ).filter(
     (element) =>
       element.getAttribute('aria-hidden') !== 'true' &&
+      element.tabIndex >= 0 &&
+      !element.matches(':disabled') &&
+      !element.closest('[inert]') &&
       element.getClientRects().length > 0,
   )
+}
+
+function focusDialogTarget(
+  dialog: HTMLElement,
+  preferred?: HTMLElement | null,
+) {
+  const focusable = focusableElements(dialog)
+  const target =
+    (preferred && focusable.includes(preferred) ? preferred : null) ??
+    focusable[0] ??
+    (dialog.hasAttribute('tabindex') ? dialog : null)
+  target?.focus()
 }
 
 function makeOutsideContentInert(dialog: HTMLElement) {
@@ -101,9 +116,29 @@ export function useModalDialog({
     const restoreOutsideContent = makeOutsideContentInert(dialog)
     const frame = window.requestAnimationFrame(() => {
       if (dialog.contains(document.activeElement)) return
-      const initial = initialFocusRef?.current ?? focusableElements(dialog)[0]
-      initial?.focus()
+      focusDialogTarget(dialog, initialFocusRef?.current)
     })
+    const keepFocusInside = () => {
+      const focused = document.activeElement
+      if (
+        focused instanceof HTMLElement &&
+        dialog.contains(focused) &&
+        (focused === dialog || focusableElements(dialog).includes(focused))
+      ) {
+        return
+      }
+      focusDialogTarget(dialog, initialFocusRef?.current)
+    }
+    const focusObserver = new MutationObserver(keepFocusInside)
+    focusObserver.observe(dialog, {
+      attributeFilter: ['aria-hidden', 'disabled', 'hidden', 'tabindex'],
+      attributes: true,
+      subtree: true,
+    })
+    const handleFocusIn = (event: FocusEvent) => {
+      if (event.target instanceof Node && dialog.contains(event.target)) return
+      keepFocusInside()
+    }
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         if (!canCloseRef.current) return
@@ -136,9 +171,12 @@ export function useModalDialog({
       }
     }
 
+    document.addEventListener('focusin', handleFocusIn)
     window.addEventListener('keydown', handleKeyDown)
     return () => {
       window.cancelAnimationFrame(frame)
+      focusObserver.disconnect()
+      document.removeEventListener('focusin', handleFocusIn)
       window.removeEventListener('keydown', handleKeyDown)
       restoreOutsideContent()
       window.setTimeout(() => focusTarget?.focus(), 0)

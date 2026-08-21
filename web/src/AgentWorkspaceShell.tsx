@@ -1,10 +1,18 @@
-import { lazy, Suspense, useMemo } from 'react'
+import {
+  lazy,
+  Suspense,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import { createPortal } from 'react-dom'
 import {
   Bot,
   Boxes,
   BriefcaseBusiness,
   Folder,
   GitBranch,
+  Info,
   Network,
   PanelLeftClose,
   Server,
@@ -19,6 +27,7 @@ import {
   type TerminalPresentation,
 } from './AgentWorkspaceContext'
 import { groupAgentWindowTargets } from './agentWindowNavigator'
+import { useModalDialog } from './useModalDialog'
 import type {
   CoordinationNodeRoute,
   Project,
@@ -97,6 +106,90 @@ function targetTitle(target: AgentWorkspaceTarget) {
     .join('\n')
 }
 
+function targetDetailsControlLabel(target: AgentWorkspaceTarget) {
+  return `Show runtime details for ${target.label}, ${target.contextLabel}, workspace ${target.workspaceId}, ${target.session} terminal ${target.terminalId}`
+}
+
+function AgentWindowDetailsDialog({
+  onClose,
+  returnFocus,
+  target,
+}: {
+  onClose: () => void
+  returnFocus: HTMLElement | null
+  target: AgentWorkspaceTarget
+}) {
+  const dialogRef = useRef<HTMLElement>(null)
+  useModalDialog({
+    dialogRef,
+    onClose,
+    returnFocus,
+  })
+
+  const details = [
+    ['Role', `${target.roleLabel} / ${target.contextLabel}`],
+    ['Workspace', target.workspaceId],
+    ['Herdr session', target.session],
+    [
+      'Runtime state',
+      target.observation === 'observed'
+        ? `Observed / ${target.status}`
+        : 'Durable binding / not observed',
+    ],
+    ['Terminal', target.terminalId],
+    ['Tab', target.tabId ?? 'Not recorded'],
+    ['Pane', target.paneId],
+    ['Harness', `${target.harness} / ${target.runtimeAdapter}`],
+    ['Working directory', target.cwd ?? 'Not reported'],
+  ]
+
+  return (
+    <div
+      className="modal-backdrop agent-window-details-backdrop"
+      role="presentation"
+    >
+      <section
+        aria-labelledby="agent-window-details-title"
+        aria-modal="true"
+        className="control-dialog agent-window-details-dialog"
+        id="agent-window-details-dialog"
+        onKeyDown={(event) => {
+          if (event.key !== 'Escape') return
+          event.preventDefault()
+          event.stopPropagation()
+          onClose()
+        }}
+        ref={dialogRef}
+        role="dialog"
+      >
+        <header className="dialog-heading">
+          <div>
+            <p className="eyebrow">Runtime target</p>
+            <h2 id="agent-window-details-title">{target.label}</h2>
+          </div>
+          <button
+            aria-label="Close runtime details"
+            className="icon-button"
+            onClick={onClose}
+            title="Close runtime details"
+            type="button"
+          >
+            <X aria-hidden="true" size={17} />
+          </button>
+        </header>
+        <dl className="agent-window-details-list">
+          {details.map(([label, value]) => (
+            <div key={label}>
+              <dt>{label}</dt>
+              <dd>{value}</dd>
+            </div>
+          ))}
+        </dl>
+      </section>
+    </div>
+  )
+}
+
 export function AgentWorkspaceShell({
   activeTarget,
   inventory,
@@ -154,6 +247,10 @@ export function AgentWorkspaceShell({
           )
         : []
   const terminalVisible = isTerminalWorkspaceMode(mode)
+  const [detailsTarget, setDetailsTarget] = useState<{
+    returnFocus: HTMLButtonElement
+    target: AgentWorkspaceTarget
+  } | null>(null)
   const workspaceGroups = useMemo(
     () => groupAgentWindowTargets(targets, inventory, sessions),
     [inventory, sessions, targets],
@@ -275,66 +372,90 @@ export function AgentWorkspaceShell({
                 </header>
                 {group.targets.map((target, targetIndex) => {
                   const descriptionId = `agent-window-target-${groupIndex}-${targetIndex}-description`
+                  const detailsOpen = detailsTarget?.target.key === target.key
+                  const detailsControlLabel =
+                    targetDetailsControlLabel(target)
                   return (
-                    <button
-                      aria-describedby={descriptionId}
-                      aria-label={`${target.label}, ${target.roleLabel}, ${target.contextLabel}`}
-                      aria-current={
-                        target.key === activeTarget.key
-                          ? 'page'
-                          : undefined
-                      }
-                      className="agent-window-row"
-                      data-observation={target.observation}
-                      data-status={target.status}
-                      data-target-key={target.key}
+                    <div
+                      className="agent-window-row-frame"
                       key={target.key}
-                      onClick={() => onTargetChange(target)}
-                      title={targetTitle(target)}
-                      type="button"
                     >
-                      <span
-                        className="visually-hidden"
-                        id={descriptionId}
+                      <button
+                        aria-describedby={descriptionId}
+                        aria-label={`${target.label}, ${target.roleLabel}, ${target.contextLabel}`}
+                        aria-current={
+                          target.key === activeTarget.key
+                            ? 'page'
+                            : undefined
+                        }
+                        className="agent-window-row"
+                        data-observation={target.observation}
+                        data-status={target.status}
+                        data-target-key={target.key}
+                        onClick={() => onTargetChange(target)}
+                        title={targetTitle(target)}
+                        type="button"
                       >
-                        {targetTitle(target)}
-                      </span>
-                      <span className="agent-window-row__icon">
-                        <TargetIcon target={target} />
-                        <i aria-hidden="true" />
-                      </span>
-                      <span className="agent-window-row__body">
-                        <span className="agent-window-row__identity">
-                          <strong>{target.label}</strong>
-                          <small>
-                            {target.observation === 'observed'
-                              ? `Runtime ${target.status}`
-                              : 'Not observed'}
-                          </small>
+                        <span
+                          className="visually-hidden"
+                          id={descriptionId}
+                        >
+                          {targetTitle(target)}
                         </span>
-                        <small className="agent-window-row__context">
-                          {target.roleLabel} · {target.contextLabel}
-                        </small>
-                        <span className="agent-window-row__runtime">
-                          <small>
-                            {target.harness} · {target.session}
-                          </small>
-                          <code>{target.terminalId}</code>
+                        <span className="agent-window-row__icon">
+                          <TargetIcon target={target} />
+                          <i aria-hidden="true" />
                         </span>
-                        <code className="agent-window-row__topology">
-                          {target.tabId
-                            ? `tab ${target.tabId} · `
-                            : ''}
-                          pane {target.paneId}
-                        </code>
-                        {target.cwd ? (
-                          <span className="agent-window-row__path">
-                            <Folder aria-hidden="true" size={9} />
-                            <code>{target.cwd}</code>
+                        <span className="agent-window-row__body">
+                          <span className="agent-window-row__identity">
+                            <strong>{target.label}</strong>
+                            <small>
+                              {target.observation === 'observed'
+                                ? `Runtime ${target.status}`
+                                : 'Not observed'}
+                            </small>
                           </span>
-                        ) : null}
-                      </span>
-                    </button>
+                          <small className="agent-window-row__context">
+                            {target.roleLabel} · {target.contextLabel}
+                          </small>
+                          <span className="agent-window-row__runtime">
+                            <small>
+                              {target.harness} · {target.session}
+                            </small>
+                            <code>{target.terminalId}</code>
+                          </span>
+                          <code className="agent-window-row__topology">
+                            {target.tabId
+                              ? `tab ${target.tabId} · `
+                              : ''}
+                            pane {target.paneId}
+                          </code>
+                          {target.cwd ? (
+                            <span className="agent-window-row__path">
+                              <Folder aria-hidden="true" size={9} />
+                              <code>{target.cwd}</code>
+                            </span>
+                          ) : null}
+                        </span>
+                      </button>
+                      <button
+                        aria-controls="agent-window-details-dialog"
+                        aria-expanded={detailsOpen}
+                        aria-haspopup="dialog"
+                        aria-label={detailsControlLabel}
+                        className="icon-button agent-window-row__details"
+                        onClick={(event) =>
+                          setDetailsTarget({
+                            returnFocus: event.currentTarget,
+                            target,
+                          })
+                        }
+                        title={detailsControlLabel}
+                        type="button"
+                      >
+                        <Info aria-hidden="true" size={14} />
+                      </button>
+                    </div>
                   )
                 })}
               </section>
@@ -343,6 +464,17 @@ export function AgentWorkspaceShell({
         </div>
         </aside>
       ) : null}
+
+      {detailsTarget
+        ? createPortal(
+            <AgentWindowDetailsDialog
+              onClose={() => setDetailsTarget(null)}
+              returnFocus={detailsTarget.returnFocus}
+              target={detailsTarget.target}
+            />,
+            document.body,
+          )
+        : null}
 
       {mode !== 'map' ? (
         <header className="agent-workspace-toolbar">
