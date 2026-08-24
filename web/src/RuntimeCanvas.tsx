@@ -804,6 +804,12 @@ function WorkerMarker({ data, selected }: NodeProps<ObservedWorkerNode>) {
   const StatusIcon = STATUS_ICONS[worker.status]
   const label =
     worker.name ?? worker.display_provider ?? worker.provider ?? 'Worker'
+  const activity =
+    worker.status === 'blocked'
+      ? attentionActivity('Blocked: needs input')
+      : worker.status === 'done'
+        ? quietActivity('Ready for review')
+        : null
 
   return (
     <div className="worker-node-shell">
@@ -829,6 +835,7 @@ function WorkerMarker({ data, selected }: NodeProps<ObservedWorkerNode>) {
         }}
         style={motionProperties(worker.runtime_id)}
       >
+        <WorkerActivityBubble activity={activity} />
         <Handle
           className="provider-child-handle"
           id="child-source"
@@ -875,6 +882,14 @@ function ChildAgentMarker({
   const { agent, parentNodeId } = data
   const StatusIcon = STATUS_ICONS[agent.status]
   const label = childAgentLabel(agent)
+  const activity =
+    agent.status === 'blocked'
+      ? attentionActivity('Blocked: needs input')
+      : agent.status === 'done'
+        ? quietActivity('Ready for review')
+        : agent.status === 'working'
+          ? activeActivity(agent.description ?? agent.role ?? '')
+          : null
 
   return (
     <button
@@ -886,6 +901,7 @@ function ChildAgentMarker({
       data-status={agent.status}
       type="button"
     >
+      <WorkerActivityBubble activity={activity} />
       <Handle
         className="provider-child-handle"
         id="child-target"
@@ -937,6 +953,61 @@ function workerLabel(worker: ObservedWorker) {
   return worker.name ?? worker.display_provider ?? worker.provider ?? 'Worker'
 }
 
+type WorkerActivityState = 'active' | 'attention' | 'quiet'
+
+interface WorkerActivity {
+  state: WorkerActivityState
+  text: string
+}
+
+function activeActivity(text: string): WorkerActivity | null {
+  return text.trim() ? { state: 'active', text: text.trim() } : null
+}
+
+function attentionActivity(text: string): WorkerActivity {
+  return { state: 'attention', text }
+}
+
+function quietActivity(text: string): WorkerActivity {
+  return { state: 'quiet', text }
+}
+
+function runtimeActivity(
+  status: ObservedStatus,
+  processState: WorkerRuntimeBinding['process_state'] | undefined,
+  activeText: string,
+): WorkerActivity {
+  if (processState === 'exited') {
+    return attentionActivity(
+      status === 'blocked' ? 'Blocked: session ended' : 'Session ended',
+    )
+  }
+  if (status === 'blocked') return attentionActivity('Blocked: needs input')
+  if (status === 'unknown') return quietActivity(activeText)
+  if (status === 'done') return quietActivity('Ready for review')
+  if (status === 'idle') return quietActivity('Waiting for direction')
+  return activeActivity(activeText) ?? quietActivity('Working')
+}
+
+function WorkerActivityBubble({
+  activity,
+}: {
+  activity: WorkerActivity | null
+}) {
+  if (!activity) return null
+  return (
+    <span
+      aria-hidden="true"
+      className="worker-activity-bubble"
+      data-activity-state={activity.state}
+      title={activity.text}
+    >
+      <span className="worker-activity-bubble__signal" />
+      <span className="worker-activity-bubble__text">{activity.text}</span>
+    </span>
+  )
+}
+
 function YardOrchestratorMarker({
   data,
   selected,
@@ -946,6 +1017,18 @@ function YardOrchestratorMarker({
   const runtimeState = resolvedRuntimeState(worker?.runtime ?? null, observed)
   const StatusIcon = STATUS_ICONS[runtimeState.status]
   const configured = worker !== null
+  const activity =
+    configured &&
+    (runtimeState.processState === 'exited' ||
+      runtimeState.status === 'blocked' ||
+      runtimeState.status === 'done' ||
+      runtimeState.status === 'working')
+    ? runtimeActivity(
+        runtimeState.status,
+        runtimeState.processState,
+        'Coordinating Yard',
+      )
+    : null
 
   return (
     <div className="yard-hub-node">
@@ -970,6 +1053,7 @@ function YardOrchestratorMarker({
         data-status={runtimeState.status}
         data-worker-id={worker?.id ?? ''}
       >
+        <WorkerActivityBubble activity={activity} />
         <Handle
           className="automation-handle"
           id="automation-target"
@@ -1078,6 +1162,27 @@ function OrchestratorMarker({
     ? WORKFLOW_ICONS[statusReport.state]
     : null
   const label = observed ? workerLabel(observed) : 'Orchestrator'
+  const activity =
+    statusReport?.state === 'needs_attention'
+      ? attentionActivity(
+          statusReport.blockers[0] ||
+            statusReport.next ||
+            'Blocked: needs input',
+        )
+      : statusReport ||
+          runtimeState.processState === 'exited' ||
+          runtimeState.status === 'blocked' ||
+          runtimeState.status === 'done' ||
+          runtimeState.status === 'working'
+        ? runtimeActivity(
+            runtimeState.status,
+            runtimeState.processState,
+            statusReport?.next ||
+              (statusReport?.state === 'idle'
+                ? 'Ready for direction'
+                : `Coordinating ${project.name}`),
+          )
+        : null
 
   return (
     <div className="worker-node-shell">
@@ -1105,6 +1210,7 @@ function OrchestratorMarker({
         data-worker-id={worker.id}
         style={motionProperties(worker.id)}
       >
+        <WorkerActivityBubble activity={activity} />
         <Handle
           className="automation-handle"
           id="automation-target"
@@ -1165,6 +1271,15 @@ function AssignedWorkerMarker({
   const { assignment, observed } = data
   const runtimeState = resolvedRuntimeState(assignment.worker.runtime, observed)
   const StatusIcon = STATUS_ICONS[runtimeState.status]
+  const activity = runtimeActivity(
+    runtimeState.status,
+    runtimeState.processState,
+    assignment.lifecycle === 'allocating'
+      ? `Starting: ${assignment.objective}`
+      : assignment.lifecycle === 'handing_off'
+        ? `Handing off: ${assignment.objective}`
+        : assignment.objective,
+  )
 
   return (
     <div className="worker-node-shell">
@@ -1195,6 +1310,7 @@ function AssignedWorkerMarker({
         }}
         style={motionProperties(assignment.worker.id)}
       >
+        <WorkerActivityBubble activity={activity} />
         <Handle
           className="allocation-handle"
           id="allocation-target"

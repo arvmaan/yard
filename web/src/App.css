@@ -1239,6 +1239,10 @@ select:focus-visible {
   pointer-events: none;
 }
 
+.worker-activity-bubble {
+  display: none;
+}
+
 .worker-marker__placement-handle {
   position: absolute;
   z-index: 3;
@@ -7400,6 +7404,87 @@ html[data-yard-allocation-dragging="true"]
   animation: none;
 }
 
+/* Operational callouts stay compact and upright above the crew art. Assigned
+   work and orchestrator reports provide the text; the observed runtime status
+   only controls tone, so provider-specific terminal output never leaks into the
+   map. The bubble is deliberately absent from the flat planning view. */
+.runtime-canvas[data-visual-mode="depth"] .yard-orchestrator-marker,
+.runtime-canvas[data-visual-mode="depth"] .child-agent-marker {
+  position: relative;
+}
+
+.runtime-canvas[data-visual-mode="depth"] .worker-activity-bubble {
+  position: absolute;
+  z-index: 5;
+  top: -34px;
+  left: 50%;
+  display: flex;
+  width: max-content;
+  min-height: 25px;
+  max-width: 164px;
+  align-items: flex-start;
+  gap: 5px;
+  padding: 5px 7px;
+  border: 1px solid
+    color-mix(in srgb, var(--status-color, var(--line-strong)) 48%, var(--line));
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--paper) 96%, var(--status-bg));
+  box-shadow: 0 3px 10px color-mix(in srgb, var(--ink) 13%, transparent);
+  color: var(--ink);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 9.2px;
+  line-height: 1.2;
+  pointer-events: none;
+  text-align: left;
+  transform: translateX(-50%);
+}
+
+.runtime-canvas[data-visual-mode="depth"] .worker-activity-bubble::after {
+  position: absolute;
+  bottom: -4px;
+  left: 50%;
+  width: 7px;
+  height: 7px;
+  border-right: 1px solid
+    color-mix(in srgb, var(--status-color, var(--line-strong)) 48%, var(--line));
+  border-bottom: 1px solid
+    color-mix(in srgb, var(--status-color, var(--line-strong)) 48%, var(--line));
+  background: inherit;
+  content: "";
+  transform: translateX(-50%) rotate(45deg);
+}
+
+.runtime-canvas[data-visual-mode="depth"]
+  .worker-activity-bubble[data-activity-state="attention"] {
+  border-color: var(--status-color);
+  background: color-mix(in srgb, var(--status-bg) 55%, var(--paper));
+  color: color-mix(in srgb, var(--status-color) 78%, var(--ink));
+  font-weight: 600;
+}
+
+.runtime-canvas[data-visual-mode="depth"]
+  .worker-activity-bubble[data-activity-state="attention"]::after {
+  border-color: var(--status-color);
+}
+
+.worker-activity-bubble__signal {
+  width: 5px;
+  height: 5px;
+  flex: 0 0 5px;
+  margin-top: 3px;
+  border-radius: 50%;
+  background: var(--status-color, var(--muted));
+}
+
+.worker-activity-bubble__text {
+  display: -webkit-box;
+  min-width: 0;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
 /* ReactFlow raises selected nodes above their siblings. In depth mode that
    would put a selected territory over the intentionally overflowing worker
    sprites, leaving only the small hit-box-sized center visible. Territories
@@ -7817,6 +7902,22 @@ html[data-yard-allocation-dragging="true"]
   .projected-route__junction,
   .projected-route__signal-light {
     fill: CanvasText;
+  }
+
+  .runtime-canvas[data-visual-mode="depth"] .worker-activity-bubble {
+    border-color: CanvasText;
+    background: Canvas;
+    box-shadow: none;
+    color: CanvasText;
+  }
+
+  .runtime-canvas[data-visual-mode="depth"] .worker-activity-bubble::after {
+    border-color: CanvasText;
+    background: Canvas;
+  }
+
+  .worker-activity-bubble__signal {
+    background: CanvasText;
   }
 
   .projected-building__hatch {

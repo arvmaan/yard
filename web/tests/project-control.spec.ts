@@ -4489,6 +4489,106 @@ test('keeps exited assignment process state separate from runtime status', async
   ).toBeVisible()
 })
 
+test('shows restrained worker activity bubbles only in the spatial view', async ({
+  page,
+}, testInfo) => {
+  const state = await mockApi(page)
+  const working = seedActiveAssignment(state, 'assignment-activity-working')
+  const blocked = assignment(
+    'assignment-activity-blocked',
+    'project-2',
+    state.profiles[0],
+    'Verify the release policy before deployment.',
+    'reviewer',
+  )
+  const unknown = assignment(
+    'assignment-activity-unknown',
+    'project-1',
+    state.profiles[0],
+    'Recover the disconnected worker session.',
+    'implementer',
+  )
+  working.worker.runtime!.status = 'working'
+  blocked.worker.runtime!.status = 'blocked'
+  unknown.worker.runtime!.status = 'unknown'
+  state.assignments.push(blocked, unknown)
+
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.goto('/')
+
+  const workingMarker = page.locator(
+    `.assigned-worker-marker[data-worker-id="${working.worker.id}"]`,
+  )
+  const blockedMarker = page.locator(
+    `.assigned-worker-marker[data-worker-id="${blocked.worker.id}"]`,
+  )
+  const unknownMarker = page.locator(
+    `.assigned-worker-marker[data-worker-id="${unknown.worker.id}"]`,
+  )
+  await expect(
+    workingMarker.locator('.worker-activity-bubble'),
+  ).toContainText('Inspect and guide the active work.')
+  await expect(
+    blockedMarker.locator(
+      '.worker-activity-bubble[data-activity-state="attention"]',
+    ),
+  ).toHaveText('Blocked: needs input')
+  await expect(
+    unknownMarker.locator(
+      '.worker-activity-bubble[data-activity-state="quiet"]',
+    ),
+  ).toHaveText('Recover the disconnected worker session.')
+  await expect(
+    unknownMarker.locator(
+      '.worker-activity-bubble[data-activity-state="attention"]',
+    ),
+  ).toHaveCount(0)
+  await expectRuntimeLayout(page)
+  await page.screenshot({
+    path: testInfo.outputPath('worker-activity-bubbles-depth.png'),
+    fullPage: true,
+  })
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.reload()
+  await expect(
+    blockedMarker.locator(
+      '.worker-activity-bubble[data-activity-state="attention"]',
+    ),
+  ).toBeVisible()
+  const mobileLayout = await page.evaluate(() => {
+    const visibleBubbles = Array.from(
+      document.querySelectorAll<HTMLElement>('.worker-activity-bubble'),
+    )
+      .filter((bubble) => getComputedStyle(bubble).display !== 'none')
+      .map((bubble) => {
+        const bounds = bubble.getBoundingClientRect()
+        return { height: bounds.height, width: bounds.width }
+      })
+    return {
+      documentOverflow:
+        document.documentElement.scrollWidth - window.innerWidth,
+      maximumHeight: Math.max(0, ...visibleBubbles.map(({ height }) => height)),
+      maximumWidth: Math.max(0, ...visibleBubbles.map(({ width }) => width)),
+    }
+  })
+  expect(mobileLayout.documentOverflow).toBeLessThanOrEqual(0)
+  expect(mobileLayout.maximumHeight).toBeLessThanOrEqual(36)
+  expect(mobileLayout.maximumWidth).toBeLessThanOrEqual(132)
+  await page.screenshot({
+    path: testInfo.outputPath('worker-activity-bubbles-mobile.png'),
+    fullPage: true,
+  })
+
+  await setMapView(page, '2D view')
+  await expect(
+    workingMarker.locator('.worker-activity-bubble'),
+  ).toBeHidden()
+  await expect(
+    blockedMarker.locator('.worker-activity-bubble'),
+  ).toBeHidden()
+})
+
 test('keeps Herdr in a loading state until session discovery completes', async ({
   page,
 }) => {
