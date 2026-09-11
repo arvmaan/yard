@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     ffi::OsString,
     fs::{self, File, OpenOptions},
@@ -20,31 +20,33 @@ use thiserror::Error;
 use tokio::task;
 use uuid::Uuid;
 use yard_domain::{
-    AgentProfile, AgentProfileManifest, AgentProfiles, AllocationContext, AllocationMode, Artifact,
-    ArtifactKind, ArtifactRegistration, ArtifactSource, Assignment, AssignmentAttempt,
-    AssignmentLifecycle, Assignments, AttemptLifecycle, AutomaticSummaryRequestKind, Automation,
-    AutomationCommandResult, AutomationRun, AutomationRunCommandResult, AutomationRuns,
-    Automations, CanvasPlacement, CompletionOutcome, CompletionReceipt, ConfigureYardOrchestrator,
-    ConfiguredYardOrchestrator, ConfirmProfileAllocation, ConfirmWorkerAllocation,
-    ConfirmWorkerHandoff, ConfirmedAllocation, ConfirmedProjectCreation, ConfirmedWorkerHandoff,
-    CoordinationCommandStatus, CoordinationNode, CoordinationNodeCommandResult,
-    CoordinationNodePromptAcknowledgement, CoordinationNodeRoute, CoordinationNodeRoutes,
-    CoordinationNodes, CoordinationSnapshot, CoordinationSnapshots, CreateAgentProfile,
-    CreateAutomation, CreateCoordinationNode, CreateProject, CreateProjectFromProfile,
-    CreateProjectRelationship, CreateWorkerProfile, CreateWorkspaceProjectFromProfile,
-    CreatedProjectRelationship, DeleteProjectRelationship, DeletedProjectRelationship,
-    EndWorkerSession, EndedWorkerSession, HandoffTargetRole, IsolationPolicy, ObservedStatus,
-    ObservedWorker, OldSessionDisposition, OrchestratorPromptAcknowledgement,
-    OrchestratorWorkflowProfile, OrchestratorWorkflowProfiles, PaneObservation,
-    PreparedAgentProfile, Project, ProjectPlacement, ProjectRelationship, ProjectRelationshipKind,
-    ProjectRelationships, ProjectRuntimeBinding, ProjectWorkflowProfilePin, Projects,
-    ProviderSessionRef, ProvisionCoordinationNode, ProvisionYardOrchestrator,
-    RecordCompletionReceipt, RecordedCompletionReceipt, ReplaceProjectOrchestrator,
-    ReplacedProjectOrchestrator, RequestCoordinationSnapshot, ResetOrchestratorWorkflowProfile,
-    RunAutomationNow, RuntimeInventory, RuntimeObservationState, RuntimeProcessState,
-    RuntimeReconciliation, SendAssignmentPrompt, SendCoordinationNodePrompt,
-    SendCoordinationNodeRoute, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
-    SendYardOrchestratorRoute, SetAutomationPaused, TokenSpendSettings,
+    AgentProfile, AgentProfileManifest, AgentProfiles, AllocationContext, AllocationMode,
+    ArchiveProject, ArchivedProject, Artifact, ArtifactKind, ArtifactRegistration, ArtifactSource,
+    Assignment, AssignmentAttempt, AssignmentLifecycle, Assignments, AttemptLifecycle,
+    AutomaticSummaryRequestKind, Automation, AutomationCommandResult, AutomationRun,
+    AutomationRunCommandResult, AutomationRuns, Automations, CanvasPlacement, CompletionOutcome,
+    CompletionReceipt, ConfigureYardOrchestrator, ConfiguredYardOrchestrator,
+    ConfirmProfileAllocation, ConfirmWorkerAllocation, ConfirmWorkerHandoff, ConfirmedAllocation,
+    ConfirmedProjectCreation, ConfirmedWorkerHandoff, CoordinationCommandStatus, CoordinationNode,
+    CoordinationNodeCommandResult, CoordinationNodePromptAcknowledgement, CoordinationNodeRoute,
+    CoordinationNodeRoutes, CoordinationNodes, CoordinationSnapshot, CoordinationSnapshots,
+    CreateAgentProfile, CreateAutomation, CreateCoordinationNode, CreateProject,
+    CreateProjectFromProfile, CreateProjectRelationship, CreateWorkerProfile,
+    CreateWorkspaceProjectFromProfile, CreatedProjectRelationship, DeleteProject,
+    DeleteProjectRelationship, DeleteWorker, DeletedProject, DeletedProjectRelationship,
+    DeletedWorker, EndWorkerSession, EndedWorkerSession, HandoffTargetRole, IsolationPolicy,
+    ManagedRuntimeOccupant, ManagedRuntimeOccupantKind, ManagedRuntimeWorkspace,
+    ManagedRuntimeWorkspaceKind, ObservedStatus, ObservedWorker, OldSessionDisposition,
+    OrchestratorPromptAcknowledgement, OrchestratorWorkflowProfile, OrchestratorWorkflowProfiles,
+    PaneObservation, PreparedAgentProfile, Project, ProjectPlacement, ProjectRelationship,
+    ProjectRelationshipKind, ProjectRelationships, ProjectRuntimeBinding,
+    ProjectWorkflowProfilePin, Projects, ProviderSessionRef, ProvisionCoordinationNode,
+    ProvisionYardOrchestrator, RecordCompletionReceipt, RecordedCompletionReceipt,
+    ReplaceProjectOrchestrator, ReplacedProjectOrchestrator, RequestCoordinationSnapshot,
+    ResetOrchestratorWorkflowProfile, RunAutomationNow, RuntimeInventory, RuntimeObservationState,
+    RuntimeProcessState, RuntimeReconciliation, RuntimeTopology, SendAssignmentPrompt,
+    SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
+    SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SetAutomationPaused, TokenSpendSettings,
     TransferProjectOrchestrator, TransferredProjectOrchestrator, UpdateAgentProfile,
     UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
     UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
@@ -52,7 +54,7 @@ use yard_domain::{
     WorkerAllocation, WorkerAvailability, WorkerCandidate, WorkerCandidates, WorkerDesiredState,
     WorkerProfile, WorkerProfileSpec, WorkerProfiles, WorkerRuntimeBinding,
     YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator, YardOrchestratorPromptAcknowledgement,
-    YardOrchestratorRoute, YardOrchestratorRoutes,
+    YardOrchestratorRoute, YardOrchestratorRoutes, herdr_agent_name,
 };
 
 mod automation_store;
@@ -60,7 +62,8 @@ mod coordination_node_store;
 mod orchestrator_workflow_profile_store;
 mod token_spend_store;
 
-const SCHEMA_VERSION: i64 = 26;
+const SCHEMA_VERSION: i64 = 28;
+const PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS: u64 = 120_000;
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_projects.sql");
 const PROFILE_ASSIGNMENT_MIGRATION: &str =
     include_str!("../migrations/0002_profiles_assignments.sql");
@@ -107,6 +110,9 @@ const PROVIDER_NEUTRAL_WORKFLOW_PROFILES_MIGRATION: &str =
     include_str!("../migrations/0026_provider_neutral_workflow_profiles.sql");
 const PROVIDER_NEUTRAL_WORKFLOW_PROFILE_INTEGRITY_MIGRATION: &str =
     include_str!("../migrations/0026_provider_neutral_workflow_profile_integrity.sql");
+const PROJECT_ARCHIVING_MIGRATION: &str = include_str!("../migrations/0027_project_archiving.sql");
+const VISIBILITY_DELETIONS_MIGRATION: &str =
+    include_str!("../migrations/0028_visibility_deletions.sql");
 const BLANK_WORKER_PROFILE_ID: &str = "yard:managed-blank-profile";
 const BLANK_WORKER_PROFILE_NAME: &str = "Blank profile";
 const MAX_ROUTE_LIST_LIMIT: usize = 500;
@@ -354,6 +360,16 @@ pub trait YardStore: Send + Sync {
         command: DeleteProjectRelationship,
     ) -> Result<DeletedProjectRelationship, ProjectStoreError>;
     async fn get_project(&self, project_id: &str) -> Result<Project, ProjectStoreError>;
+    async fn archive_project(
+        &self,
+        project_id: &str,
+        command: ArchiveProject,
+    ) -> Result<ArchivedProject, ProjectStoreError>;
+    async fn delete_project(
+        &self,
+        project_id: &str,
+        command: DeleteProject,
+    ) -> Result<DeletedProject, ProjectStoreError>;
     async fn update_project_workflow_profile(
         &self,
         project_id: &str,
@@ -413,6 +429,11 @@ pub trait YardStore: Send + Sync {
     async fn get_worker_profile(
         &self,
         profile_id: &str,
+    ) -> Result<WorkerProfile, ProjectStoreError>;
+    async fn get_worker_profile_revision(
+        &self,
+        profile_id: &str,
+        version: u64,
     ) -> Result<WorkerProfile, ProjectStoreError>;
     async fn pin_worker_profile(
         &self,
@@ -598,6 +619,11 @@ pub trait YardStore: Send + Sync {
         worker_id: &str,
         command: EndWorkerSession,
     ) -> Result<EndedWorkerSession, ProjectStoreError>;
+    async fn delete_worker(
+        &self,
+        worker_id: &str,
+        command: DeleteWorker,
+    ) -> Result<DeletedWorker, ProjectStoreError>;
     async fn claim_pending_runtime_cleanups(
         &self,
         command_id: Option<&str>,
@@ -721,6 +747,11 @@ pub trait YardStore: Send + Sync {
         &self,
         inventory: RuntimeInventory,
     ) -> Result<RuntimeReconciliation, ProjectStoreError>;
+    async fn runtime_topology(
+        &self,
+        adapter: &str,
+        session: &str,
+    ) -> Result<RuntimeTopology, ProjectStoreError>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1012,7 +1043,8 @@ pub struct SqliteProjectStore {
 #[derive(Debug)]
 struct DatabaseLock {
     _sidecar: File,
-    _database: File,
+    database: File,
+    _identity: File,
 }
 
 /// Resolve a database path through every existing ancestor.
@@ -1026,6 +1058,7 @@ struct DatabaseLock {
 /// ancestor cannot be resolved.
 pub fn normalize_database_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     let path = path.as_ref();
+    validate_explicit_current_directory(path)?;
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1060,6 +1093,22 @@ pub fn normalize_database_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
         }
     }
     Ok(resolved)
+}
+
+#[cfg(unix)]
+fn validate_explicit_current_directory(path: &Path) -> io::Result<()> {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let bytes = path.as_os_str().as_bytes();
+    if let Some(ancestor) = bytes.strip_suffix(b"/.") {
+        validate_database_path_ancestor(Path::new(OsStr::from_bytes(ancestor)))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_explicit_current_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn validate_database_path_ancestor(path: &Path) -> io::Result<()> {
@@ -1133,6 +1182,7 @@ impl SqliteProjectStore {
         let (lock, connection) = task::spawn_blocking(move || {
             let lock = acquire_database_lock(&path)?;
             let mut connection = open_connection(&path)?;
+            validate_locked_database_path(&path, &lock.database)?;
             migrate(&mut connection)?;
             recover_interrupted_commands(&mut connection)?;
             Ok::<_, ProjectStoreError>((lock, connection))
@@ -1269,7 +1319,6 @@ impl SqliteProjectStore {
                     .provider_session
                     .as_ref()
                     .is_some_and(|expected| runtime.provider_session.as_ref() != Some(expected))
-                || runtime.provider_session.is_none()
                 || runtime.process_state != RuntimeProcessState::Running
             {
                 return Err(ProjectStoreError::ProvisioningRuntimeClaimMismatch);
@@ -2188,11 +2237,20 @@ impl YardStore for SqliteProjectStore {
     async fn list_project_relationships(&self) -> Result<ProjectRelationships, ProjectStoreError> {
         self.run(|connection| {
             let mut statement = connection.prepare(
-                "SELECT id, source_project_id, target_project_id, kind,
-                        version, created_by, created_at_unix_ms,
-                        updated_at_unix_ms
-                   FROM project_relationships
-                  ORDER BY created_at_unix_ms, id",
+                "SELECT relationship.id, relationship.source_project_id,
+                        relationship.target_project_id, relationship.kind,
+                        relationship.version, relationship.created_by,
+                        relationship.created_at_unix_ms,
+                        relationship.updated_at_unix_ms
+                   FROM project_relationships relationship
+                   JOIN project_workspace_bindings source_binding
+                     ON source_binding.project_id =
+                        relationship.source_project_id
+                   JOIN project_workspace_bindings target_binding
+                     ON target_binding.project_id =
+                        relationship.target_project_id
+                  ORDER BY relationship.created_at_unix_ms,
+                           relationship.id",
             )?;
             let relationships = statement
                 .query_map([], project_relationship_from_row)?
@@ -2403,6 +2461,331 @@ impl YardStore for SqliteProjectStore {
         let project_id = required_id(project_id)?;
         self.run(move |connection| select_project(connection, &project_id))
             .await
+    }
+
+    async fn archive_project(
+        &self,
+        project_id: &str,
+        command: ArchiveProject,
+    ) -> Result<ArchivedProject, ProjectStoreError> {
+        let project_id = required_id(project_id)?;
+        let command = command.normalize()?;
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(existing) =
+                select_archived_project_command(&transaction, &command.command_id)?
+            {
+                if !existing.matches(&project_id, &command) {
+                    return Err(ProjectStoreError::IdempotencyConflict);
+                }
+                let cleanup_pending = runtime_cleanup_pending(&transaction, &command.command_id)?;
+                transaction.commit()?;
+                return Ok(existing.archived(cleanup_pending, true));
+            }
+            if command_id_exists(&transaction, &command.command_id)? {
+                return Err(ProjectStoreError::IdempotencyConflict);
+            }
+            if archived_project_exists(&transaction, &project_id)? {
+                return Err(ProjectStoreError::ProjectAlreadyArchived);
+            }
+
+            let project = select_project(&transaction, &project_id)?;
+            if project.version != command.expected_project_version {
+                return Err(ProjectStoreError::ProjectVersionConflict {
+                    current_version: project.version,
+                });
+            }
+            if project.orchestrator.id != command.expected_orchestrator_worker_id {
+                return Err(ProjectStoreError::OrchestratorNotCurrent {
+                    current_worker_id: project.orchestrator.id,
+                });
+            }
+            if project.orchestrator.version != command.expected_orchestrator_worker_version {
+                return Err(ProjectStoreError::WorkerVersionConflict {
+                    current_version: project.orchestrator.version,
+                });
+            }
+            let current_runtime_version = project
+                .orchestrator
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.version);
+            if current_runtime_version != command.expected_orchestrator_runtime_version {
+                return Err(ProjectStoreError::WorkerRuntimeVersionConflict {
+                    current_version: current_runtime_version,
+                });
+            }
+            reject_project_archive_dependencies(&transaction, &project_id)?;
+            if project_has_active_work(&transaction, &project_id)? {
+                return Err(ProjectStoreError::ProjectHasArchiveDependencies);
+            }
+
+            let next_project_version = project
+                .version
+                .checked_add(1)
+                .ok_or(ProjectStoreError::VersionOverflow)?;
+            let next_worker_version = project
+                .orchestrator
+                .version
+                .checked_add(1)
+                .ok_or(ProjectStoreError::VersionOverflow)?;
+            let now = unix_time_ms()?;
+            transaction.execute(
+                "INSERT INTO command_acknowledgements (
+                    id, command_type, actor, status, error_message,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (
+                    ?1, 'project_archive', ?2, 'pending', NULL, ?3, ?3
+                 )",
+                params![command.command_id, command.actor, to_i64(now)?],
+            )?;
+            transaction.execute(
+                "INSERT INTO archived_projects (
+                    project_id, command_id, expected_project_version,
+                    expected_orchestrator_worker_id,
+                    expected_orchestrator_worker_version,
+                    expected_orchestrator_runtime_version,
+                    result_project_version,
+                    result_orchestrator_worker_version, runtime_adapter,
+                    runtime_session, runtime_workspace_id,
+                    archived_at_unix_ms
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+                 )",
+                params![
+                    project_id,
+                    command.command_id,
+                    to_i64(command.expected_project_version)?,
+                    command.expected_orchestrator_worker_id,
+                    to_i64(command.expected_orchestrator_worker_version)?,
+                    command
+                        .expected_orchestrator_runtime_version
+                        .map(to_i64)
+                        .transpose()?,
+                    to_i64(next_project_version)?,
+                    to_i64(next_worker_version)?,
+                    project.runtime.adapter,
+                    project.runtime.session,
+                    project.runtime.workspace_id,
+                    to_i64(now)?,
+                ],
+            )?;
+
+            let project_rows = transaction.execute(
+                "UPDATE projects
+                    SET version = ?1, updated_at_unix_ms = ?2
+                  WHERE id = ?3 AND version = ?4
+                    AND orchestrator_worker_id = ?5",
+                params![
+                    to_i64(next_project_version)?,
+                    to_i64(now)?,
+                    project_id,
+                    to_i64(project.version)?,
+                    command.expected_orchestrator_worker_id,
+                ],
+            )?;
+            if project_rows != 1 {
+                return Err(ProjectStoreError::ProjectVersionConflict {
+                    current_version: project.version,
+                });
+            }
+            transaction.execute(
+                "UPDATE worker_allocations
+                    SET ended_at_unix_ms = ?1
+                  WHERE project_id = ?2 AND ended_at_unix_ms IS NULL",
+                params![to_i64(now)?, project_id],
+            )?;
+
+            let cleanup_pending = if let Some(runtime) = project.orchestrator.runtime.as_ref() {
+                insert_retired_runtime_binding(
+                    &transaction,
+                    &command.command_id,
+                    &project.orchestrator.id,
+                    "project_archive",
+                    runtime,
+                    now,
+                )?;
+                insert_runtime_cleanup_job(
+                    &transaction,
+                    &command.command_id,
+                    &project.orchestrator.id,
+                    "project_archive",
+                    runtime,
+                    RuntimeCleanupExpectation {
+                        worker_version: Some(next_worker_version),
+                        binding_state: "detached",
+                    },
+                    now,
+                )?;
+                let runtime_rows = transaction.execute(
+                    "DELETE FROM worker_runtime_bindings
+                          WHERE worker_id = ?1 AND version = ?2",
+                    params![project.orchestrator.id, to_i64(runtime.version)?,],
+                )?;
+                if runtime_rows != 1 {
+                    return Err(ProjectStoreError::WorkerRuntimeVersionConflict {
+                        current_version: None,
+                    });
+                }
+                true
+            } else {
+                false
+            };
+
+            let worker_rows = transaction.execute(
+                "UPDATE workers
+                    SET ended_at_unix_ms = ?1, version = ?2,
+                        updated_at_unix_ms = ?1
+                  WHERE id = ?3 AND version = ?4
+                    AND ended_at_unix_ms IS NULL",
+                params![
+                    to_i64(now)?,
+                    to_i64(next_worker_version)?,
+                    project.orchestrator.id,
+                    to_i64(project.orchestrator.version)?,
+                ],
+            )?;
+            if worker_rows != 1 {
+                return Err(ProjectStoreError::WorkerVersionConflict {
+                    current_version: project.orchestrator.version,
+                });
+            }
+            let workspace_rows = transaction.execute(
+                "DELETE FROM project_workspace_bindings
+                  WHERE project_id = ?1
+                    AND adapter = ?2
+                    AND runtime_session = ?3
+                    AND runtime_workspace_id = ?4",
+                params![
+                    project_id,
+                    project.runtime.adapter,
+                    project.runtime.session,
+                    project.runtime.workspace_id,
+                ],
+            )?;
+            if workspace_rows != 1 {
+                return Err(ProjectStoreError::ProjectNotFound);
+            }
+            transaction.execute(
+                "UPDATE command_acknowledgements
+                    SET status = 'succeeded', updated_at_unix_ms = ?1
+                  WHERE id = ?2 AND status = 'pending'",
+                params![to_i64(now)?, command.command_id],
+            )?;
+            insert_lifecycle_event(
+                &transaction,
+                "project",
+                &project_id,
+                next_project_version,
+                "project_archived",
+                &command.actor,
+                now,
+            )?;
+            insert_lifecycle_event(
+                &transaction,
+                "worker",
+                &project.orchestrator.id,
+                next_worker_version,
+                "project_archive_orchestrator_ended",
+                &command.actor,
+                now,
+            )?;
+            transaction.commit()?;
+            Ok(ArchivedProject {
+                command_id: command.command_id,
+                project_id,
+                orchestrator_worker_id: project.orchestrator.id,
+                archived_at_unix_ms: now,
+                cleanup_pending,
+                replayed: false,
+            })
+        })
+        .await
+    }
+
+    async fn delete_project(
+        &self,
+        project_id: &str,
+        command: DeleteProject,
+    ) -> Result<DeletedProject, ProjectStoreError> {
+        let project_id = required_id(project_id)?;
+        let command = command.normalize()?;
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(existing) =
+                select_deleted_project_command(&transaction, &command.command_id)?
+            {
+                if existing.project_id != project_id || existing.actor != command.actor {
+                    return Err(ProjectStoreError::IdempotencyConflict);
+                }
+                let cleanup_pending =
+                    worker_runtime_cleanup_pending(&transaction, &existing.orchestrator_worker_id)?;
+                transaction.commit()?;
+                return Ok(existing.deleted(cleanup_pending, true));
+            }
+            if command_id_exists(&transaction, &command.command_id)?
+                || select_deleted_worker_command(&transaction, &command.command_id)?.is_some()
+            {
+                return Err(ProjectStoreError::IdempotencyConflict);
+            }
+            if deleted_project_exists(&transaction, &project_id)? {
+                return Err(ProjectStoreError::ProjectAlreadyDeleted);
+            }
+
+            let archived = select_archived_project_target(&transaction, &project_id)?
+                .ok_or(ProjectStoreError::ProjectNotArchived)?;
+            let worker_version = transaction
+                .query_row(
+                    "SELECT version FROM workers WHERE id = ?1",
+                    [&archived.orchestrator_worker_id],
+                    |row| row_u64(row, 0),
+                )
+                .optional()?
+                .ok_or(ProjectStoreError::WorkerNotFound)?;
+            let now = unix_time_ms()?;
+            transaction.execute(
+                "INSERT INTO deleted_projects (
+                    project_id, command_id, actor, orchestrator_worker_id,
+                    deleted_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    project_id,
+                    command.command_id,
+                    command.actor,
+                    archived.orchestrator_worker_id,
+                    to_i64(now)?,
+                ],
+            )?;
+            if !deleted_worker_exists(&transaction, &archived.orchestrator_worker_id)? {
+                transaction.execute(
+                    "INSERT INTO deleted_workers (
+                        worker_id, command_id, actor, expected_worker_version,
+                        deleted_at_unix_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        archived.orchestrator_worker_id,
+                        command.command_id,
+                        command.actor,
+                        to_i64(worker_version)?,
+                        to_i64(now)?,
+                    ],
+                )?;
+            }
+            let cleanup_pending =
+                worker_runtime_cleanup_pending(&transaction, &archived.orchestrator_worker_id)?;
+            transaction.commit()?;
+            Ok(DeletedProject {
+                command_id: command.command_id,
+                project_id,
+                orchestrator_worker_id: archived.orchestrator_worker_id,
+                deleted_at_unix_ms: now,
+                cleanup_pending,
+                replayed: false,
+            })
+        })
+        .await
     }
 
     async fn update_project_workflow_profile(
@@ -2832,7 +3215,7 @@ impl YardStore for SqliteProjectStore {
         self.run(move |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            ensure_project_workspace_available(&transaction, &project.runtime)?;
+            ensure_project_workspace_available_for(&transaction, &project.runtime, None)?;
             ensure_runtime_snapshot_current(&transaction, &orchestrator_runtime)?;
 
             let project_id = Uuid::now_v7().to_string();
@@ -2908,7 +3291,7 @@ impl YardStore for SqliteProjectStore {
                 return Err(ProjectStoreError::IdempotencyConflict);
             }
 
-            ensure_project_workspace_available(&transaction, &command.runtime)?;
+            ensure_project_workspace_available_for(&transaction, &command.runtime, None)?;
             let current_profile_version =
                 select_current_profile_version(&transaction, &command.profile_id)?;
             if current_profile_version != command.expected_profile_version {
@@ -3012,7 +3395,11 @@ impl YardStore for SqliteProjectStore {
                 command.workflow_profile_version,
             )?;
 
-            ensure_project_workspace_unbound(&transaction, &command.runtime)?;
+            ensure_project_workspace_available_for(
+                &transaction,
+                &command.runtime,
+                Some(&command_id),
+            )?;
             ensure_runtime_snapshot_current(&transaction, &orchestrator_runtime)?;
             consume_provisioning_runtime_claim(&transaction, &command_id, &orchestrator_runtime)?;
             let project_id = Uuid::now_v7().to_string();
@@ -3276,7 +3663,11 @@ impl YardStore for SqliteProjectStore {
                 session: command.runtime_session,
                 workspace_id: orchestrator_runtime.workspace_id.clone(),
             };
-            ensure_project_workspace_unbound(&transaction, &project_runtime)?;
+            ensure_project_workspace_available_for(
+                &transaction,
+                &project_runtime,
+                Some(&command_id),
+            )?;
             ensure_runtime_snapshot_current(&transaction, &orchestrator_runtime)?;
             consume_provisioning_runtime_claim(&transaction, &command_id, &orchestrator_runtime)?;
             let project_id = Uuid::now_v7().to_string();
@@ -3472,6 +3863,16 @@ impl YardStore for SqliteProjectStore {
     ) -> Result<WorkerProfile, ProjectStoreError> {
         let profile_id = required_profile_id(profile_id)?;
         self.run(move |connection| select_worker_profile(connection, &profile_id))
+            .await
+    }
+
+    async fn get_worker_profile_revision(
+        &self,
+        profile_id: &str,
+        version: u64,
+    ) -> Result<WorkerProfile, ProjectStoreError> {
+        let profile_id = required_profile_id(profile_id)?;
+        self.run(move |connection| select_worker_profile_revision(connection, &profile_id, version))
             .await
     }
 
@@ -3873,7 +4274,7 @@ impl YardStore for SqliteProjectStore {
                 |row| row.get::<_, bool>(0),
             )?;
             if allocation_in_progress {
-                return Err(ProjectStoreError::AssignmentInterventionInProgress);
+                return Err(ProjectStoreError::ProfileAllocationInProgress);
             }
 
             let project = select_project(&transaction, &project_id)?;
@@ -7306,6 +7707,73 @@ impl YardStore for SqliteProjectStore {
         .await
     }
 
+    async fn delete_worker(
+        &self,
+        worker_id: &str,
+        command: DeleteWorker,
+    ) -> Result<DeletedWorker, ProjectStoreError> {
+        let worker_id = required_id(worker_id)?;
+        let command = command.normalize()?;
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(existing) =
+                select_deleted_worker_command(&transaction, &command.command_id)?
+            {
+                if !existing.matches(&worker_id, &command) {
+                    return Err(ProjectStoreError::IdempotencyConflict);
+                }
+                let cleanup_pending = worker_runtime_cleanup_pending(&transaction, &worker_id)?;
+                transaction.commit()?;
+                return Ok(existing.deleted(cleanup_pending, true));
+            }
+            if command_id_exists(&transaction, &command.command_id)?
+                || select_deleted_project_command(&transaction, &command.command_id)?.is_some()
+            {
+                return Err(ProjectStoreError::IdempotencyConflict);
+            }
+            if deleted_worker_exists(&transaction, &worker_id)? {
+                return Err(ProjectStoreError::WorkerAlreadyDeleted);
+            }
+
+            let candidate = select_worker_candidate(&transaction, &worker_id)?
+                .ok_or(ProjectStoreError::WorkerNotFound)?;
+            if candidate.worker.version != command.expected_worker_version {
+                return Err(ProjectStoreError::WorkerVersionConflict {
+                    current_version: candidate.worker.version,
+                });
+            }
+            if candidate.availability != WorkerAvailability::Ended {
+                return Err(ProjectStoreError::WorkerNotEnded);
+            }
+
+            let now = unix_time_ms()?;
+            transaction.execute(
+                "INSERT INTO deleted_workers (
+                    worker_id, command_id, actor, expected_worker_version,
+                    deleted_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    worker_id,
+                    command.command_id,
+                    command.actor,
+                    to_i64(command.expected_worker_version)?,
+                    to_i64(now)?,
+                ],
+            )?;
+            let cleanup_pending = worker_runtime_cleanup_pending(&transaction, &worker_id)?;
+            transaction.commit()?;
+            Ok(DeletedWorker {
+                command_id: command.command_id,
+                worker_id,
+                deleted_at_unix_ms: now,
+                cleanup_pending,
+                replayed: false,
+            })
+        })
+        .await
+    }
+
     async fn claim_pending_runtime_cleanups(
         &self,
         command_id: Option<&str>,
@@ -8686,6 +9154,20 @@ impl YardStore for SqliteProjectStore {
         })
         .await
     }
+
+    async fn runtime_topology(
+        &self,
+        adapter: &str,
+        session: &str,
+    ) -> Result<RuntimeTopology, ProjectStoreError> {
+        let adapter = adapter.trim().to_owned();
+        let session = session.trim().to_owned();
+        if adapter.is_empty() || session.is_empty() {
+            return Err(ProjectStoreError::InvalidRuntimeInventory);
+        }
+        self.run(move |connection| select_runtime_topology(connection, &adapter, &session))
+            .await
+    }
 }
 
 struct StoredRuntimeBinding {
@@ -8693,6 +9175,298 @@ struct StoredRuntimeBinding {
     worker_version: u64,
     expected_workspace_id: Option<String>,
     runtime: WorkerRuntimeBinding,
+}
+
+fn select_runtime_topology(
+    connection: &Connection,
+    adapter: &str,
+    session: &str,
+) -> Result<RuntimeTopology, ProjectStoreError> {
+    let mut managed_workspaces = BTreeMap::<String, ManagedRuntimeWorkspace>::new();
+    add_central_runtime_workspace(connection, adapter, session, &mut managed_workspaces)?;
+    add_managed_workspace_rows(
+        connection,
+        "SELECT DISTINCT binding.runtime_workspace_id
+           FROM coordination_nodes node
+           JOIN worker_runtime_bindings binding
+             ON binding.worker_id = node.worker_id
+          WHERE binding.adapter = ?1
+            AND binding.runtime_session = ?2
+          ORDER BY binding.runtime_workspace_id",
+        adapter,
+        session,
+        ManagedRuntimeWorkspaceKind::Coordination,
+        "Yard coordination",
+        &mut managed_workspaces,
+    )?;
+    add_managed_workspace_rows(
+        connection,
+        "SELECT command.runtime_workspace_id
+           FROM profile_project_creation_commands command
+          WHERE command.finished_at_unix_ms IS NULL
+            AND command.runtime_adapter = ?1
+            AND command.runtime_session = ?2
+          ORDER BY command.runtime_workspace_id",
+        adapter,
+        session,
+        ManagedRuntimeWorkspaceKind::Provisioning,
+        "Runtime provisioning pending",
+        &mut managed_workspaces,
+    )?;
+    add_provisioning_runtime_occupants(connection, adapter, session, &mut managed_workspaces)?;
+    add_quarantined_runtime_occupants(connection, adapter, session, &mut managed_workspaces)?;
+    add_cleanup_runtime_occupants(connection, adapter, session, &mut managed_workspaces)?;
+
+    Ok(RuntimeTopology {
+        adapter: adapter.to_owned(),
+        session: session.to_owned(),
+        managed_workspaces: managed_workspaces.into_values().collect(),
+    })
+}
+
+fn add_central_runtime_workspace(
+    connection: &Connection,
+    adapter: &str,
+    session: &str,
+    managed_workspaces: &mut BTreeMap<String, ManagedRuntimeWorkspace>,
+) -> Result<(), ProjectStoreError> {
+    let workspace_id = connection
+        .query_row(
+            "SELECT binding.runtime_workspace_id
+               FROM yard_orchestrator orchestrator
+               JOIN worker_runtime_bindings binding
+                 ON binding.worker_id = orchestrator.worker_id
+              WHERE binding.adapter = ?1
+                AND binding.runtime_session = ?2",
+            params![adapter, session],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(workspace_id) = workspace_id {
+        ensure_managed_workspace(
+            managed_workspaces,
+            workspace_id,
+            ManagedRuntimeWorkspaceKind::YardCentral,
+            "Yard central",
+        );
+    }
+    Ok(())
+}
+
+fn add_managed_workspace_rows(
+    connection: &Connection,
+    query: &str,
+    adapter: &str,
+    session: &str,
+    kind: ManagedRuntimeWorkspaceKind,
+    label: &str,
+    managed_workspaces: &mut BTreeMap<String, ManagedRuntimeWorkspace>,
+) -> Result<(), ProjectStoreError> {
+    let mut statement = connection.prepare(query)?;
+    let workspace_ids = statement
+        .query_map(params![adapter, session], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for workspace_id in workspace_ids {
+        ensure_managed_workspace(managed_workspaces, workspace_id, kind, label);
+    }
+    Ok(())
+}
+
+fn ensure_managed_workspace(
+    managed_workspaces: &mut BTreeMap<String, ManagedRuntimeWorkspace>,
+    workspace_id: String,
+    kind: ManagedRuntimeWorkspaceKind,
+    label: &str,
+) {
+    managed_workspaces
+        .entry(workspace_id.clone())
+        .or_insert_with(|| ManagedRuntimeWorkspace {
+            workspace_id,
+            kind,
+            label: label.to_owned(),
+            occupants: Vec::new(),
+        });
+}
+
+fn add_managed_runtime_occupant(
+    managed_workspaces: &mut BTreeMap<String, ManagedRuntimeWorkspace>,
+    workspace_id: String,
+    workspace_kind: ManagedRuntimeWorkspaceKind,
+    workspace_label: &str,
+    occupant: ManagedRuntimeOccupant,
+) {
+    let workspace = managed_workspaces
+        .entry(workspace_id.clone())
+        .or_insert_with(|| ManagedRuntimeWorkspace {
+            workspace_id,
+            kind: workspace_kind,
+            label: workspace_label.to_owned(),
+            occupants: Vec::new(),
+        });
+    if workspace
+        .occupants
+        .iter()
+        .all(|existing| existing.terminal_id != occupant.terminal_id)
+    {
+        workspace.occupants.push(occupant);
+    }
+}
+
+fn add_provisioning_runtime_occupants(
+    connection: &Connection,
+    adapter: &str,
+    session: &str,
+    managed_workspaces: &mut BTreeMap<String, ManagedRuntimeWorkspace>,
+) -> Result<(), ProjectStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT claim.runtime_workspace_id, claim.terminal_id,
+                claim.tab_id, claim.pane_id,
+                COALESCE(profile.project_name, workspace.project_name)
+           FROM provisioning_runtime_claims claim
+           LEFT JOIN profile_project_creation_commands profile
+             ON profile.command_id = claim.command_id
+           LEFT JOIN workspace_project_creation_commands workspace
+             ON workspace.command_id = claim.command_id
+          WHERE claim.adapter = ?1
+            AND claim.runtime_session = ?2
+          ORDER BY claim.captured_at_unix_ms, claim.command_id",
+    )?;
+    let occupants = statement
+        .query_map(params![adapter, session], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (workspace_id, terminal_id, tab_id, pane_id, project_name) in occupants {
+        add_managed_runtime_occupant(
+            managed_workspaces,
+            workspace_id,
+            ManagedRuntimeWorkspaceKind::Provisioning,
+            "Runtime provisioning pending",
+            ManagedRuntimeOccupant {
+                kind: ManagedRuntimeOccupantKind::Provisioning,
+                terminal_id,
+                tab_id,
+                pane_id,
+                label: "Provisioned runtime—binding pending".to_owned(),
+                reason: "runtime_provisioning".to_owned(),
+                project_name,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn add_quarantined_runtime_occupants(
+    connection: &Connection,
+    adapter: &str,
+    session: &str,
+    managed_workspaces: &mut BTreeMap<String, ManagedRuntimeWorkspace>,
+) -> Result<(), ProjectStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT quarantine.runtime_workspace_id, quarantine.terminal_id,
+                quarantine.tab_id, quarantine.pane_id,
+                COALESCE(profile.project_name, workspace.project_name)
+           FROM quarantined_provisioning_runtime_bindings quarantine
+           LEFT JOIN profile_project_creation_commands profile
+             ON profile.command_id = quarantine.command_id
+           LEFT JOIN workspace_project_creation_commands workspace
+             ON workspace.command_id = quarantine.command_id
+          WHERE quarantine.adapter = ?1
+            AND quarantine.runtime_session = ?2
+          ORDER BY quarantine.captured_at_unix_ms, quarantine.command_id",
+    )?;
+    let occupants = statement
+        .query_map(params![adapter, session], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (workspace_id, terminal_id, tab_id, pane_id, project_name) in occupants {
+        add_managed_runtime_occupant(
+            managed_workspaces,
+            workspace_id,
+            ManagedRuntimeWorkspaceKind::Quarantined,
+            "Provisioned runtime quarantined",
+            ManagedRuntimeOccupant {
+                kind: ManagedRuntimeOccupantKind::Quarantined,
+                terminal_id,
+                tab_id,
+                pane_id,
+                label: "Provisioned runtime—quarantined".to_owned(),
+                reason: "provisioning_quarantine".to_owned(),
+                project_name,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn add_cleanup_runtime_occupants(
+    connection: &Connection,
+    adapter: &str,
+    session: &str,
+    managed_workspaces: &mut BTreeMap<String, ManagedRuntimeWorkspace>,
+) -> Result<(), ProjectStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT cleanup.runtime_workspace_id, cleanup.terminal_id,
+                cleanup.tab_id, cleanup.pane_id, cleanup.reason,
+                project.name
+           FROM runtime_cleanup_jobs cleanup
+           LEFT JOIN archived_projects archived
+             ON archived.command_id = cleanup.command_id
+           LEFT JOIN projects project
+             ON project.id = archived.project_id
+          WHERE cleanup.status = 'pending'
+            AND cleanup.adapter = ?1
+            AND cleanup.runtime_session = ?2
+          ORDER BY cleanup.created_at_unix_ms, cleanup.id",
+    )?;
+    let occupants = statement
+        .query_map(params![adapter, session], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (workspace_id, terminal_id, tab_id, pane_id, reason, project_name) in occupants {
+        let label = if reason == "project_archive" {
+            "Archived runtime—cleanup pending"
+        } else {
+            "Managed runtime—cleanup pending"
+        };
+        add_managed_runtime_occupant(
+            managed_workspaces,
+            workspace_id,
+            ManagedRuntimeWorkspaceKind::CleanupPending,
+            "Runtime cleanup pending",
+            ManagedRuntimeOccupant {
+                kind: ManagedRuntimeOccupantKind::CleanupPending,
+                terminal_id,
+                tab_id,
+                pane_id,
+                label: label.to_owned(),
+                reason,
+                project_name,
+            },
+        );
+    }
+    Ok(())
 }
 
 fn reconcile_runtime_inventory(
@@ -8704,6 +9478,8 @@ fn reconcile_runtime_inventory(
         return Ok(result);
     }
 
+    let profile_allocation_reserved_workers =
+        reconcile_stale_profile_allocations(transaction, inventory)?;
     let bindings = select_runtime_bindings(transaction, &inventory.adapter, &inventory.session)?;
     let bound_terminals: HashMap<&str, &str> = bindings
         .iter()
@@ -8750,6 +9526,7 @@ fn reconcile_runtime_inventory(
         if accounted_workers.contains(&worker.terminal_id)
             || accounted_panes.contains(&worker.terminal_id)
             || bound_terminals.contains_key(worker.terminal_id.as_str())
+            || profile_allocation_reserved_workers.contains(&worker.terminal_id)
             || unknown_adoption_blocked
             || runtime_identity_is_reserved(transaction, inventory, worker)?
         {
@@ -8761,6 +9538,442 @@ fn reconcile_runtime_inventory(
 
     persist_reconciliation_watermark(transaction, inventory)?;
     Ok(result)
+}
+
+fn reconcile_stale_profile_allocations(
+    transaction: &Transaction<'_>,
+    inventory: &RuntimeInventory,
+) -> Result<HashSet<String>, ProjectStoreError> {
+    let Some(cutoff) = inventory
+        .observed_at_unix_ms
+        .checked_sub(PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS)
+    else {
+        return Ok(HashSet::new());
+    };
+    let commands = select_stale_profile_allocations(transaction, inventory, cutoff)?;
+    let mut reserved_workers = HashSet::new();
+    for (command_id, expected_workspace_id, error_message) in commands {
+        reconcile_stale_profile_allocation(
+            transaction,
+            inventory,
+            &command_id,
+            &expected_workspace_id,
+            error_message.as_deref(),
+            &mut reserved_workers,
+        )?;
+    }
+
+    Ok(reserved_workers)
+}
+
+fn select_stale_profile_allocations(
+    transaction: &Transaction<'_>,
+    inventory: &RuntimeInventory,
+    cutoff: u64,
+) -> Result<Vec<(String, String, Option<String>)>, ProjectStoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT allocation.command_id, workspace.runtime_workspace_id,
+                command.error_message
+           FROM profile_allocation_commands allocation
+           JOIN command_acknowledgements command
+             ON command.id = allocation.command_id
+           JOIN project_workspace_bindings workspace
+             ON workspace.project_id = allocation.project_id
+          WHERE command.status = 'ambiguous'
+            AND allocation.result_assignment_id IS NULL
+            AND workspace.adapter = ?1
+            AND workspace.runtime_session = ?2
+            AND command.updated_at_unix_ms <= ?3",
+    )?;
+    let commands = statement
+        .query_map(
+            params![inventory.adapter, inventory.session, to_i64(cutoff)?],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(commands)
+}
+
+fn reconcile_stale_profile_allocation(
+    transaction: &Transaction<'_>,
+    inventory: &RuntimeInventory,
+    command_id: &str,
+    expected_workspace_id: &str,
+    error_message: Option<&str>,
+    reserved_workers: &mut HashSet<String>,
+) -> Result<(), ProjectStoreError> {
+    let claim = select_provisioning_runtime_claim(transaction, command_id)?;
+    let quarantine = select_quarantined_provisioning_runtime(transaction, command_id)?;
+    let captured_outside_snapshot = claim.iter().chain(quarantine.iter()).any(|runtime| {
+        runtime.adapter != inventory.adapter
+            || runtime.session != inventory.session
+            || runtime.workspace_id != expected_workspace_id
+    });
+    let captured_runtime_is_yard_owned = claim
+        .iter()
+        .chain(quarantine.iter())
+        .all(|runtime| runtime.owns_tab);
+    let captured_runtime_present = claim
+        .iter()
+        .chain(quarantine.iter())
+        .any(|runtime| captured_runtime_is_observed(inventory, runtime));
+    let named_runtime_present = reserve_named_profile_runtime(
+        transaction,
+        inventory,
+        command_id,
+        expected_workspace_id,
+        claim.as_ref(),
+        quarantine.as_ref(),
+        reserved_workers,
+    )?;
+
+    if legacy_agent_blocked_error(error_message) && captured_runtime_is_yard_owned {
+        consolidate_legacy_agent_blocked_runtime(
+            transaction,
+            command_id,
+            inventory.observed_at_unix_ms,
+        )?;
+        mark_ambiguous_profile_allocation_failed(
+            transaction,
+            command_id,
+            inventory.observed_at_unix_ms,
+            "Legacy agent_blocked allocation was released after fresh inventory; its Yard-owned runtime remains quarantined for explicit cleanup",
+        )?;
+    } else if !captured_outside_snapshot && !captured_runtime_present && !named_runtime_present {
+        release_stale_profile_allocation(transaction, command_id, inventory.observed_at_unix_ms)?;
+    }
+    Ok(())
+}
+
+fn reserve_named_profile_runtime(
+    transaction: &Transaction<'_>,
+    inventory: &RuntimeInventory,
+    command_id: &str,
+    expected_workspace_id: &str,
+    claim: Option<&WorkerRuntimeBinding>,
+    quarantine: Option<&WorkerRuntimeBinding>,
+    reserved_workers: &mut HashSet<String>,
+) -> Result<bool, ProjectStoreError> {
+    let agent_name = herdr_agent_name(command_id);
+    let mut runtime_present = false;
+    for worker in inventory.workers.iter().filter(|worker| {
+        worker.workspace_id == expected_workspace_id
+            && worker.name.as_deref() == Some(agent_name.as_str())
+    }) {
+        let runtime = profile_allocation_runtime_from_observation(inventory, worker);
+        if runtime_identity_has_authoritative_binding(transaction, &runtime)? {
+            continue;
+        }
+        reserved_workers.insert(worker.terminal_id.clone());
+        if !runtime_present {
+            quarantine_named_profile_runtime(
+                transaction,
+                command_id,
+                claim,
+                quarantine,
+                &runtime,
+                inventory.observed_at_unix_ms,
+            )?;
+            runtime_present = true;
+        }
+    }
+    Ok(runtime_present)
+}
+
+fn release_stale_profile_allocation(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    observed_at_unix_ms: u64,
+) -> Result<(), ProjectStoreError> {
+    transaction.execute(
+        "DELETE FROM provisioning_runtime_claims WHERE command_id = ?1",
+        [command_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM quarantined_provisioning_runtime_bindings WHERE command_id = ?1",
+        [command_id],
+    )?;
+    mark_ambiguous_profile_allocation_failed(
+        transaction,
+        command_id,
+        observed_at_unix_ms,
+        "Stale profile allocation was released after fresh inventory found no matching Herdr runtime",
+    )
+}
+
+fn mark_ambiguous_profile_allocation_failed(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    observed_at_unix_ms: u64,
+    error_message: &str,
+) -> Result<(), ProjectStoreError> {
+    transaction.execute(
+        "UPDATE command_acknowledgements
+            SET status = 'failed',
+                error_message = ?1,
+                updated_at_unix_ms = ?2
+          WHERE id = ?3 AND status = 'ambiguous'",
+        params![error_message, to_i64(observed_at_unix_ms)?, command_id,],
+    )?;
+    Ok(())
+}
+
+fn legacy_agent_blocked_error(message: Option<&str>) -> bool {
+    message.is_some_and(|message| message.contains("Herdr API returned agent_blocked"))
+}
+
+fn consolidate_legacy_agent_blocked_runtime(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    observed_at_unix_ms: u64,
+) -> Result<(), ProjectStoreError> {
+    let claim = select_provisioning_runtime_claim(transaction, command_id)?;
+    let quarantine = select_quarantined_provisioning_runtime(transaction, command_id)?;
+    let Some(claim) = claim else {
+        return Ok(());
+    };
+    match quarantine {
+        None => {
+            upsert_quarantined_profile_runtime(
+                transaction,
+                command_id,
+                &claim,
+                observed_at_unix_ms,
+            )?;
+            transaction.execute(
+                "DELETE FROM provisioning_runtime_claims WHERE command_id = ?1",
+                [command_id],
+            )?;
+        }
+        Some(quarantine) if runtime_capture_identity_matches(&claim, &quarantine) => {
+            transaction.execute(
+                "DELETE FROM provisioning_runtime_claims WHERE command_id = ?1",
+                [command_id],
+            )?;
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+fn captured_runtime_is_observed(
+    inventory: &RuntimeInventory,
+    runtime: &WorkerRuntimeBinding,
+) -> bool {
+    if runtime.adapter != inventory.adapter || runtime.session != inventory.session {
+        return false;
+    }
+    let provider_matches = |provider: Option<&ProviderSessionRef>| {
+        matches!(
+            (runtime.provider_session.as_ref(), provider),
+            (Some(expected), Some(observed)) if expected == observed
+        )
+    };
+    inventory.workers.iter().any(|worker| {
+        worker.terminal_id == runtime.terminal_id
+            || worker.pane_id == runtime.pane_id
+            || runtime
+                .tab_id
+                .as_deref()
+                .is_some_and(|tab_id| tab_id == worker.tab_id)
+            || provider_matches(worker.provider_session.as_ref())
+    }) || inventory.panes.iter().any(|pane| {
+        pane.terminal_id == runtime.terminal_id
+            || pane.runtime_id == runtime.pane_id
+            || runtime
+                .tab_id
+                .as_deref()
+                .is_some_and(|tab_id| tab_id == pane.tab_id)
+            || provider_matches(pane.provider_session.as_ref())
+    }) || runtime
+        .tab_id
+        .as_deref()
+        .is_some_and(|tab_id| inventory.tabs.iter().any(|tab| tab.runtime_id == tab_id))
+}
+
+fn profile_allocation_runtime_from_observation(
+    inventory: &RuntimeInventory,
+    worker: &ObservedWorker,
+) -> WorkerRuntimeBinding {
+    WorkerRuntimeBinding {
+        adapter: inventory.adapter.clone(),
+        session: inventory.session.clone(),
+        workspace_id: worker.workspace_id.clone(),
+        terminal_id: worker.terminal_id.clone(),
+        tab_id: Some(worker.tab_id.clone()),
+        pane_id: worker.pane_id.clone(),
+        provider_session: worker.provider_session.clone(),
+        owns_tab: true,
+        observation_state: RuntimeObservationState::Observed,
+        process_state: RuntimeProcessState::Running,
+        status: worker.status,
+        state_change_sequence: worker.state_change_sequence,
+        revision: worker.revision,
+        version: 1,
+        last_observed_at_unix_ms: inventory.observed_at_unix_ms,
+    }
+}
+
+fn quarantine_named_profile_runtime(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    claim: Option<&WorkerRuntimeBinding>,
+    quarantine: Option<&WorkerRuntimeBinding>,
+    runtime: &WorkerRuntimeBinding,
+    observed_at_unix_ms: u64,
+) -> Result<(), ProjectStoreError> {
+    match quarantine {
+        None => upsert_quarantined_profile_runtime(
+            transaction,
+            command_id,
+            runtime,
+            observed_at_unix_ms,
+        ),
+        Some(existing) if runtime_capture_identity_matches(existing, runtime) => {
+            upsert_quarantined_profile_runtime(
+                transaction,
+                command_id,
+                runtime,
+                observed_at_unix_ms,
+            )
+        }
+        Some(_) if claim.is_none() => {
+            transaction.execute(
+                "INSERT INTO provisioning_runtime_claims (
+                    command_id, adapter, runtime_session,
+                    runtime_workspace_id, terminal_id, tab_id, pane_id,
+                    provider_session_source, provider_session_provider,
+                    provider_session_kind, provider_session_value, owns_tab,
+                    observation_state, process_state, observed_status,
+                    state_change_sequence, runtime_revision, runtime_version,
+                    last_observed_at_unix_ms, captured_at_unix_ms
+                 )
+                 SELECT command_id, adapter, runtime_session,
+                        runtime_workspace_id, terminal_id, tab_id, pane_id,
+                        provider_session_source, provider_session_provider,
+                        provider_session_kind, provider_session_value, owns_tab,
+                        observation_state, process_state, observed_status,
+                        state_change_sequence, runtime_revision, runtime_version,
+                        last_observed_at_unix_ms, captured_at_unix_ms
+                   FROM quarantined_provisioning_runtime_bindings
+                  WHERE command_id = ?1
+                 ON CONFLICT(command_id) DO NOTHING",
+                [command_id],
+            )?;
+            upsert_quarantined_profile_runtime(
+                transaction,
+                command_id,
+                runtime,
+                observed_at_unix_ms,
+            )
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+fn runtime_capture_identity_matches(
+    left: &WorkerRuntimeBinding,
+    right: &WorkerRuntimeBinding,
+) -> bool {
+    left.adapter == right.adapter
+        && left.session == right.session
+        && !left
+            .provider_session
+            .as_ref()
+            .is_some_and(|expected| right.provider_session.as_ref() != Some(expected))
+        && (left.terminal_id == right.terminal_id
+            || left.pane_id == right.pane_id
+            || (left.tab_id.is_some() && left.tab_id == right.tab_id)
+            || matches!(
+                (
+                    left.provider_session.as_ref(),
+                    right.provider_session.as_ref()
+                ),
+                (Some(left), Some(right)) if left == right
+            ))
+}
+
+fn upsert_quarantined_profile_runtime(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    runtime: &WorkerRuntimeBinding,
+    captured_at_unix_ms: u64,
+) -> Result<(), ProjectStoreError> {
+    transaction.execute(
+        "INSERT INTO quarantined_provisioning_runtime_bindings (
+            command_id, adapter, runtime_session,
+            runtime_workspace_id, terminal_id, tab_id, pane_id,
+            provider_session_source, provider_session_provider,
+            provider_session_kind, provider_session_value, owns_tab,
+            observation_state, process_state, observed_status,
+            state_change_sequence, runtime_revision, runtime_version,
+            last_observed_at_unix_ms, captured_at_unix_ms
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+         )
+         ON CONFLICT(command_id) DO UPDATE SET
+            adapter = excluded.adapter,
+            runtime_session = excluded.runtime_session,
+            runtime_workspace_id = excluded.runtime_workspace_id,
+            terminal_id = excluded.terminal_id,
+            tab_id = excluded.tab_id,
+            pane_id = excluded.pane_id,
+            provider_session_source = excluded.provider_session_source,
+            provider_session_provider = excluded.provider_session_provider,
+            provider_session_kind = excluded.provider_session_kind,
+            provider_session_value = excluded.provider_session_value,
+            owns_tab = excluded.owns_tab,
+            observation_state = excluded.observation_state,
+            process_state = excluded.process_state,
+            observed_status = excluded.observed_status,
+            state_change_sequence = excluded.state_change_sequence,
+            runtime_revision = excluded.runtime_revision,
+            runtime_version = excluded.runtime_version,
+            last_observed_at_unix_ms = excluded.last_observed_at_unix_ms,
+            captured_at_unix_ms = excluded.captured_at_unix_ms",
+        params![
+            command_id,
+            runtime.adapter,
+            runtime.session,
+            runtime.workspace_id,
+            runtime.terminal_id,
+            runtime.tab_id,
+            runtime.pane_id,
+            runtime
+                .provider_session
+                .as_ref()
+                .map(|session| session.source.as_str()),
+            runtime
+                .provider_session
+                .as_ref()
+                .map(|session| session.provider.as_str()),
+            runtime
+                .provider_session
+                .as_ref()
+                .map(|session| session.kind.as_str()),
+            runtime
+                .provider_session
+                .as_ref()
+                .map(|session| session.value.as_str()),
+            runtime.owns_tab,
+            runtime_observation_state_value(runtime.observation_state),
+            runtime_process_state_value(runtime.process_state),
+            observed_status_value(runtime.status),
+            to_i64(runtime.state_change_sequence)?,
+            to_i64(runtime.revision)?,
+            to_i64(runtime.version)?,
+            to_i64(runtime.last_observed_at_unix_ms)?,
+            to_i64(captured_at_unix_ms)?,
+        ],
+    )?;
+    Ok(())
 }
 
 fn pending_provisioning_adoption_fence(
@@ -8804,7 +10017,7 @@ fn adopt_claimed_dedicated_runtime(
     inventory: &RuntimeInventory,
     worker: &ObservedWorker,
 ) -> Result<bool, ProjectStoreError> {
-    if !worker.interactive_ready || worker.provider_session.is_none() {
+    if !worker.interactive_ready {
         return Ok(false);
     }
     let intent = transaction
@@ -8925,6 +10138,10 @@ fn runtime_identity_is_reserved(
     worker: &ObservedWorker,
 ) -> Result<bool, ProjectStoreError> {
     let provider = worker.provider_session.as_ref();
+    let observed_runtime = profile_allocation_runtime_from_observation(inventory, worker);
+    if runtime_identity_has_authoritative_binding(transaction, &observed_runtime)? {
+        return Ok(true);
+    }
     if runtime_identity_is_provisioning_claimed(
         transaction,
         &inventory.adapter,
@@ -9253,7 +10470,33 @@ fn resolve_running_worker(
         });
     }
 
-    let provider_session = binding.runtime.provider_session.as_ref()?;
+    let Some(provider_session) = binding.runtime.provider_session.as_ref() else {
+        let topology_workers = inventory
+            .workers
+            .iter()
+            .filter(|worker| worker_matches_stable_topology(binding, worker))
+            .collect::<Vec<_>>();
+        if topology_workers.is_empty() {
+            return None;
+        }
+        for worker in &topology_workers {
+            accounted_workers.insert(worker.terminal_id.clone());
+        }
+        if topology_workers.len() != 1 || !topology_binding_is_unique(bindings, binding) {
+            return Some(ambiguous_runtime(binding));
+        }
+        let worker = topology_workers[0];
+        let belongs_to_other_binding = bound_terminals
+            .get(worker.terminal_id.as_str())
+            .is_some_and(|worker_id| **worker_id != binding.worker_id);
+        return Some(
+            if belongs_to_other_binding || workspace_conflicts(binding, &worker.workspace_id) {
+                ambiguous_runtime(binding)
+            } else {
+                runtime_from_worker(binding, worker, inventory.observed_at_unix_ms)
+            },
+        );
+    };
     let provider_workers = inventory
         .workers
         .iter()
@@ -9303,7 +10546,26 @@ fn resolve_exited_or_missing(
     }
 
     let Some(provider_session) = binding.runtime.provider_session.as_ref() else {
-        return missing_runtime(binding);
+        let topology_panes = inventory
+            .panes
+            .iter()
+            .filter(|pane| pane_matches_stable_topology(binding, pane))
+            .collect::<Vec<_>>();
+        for pane in &topology_panes {
+            accounted_panes.insert(pane.terminal_id.clone());
+        }
+        if topology_panes.is_empty() {
+            return missing_runtime(binding);
+        }
+        if topology_panes.len() != 1 || !topology_binding_is_unique(bindings, binding) {
+            return ambiguous_runtime(binding);
+        }
+        let pane = topology_panes[0];
+        return if pane_conflicts(binding, pane, bound_terminals) {
+            ambiguous_runtime(binding)
+        } else {
+            runtime_from_exited_pane(binding, pane, inventory.observed_at_unix_ms)
+        };
     };
     let provider_panes = inventory
         .panes
@@ -9339,11 +10601,46 @@ fn provider_binding_is_unique(
         == 1
 }
 
+fn topology_binding_is_unique(
+    bindings: &[StoredRuntimeBinding],
+    expected: &StoredRuntimeBinding,
+) -> bool {
+    bindings
+        .iter()
+        .filter(|binding| {
+            binding.runtime.workspace_id == expected.runtime.workspace_id
+                && binding.runtime.tab_id == expected.runtime.tab_id
+                && binding.runtime.pane_id == expected.runtime.pane_id
+        })
+        .count()
+        == 1
+}
+
+fn worker_matches_stable_topology(binding: &StoredRuntimeBinding, worker: &ObservedWorker) -> bool {
+    binding.runtime.tab_id.as_deref() == Some(worker.tab_id.as_str())
+        && binding.runtime.pane_id == worker.pane_id
+        && binding.runtime.workspace_id == worker.workspace_id
+}
+
+fn pane_matches_stable_topology(binding: &StoredRuntimeBinding, pane: &PaneObservation) -> bool {
+    binding.runtime.tab_id.as_deref() == Some(pane.tab_id.as_str())
+        && binding.runtime.pane_id == pane.runtime_id
+        && binding.runtime.workspace_id == pane.workspace_id
+        && pane.provider_session.is_none()
+}
+
 fn worker_conflicts(binding: &StoredRuntimeBinding, worker: &ObservedWorker) -> bool {
+    let provider_matches = binding
+        .runtime
+        .provider_session
+        .as_ref()
+        .is_some_and(|expected| worker.provider_session.as_ref() == Some(expected));
+
     provider_conflicts(
         binding.runtime.provider_session.as_ref(),
         worker.provider_session.as_ref(),
-    ) || workspace_conflicts(binding, &worker.workspace_id)
+    ) || (!provider_matches && !worker_matches_stable_topology(binding, worker))
+        || workspace_conflicts(binding, &worker.workspace_id)
 }
 
 fn pane_conflicts(
@@ -9358,6 +10655,8 @@ fn pane_conflicts(
             binding.runtime.provider_session.as_ref(),
             pane.provider_session.as_ref(),
         )
+        || (binding.runtime.provider_session.is_none()
+            && !pane_matches_stable_topology(binding, pane))
         || workspace_conflicts(binding, &pane.workspace_id)
 }
 
@@ -9386,6 +10685,11 @@ fn select_runtime_bindings(
            FROM worker_runtime_bindings wrb
            JOIN workers w ON w.id = wrb.worker_id
           WHERE wrb.adapter = ?1 AND wrb.runtime_session = ?2
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM deleted_workers deleted
+                 WHERE deleted.worker_id = w.id
+            )
           ORDER BY wrb.worker_id",
     )?;
     statement
@@ -9857,32 +11161,16 @@ const WORKER_CANDIDATE_SELECT: &str = "
                  FROM runtime_cleanup_jobs cleanup
                 WHERE cleanup.worker_id = w.id
                   AND cleanup.status = 'pending'
-           ),
-           EXISTS (
-               SELECT 1
-                 FROM project_orchestrator_transfer_runtime_bindings captured
-                WHERE captured.binding_role = 'displaced'
-                  AND captured.worker_id = w.id
-                  AND captured.adapter = wrb.adapter
-                  AND captured.runtime_session = wrb.runtime_session
-                  AND captured.runtime_workspace_id = wrb.runtime_workspace_id
-                  AND captured.terminal_id = wrb.terminal_id
-                  AND captured.tab_id IS wrb.tab_id
-                  AND captured.pane_id = wrb.pane_id
-                  AND captured.provider_session_source
-                      IS wrb.provider_session_source
-                  AND captured.provider_session_provider
-                      IS wrb.provider_session_provider
-                  AND captured.provider_session_kind
-                      IS wrb.provider_session_kind
-                  AND captured.provider_session_value
-                      IS wrb.provider_session_value
-                  AND captured.owns_tab = wrb.owns_tab
            )
       FROM workers w
       LEFT JOIN worker_profile_revisions pr
         ON pr.profile_id = w.profile_id AND pr.version = w.profile_version
-      LEFT JOIN worker_runtime_bindings wrb ON wrb.worker_id = w.id";
+      LEFT JOIN worker_runtime_bindings wrb ON wrb.worker_id = w.id
+     WHERE NOT EXISTS (
+           SELECT 1
+             FROM deleted_workers deleted
+            WHERE deleted.worker_id = w.id
+     )";
 
 fn open_connection(path: &Path) -> Result<Connection, ProjectStoreError> {
     let connection = Connection::open(path)?;
@@ -9911,11 +11199,72 @@ fn acquire_database_lock(path: &Path) -> Result<DatabaseLock, ProjectStoreError>
         .truncate(false)
         .write(true)
         .open(path)?;
-    try_lock_database_file(&database)?;
+    let identity = acquire_database_identity_lock(&database)?;
+    validate_locked_database_path(path, &database)?;
     Ok(DatabaseLock {
         _sidecar: sidecar,
-        _database: database,
+        database,
+        _identity: identity,
     })
+}
+
+#[cfg(unix)]
+fn acquire_database_identity_lock(database: &File) -> Result<File, ProjectStoreError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+
+    let metadata = database.metadata()?;
+    let runtime_root = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| {
+            PathBuf::from("/tmp").join(format!("yard-{}", rustix::process::geteuid().as_raw()))
+        });
+    let lock_directory = runtime_root.join("database-locks");
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&lock_directory)?;
+    let identity_path =
+        lock_directory.join(format!("{:x}-{:x}.lock", metadata.dev(), metadata.ino()));
+    let identity = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(identity_path)?;
+    try_lock_database_file(&identity)?;
+    Ok(identity)
+}
+
+#[cfg(not(unix))]
+fn acquire_database_identity_lock(database: &File) -> Result<File, ProjectStoreError> {
+    let identity = database.try_clone()?;
+    try_lock_database_file(&identity)?;
+    Ok(identity)
+}
+
+#[cfg(unix)]
+fn validate_locked_database_path(path: &Path, database: &File) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let locked = database.metadata()?;
+    let current = fs::metadata(path)?;
+    if !current.is_file() || current.dev() != locked.dev() || current.ino() != locked.ino() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "database path '{}' changed while Yard was acquiring ownership",
+                path.display()
+            ),
+        ));
+    }
+    validate_database_file_identity(path)
+}
+
+#[cfg(not(unix))]
+fn validate_locked_database_path(path: &Path, _database: &File) -> io::Result<()> {
+    validate_database_file_identity(path)
 }
 
 fn try_lock_database_file(file: &File) -> Result<(), ProjectStoreError> {
@@ -9931,6 +11280,23 @@ fn try_lock_database_file(file: &File) -> Result<(), ProjectStoreError> {
 fn recover_interrupted_commands(connection: &mut Connection) -> Result<(), ProjectStoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let now = unix_time_ms()?;
+    transaction.execute(
+        "UPDATE command_acknowledgements
+            SET status = 'ambiguous',
+                error_message = ?1,
+                updated_at_unix_ms = ?2
+          WHERE status = 'pending'
+            AND command_type = 'profile_allocation'
+            AND id IN (
+                SELECT command_id
+                  FROM profile_allocation_commands
+                 WHERE result_assignment_id IS NULL
+            )",
+        params![
+            "Yard restarted during worker profile allocation; fresh runtime inventory is required before the reservation can be released",
+            to_i64(now)?,
+        ],
+    )?;
     transaction.execute(
         "UPDATE command_acknowledgements
             SET status = 'ambiguous',
@@ -10416,6 +11782,28 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
         migration?;
         foreign_keys?;
+        current = 26;
+    }
+    if current == 26 {
+        connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let migration = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(PROJECT_ARCHIVING_MIGRATION)?;
+            ensure_foreign_keys(&transaction)?;
+            transaction.commit()?;
+            Ok::<(), ProjectStoreError>(())
+        })();
+        let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
+        migration?;
+        foreign_keys?;
+        current = 27;
+    }
+    if current == 27 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(VISIBILITY_DELETIONS_MIGRATION)?;
+        ensure_foreign_keys(&transaction)?;
+        transaction.commit()?;
     }
     ensure_foreign_keys(connection)?;
     Ok(())
@@ -11764,23 +13152,63 @@ fn table_has_column(
     Ok(false)
 }
 
-fn ensure_project_workspace_available(
+fn ensure_project_workspace_available_for(
     transaction: &Transaction<'_>,
     project_runtime: &ProjectRuntimeBinding,
+    excluded_command_id: Option<&str>,
 ) -> Result<(), ProjectStoreError> {
     ensure_project_workspace_unbound(transaction, project_runtime)?;
     let reserved = transaction.query_row(
         "SELECT EXISTS (
-            SELECT 1 FROM profile_project_creation_commands
-             WHERE runtime_adapter = ?1
-               AND runtime_session = ?2
-               AND runtime_workspace_id = ?3
-               AND finished_at_unix_ms IS NULL
+            SELECT 1
+              FROM profile_project_creation_commands command
+             WHERE command.runtime_adapter = ?1
+               AND command.runtime_session = ?2
+               AND command.runtime_workspace_id = ?3
+               AND command.finished_at_unix_ms IS NULL
+               AND (?4 IS NULL OR command.command_id <> ?4)
+            UNION ALL
+            SELECT 1
+              FROM yard_orchestrator orchestrator
+              JOIN worker_runtime_bindings binding
+                ON binding.worker_id = orchestrator.worker_id
+             WHERE binding.adapter = ?1
+               AND binding.runtime_session = ?2
+               AND binding.runtime_workspace_id = ?3
+            UNION ALL
+            SELECT 1
+              FROM coordination_nodes node
+              JOIN worker_runtime_bindings binding
+                ON binding.worker_id = node.worker_id
+             WHERE binding.adapter = ?1
+               AND binding.runtime_session = ?2
+               AND binding.runtime_workspace_id = ?3
+            UNION ALL
+            SELECT 1
+              FROM provisioning_runtime_claims claim
+             WHERE claim.adapter = ?1
+               AND claim.runtime_session = ?2
+               AND claim.runtime_workspace_id = ?3
+               AND (?4 IS NULL OR claim.command_id <> ?4)
+            UNION ALL
+            SELECT 1
+              FROM quarantined_provisioning_runtime_bindings quarantine
+             WHERE quarantine.adapter = ?1
+               AND quarantine.runtime_session = ?2
+               AND quarantine.runtime_workspace_id = ?3
+            UNION ALL
+            SELECT 1
+              FROM runtime_cleanup_jobs cleanup
+             WHERE cleanup.status = 'pending'
+               AND cleanup.adapter = ?1
+               AND cleanup.runtime_session = ?2
+               AND cleanup.runtime_workspace_id = ?3
          )",
         params![
             project_runtime.adapter,
             project_runtime.session,
             project_runtime.workspace_id,
+            excluded_command_id,
         ],
         |row| row.get::<_, bool>(0),
     )?;
@@ -11899,6 +13327,47 @@ fn select_reusable_runtime_worker(
     Ok(Some(worker_id))
 }
 
+fn claim_reusable_runtime_worker(
+    transaction: &Transaction<'_>,
+    worker_id: &str,
+    runtime: &WorkerRuntimeBinding,
+    profile_id: &str,
+    profile_version: u64,
+    now: u64,
+) -> Result<(), ProjectStoreError> {
+    ensure_worker_binding_available_for(transaction, worker_id, runtime)?;
+    let (existing_profile_id, worker_version) = transaction.query_row(
+        "SELECT profile_id, version FROM workers WHERE id = ?1",
+        [worker_id],
+        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    if existing_profile_id.is_some() {
+        return Err(ProjectStoreError::RuntimeWorkerAlreadyBound);
+    }
+    let worker_version = to_u64(worker_version)?;
+    let next_worker_version = worker_version
+        .checked_add(1)
+        .ok_or(ProjectStoreError::VersionOverflow)?;
+    let rows = transaction.execute(
+        "UPDATE workers
+            SET profile_id = ?1, profile_version = ?2, version = ?3,
+                updated_at_unix_ms = ?4
+          WHERE id = ?5 AND version = ?6 AND profile_id IS NULL",
+        params![
+            profile_id,
+            to_i64(profile_version)?,
+            to_i64(next_worker_version)?,
+            to_i64(now)?,
+            worker_id,
+            to_i64(worker_version)?,
+        ],
+    )?;
+    if rows != 1 {
+        return Err(ProjectStoreError::RuntimeWorkerAlreadyBound);
+    }
+    replace_worker_runtime_binding(transaction, worker_id, runtime, now)
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn insert_project_aggregate(
     transaction: &Transaction<'_>,
@@ -11930,34 +13399,14 @@ fn insert_project_aggregate(
         )?;
         insert_worker_runtime_binding(transaction, worker_id, orchestrator_runtime, now)?;
     } else if let Some((profile_id, profile_version)) = profile {
-        ensure_worker_binding_available_for(transaction, worker_id, orchestrator_runtime)?;
-        let (existing_profile_id, worker_version) = transaction.query_row(
-            "SELECT profile_id, version FROM workers WHERE id = ?1",
-            [worker_id],
-            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        claim_reusable_runtime_worker(
+            transaction,
+            worker_id,
+            orchestrator_runtime,
+            profile_id,
+            profile_version,
+            now,
         )?;
-        if existing_profile_id.is_some() {
-            return Err(ProjectStoreError::RuntimeWorkerAlreadyBound);
-        }
-        let worker_version = to_u64(worker_version)?;
-        let next_worker_version = worker_version
-            .checked_add(1)
-            .ok_or(ProjectStoreError::VersionOverflow)?;
-        transaction.execute(
-            "UPDATE workers
-                SET profile_id = ?1, profile_version = ?2, version = ?3,
-                    updated_at_unix_ms = ?4
-              WHERE id = ?5 AND version = ?6 AND profile_id IS NULL",
-            params![
-                profile_id,
-                to_i64(profile_version)?,
-                to_i64(next_worker_version)?,
-                now_i64,
-                worker_id,
-                to_i64(worker_version)?,
-            ],
-        )?;
-        replace_worker_runtime_binding(transaction, worker_id, orchestrator_runtime, now)?;
     }
     transaction.execute(
         "INSERT INTO projects (
@@ -12103,6 +13552,39 @@ fn reject_project_orchestrator_intervention(
     }
 }
 
+fn reject_project_archive_dependencies(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<(), ProjectStoreError> {
+    let snapshot_collection_pending = connection.query_row(
+        "SELECT EXISTS (
+            SELECT 1
+              FROM coordination_snapshot_projects snapshot
+             WHERE snapshot.project_id = ?1
+               AND snapshot.collection_status <> 'collected'
+         )",
+        [project_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if snapshot_collection_pending {
+        return Err(ProjectStoreError::ProjectArchiveSnapshotCollectionPending);
+    }
+    let incoming_handoff = connection.query_row(
+        "SELECT EXISTS (
+            SELECT 1
+              FROM worker_handoff_commands handoff
+             WHERE handoff.target_project_id = ?1
+               AND handoff.finished_at_unix_ms IS NULL
+         )",
+        [project_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if incoming_handoff {
+        return Err(ProjectStoreError::ProjectArchiveHandoffInProgress);
+    }
+    reject_project_orchestrator_intervention(connection, project_id, None)
+}
+
 fn select_project(connection: &Connection, project_id: &str) -> Result<Project, ProjectStoreError> {
     connection
         .query_row(
@@ -12114,10 +13596,304 @@ fn select_project(connection: &Connection, project_id: &str) -> Result<Project, 
         .ok_or(ProjectStoreError::ProjectNotFound)
 }
 
+#[derive(Debug)]
+struct StoredArchivedProject {
+    project_id: String,
+    command_id: String,
+    actor: String,
+    expected_project_version: u64,
+    expected_orchestrator_worker_id: String,
+    expected_orchestrator_worker_version: u64,
+    expected_orchestrator_runtime_version: Option<u64>,
+    archived_at_unix_ms: u64,
+}
+
+impl StoredArchivedProject {
+    fn matches(&self, project_id: &str, command: &ArchiveProject) -> bool {
+        self.project_id == project_id
+            && self.actor == command.actor
+            && self.expected_project_version == command.expected_project_version
+            && self.expected_orchestrator_worker_id == command.expected_orchestrator_worker_id
+            && self.expected_orchestrator_worker_version
+                == command.expected_orchestrator_worker_version
+            && self.expected_orchestrator_runtime_version
+                == command.expected_orchestrator_runtime_version
+    }
+
+    fn archived(self, cleanup_pending: bool, replayed: bool) -> ArchivedProject {
+        ArchivedProject {
+            command_id: self.command_id,
+            project_id: self.project_id,
+            orchestrator_worker_id: self.expected_orchestrator_worker_id,
+            archived_at_unix_ms: self.archived_at_unix_ms,
+            cleanup_pending,
+            replayed,
+        }
+    }
+}
+
+fn select_archived_project_command(
+    connection: &Connection,
+    command_id: &str,
+) -> Result<Option<StoredArchivedProject>, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT archived.project_id, archived.command_id, command.actor,
+                    archived.expected_project_version,
+                    archived.expected_orchestrator_worker_id,
+                    archived.expected_orchestrator_worker_version,
+                    archived.expected_orchestrator_runtime_version,
+                    archived.archived_at_unix_ms
+               FROM archived_projects archived
+               JOIN command_acknowledgements command
+                 ON command.id = archived.command_id
+              WHERE archived.command_id = ?1",
+            [command_id],
+            |row| {
+                Ok(StoredArchivedProject {
+                    project_id: row.get(0)?,
+                    command_id: row.get(1)?,
+                    actor: row.get(2)?,
+                    expected_project_version: row_u64(row, 3)?,
+                    expected_orchestrator_worker_id: row.get(4)?,
+                    expected_orchestrator_worker_version: row_u64(row, 5)?,
+                    expected_orchestrator_runtime_version: row_optional_u64(row, 6)?,
+                    archived_at_unix_ms: row_u64(row, 7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn archived_project_exists(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<bool, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM archived_projects WHERE project_id = ?1
+             )",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+struct ArchivedProjectDeletionTarget {
+    orchestrator_worker_id: String,
+}
+
+fn select_archived_project_target(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<Option<ArchivedProjectDeletionTarget>, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT expected_orchestrator_worker_id
+               FROM archived_projects
+              WHERE project_id = ?1",
+            [project_id],
+            |row| {
+                Ok(ArchivedProjectDeletionTarget {
+                    orchestrator_worker_id: row.get(0)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+struct StoredDeletedProject {
+    project_id: String,
+    command_id: String,
+    actor: String,
+    orchestrator_worker_id: String,
+    deleted_at_unix_ms: u64,
+}
+
+impl StoredDeletedProject {
+    fn deleted(self, cleanup_pending: bool, replayed: bool) -> DeletedProject {
+        DeletedProject {
+            command_id: self.command_id,
+            project_id: self.project_id,
+            orchestrator_worker_id: self.orchestrator_worker_id,
+            deleted_at_unix_ms: self.deleted_at_unix_ms,
+            cleanup_pending,
+            replayed,
+        }
+    }
+}
+
+fn select_deleted_project_command(
+    connection: &Connection,
+    command_id: &str,
+) -> Result<Option<StoredDeletedProject>, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT project_id, command_id, actor, orchestrator_worker_id,
+                    deleted_at_unix_ms
+               FROM deleted_projects
+              WHERE command_id = ?1",
+            [command_id],
+            |row| {
+                Ok(StoredDeletedProject {
+                    project_id: row.get(0)?,
+                    command_id: row.get(1)?,
+                    actor: row.get(2)?,
+                    orchestrator_worker_id: row.get(3)?,
+                    deleted_at_unix_ms: row_u64(row, 4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn deleted_project_exists(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<bool, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM deleted_projects WHERE project_id = ?1
+             )",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+struct StoredDeletedWorker {
+    worker_id: String,
+    command_id: String,
+    actor: String,
+    expected_worker_version: u64,
+    deleted_at_unix_ms: u64,
+}
+
+impl StoredDeletedWorker {
+    fn matches(&self, worker_id: &str, command: &DeleteWorker) -> bool {
+        self.worker_id == worker_id
+            && self.actor == command.actor
+            && self.expected_worker_version == command.expected_worker_version
+    }
+
+    fn deleted(self, cleanup_pending: bool, replayed: bool) -> DeletedWorker {
+        DeletedWorker {
+            command_id: self.command_id,
+            worker_id: self.worker_id,
+            deleted_at_unix_ms: self.deleted_at_unix_ms,
+            cleanup_pending,
+            replayed,
+        }
+    }
+}
+
+fn select_deleted_worker_command(
+    connection: &Connection,
+    command_id: &str,
+) -> Result<Option<StoredDeletedWorker>, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT worker_id, command_id, actor, expected_worker_version,
+                    deleted_at_unix_ms
+               FROM deleted_workers
+              WHERE command_id = ?1",
+            [command_id],
+            |row| {
+                Ok(StoredDeletedWorker {
+                    worker_id: row.get(0)?,
+                    command_id: row.get(1)?,
+                    actor: row.get(2)?,
+                    expected_worker_version: row_u64(row, 3)?,
+                    deleted_at_unix_ms: row_u64(row, 4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn deleted_worker_exists(
+    connection: &Connection,
+    worker_id: &str,
+) -> Result<bool, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM deleted_workers WHERE worker_id = ?1
+             )",
+            [worker_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn project_has_active_work(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<bool, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM assignments
+                 WHERE project_id = ?1
+                   AND lifecycle IN ('allocating', 'active', 'handing_off')
+                UNION ALL
+                SELECT 1
+                  FROM profile_allocation_commands allocation
+                  JOIN command_acknowledgements command
+                    ON command.id = allocation.command_id
+                 WHERE allocation.project_id = ?1
+                   AND command.status IN ('pending', 'ambiguous')
+                UNION ALL
+                SELECT 1
+                  FROM worker_allocation_commands allocation
+                  JOIN command_acknowledgements command
+                    ON command.id = allocation.command_id
+                 WHERE allocation.project_id = ?1
+                   AND command.status IN ('pending', 'ambiguous')
+                UNION ALL
+                SELECT 1
+                  FROM automations
+                 WHERE scope_project_id = ?1
+                UNION ALL
+                SELECT 1
+                  FROM automation_selected_projects
+                 WHERE project_id = ?1
+                UNION ALL
+                SELECT 1
+                  FROM automation_runs
+                 WHERE scope_project_id = ?1
+                   AND status IN ('pending', 'ambiguous')
+                UNION ALL
+                SELECT 1
+                  FROM automation_run_projects run_project
+                  JOIN automation_runs run
+                    ON run.id = run_project.run_id
+                 WHERE run_project.project_id = ?1
+                   AND run.status IN ('pending', 'ambiguous')
+             )",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
 fn project_exists(connection: &Connection, project_id: &str) -> Result<bool, ProjectStoreError> {
     connection
         .query_row(
-            "SELECT EXISTS (SELECT 1 FROM projects WHERE id = ?1)",
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM projects project
+                  JOIN project_workspace_bindings binding
+                    ON binding.project_id = project.id
+                 WHERE project.id = ?1
+             )",
             [project_id],
             |row| row.get(0),
         )
@@ -13864,14 +15640,32 @@ fn ensure_worker_binding_available(
     transaction: &Transaction<'_>,
     runtime: &WorkerRuntimeBinding,
 ) -> Result<(), ProjectStoreError> {
+    let provider = runtime.provider_session.as_ref();
     let unavailable = transaction.query_row(
         "SELECT EXISTS (
             SELECT 1 FROM worker_runtime_bindings
              WHERE adapter = ?1
                AND runtime_session = ?2
-               AND terminal_id = ?3
+               AND (
+                   terminal_id = ?3
+                   OR (
+                       ?4 IS NOT NULL
+                       AND provider_session_source = ?4
+                       AND provider_session_provider = ?5
+                       AND provider_session_kind = ?6
+                       AND provider_session_value = ?7
+                   )
+               )
          )",
-        params![runtime.adapter, runtime.session, runtime.terminal_id],
+        params![
+            runtime.adapter,
+            runtime.session,
+            runtime.terminal_id,
+            provider.map(|session| session.source.as_str()),
+            provider.map(|session| session.provider.as_str()),
+            provider.map(|session| session.kind.as_str()),
+            provider.map(|session| session.value.as_str()),
+        ],
         |row| row.get::<_, bool>(0),
     )? || runtime_identity_is_provisioning_claimed(
         transaction,
@@ -13995,18 +15789,32 @@ fn ensure_worker_binding_available_for(
     worker_id: &str,
     runtime: &WorkerRuntimeBinding,
 ) -> Result<(), ProjectStoreError> {
+    let provider = runtime.provider_session.as_ref();
     let unavailable = transaction.query_row(
         "SELECT EXISTS (
             SELECT 1 FROM worker_runtime_bindings
              WHERE adapter = ?1
                AND runtime_session = ?2
-               AND terminal_id = ?3
-               AND worker_id <> ?4
+               AND (
+                   terminal_id = ?3
+                   OR (
+                       ?4 IS NOT NULL
+                       AND provider_session_source = ?4
+                       AND provider_session_provider = ?5
+                       AND provider_session_kind = ?6
+                       AND provider_session_value = ?7
+                   )
+               )
+               AND worker_id <> ?8
          )",
         params![
             runtime.adapter,
             runtime.session,
             runtime.terminal_id,
+            provider.map(|session| session.source.as_str()),
+            provider.map(|session| session.provider.as_str()),
+            provider.map(|session| session.kind.as_str()),
+            provider.map(|session| session.value.as_str()),
             worker_id,
         ],
         |row| row.get::<_, bool>(0),
@@ -14313,6 +16121,23 @@ fn runtime_cleanup_pending(
         .map_err(Into::into)
 }
 
+fn worker_runtime_cleanup_pending(
+    connection: &Connection,
+    worker_id: &str,
+) -> Result<bool, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM runtime_cleanup_jobs
+                 WHERE worker_id = ?1 AND status = 'pending'
+             )",
+            [worker_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
 fn capped_exponential_delay(base_ms: u64, cap_ms: u64, attempts: u32) -> u64 {
     let multiplier = 1_u64.checked_shl(attempts).unwrap_or(u64::MAX);
     base_ms.saturating_mul(multiplier).min(cap_ms)
@@ -14445,8 +16270,11 @@ fn validate_detached_runtime_cleanup(
                        AND lifecycle IN ('allocating', 'active', 'handing_off')
                 )
                 OR EXISTS (
-                    SELECT 1 FROM projects
-                     WHERE orchestrator_worker_id = ?1
+                    SELECT 1
+                      FROM projects project
+                      JOIN project_workspace_bindings binding
+                        ON binding.project_id = project.id
+                     WHERE project.orchestrator_worker_id = ?1
                 )
                 OR EXISTS (
                     SELECT 1 FROM yard_orchestrator
@@ -14562,6 +16390,7 @@ fn insert_worker_runtime_binding(
     runtime: &WorkerRuntimeBinding,
     now: u64,
 ) -> Result<(), ProjectStoreError> {
+    ensure_worker_binding_available(transaction, runtime)?;
     ensure_runtime_not_pending_cleanup(transaction, runtime)?;
     insert_worker_runtime_binding_unchecked(transaction, worker_id, runtime, now)
 }
@@ -14699,7 +16528,7 @@ fn select_worker_candidate(
 ) -> Result<Option<WorkerCandidate>, ProjectStoreError> {
     connection
         .query_row(
-            &format!("{WORKER_CANDIDATE_SELECT} WHERE w.id = ?1"),
+            &format!("{WORKER_CANDIDATE_SELECT} AND w.id = ?1"),
             [worker_id],
             worker_candidate_from_row,
         )
@@ -14844,7 +16673,6 @@ fn worker_candidate_from_row(row: &Row<'_>) -> rusqlite::Result<WorkerCandidate>
     let assignment_id = row.get::<_, Option<String>>(30)?;
     let coordination_node_id = row.get::<_, Option<String>>(31)?;
     let has_pending_cleanup = row.get::<_, bool>(32)?;
-    let has_transfer_displacement = row.get::<_, bool>(33)?;
     let (availability, project_id, reason) = worker_availability(
         desired_state,
         WorkerAvailabilityContext {
@@ -14853,7 +16681,6 @@ fn worker_candidate_from_row(row: &Row<'_>) -> rusqlite::Result<WorkerCandidate>
             orchestrator_project_id,
             active_project_id,
             has_pending_cleanup,
-            has_transfer_displacement,
         },
         profile_id.as_deref(),
         runtime.as_ref(),
@@ -14884,7 +16711,6 @@ struct WorkerAvailabilityContext {
     orchestrator_project_id: Option<String>,
     active_project_id: Option<String>,
     has_pending_cleanup: bool,
-    has_transfer_displacement: bool,
 }
 
 fn worker_availability(
@@ -14947,7 +16773,6 @@ fn worker_availability(
     let is_live = runtime.is_some_and(|runtime| {
         runtime.observation_state == RuntimeObservationState::Observed
             && runtime.process_state == RuntimeProcessState::Running
-            && (runtime.provider_session.is_some() || context.has_transfer_displacement)
     });
     if is_live {
         return (WorkerAvailability::UnassignedLive, None, None);
@@ -16609,6 +18434,18 @@ pub enum ProjectStoreError {
     SnapshotProjectNotFound,
     #[error("project was not found")]
     ProjectNotFound,
+    #[error("project is already archived")]
+    ProjectAlreadyArchived,
+    #[error("project must be archived before it can be deleted")]
+    ProjectNotArchived,
+    #[error("project has already been deleted from the Yard UI")]
+    ProjectAlreadyDeleted,
+    #[error("project has active work or automation dependencies")]
+    ProjectHasArchiveDependencies,
+    #[error("a worker handoff targeting this project is still in progress")]
+    ProjectArchiveHandoffInProgress,
+    #[error("a coordination snapshot has not finished collecting this project")]
+    ProjectArchiveSnapshotCollectionPending,
     #[error("the relationship source project was not found")]
     RelationshipSourceProjectNotFound,
     #[error("the relationship target project was not found")]
@@ -16635,6 +18472,10 @@ pub enum ProjectStoreError {
     WorkerRuntimeVersionConflict { current_version: Option<u64> },
     #[error("the worker session has already ended")]
     WorkerAlreadyEnded,
+    #[error("the worker session must be ended before it can be deleted")]
+    WorkerNotEnded,
+    #[error("the worker has already been deleted from the Yard UI")]
+    WorkerAlreadyDeleted,
     #[error("the project orchestrator session cannot end without a replacement")]
     OrchestratorSessionEndForbidden,
     #[error("the Yard orchestrator session cannot end without a replacement")]
@@ -16697,6 +18538,8 @@ pub enum ProjectStoreError {
     RuntimeHandoffClaimConflict,
     #[error("an assignment intervention is still in progress")]
     AssignmentInterventionInProgress,
+    #[error("a worker profile allocation is still pending or ambiguous")]
+    ProfileAllocationInProgress,
     #[error("completion receipt was not found")]
     CompletionReceiptNotFound,
     #[error("artifact was not found")]
@@ -16812,21 +18655,23 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
     use yard_domain::{
-        AllocationMode, ArtifactKind, ArtifactRegistration, AssignmentLifecycle, AttemptLifecycle,
-        CanvasPlacement, CompletionOutcome, ConfigureYardOrchestrator, ConfirmProfileAllocation,
-        ConfirmWorkerAllocation, ConfirmWorkerHandoff, CoordinationCommandStatus,
-        CoordinationNodeKind, CreateAgentProfile, CreateCoordinationNode, CreateProject,
-        CreateProjectFromProfile, CreateProjectRelationship, CreateWorkerProfile,
-        CreateWorkspaceProjectFromProfile, DeleteProjectRelationship, EndWorkerSession,
-        FocusObservation, HandoffTargetRole, IsolationPolicy, ObservedStatus, ObservedWorker,
-        OldSessionDisposition, PaneObservation, Project, ProjectRelationshipKind,
-        ProjectRuntimeBinding, ProviderSessionRef, ProvisionCoordinationNode,
-        ProvisionYardOrchestrator, RecordCompletionReceipt, ReplaceProjectOrchestrator,
-        RequestCoordinationSnapshot, RuntimeInventory, RuntimeObservationState,
-        RuntimeProcessState, SendAssignmentPrompt, SendCoordinationNodePrompt,
-        SendCoordinationNodeRoute, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
-        SendYardOrchestratorRoute, SnapshotCollectionStatus, TransferProjectOrchestrator,
-        UpdateAgentProfile, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
+        AllocationMode, ArchiveProject, ArtifactKind, ArtifactRegistration, AssignmentLifecycle,
+        AttemptLifecycle, AutomationScope, CanvasPlacement, CompletionOutcome,
+        ConfigureYardOrchestrator, ConfirmProfileAllocation, ConfirmWorkerAllocation,
+        ConfirmWorkerHandoff, CoordinationCommandStatus, CoordinationNodeKind, CreateAgentProfile,
+        CreateAutomation, CreateCoordinationNode, CreateProject, CreateProjectFromProfile,
+        CreateProjectRelationship, CreateWorkerProfile, CreateWorkspaceProjectFromProfile,
+        DailySchedule, DeleteProject, DeleteProjectRelationship, DeleteWorker, EndWorkerSession,
+        FocusObservation, HandoffTargetRole, IsolationPolicy, ManagedRuntimeOccupantKind,
+        ManagedRuntimeWorkspaceKind, ObservedStatus, ObservedWorker, OldSessionDisposition,
+        PaneObservation, Project, ProjectRelationshipKind, ProjectRuntimeBinding,
+        ProviderSessionRef, ProvisionCoordinationNode, ProvisionYardOrchestrator,
+        RecordCompletionReceipt, ReplaceProjectOrchestrator, RequestCoordinationSnapshot,
+        RunAutomationNow, RuntimeInventory, RuntimeObservationState, RuntimeProcessState,
+        SendAssignmentPrompt, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
+        SendOrchestratorPrompt, SendYardOrchestratorPrompt, SendYardOrchestratorRoute,
+        SnapshotCollectionStatus, TransferProjectOrchestrator, UpdateAgentProfile,
+        UpdateAutomation, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
         UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
         UpdateTokenSpendSettings, UpdateWorkerProfile, WorkerAvailability, WorkerProfile,
         WorkerProfileSpec, WorkerRuntimeBinding, YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
@@ -16842,9 +18687,10 @@ mod tests {
         COMPLETION_RECEIPT_MIGRATION, FINAL_BACKEND_SAFETY_MIGRATION, INITIAL_MIGRATION,
         OrchestratorReplacementRecoveryOutcome, OrchestratorReplacementRecoveryTarget,
         OrchestratorReplacementRuntimeRole, OrchestratorReplacementStartEvidence,
-        PROFILE_ASSIGNMENT_MIGRATION, ProjectStoreError, SCHEMA_VERSION, SnapshotDeliveryResult,
-        SnapshotProjectFolder, SqliteProjectStore, TokenSpendCommandSource, YardStore,
-        insert_worker_runtime_binding, insert_worker_runtime_binding_unchecked,
+        PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS, PROFILE_ASSIGNMENT_MIGRATION,
+        ProjectStoreError, SCHEMA_VERSION, SnapshotDeliveryResult, SnapshotProjectFolder,
+        SqliteProjectStore, TokenSpendCommandSource, YardStore, insert_worker_runtime_binding,
+        insert_worker_runtime_binding_unchecked,
     };
 
     const HISTORICAL_PROVIDER_NEUTRAL_WORKFLOW_V25_MIGRATION: &str =
@@ -16891,6 +18737,47 @@ mod tests {
         SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
             .await
             .unwrap()
+    }
+
+    fn age_command_for_reconciliation(temp: &TempDir, command_id: &str) {
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE command_acknowledgements
+                    SET updated_at_unix_ms = 1
+                  WHERE id = ?1",
+                [command_id],
+            )
+            .unwrap();
+    }
+
+    fn assert_legacy_agent_blocked_runtime_retained(temp: &TempDir, command_id: &str) {
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let retained: (String, i64, i64, i64) = connection
+            .query_row(
+                "SELECT command.status,
+                        EXISTS (
+                            SELECT 1 FROM provisioning_runtime_claims claim
+                             WHERE claim.command_id = command.id
+                        ),
+                        EXISTS (
+                            SELECT 1
+                              FROM quarantined_provisioning_runtime_bindings quarantine
+                             WHERE quarantine.command_id = command.id
+                               AND quarantine.terminal_id = 'terminal-blocked'
+                               AND quarantine.owns_tab = 1
+                        ),
+                        EXISTS (
+                            SELECT 1 FROM worker_runtime_bindings binding
+                             WHERE binding.terminal_id = 'terminal-blocked'
+                        )
+                   FROM command_acknowledgements command
+                  WHERE command.id = ?1",
+                [command_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, ("failed".to_owned(), 0, 1, 0));
     }
 
     fn install_historical_provider_neutral_workflow_v25(connection: &mut Connection) {
@@ -17113,6 +19000,9 @@ mod tests {
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = OFF;
+                 DROP TABLE IF EXISTS deleted_projects;
+                 DROP TABLE IF EXISTS deleted_workers;
+                 DROP TABLE IF EXISTS archived_projects;
                  DROP TRIGGER orchestrator_workflow_profile_revision_immutable_update;
                  DROP TRIGGER orchestrator_workflow_profile_revision_immutable_delete;
                  DROP TRIGGER profile_project_creation_workflow_pin_insert;
@@ -17456,7 +19346,12 @@ mod tests {
         std::os::unix::fs::symlink(&nested, &alias).unwrap();
 
         let normalized = super::normalize_database_path(alias.join("../yard.sqlite3")).unwrap();
-        assert_eq!(normalized, directory.join("yard.sqlite3"));
+        assert_eq!(
+            normalized,
+            std::fs::canonicalize(directory)
+                .unwrap()
+                .join("yard.sqlite3")
+        );
     }
 
     #[test]
@@ -17479,6 +19374,35 @@ mod tests {
         let alias = temp.path().join("yard-hard-link.sqlite3");
         let store = SqliteProjectStore::open(&path).await.unwrap();
         std::fs::hard_link(&path, &alias).unwrap();
+
+        let error = super::acquire_database_lock(&alias).unwrap_err();
+        assert!(matches!(error, ProjectStoreError::DatabaseAlreadyOpen));
+        drop(store);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn database_inode_lock_survives_path_rename() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let renamed = temp.path().join("yard-renamed.sqlite3");
+        let store = SqliteProjectStore::open(&path).await.unwrap();
+        std::fs::rename(&path, &renamed).unwrap();
+
+        let error = super::acquire_database_lock(&renamed).unwrap_err();
+        assert!(matches!(error, ProjectStoreError::DatabaseAlreadyOpen));
+        drop(store);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn database_inode_lock_survives_link_then_original_unlink() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let alias = temp.path().join("yard-moved.sqlite3");
+        let store = SqliteProjectStore::open(&path).await.unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        std::fs::remove_file(&path).unwrap();
 
         let error = super::acquire_database_lock(&alias).unwrap_err();
         assert!(matches!(error, ProjectStoreError::DatabaseAlreadyOpen));
@@ -20576,6 +22500,356 @@ mod tests {
         ));
     }
 
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn central_and_coordination_workspaces_cannot_become_projects() {
+        let central_temp = TempDir::new().unwrap();
+        let central_store = open_store(&central_temp).await;
+        configure_yard_orchestrator_for_routes(&central_store).await;
+        let profile = central_store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Central reservation"),
+            })
+            .await
+            .unwrap();
+        let begin_error = central_store
+            .begin_profile_project_creation(profile_project_command(
+                &profile,
+                "workspace-yard-routes",
+                "create-project-in-central",
+            ))
+            .await
+            .unwrap_err();
+        let (central_project, central_runtime) =
+            draft("workspace-yard-routes", "central-project-terminal");
+        let adoption_error = central_store
+            .create_project(central_project, central_runtime)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            begin_error,
+            ProjectStoreError::RuntimeWorkspaceReserved
+        ));
+        assert!(matches!(
+            adoption_error,
+            ProjectStoreError::RuntimeWorkspaceReserved
+        ));
+        let central_topology = central_store
+            .runtime_topology("herdr", "default")
+            .await
+            .unwrap();
+        assert_eq!(
+            central_topology.managed_workspaces[0].kind,
+            ManagedRuntimeWorkspaceKind::YardCentral
+        );
+
+        let coordination_temp = TempDir::new().unwrap();
+        let coordination_store = open_store(&coordination_temp).await;
+        let coordination_profile = coordination_store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Coordination reservation"),
+            })
+            .await
+            .unwrap();
+        let node_id = Uuid::now_v7().to_string();
+        let node = coordination_store
+            .create_coordination_node(
+                &node_id,
+                Some(
+                    coordination_temp
+                        .path()
+                        .join("coordination")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                None,
+                create_node_command(
+                    "create-reserved-coordination-node",
+                    CoordinationNodeKind::Workstream,
+                    Vec::new(),
+                ),
+            )
+            .await
+            .unwrap()
+            .node;
+        coordination_store
+            .reconcile_runtime_inventory(inventory(
+                30,
+                vec![observed_worker(
+                    "coordination-terminal",
+                    "coordination-workspace",
+                    "coordination-tab",
+                    "coordination-pane",
+                    Some(provider_session("coordination-session")),
+                )],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let candidate = coordination_store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| {
+                candidate
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.terminal_id == "coordination-terminal")
+            })
+            .unwrap();
+        let pinned = coordination_store
+            .pin_worker_profile(
+                &candidate.worker.id,
+                &coordination_profile.id,
+                coordination_profile.version,
+            )
+            .await
+            .unwrap();
+        coordination_store
+            .configure_coordination_node(
+                &node_id,
+                ProvisionCoordinationNode {
+                    command_id: "provision-reserved-coordination-node".to_owned(),
+                    actor: "local-user".to_owned(),
+                    profile_id: coordination_profile.id,
+                    expected_profile_version: coordination_profile.version,
+                    expected_node_version: node.version,
+                },
+                &pinned.id,
+                pinned.version,
+            )
+            .await
+            .unwrap();
+        let (coordination_project, coordination_runtime) =
+            draft("coordination-workspace", "coordination-project-terminal");
+        let coordination_error = coordination_store
+            .create_project(coordination_project, coordination_runtime)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            coordination_error,
+            ProjectStoreError::RuntimeWorkspaceReserved
+        ));
+        let coordination_topology = coordination_store
+            .runtime_topology("herdr", "default")
+            .await
+            .unwrap();
+        assert_eq!(
+            coordination_topology.managed_workspaces[0].kind,
+            ManagedRuntimeWorkspaceKind::Coordination
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn claimed_quarantined_and_cleanup_pending_workspaces_cannot_become_projects() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Transient reservation"),
+            })
+            .await
+            .unwrap();
+        store
+            .begin_profile_project_creation(profile_project_command(
+                &profile,
+                "profile-reserved-workspace",
+                "profile-reserved-workspace-command",
+            ))
+            .await
+            .unwrap();
+
+        let claim_command = workspace_project_command(&profile, "claim-workspace-command");
+        store
+            .begin_workspace_project_creation(claim_command.clone())
+            .await
+            .unwrap();
+        let (_, claim_runtime) = draft("claimed-workspace", "claimed-terminal");
+        store
+            .claim_provisioning_runtime(&claim_command.command_id, claim_runtime)
+            .await
+            .unwrap();
+        let (claimed_project, claimed_project_runtime) =
+            draft("claimed-workspace", "claimed-project-terminal");
+        assert!(matches!(
+            store
+                .create_project(claimed_project, claimed_project_runtime)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::RuntimeWorkspaceReserved
+        ));
+
+        let mut quarantine_command =
+            workspace_project_command(&profile, "quarantine-workspace-command");
+        quarantine_command.cwd = "/work/quarantine-runtime-api".to_owned();
+        store
+            .begin_workspace_project_creation(quarantine_command.clone())
+            .await
+            .unwrap();
+        let (_, quarantine_runtime) = draft("quarantined-workspace", "quarantined-terminal");
+        store
+            .quarantine_provisioning_runtime(&quarantine_command.command_id, quarantine_runtime)
+            .await
+            .unwrap();
+        let (quarantined_project, quarantined_project_runtime) =
+            draft("quarantined-workspace", "quarantined-project-terminal");
+        assert!(matches!(
+            store
+                .create_project(quarantined_project, quarantined_project_runtime)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::RuntimeWorkspaceReserved
+        ));
+
+        let (mut archived_draft, archived_runtime) = draft("cleanup-workspace", "cleanup-terminal");
+        archived_draft.name = "Archived cleanup".to_owned();
+        let archived_project = store
+            .create_project(archived_draft, archived_runtime)
+            .await
+            .unwrap();
+        store
+            .archive_project(
+                &archived_project.id,
+                archive_command(&archived_project, "archive-cleanup-reservation"),
+            )
+            .await
+            .unwrap();
+        let (cleanup_project, cleanup_project_runtime) =
+            draft("cleanup-workspace", "cleanup-project-terminal");
+        assert!(matches!(
+            store
+                .create_project(cleanup_project, cleanup_project_runtime)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::RuntimeWorkspaceReserved
+        ));
+
+        let topology = store.runtime_topology("herdr", "default").await.unwrap();
+        let profile_reserved = topology
+            .managed_workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == "profile-reserved-workspace")
+            .unwrap();
+        assert_eq!(
+            profile_reserved.kind,
+            ManagedRuntimeWorkspaceKind::Provisioning
+        );
+        assert!(profile_reserved.occupants.is_empty());
+        let claimed = topology
+            .managed_workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == "claimed-workspace")
+            .unwrap();
+        assert_eq!(claimed.kind, ManagedRuntimeWorkspaceKind::Provisioning);
+        assert_eq!(
+            claimed.occupants[0].kind,
+            ManagedRuntimeOccupantKind::Provisioning
+        );
+        let quarantined = topology
+            .managed_workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == "quarantined-workspace")
+            .unwrap();
+        assert_eq!(quarantined.kind, ManagedRuntimeWorkspaceKind::Quarantined);
+        assert_eq!(
+            quarantined.occupants[0].kind,
+            ManagedRuntimeOccupantKind::Quarantined
+        );
+        let cleanup = topology
+            .managed_workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == "cleanup-workspace")
+            .unwrap();
+        assert_eq!(cleanup.kind, ManagedRuntimeWorkspaceKind::CleanupPending);
+        assert_eq!(
+            cleanup.occupants[0].kind,
+            ManagedRuntimeOccupantKind::CleanupPending
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_project_finalization_revalidates_central_reservation() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        store
+            .reconcile_runtime_inventory(inventory(
+                30,
+                vec![observed_worker(
+                    "future-central-terminal",
+                    "finalize-race-workspace",
+                    "future-central-tab",
+                    "future-central-pane",
+                    Some(provider_session("future-central-session")),
+                )],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let central_candidate = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| {
+                candidate
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.terminal_id == "future-central-terminal")
+            })
+            .unwrap();
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Finalize race"),
+            })
+            .await
+            .unwrap();
+        let command = workspace_project_command(&profile, "finalize-race-command");
+        store
+            .begin_workspace_project_creation(command.clone())
+            .await
+            .unwrap();
+        let (_, project_runtime) = draft("finalize-race-workspace", "future-project-terminal");
+        store
+            .claim_provisioning_runtime(&command.command_id, project_runtime.clone())
+            .await
+            .unwrap();
+        let current = store.get_yard_orchestrator().await.unwrap();
+        store
+            .configure_yard_orchestrator(ConfigureYardOrchestrator {
+                command_id: "configure-central-during-finalize".to_owned(),
+                actor: "local-user".to_owned(),
+                worker_id: central_candidate.worker.id,
+                expected_worker_version: central_candidate.worker.version,
+                expected_orchestrator_version: current.version,
+                workflow_profile_version: None,
+            })
+            .await
+            .unwrap();
+
+        let error = store
+            .finalize_workspace_project_creation(&command.command_id, project_runtime)
+            .await
+            .unwrap_err();
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let retained_claim: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM provisioning_runtime_claims
+                  WHERE command_id = ?1",
+                [&command.command_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(error, ProjectStoreError::RuntimeWorkspaceReserved));
+        assert_eq!(retained_claim, 1);
+        assert!(store.list_projects().await.unwrap().projects.is_empty());
+    }
+
     #[tokio::test]
     async fn failed_project_creation_releases_workspace_reservation() {
         let temp = TempDir::new().unwrap();
@@ -21218,6 +23492,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_session_can_only_back_one_yard_worker() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let shared_provider = provider_session("shared-provider-session");
+        let (first_project, mut first_worker) = draft("workspace-1", "terminal-1");
+        first_worker.provider_session = Some(shared_provider.clone());
+        store
+            .create_project(first_project, first_worker)
+            .await
+            .unwrap();
+        let (second_project, mut second_worker) = draft("workspace-2", "terminal-2");
+        second_worker.provider_session = Some(shared_provider);
+
+        let error = store
+            .create_project(second_project, second_worker)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProjectStoreError::RuntimeWorkerAlreadyBound
+        ));
+    }
+
+    #[tokio::test]
     async fn placement_updates_use_independent_optimistic_versions() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
@@ -21499,11 +23798,31 @@ mod tests {
             .await
             .unwrap();
         let (second_draft, mut second_runtime) = draft("workspace-2", "terminal-2");
-        second_runtime.provider_session = Some(shared_provider.clone());
+        second_runtime.provider_session = Some(provider_session("distinct-second-session"));
         let second = store
             .create_project(second_draft, second_runtime)
             .await
             .unwrap();
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let legacy_duplicate_rows = connection
+            .execute(
+                "UPDATE worker_runtime_bindings
+                    SET provider_session_source = ?1,
+                        provider_session_provider = ?2,
+                        provider_session_kind = ?3,
+                        provider_session_value = ?4
+                  WHERE worker_id = ?5",
+                params![
+                    shared_provider.source.as_str(),
+                    shared_provider.provider.as_str(),
+                    shared_provider.kind.as_str(),
+                    shared_provider.value.as_str(),
+                    second.orchestrator.id.as_str(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(legacy_duplicate_rows, 1);
+        drop(connection);
 
         let result = store
             .reconcile_runtime_inventory(inventory(
@@ -21554,8 +23873,8 @@ mod tests {
                 vec![observed_worker(
                     "terminal-1",
                     "workspace-1",
-                    "tab-new",
-                    "pane-new",
+                    "tab-1",
+                    "pane-1",
                     None,
                 )],
                 Vec::new(),
@@ -21589,13 +23908,13 @@ mod tests {
         assert_eq!(stale.adopted_workers, 0);
         assert_eq!(runtime.observation_state, RuntimeObservationState::Observed);
         assert_eq!(runtime.terminal_id, "terminal-1");
-        assert_eq!(runtime.tab_id.as_deref(), Some("tab-new"));
+        assert_eq!(runtime.tab_id.as_deref(), Some("tab-1"));
         assert_eq!(runtime.last_observed_at_unix_ms, 30);
         assert_eq!(worker_count, 1);
     }
 
     #[tokio::test]
-    async fn reconciliation_updates_exact_binding_status_and_topology() {
+    async fn reconciliation_rejects_changed_topology_for_providerless_exact_terminal() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
         let (project_draft, orchestrator) = draft("workspace-1", "terminal-1");
@@ -21621,13 +23940,116 @@ mod tests {
         let loaded = store.get_project(&project.id).await.unwrap();
         let runtime = loaded.orchestrator.runtime.unwrap();
 
-        assert_eq!(result.updated_bindings, 1);
-        assert_eq!(runtime.tab_id.as_deref(), Some("tab-moved"));
-        assert_eq!(runtime.pane_id, "pane-moved");
-        assert_eq!(runtime.status, ObservedStatus::Working);
-        assert_eq!(runtime.state_change_sequence, 7);
-        assert_eq!(runtime.revision, 9);
+        assert_eq!(result.ambiguous_bindings, 1);
+        assert_eq!(result.adopted_workers, 0);
+        assert_eq!(runtime.tab_id.as_deref(), Some("tab-1"));
+        assert_eq!(runtime.pane_id, "pane-1");
+        assert_eq!(
+            runtime.observation_state,
+            RuntimeObservationState::Ambiguous
+        );
+        assert_eq!(runtime.process_state, RuntimeProcessState::Unknown);
+        assert_eq!(runtime.status, ObservedStatus::Unknown);
         assert_eq!(runtime.version, 2);
+        assert_eq!(runtime.last_observed_at_unix_ms, 1);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_never_adopts_a_second_terminal_for_a_bound_provider_session() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let shared_provider = provider_session("shared-provider-session");
+        let (project_draft, mut orchestrator) = draft("workspace-1", "terminal-1");
+        orchestrator.provider_session = Some(shared_provider.clone());
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+
+        let result = store
+            .reconcile_runtime_inventory(inventory(
+                20,
+                vec![
+                    observed_worker(
+                        "terminal-1",
+                        "workspace-1",
+                        "tab-1",
+                        "pane-1",
+                        Some(provider_session("different-provider-session")),
+                    ),
+                    observed_worker(
+                        "terminal-2",
+                        "workspace-1",
+                        "tab-2",
+                        "pane-2",
+                        Some(shared_provider),
+                    ),
+                ],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let runtime = store
+            .get_project(&project.id)
+            .await
+            .unwrap()
+            .orchestrator
+            .runtime
+            .unwrap();
+        let worker_count: i64 = Connection::open(temp.path().join("yard.sqlite3"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM workers", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(result.ambiguous_bindings, 1);
+        assert_eq!(result.adopted_workers, 0);
+        assert_eq!(runtime.terminal_id, "terminal-1");
+        assert_eq!(
+            runtime.observation_state,
+            RuntimeObservationState::Ambiguous
+        );
+        assert_eq!(worker_count, 1);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_preserves_bound_provider_session_when_observation_omits_it() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let stable_provider = provider_session("stable-provider-session");
+        let (project_draft, mut orchestrator) = draft("workspace-1", "terminal-1");
+        orchestrator.provider_session = Some(stable_provider.clone());
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+
+        let result = store
+            .reconcile_runtime_inventory(inventory(
+                20,
+                vec![observed_worker(
+                    "terminal-1",
+                    "workspace-1",
+                    "tab-1",
+                    "pane-1",
+                    None,
+                )],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let runtime = store
+            .get_project(&project.id)
+            .await
+            .unwrap()
+            .orchestrator
+            .runtime
+            .unwrap();
+
+        assert_eq!(result.updated_bindings, 1);
+        assert_eq!(result.ambiguous_bindings, 0);
+        assert_eq!(runtime.provider_session, Some(stable_provider));
+        assert_eq!(runtime.observation_state, RuntimeObservationState::Observed);
+        assert_eq!(runtime.process_state, RuntimeProcessState::Running);
         assert_eq!(runtime.last_observed_at_unix_ms, 20);
     }
 
@@ -21666,6 +24088,84 @@ mod tests {
         assert_eq!(runtime.pane_id, "pane-new");
         assert_eq!(runtime.observation_state, RuntimeObservationState::Observed);
         assert_eq!(runtime.process_state, RuntimeProcessState::Running);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_repairs_providerless_binding_by_stable_topology() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, mut orchestrator) = draft("workspace-1", "terminal-old");
+        orchestrator.tab_id = Some("tab-stable".to_owned());
+        orchestrator.pane_id = "pane-stable".to_owned();
+        orchestrator.provider_session = None;
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+
+        let result = store
+            .reconcile_runtime_inventory(inventory(
+                20,
+                vec![observed_worker(
+                    "terminal-restored",
+                    "workspace-1",
+                    "tab-stable",
+                    "pane-stable",
+                    Some(provider_session("resumed-session")),
+                )],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let loaded = store.get_project(&project.id).await.unwrap();
+        let runtime = loaded.orchestrator.runtime.unwrap();
+
+        assert_eq!(result.updated_bindings, 1);
+        assert_eq!(result.adopted_workers, 0);
+        assert_eq!(runtime.terminal_id, "terminal-restored");
+        assert_eq!(
+            runtime.provider_session,
+            Some(provider_session("resumed-session"))
+        );
+        assert_eq!(runtime.observation_state, RuntimeObservationState::Observed);
+        assert_eq!(runtime.process_state, RuntimeProcessState::Running);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_tracks_providerless_restored_shell_by_stable_topology() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, mut orchestrator) = draft("workspace-1", "terminal-old");
+        orchestrator.tab_id = Some("tab-stable".to_owned());
+        orchestrator.pane_id = "pane-stable".to_owned();
+        orchestrator.provider_session = None;
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+
+        let result = store
+            .reconcile_runtime_inventory(inventory(
+                20,
+                Vec::new(),
+                vec![observed_pane(
+                    "terminal-restored",
+                    "workspace-1",
+                    "tab-stable",
+                    "pane-stable",
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        let loaded = store.get_project(&project.id).await.unwrap();
+        let runtime = loaded.orchestrator.runtime.unwrap();
+
+        assert_eq!(result.updated_bindings, 1);
+        assert_eq!(result.exited_processes, 1);
+        assert_eq!(runtime.terminal_id, "terminal-restored");
+        assert_eq!(runtime.observation_state, RuntimeObservationState::Observed);
+        assert_eq!(runtime.process_state, RuntimeProcessState::Exited);
     }
 
     #[tokio::test]
@@ -21761,6 +24261,61 @@ mod tests {
         assert_eq!(runtime.process_state, RuntimeProcessState::Exited);
         assert_eq!(runtime.status, ObservedStatus::Unknown);
         assert_eq!(runtime.last_observed_at_unix_ms, 20);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_rejects_changed_pane_topology_for_providerless_exact_terminal() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, orchestrator) = draft("workspace-1", "terminal-1");
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+
+        let result = store
+            .reconcile_runtime_inventory(inventory(
+                20,
+                Vec::new(),
+                vec![observed_pane(
+                    "terminal-1",
+                    "workspace-1",
+                    "tab-reused",
+                    "pane-reused",
+                    None,
+                )],
+            ))
+            .await
+            .unwrap();
+        let loaded = store.get_project(&project.id).await.unwrap();
+        let runtime = loaded.orchestrator.runtime.unwrap();
+
+        assert_eq!(result.ambiguous_bindings, 1);
+        assert_eq!(result.exited_processes, 0);
+        assert_eq!(runtime.tab_id.as_deref(), Some("tab-1"));
+        assert_eq!(runtime.pane_id, "pane-1");
+        assert_eq!(
+            runtime.observation_state,
+            RuntimeObservationState::Ambiguous
+        );
+        assert_eq!(runtime.process_state, RuntimeProcessState::Unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locked_database_path_rejects_inode_replacement() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        std::fs::write(&path, b"original").unwrap();
+        let locked = std::fs::File::open(&path).unwrap();
+        let displaced = temp.path().join("displaced.sqlite3");
+        std::fs::rename(&path, displaced).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+
+        let error = super::validate_locked_database_path(&path, &locked).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("changed"));
     }
 
     #[tokio::test]
@@ -22458,7 +25013,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 26);
+        assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(foreign_key_errors, 0);
         assert_eq!(pending_creation_pins, 2);
     }
@@ -22846,7 +25401,7 @@ mod tests {
                 })
                 .unwrap(),
         );
-        assert_eq!(version, 26);
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(backend_marker);
         assert_eq!(pending_pins, 2);
         assert_eq!(
@@ -23724,7 +26279,7 @@ mod tests {
                 })
                 .unwrap(),
         );
-        assert_eq!(version, 26);
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(projects >= 1);
         assert_eq!(transfer_results, 1);
         assert_eq!(profile_revisions, 2);
@@ -23732,7 +26287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_v26_database_reopens_idempotently() {
+    async fn fresh_database_reopens_idempotently() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("yard.sqlite3");
         let store = open_store(&temp).await;
@@ -23770,7 +26325,7 @@ mod tests {
                 })
                 .unwrap(),
         );
-        assert_eq!(version, 26);
+        assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(revisions, 1);
         assert_eq!(catalog_rows, 1);
         assert_eq!(foreign_key_errors, 0);
@@ -24028,7 +26583,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_profile_allocation_reserves_project_without_a_runtime_identity() {
+    async fn ambiguous_profile_allocation_releases_after_grace_and_fresh_absence() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
         let (project_draft, orchestrator) = draft("workspace-1", "terminal-1");
@@ -24068,15 +26623,327 @@ mod tests {
                 .unwrap_err(),
             ProjectStoreError::CommandOutcomeAmbiguous(_)
         ));
-        let mut fresh = command;
+        let mut fresh = command.clone();
         fresh.command_id = "fresh-after-ambiguous-profile-allocation".to_owned();
+        fresh.expected_project_version = store.get_project(&project.id).await.unwrap().version;
+        assert!(matches!(
+            store
+                .begin_profile_allocation(&project.id, fresh.clone())
+                .await
+                .unwrap_err(),
+            ProjectStoreError::ProfileAllocationInProgress
+        ));
+
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE command_acknowledgements
+                    SET updated_at_unix_ms = 1
+                  WHERE id = ?1",
+                [&command.command_id],
+            )
+            .unwrap();
+        drop(connection);
+        store
+            .reconcile_runtime_inventory(inventory(
+                PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS + 1,
+                vec![observed_worker(
+                    "terminal-1",
+                    "workspace-1",
+                    "tab-1",
+                    "pane-1",
+                    None,
+                )],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .begin_profile_allocation(&project.id, fresh)
+                .await
+                .unwrap(),
+            BeginProfileAllocation::Started(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_profile_allocation_is_not_released_until_restart_recovery() {
+        let temp = TempDir::new().unwrap();
+        let database_path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let (project_draft, orchestrator) = draft("workspace-1", "terminal-1");
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Implementer"),
+            })
+            .await
+            .unwrap();
+        let command = ConfirmProfileAllocation {
+            command_id: "pending-profile-allocation".to_owned(),
+            actor: "local-user".to_owned(),
+            profile_id: profile.id,
+            expected_profile_version: profile.version,
+            expected_project_version: project.version,
+            objective: "Protect an in-flight allocation from reconciliation.".to_owned(),
+            role: "implementer".to_owned(),
+            isolation_policy: IsolationPolicy::ProjectWorkspace,
+        };
+        store
+            .begin_profile_allocation(&project.id, command.clone())
+            .await
+            .unwrap();
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute(
+                "UPDATE command_acknowledgements
+                    SET updated_at_unix_ms = 1
+                  WHERE id = ?1",
+                [&command.command_id],
+            )
+            .unwrap();
+        drop(connection);
+        let project_worker =
+            || observed_worker("terminal-1", "workspace-1", "tab-1", "pane-1", None);
+        store
+            .reconcile_runtime_inventory(inventory(
+                PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS + 1,
+                vec![project_worker()],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let mut fresh = command.clone();
+        fresh.command_id = "fresh-after-pending-profile-allocation".to_owned();
+        assert!(matches!(
+            store
+                .begin_profile_allocation(&project.id, fresh.clone())
+                .await
+                .unwrap_err(),
+            ProjectStoreError::ProfileAllocationInProgress
+        ));
+        drop(store);
+
+        let reopened = SqliteProjectStore::open(&database_path).await.unwrap();
+        let connection = Connection::open(&database_path).unwrap();
+        let recovered_status: String = connection
+            .query_row(
+                "SELECT status FROM command_acknowledgements WHERE id = ?1",
+                [&command.command_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovered_status, "ambiguous");
+        connection
+            .execute(
+                "UPDATE command_acknowledgements
+                    SET updated_at_unix_ms = 1
+                  WHERE id = ?1",
+                [&command.command_id],
+            )
+            .unwrap();
+        drop(connection);
+        reopened
+            .reconcile_runtime_inventory(inventory(
+                PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS + 2,
+                vec![project_worker()],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        fresh.expected_project_version = reopened.get_project(&project.id).await.unwrap().version;
+        assert!(matches!(
+            reopened
+                .begin_profile_allocation(&project.id, fresh)
+                .await
+                .unwrap(),
+            BeginProfileAllocation::Started(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_profile_allocation_quarantines_named_runtime_in_project_workspace() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, orchestrator) = draft("workspace-1", "terminal-1");
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Implementer"),
+            })
+            .await
+            .unwrap();
+        let command = ConfirmProfileAllocation {
+            command_id: "named-stale-allocation".to_owned(),
+            actor: "local-user".to_owned(),
+            profile_id: profile.id,
+            expected_profile_version: profile.version,
+            expected_project_version: project.version,
+            objective: "Retain the command-named Herdr runtime.".to_owned(),
+            role: "implementer".to_owned(),
+            isolation_policy: IsolationPolicy::ProjectWorkspace,
+        };
+        store
+            .begin_profile_allocation(&project.id, command.clone())
+            .await
+            .unwrap();
+        store
+            .fail_profile_allocation(&command.command_id, "agent.start outcome was lost", true)
+            .await
+            .unwrap();
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE command_acknowledgements
+                    SET updated_at_unix_ms = 1
+                  WHERE id = ?1",
+                [&command.command_id],
+            )
+            .unwrap();
+        drop(connection);
+        let agent_name = yard_domain::herdr_agent_name(&command.command_id);
+        let mut outside = observed_worker(
+            "terminal-outside",
+            "workspace-2",
+            "tab-outside",
+            "pane-outside",
+            Some(provider_session("outside-session")),
+        );
+        outside.name = Some(agent_name.clone());
+        let mut matching = observed_worker(
+            "terminal-matching",
+            "workspace-1",
+            "tab-matching",
+            "pane-matching",
+            Some(provider_session("matching-session")),
+        );
+        matching.name = Some(agent_name);
+        store
+            .reconcile_runtime_inventory(inventory(
+                PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS + 1,
+                vec![
+                    observed_worker("terminal-1", "workspace-1", "tab-1", "pane-1", None),
+                    outside,
+                    matching,
+                ],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let state: (String, String, i64) = connection
+            .query_row(
+                "SELECT command.status, quarantine.terminal_id,
+                        EXISTS (
+                            SELECT 1 FROM worker_runtime_bindings binding
+                             WHERE binding.terminal_id = quarantine.terminal_id
+                        )
+                   FROM command_acknowledgements command
+                   JOIN quarantined_provisioning_runtime_bindings quarantine
+                     ON quarantine.command_id = command.id
+                  WHERE command.id = ?1",
+                [&command.command_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            ("ambiguous".to_owned(), "terminal-matching".to_owned(), 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_agent_blocked_allocation_releases_project_but_retains_quarantine() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, orchestrator) = draft("workspace-1", "terminal-1");
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Claude auto"),
+            })
+            .await
+            .unwrap();
+        let command = ConfirmProfileAllocation {
+            command_id: "b7204888-76c8-4159-bb53-5f24feaf7ac5".to_owned(),
+            actor: "local-user".to_owned(),
+            profile_id: profile.id,
+            expected_profile_version: profile.version,
+            expected_project_version: project.version,
+            objective: "Recover from a persisted Claude permission block.".to_owned(),
+            role: "implementer".to_owned(),
+            isolation_policy: IsolationPolicy::ProjectWorkspace,
+        };
+        store
+            .begin_profile_allocation(&project.id, command.clone())
+            .await
+            .unwrap();
+        let (_, mut blocked_runtime) = draft("workspace-1", "terminal-blocked");
+        blocked_runtime.tab_id = Some("w1:t5".to_owned());
+        blocked_runtime.pane_id = "pane-blocked".to_owned();
+        blocked_runtime.provider_session = Some(provider_session("claude-blocked-session"));
+        blocked_runtime.owns_tab = true;
+        store
+            .claim_provisioning_runtime(&command.command_id, blocked_runtime.clone())
+            .await
+            .unwrap();
+        store
+            .quarantine_provisioning_runtime(&command.command_id, blocked_runtime.clone())
+            .await
+            .unwrap();
+        store
+            .fail_profile_allocation(
+                &command.command_id,
+                "Herdr API returned agent_blocked: permission prompt requires operator input",
+                true,
+            )
+            .await
+            .unwrap();
+        age_command_for_reconciliation(&temp, &command.command_id);
+        let mut observed_blocked = observed_worker(
+            "terminal-blocked",
+            "workspace-1",
+            "w1:t5",
+            "pane-blocked",
+            Some(provider_session("claude-blocked-session")),
+        );
+        observed_blocked.name = Some(yard_domain::herdr_agent_name(&command.command_id));
+        store
+            .reconcile_runtime_inventory(inventory(
+                PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS + 1,
+                vec![
+                    observed_worker("terminal-1", "workspace-1", "tab-1", "pane-1", None),
+                    observed_blocked,
+                ],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        assert_legacy_agent_blocked_runtime_retained(&temp, &command.command_id);
+
+        let mut fresh = command;
+        fresh.command_id = "fresh-after-agent-blocked".to_owned();
         fresh.expected_project_version = store.get_project(&project.id).await.unwrap().version;
         assert!(matches!(
             store
                 .begin_profile_allocation(&project.id, fresh)
                 .await
-                .unwrap_err(),
-            ProjectStoreError::AssignmentInterventionInProgress
+                .unwrap(),
+            BeginProfileAllocation::Started(_)
         ));
     }
 
@@ -24179,6 +27046,178 @@ mod tests {
             )
             .unwrap();
         assert_eq!(objective_events, 1);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn profile_allocation_claim_blocks_providerless_worker_adoption() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, orchestrator) = draft("workspace-1", "terminal-1");
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Reviewer"),
+            })
+            .await
+            .unwrap();
+        let command = ConfirmProfileAllocation {
+            command_id: "reconciled-allocation-command".to_owned(),
+            actor: "local-user".to_owned(),
+            profile_id: profile.id.clone(),
+            expected_profile_version: profile.version,
+            expected_project_version: project.version,
+            objective: "Review the implementation.".to_owned(),
+            role: "reviewer".to_owned(),
+            isolation_policy: IsolationPolicy::ProjectWorkspace,
+        };
+        store
+            .begin_profile_allocation(&project.id, command.clone())
+            .await
+            .unwrap();
+        let (_, mut runtime) = draft("workspace-1", "terminal-2");
+        runtime.tab_id = Some("tab-2".to_owned());
+        runtime.pane_id = "pane-2".to_owned();
+        runtime.owns_tab = true;
+        runtime.status = ObservedStatus::Working;
+        runtime.state_change_sequence = 7;
+        runtime.revision = 9;
+        runtime.last_observed_at_unix_ms = 5;
+        store
+            .claim_provisioning_runtime(&command.command_id, runtime.clone())
+            .await
+            .unwrap();
+        let reconciliation = store
+            .reconcile_runtime_inventory(inventory(
+                5,
+                vec![
+                    observed_worker("terminal-1", "workspace-1", "tab-1", "pane-1", None),
+                    observed_worker("terminal-2", "workspace-1", "tab-2", "pane-2", None),
+                ],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reconciliation.adopted_workers, 0);
+
+        let persisted = store
+            .persist_runtime_allocation(&command.command_id, runtime)
+            .await
+            .unwrap();
+        let activated = store
+            .activate_profile_allocation(&command.command_id)
+            .await
+            .unwrap();
+        let matching_workers = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .filter(|candidate| {
+                candidate
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.terminal_id == "terminal-2")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            persisted.assignment.worker.profile_id.as_deref(),
+            Some(profile.id.as_str())
+        );
+        assert!(
+            persisted
+                .assignment
+                .worker
+                .runtime
+                .as_ref()
+                .unwrap()
+                .owns_tab
+        );
+        assert_eq!(
+            activated.assignment.lifecycle,
+            yard_domain::AssignmentLifecycle::Active
+        );
+        assert_eq!(matching_workers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn profile_allocation_rejects_providerless_claim_upgraded_to_bound_provider_session() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let shared_provider = provider_session("shared-provider-session");
+        let (project_draft, mut orchestrator) = draft("workspace-1", "terminal-1");
+        orchestrator.provider_session = Some(shared_provider.clone());
+        let project = store
+            .create_project(project_draft, orchestrator)
+            .await
+            .unwrap();
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Reviewer"),
+            })
+            .await
+            .unwrap();
+        let command = ConfirmProfileAllocation {
+            command_id: "provider-upgrade-collision".to_owned(),
+            actor: "local-user".to_owned(),
+            profile_id: profile.id,
+            expected_profile_version: profile.version,
+            expected_project_version: project.version,
+            objective: "Review the implementation.".to_owned(),
+            role: "reviewer".to_owned(),
+            isolation_policy: IsolationPolicy::ProjectWorkspace,
+        };
+        store
+            .begin_profile_allocation(&project.id, command.clone())
+            .await
+            .unwrap();
+        let (_, mut claimed_runtime) = draft("workspace-1", "terminal-2");
+        claimed_runtime.tab_id = Some("tab-2".to_owned());
+        claimed_runtime.pane_id = "pane-2".to_owned();
+        claimed_runtime.owns_tab = true;
+        store
+            .claim_provisioning_runtime(&command.command_id, claimed_runtime.clone())
+            .await
+            .unwrap();
+        let mut started_runtime = claimed_runtime;
+        started_runtime.provider_session = Some(shared_provider);
+
+        let error = store
+            .persist_runtime_allocation(&command.command_id, started_runtime)
+            .await
+            .unwrap_err();
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let rollback_state: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT
+                    EXISTS (
+                        SELECT 1 FROM provisioning_runtime_claims
+                         WHERE command_id = ?1
+                    ),
+                    (
+                        SELECT COUNT(*) FROM worker_runtime_bindings
+                         WHERE terminal_id = 'terminal-2'
+                    ),
+                    (
+                        SELECT COUNT(*) FROM assignments
+                         WHERE project_id = ?2
+                    )",
+                [&command.command_id, &project.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            error,
+            ProjectStoreError::RuntimeWorkerAlreadyBound
+        ));
+        assert_eq!(rollback_state, (1, 0, 0));
     }
 
     #[allow(clippy::too_many_lines)]
@@ -25543,7 +28582,7 @@ mod tests {
             .into_iter()
             .find(|candidate| candidate.worker.id == command.expected_orchestrator_worker_id)
             .unwrap();
-        assert_eq!(rebound.availability, WorkerAvailability::Unavailable);
+        assert_eq!(rebound.availability, WorkerAvailability::UnassignedLive);
     }
 
     #[tokio::test]
@@ -25823,6 +28862,16 @@ mod tests {
             )
             .await
             .unwrap();
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute(
+                "UPDATE worker_runtime_bindings
+                    SET process_state = 'exited', observed_status = 'unknown'
+                  WHERE worker_id = ?1",
+                [&active.worker.id],
+            )
+            .unwrap();
+        drop(connection);
         let candidate = store
             .list_worker_candidates()
             .await
@@ -25923,7 +28972,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn worker_projection_classifies_all_six_availability_states() {
+    async fn worker_projection_treats_provider_session_as_optional_identity() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
         let (project_draft, mut orchestrator) = draft("workspace-1", "terminal-orchestrator");
@@ -25971,10 +29020,10 @@ mod tests {
                         Some(provider_session("session-resumable")),
                     ),
                     observed_worker(
-                        "terminal-unavailable",
-                        "workspace-unavailable",
-                        "tab-unavailable",
-                        "pane-unavailable",
+                        "terminal-live-without-provider-session",
+                        "workspace-live-without-provider-session",
+                        "tab-live-without-provider-session",
+                        "pane-live-without-provider-session",
                         None,
                     ),
                     observed_worker(
@@ -26071,9 +29120,21 @@ mod tests {
                 WorkerAvailability::Assigned,
                 WorkerAvailability::UnassignedLive,
                 WorkerAvailability::Resumable,
-                WorkerAvailability::Unavailable,
                 WorkerAvailability::Ambiguous,
             ])
+        );
+        let live_without_provider_session = candidates
+            .workers
+            .iter()
+            .find(|candidate| {
+                candidate.worker.runtime.as_ref().is_some_and(|runtime| {
+                    runtime.terminal_id == "terminal-live-without-provider-session"
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            live_without_provider_session.availability,
+            WorkerAvailability::UnassignedLive
         );
         let assigned = candidates
             .workers
@@ -26109,6 +29170,16 @@ mod tests {
             )
             .await
             .unwrap();
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE worker_runtime_bindings
+                    SET process_state = 'exited', observed_status = 'unknown'
+                  WHERE worker_id = ?1",
+                [&active.worker.id],
+            )
+            .unwrap();
+        drop(connection);
         let candidate = store
             .list_worker_candidates()
             .await
@@ -26420,7 +29491,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedicated_adoption_requires_the_confirmed_provider_identity() {
+    async fn dedicated_adoption_requires_a_captured_provider_identity() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
         let profile = store
@@ -26483,26 +29554,119 @@ mod tests {
             0
         );
 
-        let mut confirmed_inventory = inventory(
+        let mut providerless_inventory = inventory(
             42,
             vec![observed_worker(
                 &started.terminal_id,
                 &started.workspace_id,
                 started.tab_id.as_deref().unwrap(),
                 &started.pane_id,
-                started.provider_session.clone(),
+                None,
             )],
             Vec::new(),
         );
-        confirmed_inventory.session = "yard-orchestrator".to_owned();
+        providerless_inventory.session = "yard-orchestrator".to_owned();
         assert_eq!(
             store
-                .reconcile_runtime_inventory(confirmed_inventory)
+                .reconcile_runtime_inventory(providerless_inventory)
+                .await
+                .unwrap()
+                .adopted_workers,
+            0
+        );
+        assert!(
+            store
+                .list_worker_candidates()
+                .await
+                .unwrap()
+                .workers
+                .iter()
+                .all(|candidate| candidate
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .is_none_or(|runtime| runtime.terminal_id != started.terminal_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn dedicated_adoption_supports_a_truly_providerless_runtime() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Providerless dedicated identity"),
+            })
+            .await
+            .unwrap();
+        let current = store.get_yard_orchestrator().await.unwrap();
+        let command = ProvisionYardOrchestrator {
+            command_id: "dedicated-providerless".to_owned(),
+            actor: "local-user".to_owned(),
+            profile_id: profile.id,
+            expected_profile_version: profile.version,
+            expected_orchestrator_version: current.version,
+        };
+        store
+            .begin_yard_orchestrator_runtime_provision(command.clone())
+            .await
+            .unwrap();
+        let (_, mut prepared) = draft("providerless-workspace", "providerless-terminal");
+        prepared.session = "yard-orchestrator".to_owned();
+        prepared.tab_id = Some("providerless-tab".to_owned());
+        prepared.pane_id = "providerless-pane".to_owned();
+        prepared.provider_session = None;
+        prepared.process_state = RuntimeProcessState::Unknown;
+        prepared.status = ObservedStatus::Unknown;
+        prepared.owns_tab = true;
+        store
+            .claim_provisioning_runtime(&command.command_id, prepared.clone())
+            .await
+            .unwrap();
+        let mut started = prepared;
+        started.process_state = RuntimeProcessState::Running;
+        started.status = ObservedStatus::Idle;
+        started.last_observed_at_unix_ms = 40;
+        store
+            .confirm_dedicated_runtime_provision(&command.command_id, started.clone())
+            .await
+            .unwrap();
+
+        let mut providerless_inventory = inventory(
+            41,
+            vec![observed_worker(
+                &started.terminal_id,
+                &started.workspace_id,
+                started.tab_id.as_deref().unwrap(),
+                &started.pane_id,
+                None,
+            )],
+            Vec::new(),
+        );
+        providerless_inventory.session = "yard-orchestrator".to_owned();
+        assert_eq!(
+            store
+                .reconcile_runtime_inventory(providerless_inventory)
                 .await
                 .unwrap()
                 .adopted_workers,
             1
         );
+        let adopted = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| {
+                candidate
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.terminal_id == started.terminal_id)
+            })
+            .unwrap();
+        assert!(adopted.worker.runtime.unwrap().provider_session.is_none());
     }
 
     #[tokio::test]
@@ -27920,5 +31084,566 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    fn archive_command(project: &Project, command_id: &str) -> ArchiveProject {
+        ArchiveProject {
+            command_id: command_id.to_owned(),
+            actor: "local-user".to_owned(),
+            expected_project_version: project.version,
+            expected_orchestrator_worker_id: project.orchestrator.id.clone(),
+            expected_orchestrator_worker_version: project.orchestrator.version,
+            expected_orchestrator_runtime_version: project
+                .orchestrator
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.version),
+        }
+    }
+
+    fn project_automation(
+        project: &Project,
+        automation_id: &str,
+        schedule: &DailySchedule,
+    ) -> CreateAutomation {
+        CreateAutomation {
+            command_id: "create-archive-automation".to_owned(),
+            actor: "local-user".to_owned(),
+            automation_id: automation_id.to_owned(),
+            name: "Project status".to_owned(),
+            scope: AutomationScope::ProjectOrchestrator {
+                project_id: project.id.clone(),
+            },
+            placement: CanvasPlacement {
+                x: 100.0,
+                y: 120.0,
+                width: 240.0,
+                height: 140.0,
+            },
+            schedule: schedule.clone(),
+            selected_project_ids: vec![project.id.clone()],
+            prompt_template: "Summarize current status.".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_topology_keeps_central_and_archived_cleanup_in_one_territory() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (mut archived_draft, archived_runtime) = draft("wA", "wA:t2");
+        archived_draft.name = "BISImplementationTest".to_owned();
+        let archived_project = store
+            .create_project(archived_draft, archived_runtime)
+            .await
+            .unwrap();
+        store
+            .archive_project(
+                &archived_project.id,
+                archive_command(&archived_project, "archive-bis-runtime"),
+            )
+            .await
+            .unwrap();
+        store
+            .reconcile_runtime_inventory(inventory(
+                30,
+                vec![
+                    observed_worker(
+                        "wA:t1",
+                        "wA",
+                        "wA:tab-1",
+                        "wA:pane-1",
+                        Some(provider_session("central-session")),
+                    ),
+                    observed_worker("wA:t2", "wA", "tab-1", "pane-1", None),
+                ],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let central_candidate = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| {
+                candidate
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.terminal_id == "wA:t1")
+            })
+            .unwrap();
+        let current = store.get_yard_orchestrator().await.unwrap();
+        store
+            .configure_yard_orchestrator(ConfigureYardOrchestrator {
+                command_id: "configure-wa-central".to_owned(),
+                actor: "local-user".to_owned(),
+                worker_id: central_candidate.worker.id,
+                expected_worker_version: central_candidate.worker.version,
+                expected_orchestrator_version: current.version,
+                workflow_profile_version: None,
+            })
+            .await
+            .unwrap();
+
+        let topology = store.runtime_topology("herdr", "default").await.unwrap();
+        assert_eq!(topology.managed_workspaces.len(), 1);
+        let central = &topology.managed_workspaces[0];
+        assert_eq!(central.workspace_id, "wA");
+        assert_eq!(central.kind, ManagedRuntimeWorkspaceKind::YardCentral);
+        assert_eq!(central.label, "Yard central");
+        assert_eq!(central.occupants.len(), 1);
+        assert_eq!(central.occupants[0].terminal_id, "wA:t2");
+        assert_eq!(
+            central.occupants[0].label,
+            "Archived runtime—cleanup pending"
+        );
+        assert_eq!(
+            central.occupants[0].project_name.as_deref(),
+            Some("BISImplementationTest")
+        );
+    }
+
+    #[tokio::test]
+    async fn archiving_hides_project_releases_workspace_and_queues_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) = draft("archive-workspace", "archive-terminal");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        let command = archive_command(&project, "archive-project-1");
+
+        let archived = store
+            .archive_project(&project.id, command.clone())
+            .await
+            .unwrap();
+        assert_eq!(archived.project_id, project.id);
+        assert!(archived.cleanup_pending);
+        assert!(!archived.replayed);
+        assert!(store.list_projects().await.unwrap().projects.is_empty());
+        assert!(matches!(
+            store.get_project(&project.id).await,
+            Err(ProjectStoreError::ProjectNotFound)
+        ));
+
+        let candidate = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.worker.id == project.orchestrator.id)
+            .unwrap();
+        assert_eq!(candidate.availability, WorkerAvailability::Ended);
+        assert!(candidate.worker.runtime.is_none());
+
+        let cleanup = store
+            .claim_pending_runtime_cleanups(Some(&command.command_id), 10, 30_000)
+            .await
+            .unwrap();
+        assert_eq!(cleanup.jobs.len(), 1);
+        assert_eq!(cleanup.jobs[0].reason, "project_archive");
+
+        let replayed = store.archive_project(&project.id, command).await.unwrap();
+        assert!(replayed.replayed);
+        assert!(replayed.cleanup_pending);
+
+        let (replacement_draft, replacement_runtime) =
+            draft("archive-workspace", "replacement-terminal");
+        assert!(matches!(
+            store
+                .create_project(replacement_draft.clone(), replacement_runtime.clone())
+                .await
+                .unwrap_err(),
+            ProjectStoreError::RuntimeWorkspaceReserved
+        ));
+        store
+            .succeed_runtime_cleanup(&cleanup.jobs[0].id, &cleanup.jobs[0].claim_token)
+            .await
+            .unwrap();
+        let replacement = store
+            .create_project(replacement_draft, replacement_runtime)
+            .await
+            .unwrap();
+        assert_ne!(replacement.id, project.id);
+    }
+
+    #[tokio::test]
+    async fn deleting_archived_project_hides_its_orchestrator_and_replays() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) = draft("delete-project", "delete-project-terminal");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        store
+            .archive_project(
+                &project.id,
+                archive_command(&project, "archive-before-project-delete"),
+            )
+            .await
+            .unwrap();
+        let command = DeleteProject {
+            command_id: "delete-project-command".to_owned(),
+            actor: "local-user".to_owned(),
+        };
+
+        let deleted = store
+            .delete_project(&project.id, command.clone())
+            .await
+            .unwrap();
+        assert_eq!(deleted.project_id, project.id);
+        assert_eq!(deleted.orchestrator_worker_id, project.orchestrator.id);
+        assert!(deleted.cleanup_pending);
+        assert!(!deleted.replayed);
+        assert!(
+            store
+                .list_worker_candidates()
+                .await
+                .unwrap()
+                .workers
+                .iter()
+                .all(|candidate| candidate.worker.id != project.orchestrator.id)
+        );
+
+        let replayed = store.delete_project(&project.id, command).await.unwrap();
+        assert!(replayed.replayed);
+        assert!(matches!(
+            store
+                .delete_project(
+                    &project.id,
+                    DeleteProject {
+                        command_id: "different-project-delete".to_owned(),
+                        actor: "local-user".to_owned(),
+                    },
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::ProjectAlreadyDeleted
+        ));
+    }
+
+    #[tokio::test]
+    async fn deleting_worker_requires_an_ended_session_and_hides_history() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        store
+            .reconcile_runtime_inventory(inventory(
+                50,
+                vec![observed_worker(
+                    "delete-worker-terminal",
+                    "delete-worker-workspace",
+                    "delete-worker-tab",
+                    "delete-worker-pane",
+                    Some(provider_session("delete-worker-session")),
+                )],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let candidate = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| {
+                candidate
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.terminal_id == "delete-worker-terminal")
+            })
+            .unwrap();
+        assert!(matches!(
+            store
+                .delete_worker(
+                    &candidate.worker.id,
+                    DeleteWorker {
+                        command_id: "delete-running-worker".to_owned(),
+                        actor: "local-user".to_owned(),
+                        expected_worker_version: candidate.worker.version,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::WorkerNotEnded
+        ));
+        let ended = store
+            .end_worker_session(
+                &candidate.worker.id,
+                EndWorkerSession {
+                    command_id: "end-before-worker-delete".to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_worker_version: candidate.worker.version,
+                    expected_runtime_version: candidate
+                        .worker
+                        .runtime
+                        .as_ref()
+                        .map(|runtime| runtime.version),
+                },
+            )
+            .await
+            .unwrap();
+        let command = DeleteWorker {
+            command_id: "delete-ended-worker".to_owned(),
+            actor: "local-user".to_owned(),
+            expected_worker_version: ended.worker.version,
+        };
+
+        let deleted = store
+            .delete_worker(&candidate.worker.id, command.clone())
+            .await
+            .unwrap();
+        assert_eq!(deleted.worker_id, candidate.worker.id);
+        assert!(deleted.cleanup_pending);
+        assert!(!deleted.replayed);
+        assert!(
+            store
+                .list_worker_candidates()
+                .await
+                .unwrap()
+                .workers
+                .iter()
+                .all(|worker| worker.worker.id != candidate.worker.id)
+        );
+        assert!(
+            store
+                .delete_worker(&candidate.worker.id, command)
+                .await
+                .unwrap()
+                .replayed
+        );
+    }
+
+    #[tokio::test]
+    async fn archiving_rejects_active_assignments_without_mutation() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, _) = create_active_assignment(&store).await;
+        let project = store.get_project(&project_id).await.unwrap();
+
+        let error = store
+            .archive_project(
+                &project.id,
+                archive_command(&project, "archive-active-project"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProjectStoreError::ProjectHasArchiveDependencies
+        ));
+        assert_eq!(store.get_project(&project.id).await.unwrap().id, project.id);
+    }
+
+    #[tokio::test]
+    async fn archiving_rejects_unfinished_member_handoffs_targeting_project() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (source_project, source_assignment, target_project) =
+            create_handoff_fixture(&store).await;
+        let handoff = handoff_command(
+            "member-handoff-blocks-archive",
+            &source_project,
+            &source_assignment,
+            &target_project,
+            HandoffTargetRole::Member,
+        );
+        store
+            .begin_worker_handoff(&source_project.id, &source_assignment.id, handoff)
+            .await
+            .unwrap();
+        let target_project = store.get_project(&target_project.id).await.unwrap();
+
+        let error = store
+            .archive_project(
+                &target_project.id,
+                archive_command(&target_project, "archive-handoff-target"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProjectStoreError::ProjectArchiveHandoffInProgress
+        ));
+        assert_eq!(
+            store.get_project(&target_project.id).await.unwrap().id,
+            target_project.id
+        );
+    }
+
+    #[tokio::test]
+    async fn archiving_waits_for_snapshot_collection_after_delivery() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) = draft("snapshot-archive", "snapshot-archive-terminal");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        let node_id = Uuid::now_v7().to_string();
+        let node_folder = temp.path().join("knowledge").join(&node_id);
+        let node = store
+            .create_coordination_node(
+                &node_id,
+                None,
+                Some(node_folder.to_string_lossy().into_owned()),
+                create_node_command(
+                    "create-archive-snapshot-node",
+                    CoordinationNodeKind::KnowledgeStore,
+                    vec![project.id.clone()],
+                ),
+            )
+            .await
+            .unwrap()
+            .node;
+        let snapshot_id = Uuid::now_v7().to_string();
+        let snapshot_folder = node_folder.join("snapshots").join(&snapshot_id);
+        store
+            .create_coordination_snapshot(
+                &node_id,
+                &snapshot_id,
+                snapshot_folder.to_string_lossy().into_owned(),
+                vec![SnapshotProjectFolder {
+                    project_id: project.id.clone(),
+                    folder_path: snapshot_folder
+                        .join("projects")
+                        .join(&project.id)
+                        .to_string_lossy()
+                        .into_owned(),
+                }],
+                RequestCoordinationSnapshot {
+                    command_id: "request-archive-snapshot".to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_node_version: node.version,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .record_snapshot_project_delivery(
+                &snapshot_id,
+                &project.id,
+                SnapshotDeliveryResult::Submitted {
+                    runtime_status: "accepted".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = store
+            .archive_project(
+                &project.id,
+                archive_command(&project, "archive-before-collection"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectStoreError::ProjectArchiveSnapshotCollectionPending
+        ));
+        assert_eq!(store.get_project(&project.id).await.unwrap().id, project.id);
+
+        store
+            .record_snapshot_project_collected(&snapshot_id, &project.id)
+            .await
+            .unwrap();
+        let archived = store
+            .archive_project(
+                &project.id,
+                archive_command(&project, "archive-after-collection"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(archived.project_id, project.id);
+    }
+
+    #[tokio::test]
+    async fn archiving_rejects_automation_dependencies_without_mutation() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) = draft("automation-archive", "automation-terminal");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        let automation_id = Uuid::now_v7().to_string();
+        let schedule = DailySchedule {
+            hour: 9,
+            minute: 30,
+            timezone: "UTC".to_owned(),
+        };
+        let created = store
+            .create_automation(project_automation(&project, &automation_id, &schedule), 100)
+            .await
+            .unwrap();
+
+        let definition_error = store
+            .archive_project(
+                &project.id,
+                archive_command(&project, "archive-automation-definition"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            definition_error,
+            ProjectStoreError::ProjectHasArchiveDependencies
+        ));
+
+        let run_id = Uuid::now_v7().to_string();
+        store
+            .create_manual_automation_run(
+                RunAutomationNow {
+                    command_id: "run-archive-automation".to_owned(),
+                    actor: "local-user".to_owned(),
+                    automation_id: automation_id.clone(),
+                    expected_version: created.automation.version,
+                },
+                &run_id,
+                "dispatch-archive-automation",
+            )
+            .await
+            .unwrap();
+        store
+            .update_automation(
+                UpdateAutomation {
+                    command_id: "retarget-archive-automation".to_owned(),
+                    actor: "local-user".to_owned(),
+                    automation_id,
+                    expected_version: created.automation.version,
+                    name: "Yard status".to_owned(),
+                    scope: AutomationScope::YardOrchestrator,
+                    schedule,
+                    selected_project_ids: Vec::new(),
+                    prompt_template: "Summarize Yard status.".to_owned(),
+                },
+                Some(200),
+            )
+            .await
+            .unwrap();
+
+        let pending_run_error = store
+            .archive_project(
+                &project.id,
+                archive_command(&project, "archive-pending-automation-run"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            pending_run_error,
+            ProjectStoreError::ProjectHasArchiveDependencies
+        ));
+
+        store
+            .mark_automation_run_failed(&run_id, "Dispatch outcome is unknown.", true)
+            .await
+            .unwrap();
+        let ambiguous_run_error = store
+            .archive_project(
+                &project.id,
+                archive_command(&project, "archive-ambiguous-automation-run"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            ambiguous_run_error,
+            ProjectStoreError::ProjectHasArchiveDependencies
+        ));
+        assert_eq!(store.get_project(&project.id).await.unwrap().id, project.id);
     }
 }

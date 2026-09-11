@@ -1100,6 +1100,48 @@ select:focus-visible {
   background: var(--blue);
 }
 
+.runtime-workspace-region[data-managed-kind="yard_central"] {
+  --status-color: #c64b3c;
+  --project-accent: #c64b3c;
+  border-style: solid;
+  background: color-mix(in srgb, #c64b3c 10%, transparent);
+}
+
+.runtime-workspace-region[data-managed-kind="yard_central"]
+  .workspace-region__index {
+  background: #c64b3c;
+}
+
+.runtime-workspace-region[data-managed-kind="cleanup_pending"] {
+  --status-color: #d99832;
+  --project-accent: #d99832;
+  background: color-mix(in srgb, #d99832 12%, transparent);
+}
+
+.runtime-workspace-region[data-managed-kind="cleanup_pending"]
+  .workspace-region__index {
+  background: #d99832;
+}
+
+.runtime-workspace-region[data-managed-kind="provisioning"] {
+  --status-color: #3178a8;
+  --project-accent: #3178a8;
+  border-style: dashed;
+  background: color-mix(in srgb, #3178a8 10%, transparent);
+}
+
+.runtime-workspace-region[data-managed-kind="quarantined"] {
+  --status-color: #9a5a9e;
+  --project-accent: #9a5a9e;
+  border-style: dashed;
+  background: color-mix(in srgb, #9a5a9e 12%, transparent);
+}
+
+.runtime-workspace-region[data-managed-kind="quarantined"]
+  .workspace-region__index {
+  background: #9a5a9e;
+}
+
 .worker-marker[data-draggable="true"] {
   cursor: grab;
 }
@@ -2819,11 +2861,18 @@ html[data-yard-allocation-dragging="true"]
   margin: 7px 0 0;
 }
 
+.inspector-action-note {
+  color: var(--muted-ink);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .disposition-actions .awaiting-disposition {
   margin: 0 0 4px;
 }
 
-.disposition-actions .destructive-button {
+.disposition-actions .destructive-button,
+.disposition-actions .secondary-button {
   width: 100%;
 }
 
@@ -3329,9 +3378,7 @@ html[data-yard-allocation-dragging="true"]
 }
 
 .chat-message[data-kind="user"] {
-  margin-left: auto;
   border-left-color: var(--blue);
-  background: var(--blue-soft);
 }
 
 .chat-message[data-kind="system"] {
@@ -3354,7 +3401,16 @@ html[data-yard-allocation-dragging="true"]
 }
 
 .chat-message header strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   font-size: 10px;
+}
+
+.chat-message[data-kind="user"] header strong {
+  color: var(--blue);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .chat-message header small {
@@ -3374,8 +3430,168 @@ html[data-yard-allocation-dragging="true"]
 }
 
 .chat-message[data-kind="agent"] p {
-  font-family: "IBM Plex Mono", monospace;
-  font-size: 10px;
+  font-size: 12px;
+}
+
+.chat-message[data-kind="agent"],
+.chat-message[data-kind="user"] {
+  margin-bottom: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.chat-message[data-kind="agent"] > header {
+  margin: 0;
+  padding: 1px 2px 5px;
+}
+
+.agent-output {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+
+.agent-output__entry {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--teal);
+  background: var(--paper);
+  box-shadow: 0 1px 4px rgba(23, 32, 30, 0.08);
+}
+
+.agent-output__entry[data-kind="question"] {
+  border-color: #aac5df;
+  border-left: 3px solid var(--blue);
+  background: var(--blue-soft);
+}
+
+.agent-output__entry > summary {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 14px 14px auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 10px;
+  color: var(--ink);
+  cursor: pointer;
+  list-style: none;
+}
+
+.agent-output__entry > summary::-webkit-details-marker {
+  display: none;
+}
+
+.agent-output__entry > summary:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: -2px;
+}
+
+.agent-output__entry > summary > svg {
+  flex: 0 0 auto;
+}
+
+.agent-output__entry > summary > svg:first-child {
+  color: var(--muted);
+  transition: transform 140ms ease;
+}
+
+.agent-output__entry[open] > summary > svg:first-child {
+  transform: rotate(90deg);
+}
+
+.agent-output__entry[data-kind="question"] > summary > svg:nth-child(2),
+.agent-output__entry[data-kind="question"] > summary strong {
+  color: var(--blue);
+}
+
+.agent-output__entry[data-kind="answer"] > summary > svg:nth-child(2),
+.agent-output__entry[data-kind="answer"] > summary strong {
+  color: var(--teal);
+}
+
+.agent-output__entry > summary strong {
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.agent-output__entry > summary span {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-output__entry > summary small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font: 8px/1.2 "IBM Plex Mono", monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-output__question-text,
+.agent-output__entry-body,
+.agent-output__raw {
+  margin: 0;
+  padding: 10px 12px;
+  border-top: 1px solid var(--line);
+}
+
+.agent-output__question-text,
+.agent-output__final-answer p {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.agent-output__entry-body,
+.agent-output__final-answer,
+.agent-output__total-output {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+}
+
+.agent-output__entry-body {
+  gap: 12px;
+}
+
+.agent-output__final-answer strong,
+.agent-output__total-output strong {
+  color: var(--teal);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.agent-output__final-answer p,
+.agent-output__total-output pre,
+.agent-output__raw {
+  margin: 0;
+}
+
+.agent-output__total-output pre,
+.agent-output__raw {
+  max-height: 28rem;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  background: var(--surface-muted);
+  font: 10px/1.5 "IBM Plex Mono", monospace;
+  white-space: pre-wrap;
+}
+
+.agent-output__raw {
+  border: 0;
+  border-top: 1px solid var(--line);
 }
 
 .chat-composer {
@@ -3993,8 +4209,10 @@ html[data-yard-allocation-dragging="true"]
 
 .agent-workspace-content {
   grid-area: content;
+  display: grid;
   min-width: 0;
   min-height: 0;
+  grid-template-rows: minmax(0, 1fr);
   overflow: hidden;
   background: var(--surface-muted);
 }

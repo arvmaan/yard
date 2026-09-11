@@ -10,24 +10,25 @@ use axum::{
 use serde::Serialize;
 use tokio::sync::watch;
 use yard_domain::{
-    AgentProfile, AgentProfiles, Artifact, ArtifactContent, Assignments, Automation,
-    AutomationCommandResult, AutomationRun, AutomationRunCommandResult, AutomationRuns,
-    Automations, ConfigureYardOrchestrator, ConfiguredYardOrchestrator, ConfirmProfileAllocation,
-    ConfirmWorkerAllocation, ConfirmWorkerHandoff, ConfirmedAllocation, ConfirmedProjectCreation,
-    ConfirmedWorkerHandoff, CoordinationNode, CoordinationNodeCommandResult,
-    CoordinationNodePromptAcknowledgement, CoordinationNodeRoute, CoordinationNodeRoutes,
-    CoordinationNodeTerminalOutput, CoordinationNodes, CoordinationSnapshot, CoordinationSnapshots,
-    CreateAgentProfile, CreateAutomation, CreateCoordinationNode, CreateProject,
-    CreateProjectFromProfile, CreateProjectRelationship, CreateWorkerProfile,
-    CreateWorkspaceProjectFromProfile, CreatedProjectRelationship, DeleteProjectRelationship,
-    DeletedProjectRelationship, EndWorkerSession, EndedWorkerSession,
+    AgentProfile, AgentProfiles, ArchiveProject, ArchivedProject, Artifact, ArtifactContent,
+    Assignments, Automation, AutomationCommandResult, AutomationRun, AutomationRunCommandResult,
+    AutomationRuns, Automations, ConfigureYardOrchestrator, ConfiguredYardOrchestrator,
+    ConfirmProfileAllocation, ConfirmWorkerAllocation, ConfirmWorkerHandoff, ConfirmedAllocation,
+    ConfirmedProjectCreation, ConfirmedWorkerHandoff, CoordinationNode,
+    CoordinationNodeCommandResult, CoordinationNodePromptAcknowledgement, CoordinationNodeRoute,
+    CoordinationNodeRoutes, CoordinationNodeTerminalOutput, CoordinationNodes,
+    CoordinationSnapshot, CoordinationSnapshots, CreateAgentProfile, CreateAutomation,
+    CreateCoordinationNode, CreateProject, CreateProjectFromProfile, CreateProjectRelationship,
+    CreateWorkerProfile, CreateWorkspaceProjectFromProfile, CreatedProjectRelationship,
+    DeleteProject, DeleteProjectRelationship, DeleteWorker, DeletedProject,
+    DeletedProjectRelationship, DeletedWorker, EndWorkerSession, EndedWorkerSession,
     OrchestratorPromptAcknowledgement, OrchestratorTerminalOutput, OrchestratorWorkflowProfile,
     OrchestratorWorkflowProfiles, Project, ProjectRelationships, Projects, PromptAcknowledgement,
     ProvisionCoordinationNode, ProvisionYardOrchestrator, RecordCompletionReceipt,
     RecordedCompletionReceipt, RecoverYardOrchestrator, RecoveredYardOrchestrator,
     ReplaceProjectOrchestrator, ReplacedProjectOrchestrator, RequestCoordinationSnapshot,
     ResetOrchestratorWorkflowProfile, RunAutomationNow, RuntimeInventory, RuntimeSessions,
-    SendAssignmentPrompt, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
+    RuntimeTopology, SendAssignmentPrompt, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
     SendOrchestratorPrompt, SendYardOrchestratorPrompt, SendYardOrchestratorRoute,
     SetAutomationPaused, TerminalOutput, TokenSpendSettings, TransferProjectOrchestrator,
     TransferredProjectOrchestrator, UpdateAgentProfile, UpdateAutomation,
@@ -338,6 +339,10 @@ pub(crate) fn router_with_reconciliation_and_shutdown(
             get(inventory),
         )
         .route(
+            "/api/v1/runtimes/herdr/sessions/{session}/topology",
+            get(runtime_topology),
+        )
+        .route(
             "/api/v1/runtimes/herdr/sessions/{session}/terminals/{terminal_id}/open-ghostty",
             axum::routing::post(open_terminal_in_ghostty),
         )
@@ -363,7 +368,19 @@ pub(crate) fn router_with_reconciliation_and_shutdown(
             "/api/v1/workers/{worker_id}/end-session",
             axum::routing::post(end_worker_session),
         )
+        .route(
+            "/api/v1/workers/{worker_id}/delete",
+            axum::routing::post(delete_worker),
+        )
         .route("/api/v1/projects/{project_id}", get(get_project))
+        .route(
+            "/api/v1/projects/{project_id}/archive",
+            axum::routing::post(archive_project),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/delete",
+            axum::routing::post(delete_project),
+        )
         .route(
             "/api/v1/projects/{project_id}/orchestrator",
             put(transfer_project_orchestrator),
@@ -1021,6 +1038,18 @@ async fn inventory(
         .map_err(ApiError::from)
 }
 
+async fn runtime_topology(
+    State(state): State<AppState>,
+    Path(session): Path<String>,
+) -> Result<NoStoreJson<RuntimeTopology>, ApiError> {
+    state
+        .store
+        .runtime_topology("herdr", &session)
+        .await
+        .map(NoStoreJson)
+        .map_err(|error| runtime_topology_store_error(&error))
+}
+
 #[derive(Serialize)]
 struct ExternalTerminalLaunch {
     application: &'static str,
@@ -1171,6 +1200,32 @@ async fn get_project(
         .map_err(ApiError::from)
 }
 
+async fn archive_project(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(command): Json<ArchiveProject>,
+) -> Result<NoStoreJson<ArchivedProject>, ApiError> {
+    state
+        .projects
+        .archive(&project_id, command)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn delete_project(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(command): Json<DeleteProject>,
+) -> Result<NoStoreJson<DeletedProject>, ApiError> {
+    state
+        .projects
+        .delete(&project_id, command)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
 async fn update_project_placement(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -1227,6 +1282,19 @@ async fn end_worker_session(
     state
         .worker_sessions
         .end(&worker_id, command)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn delete_worker(
+    State(state): State<AppState>,
+    Path(worker_id): Path<String>,
+    Json(command): Json<DeleteWorker>,
+) -> Result<NoStoreJson<DeletedWorker>, ApiError> {
+    state
+        .worker_sessions
+        .delete(&worker_id, command)
         .await
         .map(NoStoreJson)
         .map_err(ApiError::from)
@@ -1911,6 +1979,44 @@ impl From<ProjectServiceError> for ApiError {
                 code: "project_not_found",
                 message: "Yard project was not found".to_owned(),
             },
+            ProjectServiceError::Store(ProjectStoreError::ProjectAlreadyArchived) => Self {
+                status: StatusCode::CONFLICT,
+                code: "project_already_archived",
+                message: "Yard project is already archived".to_owned(),
+            },
+            ProjectServiceError::Store(ProjectStoreError::ProjectNotArchived) => Self {
+                status: StatusCode::CONFLICT,
+                code: "project_not_archived",
+                message: "Archive the project before deleting it".to_owned(),
+            },
+            ProjectServiceError::Store(ProjectStoreError::ProjectAlreadyDeleted) => Self {
+                status: StatusCode::CONFLICT,
+                code: "project_already_deleted",
+                message: "Yard project has already been deleted from the UI".to_owned(),
+            },
+            ProjectServiceError::Store(ProjectStoreError::ProjectHasArchiveDependencies) => Self {
+                status: StatusCode::CONFLICT,
+                code: "project_has_archive_dependencies",
+                message: "Complete or hand off active assignments and remove or retarget project \
+                          automations before archiving"
+                    .to_owned(),
+            },
+            ProjectServiceError::Store(ProjectStoreError::ProjectArchiveHandoffInProgress) => {
+                Self {
+                    status: StatusCode::CONFLICT,
+                    code: "project_archive_handoff_in_progress",
+                    message: "A worker handoff targeting this project is still in progress"
+                        .to_owned(),
+                }
+            }
+            ProjectServiceError::Store(
+                ProjectStoreError::ProjectArchiveSnapshotCollectionPending,
+            ) => Self {
+                status: StatusCode::CONFLICT,
+                code: "project_archive_snapshot_collection_pending",
+                message: "A coordination snapshot has not finished collecting this project"
+                    .to_owned(),
+            },
             ProjectServiceError::Store(ProjectStoreError::OrchestratorWorkflowProfileNotFound) => {
                 Self {
                     status: StatusCode::NOT_FOUND,
@@ -1978,6 +2084,15 @@ impl From<ProjectServiceError> for ApiError {
                         .to_owned(),
                 }
             }
+            ProjectServiceError::Store(
+                error @ (ProjectStoreError::WorkerVersionConflict { .. }
+                | ProjectStoreError::WorkerRuntimeVersionConflict { .. }
+                | ProjectStoreError::OrchestratorNotCurrent { .. }),
+            ) => Self {
+                status: StatusCode::CONFLICT,
+                code: "project_archive_conflict",
+                message: error.to_string(),
+            },
             ProjectServiceError::Store(ProjectStoreError::RuntimeWorkspaceMismatch) => Self {
                 status: StatusCode::CONFLICT,
                 code: "runtime_workspace_mismatch",
@@ -2486,12 +2601,14 @@ impl From<YardOrchestratorServiceError> for ApiError {
                 message: error.to_string(),
             },
             YardOrchestratorServiceError::RecoveryNotConfigured
-            | YardOrchestratorServiceError::RecoveryNotDedicated => Self {
+            | YardOrchestratorServiceError::RecoveryNotDedicated
+            | YardOrchestratorServiceError::RecoveryProfileMissing => Self {
                 status: StatusCode::CONFLICT,
                 code: "yard_orchestrator_recovery_unavailable",
                 message: error.to_string(),
             },
-            YardOrchestratorServiceError::RecoveryBindingMissing
+            YardOrchestratorServiceError::RecoveryLaunchPending
+            | YardOrchestratorServiceError::RecoveryBindingMissing
             | YardOrchestratorServiceError::RecoveryBindingAmbiguous
             | YardOrchestratorServiceError::RecoveryOwnershipChanged => Self {
                 status: StatusCode::CONFLICT,
@@ -2543,6 +2660,20 @@ impl From<WorkerSessionServiceError> for ApiError {
             ) => Self {
                 status: StatusCode::CONFLICT,
                 code: "worker_session_already_ended",
+                message: store_error.to_string(),
+            },
+            WorkerSessionServiceError::Store(store_error @ ProjectStoreError::WorkerNotEnded) => {
+                Self {
+                    status: StatusCode::CONFLICT,
+                    code: "worker_not_ended",
+                    message: store_error.to_string(),
+                }
+            }
+            WorkerSessionServiceError::Store(
+                store_error @ ProjectStoreError::WorkerAlreadyDeleted,
+            ) => Self {
+                status: StatusCode::CONFLICT,
+                code: "worker_already_deleted",
                 message: store_error.to_string(),
             },
             WorkerSessionServiceError::Store(
@@ -2679,6 +2810,26 @@ fn runtime_intervention_error(error: RuntimeInterventionError) -> ApiError {
         status,
         code,
         message,
+    }
+}
+
+fn runtime_topology_store_error(error: &ProjectStoreError) -> ApiError {
+    match error {
+        ProjectStoreError::InvalidRuntimeInventory => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "invalid_runtime_topology",
+            message: error.to_string(),
+        },
+        ProjectStoreError::DatabaseBusy => ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "database_busy",
+            message: "Yard storage is busy; retry the request".to_owned(),
+        },
+        _ => ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "storage_error",
+            message: "Yard runtime topology is unavailable".to_owned(),
+        },
     }
 }
 
@@ -3199,6 +3350,13 @@ fn allocation_store_command_error(error: ProjectStoreError) -> ApiError {
             code: "command_in_progress",
             message: "Allocation command is still in progress".to_owned(),
         },
+        ProjectStoreError::ProfileAllocationInProgress => ApiError {
+            status: StatusCode::CONFLICT,
+            code: "profile_allocation_in_progress",
+            message:
+                "Resolve the pending or ambiguous worker profile allocation before starting another."
+                    .to_owned(),
+        },
         ProjectStoreError::CommandPreviouslyFailed(message) => ApiError {
             status: StatusCode::CONFLICT,
             code: "command_previously_failed",
@@ -3292,12 +3450,14 @@ mod tests {
     };
     use tower::ServiceExt;
     use yard_domain::{
-        AutomationScope, CanvasPlacement, CoordinationNodeKind, CreateAutomation,
-        CreateCoordinationNode, CreateWorkerProfile, DailySchedule, FocusObservation,
-        ObservedStatus, ObservedWorker, OrchestratorWorkflowProfileValidationError,
+        ArchiveProject, AutomationScope, CanvasPlacement, ConfigureYardOrchestrator,
+        CoordinationNodeKind, CreateAutomation, CreateCoordinationNode, CreateProject,
+        CreateWorkerProfile, DailySchedule, FocusObservation, ObservedStatus, ObservedWorker,
+        OrchestratorWorkflowProfileValidationError, PaneObservation, ProjectRuntimeBinding,
         ProviderSessionRef, ProvisionCoordinationNode, RunAutomationNow, RuntimeInventory,
-        RuntimeSession, RuntimeSessions, UpdateTokenSpendSettings, WorkerProfileSpec,
-        WorkerRuntimeBinding, WorkspaceObservation, WorktreeObservation,
+        RuntimeObservationState, RuntimeProcessState, RuntimeSession, RuntimeSessions,
+        UpdateTokenSpendSettings, WorkerProfileSpec, WorkerRuntimeBinding, WorkspaceObservation,
+        WorktreeObservation,
     };
     use yard_herdr::HerdrError;
     use yard_store::{ProjectStoreError, SqliteProjectStore, YardStore};
@@ -3363,6 +3523,37 @@ mod tests {
         for error in errors {
             assert_eq!(error.status, StatusCode::CONFLICT);
             assert_eq!(error.code, "command_outcome_ambiguous");
+        }
+    }
+
+    #[derive(Default)]
+    struct RolledBackPromptRuntime {
+        start_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RuntimeControl for RolledBackPromptRuntime {
+        async fn provision_worker(
+            &self,
+            request: RuntimeProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            FakeRuntime.provision_worker(request).await
+        }
+
+        async fn start_prepared_worker(
+            &self,
+            _request: RuntimeProvisionRequest,
+            prepared: WorkerRuntimeBinding,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            if self.start_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(RuntimeProvisionError::AfterPreparation {
+                    message: "initial prompt was definitely unsent and the tab was closed"
+                        .to_owned(),
+                    ambiguous: false,
+                    started_runtime: None,
+                });
+            }
+            Ok(prepared)
         }
     }
 
@@ -3501,6 +3692,45 @@ mod tests {
                 ],
                 child_agents: Vec::new(),
             })
+        }
+    }
+
+    struct ProviderlessWorkerInventory;
+
+    #[async_trait]
+    impl InventorySource for ProviderlessWorkerInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            FakeInventory.sessions().await
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            let mut inventory = FakeInventory.inventory(session_name).await?;
+            for worker in &mut inventory.workers {
+                if matches!(
+                    worker.terminal_id.as_str(),
+                    "terminal-yard-promptallocationcommand" | "terminal-yard-allocationcommand1"
+                ) {
+                    worker.provider_session = None;
+                }
+            }
+            Ok(inventory)
+        }
+    }
+
+    struct ProviderlessRuntime;
+
+    #[async_trait]
+    impl RuntimeControl for ProviderlessRuntime {
+        async fn provision_worker(
+            &self,
+            request: RuntimeProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            let mut runtime = FakeRuntime.provision_worker(request).await?;
+            runtime.provider_session = None;
+            Ok(runtime)
         }
     }
 
@@ -3815,6 +4045,53 @@ mod tests {
                 .find(|worker| worker.terminal_id == "terminal-yard-replacecommand1")
                 .unwrap();
             replacement.provider_session = Some(provider_session("different-replacement-session"));
+            Ok(inventory)
+        }
+    }
+
+    #[derive(Default)]
+    struct ProviderlessRestoredOrchestratorInventory {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl InventorySource for ProviderlessRestoredOrchestratorInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            HandoffInventory.sessions().await
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            let mut inventory = HandoffInventory.inventory(session_name).await?;
+            let target = inventory
+                .workers
+                .iter_mut()
+                .find(|worker| worker.terminal_id == "terminal-target-orchestrator")
+                .unwrap();
+            target.provider_session = None;
+            if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                inventory
+                    .workers
+                    .retain(|worker| worker.terminal_id != "terminal-target-orchestrator");
+                inventory.panes.push(PaneObservation {
+                    runtime_id: "pane-target-orchestrator".to_owned(),
+                    terminal_id: "terminal-restored-shell".to_owned(),
+                    workspace_id: "workspace-2".to_owned(),
+                    tab_id: "tab-target-orchestrator".to_owned(),
+                    focused: false,
+                    cwd: Some("/tmp/target-api".to_owned()),
+                    foreground_cwd: Some("/tmp/target-api".to_owned()),
+                    label: None,
+                    provider: None,
+                    display_provider: None,
+                    status: ObservedStatus::Unknown,
+                    tokens: BTreeMap::new(),
+                    provider_session: None,
+                    revision: 0,
+                });
+            }
             Ok(inventory)
         }
     }
@@ -4586,6 +4863,29 @@ mod tests {
         )
     }
 
+    async fn providerless_test_router() -> (Router, TempDir) {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(ProviderlessRuntime);
+        let interactive = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        (
+            router(
+                Arc::new(ProviderlessWorkerInventory),
+                runtime,
+                interactive.clone(),
+                interactive,
+                store,
+                artifacts,
+            ),
+            temp,
+        )
+    }
+
     async fn test_router() -> (Router, TempDir) {
         test_router_with_source(Arc::new(FakeInventory)).await
     }
@@ -5209,6 +5509,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn maps_pending_profile_allocation_to_dedicated_conflict() {
+        let error = super::allocation_store_error(
+            yard_store::ProjectStoreError::ProfileAllocationInProgress,
+        );
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "profile_allocation_in_progress");
+        assert_eq!(
+            error.message,
+            "Resolve the pending or ambiguous worker profile allocation before starting another."
+        );
+    }
+
     #[tokio::test]
     async fn replacement_endpoint_claims_starts_verifies_and_cuts_over_before_cleanup() {
         let (app, temp, runtime) = handoff_test_router().await;
@@ -5289,6 +5603,41 @@ mod tests {
         assert_eq!(snapshot_count, 3);
         assert_eq!(receipt_count, 0);
         assert_eq!(old_binding_count, 0);
+    }
+
+    #[tokio::test]
+    async fn replacement_recovers_from_a_providerless_restored_shell() {
+        let (app, _temp, runtime) = handoff_test_router_with_source(
+            0,
+            Arc::new(ProviderlessRestoredOrchestratorInventory::default()),
+        )
+        .await;
+        let (uri, command, _project_id) = create_orchestrator_replacement_request(&app).await;
+
+        assert!(command["expected_orchestrator_runtime"]["provider_session"].is_null());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let replacement = response_json(response).await;
+        assert_eq!(
+            replacement["project"]["orchestrator"]["runtime"]["terminal_id"],
+            "terminal-yard-replacecommand1"
+        );
+        assert_eq!(runtime.start_calls.load(Ordering::SeqCst), 1);
+        let retirements = runtime.retirement_calls.lock().unwrap();
+        assert_eq!(retirements.len(), 1);
+        assert!(retirements[0].provider_session.is_none());
+        assert_eq!(retirements[0].terminal_id, "terminal-target-orchestrator");
     }
 
     #[tokio::test]
@@ -5428,6 +5777,152 @@ mod tests {
                 Some("yard-replacecommand1-session".to_owned())
             )
         );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn confirmed_prompt_rollback_releases_claim_for_fresh_allocation() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(RolledBackPromptRuntime::default());
+        let interactive = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            Arc::new(FakeInventory),
+            runtime.clone(),
+            interactive.clone(),
+            interactive,
+            store,
+            artifacts,
+        );
+        let project = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/projects")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(create_body("terminal-1")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let profile = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/worker-profiles")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(profile_body("Implementer")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let uri = format!(
+            "/api/v1/projects/{}/assignments",
+            project["id"].as_str().unwrap()
+        );
+        let failed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command_id": "rolled-back-allocation",
+                            "actor": "local-user",
+                            "profile_id": profile["id"],
+                            "expected_profile_version": profile["version"],
+                            "expected_project_version": project["version"],
+                            "objective": "Roll back a definitely unsent prompt.",
+                            "role": "implementer",
+                            "isolation_policy": "project_workspace"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response_json(failed).await["error"]["code"],
+            "worker_provision_failed"
+        );
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let released: (String, i64, i64) = connection
+            .query_row(
+                "SELECT command.status,
+                        EXISTS (
+                            SELECT 1 FROM provisioning_runtime_claims claim
+                             WHERE claim.command_id = command.id
+                        ),
+                        EXISTS (
+                            SELECT 1
+                              FROM quarantined_provisioning_runtime_bindings quarantine
+                             WHERE quarantine.command_id = command.id
+                        )
+                   FROM command_acknowledgements command
+                  WHERE command.id = 'rolled-back-allocation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(released, ("failed".to_owned(), 0, 0));
+        drop(connection);
+
+        let current = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/api/v1/projects/{}",
+                            project["id"].as_str().unwrap()
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let succeeded = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command_id": "allocation-command-1",
+                            "actor": "local-user",
+                            "profile_id": profile["id"],
+                            "expected_profile_version": profile["version"],
+                            "expected_project_version": current["version"],
+                            "objective": "Start a fresh worker.",
+                            "role": "implementer",
+                            "isolation_policy": "project_workspace"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(succeeded.status(), StatusCode::CREATED);
+        assert_eq!(runtime.start_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -6442,6 +6937,214 @@ mod tests {
         assert_eq!(adoption_event_count, 3);
     }
 
+    async fn archive_topology_test_project(store: &SqliteProjectStore) {
+        let runtime = WorkerRuntimeBinding {
+            adapter: "herdr".to_owned(),
+            session: "default".to_owned(),
+            workspace_id: "wA".to_owned(),
+            terminal_id: "wA:t2".to_owned(),
+            tab_id: Some("wA:tab-2".to_owned()),
+            pane_id: "wA:pane-2".to_owned(),
+            provider_session: None,
+            owns_tab: false,
+            observation_state: RuntimeObservationState::Observed,
+            process_state: RuntimeProcessState::Running,
+            status: ObservedStatus::Idle,
+            state_change_sequence: 1,
+            revision: 1,
+            version: 1,
+            last_observed_at_unix_ms: 1,
+        };
+        let project = store
+            .create_project(
+                CreateProject {
+                    name: "BISImplementationTest".to_owned(),
+                    runtime: ProjectRuntimeBinding {
+                        adapter: "herdr".to_owned(),
+                        session: "default".to_owned(),
+                        workspace_id: "wA".to_owned(),
+                    },
+                    orchestrator_observed_worker_id: "wA:t2".to_owned(),
+                    placement: CanvasPlacement {
+                        x: 80.0,
+                        y: 70.0,
+                        width: 322.0,
+                        height: 240.0,
+                    },
+                },
+                runtime,
+            )
+            .await
+            .unwrap();
+        store
+            .archive_project(
+                &project.id,
+                ArchiveProject {
+                    command_id: "archive-bis-http-topology".to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_project_version: project.version,
+                    expected_orchestrator_worker_id: project.orchestrator.id.clone(),
+                    expected_orchestrator_worker_version: project.orchestrator.version,
+                    expected_orchestrator_runtime_version: project
+                        .orchestrator
+                        .runtime
+                        .as_ref()
+                        .map(|runtime| runtime.version),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    fn topology_observed_worker(
+        terminal_id: &str,
+        tab_id: &str,
+        pane_id: &str,
+        provider_session: Option<ProviderSessionRef>,
+    ) -> ObservedWorker {
+        ObservedWorker {
+            runtime_id: terminal_id.to_owned(),
+            terminal_id: terminal_id.to_owned(),
+            workspace_id: "wA".to_owned(),
+            tab_id: tab_id.to_owned(),
+            pane_id: pane_id.to_owned(),
+            name: Some(terminal_id.to_owned()),
+            provider: Some("codex".to_owned()),
+            display_provider: Some("Codex".to_owned()),
+            status: ObservedStatus::Working,
+            focused: false,
+            launch_pending: false,
+            interactive_ready: true,
+            state_change_sequence: 2,
+            cwd: None,
+            foreground_cwd: None,
+            tokens: BTreeMap::new(),
+            provider_session,
+            revision: 2,
+        }
+    }
+
+    fn central_topology_inventory() -> RuntimeInventory {
+        RuntimeInventory {
+            adapter: "herdr".to_owned(),
+            session: "default".to_owned(),
+            runtime_version: "0.8.0".to_owned(),
+            protocol: 19,
+            observed_at_unix_ms: 30,
+            focus: FocusObservation::default(),
+            workspaces: vec![WorkspaceObservation {
+                runtime_id: "wA".to_owned(),
+                order: 0,
+                label: "wA".to_owned(),
+                focused: false,
+                active_tab_id: "wA:tab-1".to_owned(),
+                pane_count: 2,
+                tab_count: 2,
+                status: ObservedStatus::Working,
+                tokens: BTreeMap::new(),
+                worktree: None,
+            }],
+            tabs: Vec::new(),
+            panes: Vec::new(),
+            workers: vec![
+                topology_observed_worker(
+                    "wA:t1",
+                    "wA:tab-1",
+                    "wA:pane-1",
+                    Some(provider_session("central-http-session")),
+                ),
+                topology_observed_worker("wA:t2", "wA:tab-2", "wA:pane-2", None),
+            ],
+            child_agents: Vec::new(),
+        }
+    }
+
+    async fn configure_central_topology_worker(store: &SqliteProjectStore) {
+        store
+            .reconcile_runtime_inventory(central_topology_inventory())
+            .await
+            .unwrap();
+        let candidate = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| {
+                candidate
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.terminal_id == "wA:t1")
+            })
+            .unwrap();
+        let current = store.get_yard_orchestrator().await.unwrap();
+        store
+            .configure_yard_orchestrator(ConfigureYardOrchestrator {
+                command_id: "configure-central-http-topology".to_owned(),
+                actor: "local-user".to_owned(),
+                worker_id: candidate.worker.id,
+                expected_worker_version: candidate.worker.version,
+                expected_orchestrator_version: current.version,
+                workflow_profile_version: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    fn topology_test_router(temp: &TempDir, store: Arc<SqliteProjectStore>) -> Router {
+        let runtime = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        router(
+            Arc::new(FakeInventory),
+            runtime.clone(),
+            runtime.clone(),
+            runtime,
+            store,
+            artifacts,
+        )
+    }
+
+    #[tokio::test]
+    async fn runtime_topology_reports_central_workspace_and_archived_cleanup_occupant() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        archive_topology_test_project(store.as_ref()).await;
+        configure_central_topology_worker(store.as_ref()).await;
+        let app = topology_test_router(&temp, store);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/sessions/default/topology")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let topology = response_json(response).await;
+        assert_eq!(topology["managed_workspaces"][0]["workspace_id"], "wA");
+        assert_eq!(topology["managed_workspaces"][0]["kind"], "yard_central");
+        assert_eq!(
+            topology["managed_workspaces"][0]["occupants"][0]["terminal_id"],
+            "wA:t2"
+        );
+        assert_eq!(
+            topology["managed_workspaces"][0]["occupants"][0]["label"],
+            "Archived runtime—cleanup pending"
+        );
+        assert_eq!(
+            topology["managed_workspaces"][0]["occupants"][0]["project_name"],
+            "BISImplementationTest"
+        );
+    }
+
     #[tokio::test]
     async fn concurrent_inventory_gets_share_one_snapshot_and_reconciliation() {
         let source = Arc::new(CountingInventory {
@@ -6555,6 +7258,83 @@ mod tests {
         let projects = response_json(response).await;
 
         assert_eq!(projects["projects"][0]["id"], created["id"]);
+    }
+
+    #[tokio::test]
+    async fn archives_project_through_http_and_removes_it_from_active_routes() {
+        let (app, _temp) = test_router().await;
+        let created = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/projects")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(create_body("terminal-1")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let project_id = created["id"].as_str().unwrap().to_owned();
+        let archive = serde_json::json!({
+            "command_id": "archive-project-http",
+            "actor": "local-user",
+            "expected_project_version": created["version"],
+            "expected_orchestrator_worker_id": created["orchestrator"]["id"],
+            "expected_orchestrator_worker_version": created["orchestrator"]["version"],
+            "expected_orchestrator_runtime_version":
+                created["orchestrator"]["runtime"]["version"]
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/projects/{project_id}/archive"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(archive.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let archived = response_json(response).await;
+        assert_eq!(archived["project_id"], project_id);
+        assert_eq!(
+            archived["orchestrator_worker_id"],
+            created["orchestrator"]["id"]
+        );
+        assert_eq!(archived["replayed"], false);
+
+        let projects = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/projects")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(projects["projects"].as_array().unwrap().is_empty());
+
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/{project_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -7659,7 +8439,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         assert_eq!(
             response_json(response).await["error"]["code"],
-            "assignment_intervention_in_progress"
+            "profile_allocation_in_progress"
         );
         assert_eq!(runtime.provision_calls.load(Ordering::SeqCst), 1);
     }
@@ -8256,7 +9036,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn lists_and_assigns_an_existing_live_worker() {
-        let (app, _temp) = test_router().await;
+        let (app, _temp) = test_router_with_source(Arc::new(ProviderlessWorkerInventory)).await;
         let inventory_response = app
             .clone()
             .oneshot(
@@ -8795,7 +9575,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn confirms_allocation_and_replays_evidence_backed_completion() {
-        let (app, _temp) = test_router().await;
+        let (app, _temp) = providerless_test_router().await;
         let project_response = app
             .clone()
             .oneshot(
@@ -11298,10 +12078,30 @@ mod tests {
                 })
                 .unwrap()
         };
+        let set_worker_status = |worker_id: &str, status: &str| {
+            let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE worker_runtime_bindings
+                            SET observed_status = ?1
+                          WHERE worker_id = ?2",
+                        rusqlite::params![status, worker_id],
+                    )
+                    .unwrap(),
+                1
+            );
+        };
         assert_eq!(count_rows("yard_orchestrator_route_commands"), 0);
         assert_eq!(count_rows("assignment_prompt_commands"), 0);
         assert_eq!(count_rows("automation_runs"), 0);
 
+        let project_orchestrator_worker_id = store
+            .get_project(&project_id)
+            .await
+            .unwrap()
+            .orchestrator
+            .id;
         let assignment = store
             .list_project_assignments(&project_id)
             .await
@@ -11310,6 +12110,7 @@ mod tests {
             .into_iter()
             .find(|assignment| assignment.id == assignment_id)
             .unwrap();
+        let assignment_worker_id = assignment.worker.id.clone();
         let manual_prompt = serde_json::json!({
             "command_id": "manual-prompt-with-automatic-settings-off",
             "actor": "local-user",
@@ -11365,10 +12166,19 @@ mod tests {
             })
             .await
             .unwrap();
+        for status in ["working", "blocked", "unknown"] {
+            set_worker_status(&project_orchestrator_worker_id, status);
+            scheduler.run_due_once().await.unwrap();
+            assert_eq!(reporting.prompts.lock().unwrap().len(), 2);
+            assert_eq!(count_rows("yard_orchestrator_route_commands"), 0);
+            assert_eq!(count_rows("automatic_summary_request_watermarks"), 0);
+        }
+        set_worker_status(&project_orchestrator_worker_id, "idle");
         scheduler.run_due_once().await.unwrap();
         assert_eq!(reporting.prompts.lock().unwrap().len(), 3);
         assert_eq!(count_rows("yard_orchestrator_route_commands"), 1);
         assert_eq!(count_rows("assignment_prompt_commands"), 1);
+        assert_eq!(count_rows("automatic_summary_request_watermarks"), 1);
         assert_eq!(count_rows("automation_runs"), 1);
 
         let workers_only = store
@@ -11381,10 +12191,19 @@ mod tests {
             })
             .await
             .unwrap();
+        for status in ["working", "blocked", "unknown"] {
+            set_worker_status(&assignment_worker_id, status);
+            scheduler.run_due_once().await.unwrap();
+            assert_eq!(reporting.prompts.lock().unwrap().len(), 3);
+            assert_eq!(count_rows("assignment_prompt_commands"), 1);
+            assert_eq!(count_rows("automatic_summary_request_watermarks"), 1);
+        }
+        set_worker_status(&assignment_worker_id, "done");
         scheduler.run_due_once().await.unwrap();
         assert_eq!(reporting.prompts.lock().unwrap().len(), 4);
         assert_eq!(count_rows("yard_orchestrator_route_commands"), 1);
         assert_eq!(count_rows("assignment_prompt_commands"), 2);
+        assert_eq!(count_rows("automatic_summary_request_watermarks"), 2);
         assert_eq!(count_rows("automation_runs"), 1);
 
         store

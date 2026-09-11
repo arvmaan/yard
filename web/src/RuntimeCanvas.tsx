@@ -58,6 +58,8 @@ import type {
   CoordinationNode,
   CoordinationNodeKind,
   CoordinationNodeRoute,
+  ManagedRuntimeWorkspace,
+  ManagedRuntimeWorkspaceKind,
   ObservedChildAgent,
   ObservedStatus,
   ObservedWorker,
@@ -65,6 +67,7 @@ import type {
   ProjectRelationship,
   ProviderSessionRef,
   RuntimeInventory,
+  RuntimeTopology,
   StatusReport,
   Worker,
   WorkerRuntimeBinding,
@@ -141,6 +144,7 @@ interface RuntimeCanvasProps {
   projectStatusReports: ProjectStatusReports
   projects: Project[]
   runtimeLoading: boolean
+  runtimeTopology: RuntimeTopology | null
   selectedSession: string
   theme: YardTheme
   visualMode: MapVisualMode
@@ -208,6 +212,9 @@ interface WorkspaceNodeData extends Record<string, unknown> {
   workspace: WorkspaceObservation
   workerCount: number
   childAgentCount: number
+  managedKind?: ManagedRuntimeWorkspaceKind
+  managedLabel?: string
+  managedOccupantSummary?: string
 }
 
 interface OrchestratorNodeData extends Record<string, unknown> {
@@ -773,26 +780,50 @@ function ProjectRegion({ data, selected }: NodeProps<ProjectNode>) {
 }
 
 function WorkspaceRegion({ data, selected }: NodeProps<WorkspaceNode>) {
-  const { workspace, workerCount, childAgentCount } = data
+  const {
+    workspace,
+    workerCount,
+    childAgentCount,
+    managedKind,
+    managedLabel,
+    managedOccupantSummary,
+  } = data
+  const label = managedLabel ?? workspace.label
+  const workspaceType =
+    managedKind === 'yard_central'
+      ? 'Yard central territory'
+      : managedKind === 'coordination'
+        ? 'Yard coordination territory'
+        : managedKind === 'provisioning'
+          ? 'Runtime provisioning reservation'
+          : managedKind === 'quarantined'
+            ? 'Quarantined runtime reservation'
+        : managedKind === 'cleanup_pending'
+          ? 'Managed cleanup territory'
+          : 'Herdr workspace'
   return (
     <div
       className={`workspace-region runtime-workspace-region ${selected ? 'is-selected' : ''}`}
+      data-managed-kind={managedKind}
       data-status={workspace.status}
     >
       <div className="workspace-region__heading">
         <div className="workspace-region__title">
-          <span className="workspace-region__index">H</span>
-          <strong>{workspace.label}</strong>
+          <span className="workspace-region__index">
+            {managedKind === 'yard_central' ? 'C' : 'H'}
+          </span>
+          <strong>{label}</strong>
         </div>
         <span className="workspace-region__count">
           {workerCount} agent{workerCount === 1 ? '' : 's'}
           {childAgentCount > 0
             ? ` + ${childAgentCount} child${childAgentCount === 1 ? '' : 'ren'}`
             : ''}
+          {managedOccupantSummary ? ` / ${managedOccupantSummary}` : ''}
         </span>
       </div>
       <div className="workspace-region__meta">
-        <span>Herdr workspace</span>
+        <span>{workspaceType}</span>
         <span>{workspace.tab_count} tabs</span>
       </div>
     </div>
@@ -1436,6 +1467,48 @@ function observedWorkspace(
   )
 }
 
+function managedWorkspaceObservation(
+  managed: ManagedRuntimeWorkspace,
+  inventory: RuntimeInventory | null,
+  order: number,
+): WorkspaceObservation {
+  const observed = inventory?.workspaces.find(
+    (workspace) => workspace.runtime_id === managed.workspace_id,
+  )
+  if (observed) {
+    return { ...observed, label: managed.label }
+  }
+  return {
+    runtime_id: managed.workspace_id,
+    order,
+    label: managed.label,
+    focused: false,
+    active_tab_id: '',
+    pane_count: 0,
+    tab_count: 0,
+    status: 'unknown',
+    tokens: {},
+    worktree: null,
+  }
+}
+
+function managedWorkspaceOccupantSummary(
+  workspace: ManagedRuntimeWorkspace,
+): string {
+  const count = (kind: ManagedRuntimeWorkspace['occupants'][number]['kind']) =>
+    workspace.occupants.filter((occupant) => occupant.kind === kind).length
+  const cleanupPending = count('cleanup_pending')
+  const provisioning = count('provisioning')
+  const quarantined = count('quarantined')
+  return [
+    cleanupPending > 0 ? `${cleanupPending} cleanup pending` : '',
+    provisioning > 0 ? `${provisioning} provisioning` : '',
+    quarantined > 0 ? `${quarantined} quarantined` : '',
+  ]
+    .filter(Boolean)
+    .join(' / ')
+}
+
 function terminalIdentity(
   adapter: string,
   session: string,
@@ -1808,6 +1881,7 @@ function buildNodes(
   projectStatusReports: ProjectStatusReports,
   projects: Project[],
   runtimeLoading: boolean,
+  runtimeTopology: RuntimeTopology | null,
   selectedSession: string,
   visibleWorkers: ObservedWorker[],
   yardOrchestrator: YardOrchestrator | null,
@@ -1819,6 +1893,23 @@ function buildNodes(
     placement: CanvasPlacement,
   ) => void,
 ): RuntimeNode[] {
+  const activeTopology =
+    runtimeTopology?.session === selectedSession ? runtimeTopology : null
+  const managedWorkspaces = activeTopology?.managed_workspaces ?? []
+  const managedWorkspaceIds = new Set(
+    managedWorkspaces.map((workspace) => workspace.workspace_id),
+  )
+  const managedTerminalIdentities = new Set(
+    managedWorkspaces.flatMap((workspace) =>
+      workspace.occupants.map((occupant) =>
+        terminalIdentity(
+          activeTopology?.adapter ?? 'herdr',
+          activeTopology?.session ?? selectedSession,
+          occupant.terminal_id,
+        ),
+      ),
+    ),
+  )
   const yardOrchestratorTerminalIdentity = runtimeTerminalIdentity(
     yardOrchestrator?.worker?.runtime,
   )
@@ -1826,7 +1917,17 @@ function buildNodes(
     .map((node) => runtimeTerminalIdentity(node.worker?.runtime))
     .filter((identity): identity is string => identity !== null)
   const projectNodes = projects.flatMap((project): RuntimeNode[] => {
-    const workspace = observedWorkspace(project, inventory)
+    const projectWorkspaceInfrastructureManaged = managedWorkspaces.some(
+      (managed) =>
+        (managed.kind === 'yard_central' ||
+          managed.kind === 'coordination') &&
+        activeTopology?.adapter === project.runtime.adapter &&
+        activeTopology.session === project.runtime.session &&
+        managed.workspace_id === project.runtime.workspace_id,
+    )
+    const workspace = projectWorkspaceInfrastructureManaged
+      ? null
+      : observedWorkspace(project, inventory)
     const runtimePending =
       runtimeLoading &&
       (!selectedSession || project.runtime.session === selectedSession)
@@ -1852,6 +1953,9 @@ function buildNodes(
     if (yardOrchestratorTerminalIdentity) {
       assignedTerminalIdentities.add(yardOrchestratorTerminalIdentity)
     }
+    managedTerminalIdentities.forEach((identity) =>
+      assignedTerminalIdentities.add(identity),
+    )
     const workers = workspace && inventory
       ? visibleWorkers.filter(
           (worker) =>
@@ -2119,6 +2223,7 @@ function buildNodes(
     [
       yardOrchestratorTerminalIdentity,
       ...coordinationTerminalIdentities,
+      ...managedTerminalIdentities,
       ...projects
         .filter(
           (project) =>
@@ -2149,6 +2254,7 @@ function buildNodes(
       ? visibleWorkers.filter(
           (worker) =>
             !representedWorkspaceIds.has(worker.workspace_id) &&
+            !managedWorkspaceIds.has(worker.workspace_id) &&
             !representedTerminalIdentities.has(
               terminalIdentity(
                 inventory.adapter,
@@ -2184,6 +2290,7 @@ function buildNodes(
       ? inventory.workspaces.filter(
           (workspace) =>
             !representedWorkspaceIds.has(workspace.runtime_id) &&
+            !managedWorkspaceIds.has(workspace.runtime_id) &&
             (workersByWorkspace.get(workspace.runtime_id)?.length ?? 0) > 0,
         )
       : []
@@ -2278,8 +2385,166 @@ function buildNodes(
     columnBottoms[column] += height + 58
   })
 
+  const centralManagedWorkspace = managedWorkspaces.find(
+    (workspace) => workspace.kind === 'yard_central',
+  )
+  const renderedManagedWorkspaces = managedWorkspaces.filter(
+    (workspace) =>
+      workspace.kind !== 'coordination' &&
+      (workspace.kind === 'yard_central' ||
+        !representedWorkspaceIds.has(workspace.workspace_id)),
+  )
+  const managedWorkspaceNodes: RuntimeNode[] = []
+  const minimumProjectX =
+    projects.length > 0
+      ? Math.min(...projects.map((project) => project.placement.geometry.x))
+      : 440
+  const minimumProjectY =
+    projects.length > 0
+      ? Math.min(...projects.map((project) => project.placement.geometry.y))
+      : 88
+  const managedWorkspaceStartY = Math.max(...columnBottoms) + 58
+  let nonCentralWorkspaceIndex = 0
+  renderedManagedWorkspaces.forEach((managed, managedIndex) => {
+    const workspace = managedWorkspaceObservation(
+      managed,
+      inventory,
+      managedIndex,
+    )
+    const includeYardOrchestrator =
+      managed.kind === 'yard_central' && yardOrchestrator !== null
+    const yardWorker = includeYardOrchestrator
+      ? yardOrchestrator.worker
+      : null
+    const yardObserved = includeYardOrchestrator
+      ? observedRuntimeWorker(yardWorker?.runtime ?? null, inventory)
+      : null
+    const roots: ChildAgentRoot[] = [
+      ...(includeYardOrchestrator
+        ? [
+            {
+              nodeId: 'yard-orchestrator',
+              session:
+                yardObserved?.provider_session ??
+                yardWorker?.runtime?.provider_session ??
+                null,
+            },
+          ]
+        : []),
+    ]
+    const linkedChildren = linkedChildAgents(inventory, roots)
+    const treeLayout = layoutAgentTrees(
+      roots,
+      linkedChildren,
+      agentPositions,
+    )
+    const visibleAgentCount = roots.length + linkedChildren.length
+    const width = Math.max(350, treeLayout.minimumWidth)
+    const height = Math.max(
+      projectHeight(visibleAgentCount),
+      treeLayout.minimumHeight,
+    )
+    const workspaceNodeId = `workspace:${managed.workspace_id}`
+    const defaultPosition =
+      managed.kind === 'yard_central'
+        ? {
+            x: minimumProjectX - width - 48,
+            y: Math.min(220, Math.max(48, minimumProjectY - 40)),
+          }
+        : {
+            x: 32 + (nonCentralWorkspaceIndex % 3) * 430,
+            y:
+              managedWorkspaceStartY +
+              Math.floor(nonCentralWorkspaceIndex / 3) * (height + 58),
+          }
+    if (managed.kind !== 'yard_central') {
+      nonCentralWorkspaceIndex += 1
+    }
+    managedWorkspaceNodes.push({
+      id: workspaceNodeId,
+      type: 'workspace',
+      position:
+        workspacePositions[managed.workspace_id] ?? defaultPosition,
+      draggable: true,
+      dragHandle: '.workspace-region__heading',
+      style: { width, height },
+      deletable: false,
+      data: {
+        workspace,
+        workerCount: roots.length,
+        childAgentCount: linkedChildren.length,
+        managedKind: managed.kind,
+        managedLabel: managed.label,
+        managedOccupantSummary:
+          managedWorkspaceOccupantSummary(managed),
+      },
+      ariaLabel: `${managed.label}, managed ${managed.kind.replaceAll('_', ' ')}${managed.occupants.length > 0 ? `, ${managedWorkspaceOccupantSummary(managed)}` : ''}`,
+      focusable: true,
+    })
+    if (includeYardOrchestrator && yardOrchestrator) {
+      const runtimeState = resolvedRuntimeState(
+        yardWorker?.runtime ?? null,
+        yardObserved,
+      )
+      managedWorkspaceNodes.push({
+        id: 'yard-orchestrator',
+        type: 'yard-orchestrator',
+        parentId: workspaceNodeId,
+        extent: 'parent',
+        expandParent: false,
+        position:
+          treeLayout.positions.get('yard-orchestrator') ??
+          workerPosition(0),
+        draggable: true,
+        dragHandle: '.yard-hub-node__placement-handle',
+        style: {
+          height: WORKER_NODE_HEIGHT,
+          width: WORKER_NODE_WIDTH,
+          zIndex: 8,
+        },
+        deletable: false,
+        data: {
+          observed: yardObserved,
+          orchestrator: yardOrchestrator,
+        },
+        ariaLabel: yardWorker
+          ? `Superintendent, ${runtimeState.status}, process ${runtimeState.processState}`
+          : 'Superintendent, not configured',
+        focusable: true,
+      } satisfies YardOrchestratorNode)
+    }
+    linkedChildren.forEach(({ agent, parentNodeId }, childIndex) => {
+      const childId = childNodeId(agent)
+      managedWorkspaceNodes.push({
+        id: childId,
+        type: 'child-agent',
+        parentId: workspaceNodeId,
+        extent: 'parent',
+        expandParent: false,
+        draggable: false,
+        position:
+          treeLayout.positions.get(childId) ??
+          workerPosition(roots.length + childIndex),
+        style: {
+          height: CHILD_NODE_HEIGHT,
+          width: CHILD_NODE_WIDTH,
+          zIndex: 7,
+        },
+        deletable: false,
+        data: {
+          accent:
+            managed.kind === 'yard_central' ? '#c64b3c' : '#3178a8',
+          agent,
+          parentNodeId,
+        },
+        ariaLabel: `${childAgentLabel(agent)}, ${agent.provider} child agent, ${agent.status}`,
+        focusable: true,
+      } satisfies ChildAgentNode)
+    })
+  })
+
   const yardNodes: RuntimeNode[] = []
-  if (yardOrchestrator) {
+  if (yardOrchestrator && !centralManagedWorkspace) {
     const nodeId = 'yard-orchestrator'
     const worker = yardOrchestrator.worker
     const observed = observedRuntimeWorker(worker?.runtime ?? null, inventory)
@@ -2408,6 +2673,7 @@ function buildNodes(
   )
 
   return [
+    ...managedWorkspaceNodes,
     ...yardNodes,
     ...automationMapNodes,
     ...coordinationMapNodes,
@@ -2436,6 +2702,7 @@ export function RuntimeCanvas({
   projectStatusReports,
   projects,
   runtimeLoading,
+  runtimeTopology,
   selectedSession,
   theme,
   visualMode,
@@ -3245,6 +3512,14 @@ export function RuntimeCanvas({
       }
       if (node.type === 'workspace') {
         const data = node.data as WorkspaceNodeData
+        const accent =
+          data.managedKind === 'yard_central'
+            ? '#c64b3c'
+            : data.managedKind === 'quarantined'
+              ? '#9a5a9e'
+            : data.managedKind === 'cleanup_pending'
+              ? '#d99832'
+              : '#3178a8'
         const { width, height } = nodeDimensions(node, 350, projectHeight(1))
         const rect = { x: world.x, y: world.y, width, height }
         centreByNodeId.set(node.id, {
@@ -3252,11 +3527,11 @@ export function RuntimeCanvas({
           y: rect.y + rect.height / 2,
         })
         territories.push({
-          accent: '#3178a8',
+          accent,
           allocationTarget: false,
           buildings: [],
           kind: 'workspace',
-          label: data.workspace.label,
+          label: data.managedLabel ?? data.workspace.label,
           nodeId: node.id,
           rect,
           runtime: 'online',
@@ -3532,6 +3807,7 @@ export function RuntimeCanvas({
         projectStatusReports,
         projects,
         runtimeLoading,
+        runtimeTopology,
         selectedSession,
         visibleWorkers,
         yardOrchestrator,
@@ -3568,6 +3844,7 @@ export function RuntimeCanvas({
     projects,
     projectStatusReports,
     runtimeLoading,
+    runtimeTopology,
     selectedSession,
     setNodes,
     visibleWorkers,

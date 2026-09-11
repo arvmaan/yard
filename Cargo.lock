@@ -1503,6 +1503,7 @@ dependencies = [
 name = "yard-herdr"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -1554,6 +1555,7 @@ dependencies = [
  "async-trait",
  "fs2",
  "rusqlite",
+ "rustix",
  "serde_json",
  "tempfile",
  "thiserror",

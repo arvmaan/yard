@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use tracing::warn;
-use yard_domain::{EndWorkerSession, EndedWorkerSession};
+use yard_domain::{DeleteWorker, DeletedWorker, EndWorkerSession, EndedWorkerSession};
 use yard_store::{ProjectStoreError, YardStore};
 
 use crate::{allocation_service::RuntimeControl, runtime_cleanup_service::RuntimeCleanupService};
@@ -56,6 +56,24 @@ impl WorkerSessionService {
             }
         }
         Ok(ended)
+    }
+
+    /// Permanently remove an ended worker from normal Yard UI queries while
+    /// retaining durable audit and cleanup records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerSessionServiceError`] when the session is not ended,
+    /// was already deleted, is stale, or persistence fails.
+    pub async fn delete(
+        &self,
+        worker_id: &str,
+        command: DeleteWorker,
+    ) -> Result<DeletedWorker, WorkerSessionServiceError> {
+        self.store
+            .delete_worker(worker_id, command)
+            .await
+            .map_err(Into::into)
     }
 }
 

@@ -1,0 +1,143 @@
+{
+  "id": "yard:session:snapshot",
+  "result": {
+    "type": "session_snapshot",
+    "snapshot": {
+      "version": "0.8.2",
+      "protocol": 20,
+      "focused_workspace_id": "w20",
+      "focused_tab_id": "w20:t1",
+      "focused_pane_id": "w20:p1",
+      "workspaces": [
+        {
+          "workspace_id": "w20",
+          "number": 1,
+          "label": "protocol-20-project",
+          "focused": true,
+          "pane_count": 1,
+          "tab_count": 1,
+          "active_tab_id": "w20:t1",
+          "agent_status": "working",
+          "tokens": {
+            "yard_project": "protocol-20"
+          },
+          "worktree": {
+            "repo_key": "/tmp/protocol-20-project/.git",
+            "repo_name": "protocol-20-project",
+            "repo_root": "/tmp/protocol-20-project",
+            "checkout_path": "/tmp/protocol-20-project",
+            "is_linked_worktree": false
+          }
+        }
+      ],
+      "tabs": [
+        {
+          "tab_id": "w20:t1",
+          "workspace_id": "w20",
+          "number": 1,
+          "label": "Claude worker",
+          "focused": true,
+          "pane_count": 1,
+          "agent_status": "working"
+        }
+      ],
+      "panes": [
+        {
+          "pane_id": "w20:p1",
+          "terminal_id": "term_protocol20",
+          "workspace_id": "w20",
+          "tab_id": "w20:t1",
+          "focused": true,
+          "cwd": "/tmp/protocol-20-project",
+          "foreground_cwd": "/tmp/protocol-20-project",
+          "label": "Protocol 20 worker",
+          "agent": "claude",
+          "title": "Implement protocol compatibility",
+          "terminal_title": "Claude Code ◐",
+          "terminal_title_stripped": "Claude Code",
+          "display_agent": "Claude Code",
+          "agent_status": "working",
+          "state_labels": {
+            "working": "Implementing"
+          },
+          "tokens": {
+            "yard_role": "implementer"
+          },
+          "agent_session": {
+            "source": "herdr:claude",
+            "agent": "claude",
+            "kind": "id",
+            "value": "session_protocol20"
+          },
+          "scroll": {
+            "offset_from_bottom": 0,
+            "max_offset_from_bottom": 240,
+            "viewport_rows": 40
+          },
+          "revision": 42
+        }
+      ],
+      "layouts": [
+        {
+          "workspace_id": "w20",
+          "tab_id": "w20:t1",
+          "zoomed": false,
+          "area": {
+            "x": 0,
+            "y": 0,
+            "width": 120,
+            "height": 40
+          },
+          "focused_pane_id": "w20:p1",
+          "panes": [
+            {
+              "pane_id": "w20:p1",
+              "focused": true,
+              "rect": {
+                "x": 0,
+                "y": 0,
+                "width": 120,
+                "height": 40
+              }
+            }
+          ],
+          "splits": []
+        }
+      ],
+      "agents": [
+        {
+          "terminal_id": "term_protocol20",
+          "name": "yard-protocol20",
+          "agent": "claude",
+          "title": "Implement protocol compatibility",
+          "terminal_title": "Claude Code ◐",
+          "terminal_title_stripped": "Claude Code",
+          "display_agent": "Claude Code",
+          "agent_status": "working",
+          "screen_detection_skipped": true,
+          "state_labels": {
+            "working": "Implementing"
+          },
+          "tokens": {
+            "yard_role": "implementer"
+          },
+          "agent_session": {
+            "source": "herdr:claude",
+            "agent": "claude",
+            "kind": "id",
+            "value": "session_protocol20"
+          },
+          "workspace_id": "w20",
+          "tab_id": "w20:t1",
+          "pane_id": "w20:p1",
+          "focused": true,
+          "interactive_ready": true,
+          "state_change_seq": 73,
+          "cwd": "/tmp/protocol-20-project",
+          "foreground_cwd": "/tmp/protocol-20-project",
+          "revision": 42
+        }
+      ]
+    }
+  }
+}

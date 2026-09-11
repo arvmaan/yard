@@ -172,6 +172,86 @@ pub struct Projects {
     pub projects: Vec<Project>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveProject {
+    pub command_id: String,
+    pub actor: String,
+    #[serde(with = "crate::serde_u64")]
+    pub expected_project_version: u64,
+    pub expected_orchestrator_worker_id: String,
+    #[serde(with = "crate::serde_u64")]
+    pub expected_orchestrator_worker_version: u64,
+    #[serde(default, with = "crate::serde_u64::option")]
+    pub expected_orchestrator_runtime_version: Option<u64>,
+}
+
+impl ArchiveProject {
+    /// Normalize and validate a durable project archive command.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectValidationError`] when a required identifier is blank
+    /// or an optimistic version is zero.
+    pub fn normalize(mut self) -> Result<Self, ProjectValidationError> {
+        self.command_id =
+            bounded_required("command_id", &self.command_id, MAX_PROJECT_COMMAND_BYTES)?;
+        self.actor = bounded_required("actor", &self.actor, MAX_PROJECT_COMMAND_BYTES)?;
+        self.expected_orchestrator_worker_id = bounded_required(
+            "expected_orchestrator_worker_id",
+            &self.expected_orchestrator_worker_id,
+            MAX_PROJECT_COMMAND_BYTES,
+        )?;
+        if self.expected_project_version == 0
+            || self.expected_orchestrator_worker_version == 0
+            || self.expected_orchestrator_runtime_version == Some(0)
+        {
+            return Err(ProjectValidationError::InvalidVersion);
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedProject {
+    pub command_id: String,
+    pub project_id: String,
+    pub orchestrator_worker_id: String,
+    pub archived_at_unix_ms: u64,
+    pub cleanup_pending: bool,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteProject {
+    pub command_id: String,
+    pub actor: String,
+}
+
+impl DeleteProject {
+    /// Normalize and validate an irreversible project visibility deletion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectValidationError`] when a required identifier is blank
+    /// or oversized.
+    pub fn normalize(mut self) -> Result<Self, ProjectValidationError> {
+        self.command_id =
+            bounded_required("command_id", &self.command_id, MAX_PROJECT_COMMAND_BYTES)?;
+        self.actor = bounded_required("actor", &self.actor, MAX_PROJECT_COMMAND_BYTES)?;
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedProject {
+    pub command_id: String,
+    pub project_id: String,
+    pub orchestrator_worker_id: String,
+    pub deleted_at_unix_ms: u64,
+    pub cleanup_pending: bool,
+    pub replayed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateProject {
     pub name: String,
@@ -409,7 +489,7 @@ fn bounded_required(
 #[cfg(test)]
 mod tests {
     use super::{
-        CanvasPlacement, CreateProject, CreateProjectFromProfile,
+        ArchiveProject, CanvasPlacement, CreateProject, CreateProjectFromProfile,
         CreateWorkspaceProjectFromProfile, MAX_PROJECT_CWD_BYTES, ProjectRuntimeBinding,
         ProjectValidationError, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
     };
@@ -421,6 +501,24 @@ mod tests {
             width: 322.0,
             height: 240.0,
         }
+    }
+
+    #[test]
+    fn normalizes_project_archive_input() {
+        let command = ArchiveProject {
+            command_id: " archive-1 ".to_owned(),
+            actor: " local-user ".to_owned(),
+            expected_project_version: 3,
+            expected_orchestrator_worker_id: " worker-1 ".to_owned(),
+            expected_orchestrator_worker_version: 4,
+            expected_orchestrator_runtime_version: Some(2),
+        }
+        .normalize()
+        .unwrap();
+
+        assert_eq!(command.command_id, "archive-1");
+        assert_eq!(command.actor, "local-user");
+        assert_eq!(command.expected_orchestrator_worker_id, "worker-1");
     }
 
     #[test]

@@ -158,6 +158,22 @@ impl HerdrAdapter {
         control::start_prepared_agent(&self.config, request).await
     }
 
+    /// Start and prompt an agent in an existing retained shell pane.
+    ///
+    /// Unlike prepared-runtime startup, a failure never closes the existing
+    /// tab or workspace because Yard did not create that topology in this
+    /// operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HerdrControlError`] when agent start or prompt delivery fails.
+    pub async fn start_existing_agent(
+        &self,
+        request: StartPreparedAgentRequest,
+    ) -> Result<ProvisionedAgent, HerdrControlError> {
+        control::start_existing_agent(&self.config, request).await
+    }
+
     /// Start and prompt an agent in a previously prepared workspace root pane.
     ///
     /// # Errors

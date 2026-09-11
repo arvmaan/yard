@@ -127,8 +127,9 @@ impl OrchestratorReplacementService {
     /// Reconcile every ambiguous prepared or started replacement capture once.
     ///
     /// Fresh inventory can prove absence, preserve a conflicting identity, or
-    /// identify a present runtime that protocol 19 cannot safely retire. Only
-    /// a confirmed started capture can be adopted as the current orchestrator.
+    /// identify a present runtime that the installed Herdr protocol cannot
+    /// safely retire. Only a confirmed started capture can be adopted as the
+    /// current orchestrator.
     ///
     /// # Errors
     ///
@@ -274,7 +275,7 @@ impl OrchestratorReplacementService {
                             Some(
                                 OrchestratorReplacementRecoveryOutcome::PresentNotSafelyRetirable,
                             ),
-                            "Command-unique prepare intent matched exact tab, pane, and terminal topology; protocol 19 cannot retire the captured prepared runtime safely",
+                            "Command-unique prepare intent matched exact tab, pane, and terminal topology; the installed Herdr protocol cannot retire the captured prepared runtime safely",
                             true,
                         )
                         .await?;
@@ -800,10 +801,6 @@ impl OrchestratorReplacementService {
         {
             return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged);
         }
-        let expected_provider = expected
-            .provider_session
-            .as_ref()
-            .ok_or(OrchestratorReplacementServiceError::RuntimeIdentityChanged)?;
         let inventory = self.source.inventory(&project.runtime.session).await?;
         if inventory.adapter != project.runtime.adapter
             || inventory.session != project.runtime.session
@@ -819,28 +816,68 @@ impl OrchestratorReplacementService {
                     project.runtime.workspace_id.clone(),
                 )
             })?;
-        let observed = inventory
-            .workers
-            .iter()
-            .find(|worker| worker.terminal_id == expected.terminal_id)
-            .ok_or(OrchestratorReplacementServiceError::RuntimeIdentityChanged)?;
-        if observed.workspace_id != project.runtime.workspace_id
-            || observed.pane_id != expected.pane_id
-            || Some(observed.tab_id.as_str()) != expected.tab_id.as_deref()
-            || observed.provider_session.as_ref() != Some(expected_provider)
-            || !observed.interactive_ready
-        {
-            return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged);
+        let observed_worker = inventory.workers.iter().find(|worker| {
+            worker.terminal_id == expected.terminal_id
+                || expected
+                    .provider_session
+                    .as_ref()
+                    .is_some_and(|provider| worker.provider_session.as_ref() == Some(provider))
+        });
+        if let Some(observed) = observed_worker {
+            if observed.workspace_id != project.runtime.workspace_id
+                || observed.pane_id != expected.pane_id
+                || Some(observed.tab_id.as_str()) != expected.tab_id.as_deref()
+                || matches!(
+                    (
+                        expected.provider_session.as_ref(),
+                        observed.provider_session.as_ref()
+                    ),
+                    (Some(expected), observed) if observed != Some(expected)
+                )
+                || !observed.interactive_ready
+            {
+                return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged);
+            }
+            return workspace
+                .worktree
+                .as_ref()
+                .map(|worktree| worktree.checkout_path.clone())
+                .or_else(|| {
+                    observed
+                        .foreground_cwd
+                        .clone()
+                        .or_else(|| observed.cwd.clone())
+                })
+                .ok_or(OrchestratorReplacementServiceError::RuntimeCwdUnavailable);
         }
+
+        let restored_panes = inventory
+            .panes
+            .iter()
+            .filter(|pane| {
+                expected.provider_session.is_none()
+                    && pane.workspace_id == project.runtime.workspace_id
+                    && pane.runtime_id == expected.pane_id
+                    && Some(pane.tab_id.as_str()) == expected.tab_id.as_deref()
+                    && pane.provider_session.is_none()
+                    && !inventory
+                        .workers
+                        .iter()
+                        .any(|worker| worker.pane_id == pane.runtime_id)
+            })
+            .collect::<Vec<_>>();
+        let [restored] = restored_panes.as_slice() else {
+            return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged);
+        };
         workspace
             .worktree
             .as_ref()
             .map(|worktree| worktree.checkout_path.clone())
             .or_else(|| {
-                observed
+                restored
                     .foreground_cwd
                     .clone()
-                    .or_else(|| observed.cwd.clone())
+                    .or_else(|| restored.cwd.clone())
             })
             .ok_or(OrchestratorReplacementServiceError::RuntimeCwdUnavailable)
     }
@@ -1274,7 +1311,7 @@ fn resolve_provider_capture(
             )));
         }
         return CaptureResolution::PresentNotSafelyRetirable(
-            "Captured provider identity is present, but durable workflow evidence or interactive readiness is insufficient for adoption and protocol 19 cannot retire it safely",
+            "Captured provider identity is present, but durable workflow evidence or interactive readiness is insufficient for adoption and the installed Herdr protocol cannot retire it safely",
         );
     }
     if provider_panes.len() > 1 {
@@ -1285,7 +1322,7 @@ fn resolve_provider_capture(
     if let Some(pane) = provider_panes.first() {
         if pane_matches_capture(pane, &capture.runtime) {
             return CaptureResolution::PresentNotSafelyRetirable(
-                "Captured provider identity remains present on the exact pane topology without an adoptable interactive worker; protocol 19 cannot retire it safely",
+                "Captured provider identity remains present on the exact pane topology without an adoptable interactive worker; the installed Herdr protocol cannot retire it safely",
             );
         }
         return CaptureResolution::Conflicting(
@@ -1317,7 +1354,7 @@ fn resolve_topology_capture(
             .any(|pane| pane_matches_capture(pane, &capture.runtime))
     {
         return CaptureResolution::PresentNotSafelyRetirable(
-            "Prepared capture remains present at exact workspace, tab, pane, and terminal topology; protocol 19 cannot retire it with an atomic identity guard",
+            "Prepared capture remains present at exact workspace, tab, pane, and terminal topology; the installed Herdr protocol cannot retire it with an atomic identity guard",
         );
     }
     if topology_identity_is_reused(inventory, &capture.runtime) {

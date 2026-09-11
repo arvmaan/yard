@@ -5,6 +5,21 @@ const MAX_NAME_BYTES: usize = 120;
 const MAX_VALUE_BYTES: usize = 512;
 const MAX_LIST_ITEMS: usize = 64;
 
+#[must_use]
+pub fn herdr_agent_name(command_id: &str) -> String {
+    let suffix: String = command_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .take(24)
+        .collect();
+    if suffix.is_empty() {
+        "yard-worker".to_owned()
+    } else {
+        format!("yard-{suffix}")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerProfileSpec {
     pub name: String,
@@ -169,6 +184,7 @@ fn normalize_list(
 mod tests {
     use super::{
         CreateWorkerProfile, ProfileValidationError, UpdateWorkerProfile, WorkerProfileSpec,
+        herdr_agent_name,
     };
 
     fn spec() -> WorkerProfileSpec {
@@ -208,5 +224,14 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, ProfileValidationError::InvalidVersion);
+    }
+
+    #[test]
+    fn derives_bounded_herdr_agent_name_from_command_id() {
+        assert_eq!(
+            herdr_agent_name("B7204888-76C8-4159-BB53-5F24FEAF7AC5"),
+            "yard-b720488876c84159bb535f24"
+        );
+        assert_eq!(herdr_agent_name("---"), "yard-worker");
     }
 }

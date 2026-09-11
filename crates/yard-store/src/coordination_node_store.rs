@@ -1402,10 +1402,12 @@ pub(super) fn select_node(
         })
         .transpose()?;
     let mut statement = connection.prepare(
-        "SELECT project_id
-           FROM coordination_node_projects
-          WHERE node_id = ?1
-          ORDER BY project_id",
+        "SELECT attached.project_id
+           FROM coordination_node_projects attached
+           JOIN project_workspace_bindings binding
+             ON binding.project_id = attached.project_id
+          WHERE attached.node_id = ?1
+          ORDER BY attached.project_id",
     )?;
     let attached_project_ids = statement
         .query_map([node_id], |row| row.get::<_, String>(0))?

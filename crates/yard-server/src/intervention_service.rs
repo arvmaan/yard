@@ -21,6 +21,8 @@ use crate::status_protocol::{
     with_orchestrator_workflow,
 };
 
+pub(crate) const MAX_TERMINAL_OUTPUT_LINES: u32 = 10_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePromptRequest {
     pub command_id: String,
@@ -649,7 +651,7 @@ impl InterventionService {
         assignment_id: &str,
         lines: u32,
     ) -> Result<TerminalOutput, InterventionServiceError> {
-        if !(1..=1_000).contains(&lines) {
+        if !(1..=MAX_TERMINAL_OUTPUT_LINES).contains(&lines) {
             return Err(InterventionServiceError::InvalidLineCount);
         }
         let assignment = self.assignment(project_id, assignment_id).await?;
@@ -703,7 +705,7 @@ impl InterventionService {
         project_id: &str,
         lines: u32,
     ) -> Result<OrchestratorTerminalOutput, InterventionServiceError> {
-        if !(1..=1_000).contains(&lines) {
+        if !(1..=MAX_TERMINAL_OUTPUT_LINES).contains(&lines) {
             return Err(InterventionServiceError::InvalidLineCount);
         }
         let project = self.project(project_id).await?;
@@ -759,7 +761,7 @@ impl InterventionService {
         &self,
         lines: u32,
     ) -> Result<YardOrchestratorTerminalOutput, InterventionServiceError> {
-        if !(1..=1_000).contains(&lines) {
+        if !(1..=MAX_TERMINAL_OUTPUT_LINES).contains(&lines) {
             return Err(InterventionServiceError::InvalidLineCount);
         }
         let orchestrator = self.store.get_yard_orchestrator().await?;
@@ -959,7 +961,10 @@ fn provider_session_matches(
     expected: Option<&yard_domain::ProviderSessionRef>,
     observed: Option<&yard_domain::ProviderSessionRef>,
 ) -> bool {
-    expected.is_none_or(|expected| observed == Some(expected))
+    !matches!(
+        (expected, observed),
+        (Some(expected), Some(observed)) if expected != observed
+    )
 }
 
 #[derive(Debug, Error)]
@@ -1002,7 +1007,7 @@ pub enum InterventionServiceError {
     YardOrchestratorChanged,
     #[error("the requested automatic token-spend behavior is disabled")]
     AutomaticTokenSpendDisabled,
-    #[error("lines must be between 1 and 1000")]
+    #[error("lines must be between 1 and 10000")]
     InvalidLineCount,
 }
 
@@ -1030,12 +1035,12 @@ mod tests {
     }
 
     #[test]
-    fn known_provider_session_must_still_match() {
+    fn known_provider_session_accepts_missing_observation_but_rejects_change() {
         let expected = session("expected");
         let observed = session("observed");
 
         assert!(provider_session_matches(Some(&expected), Some(&expected)));
-        assert!(!provider_session_matches(Some(&expected), None));
+        assert!(provider_session_matches(Some(&expected), None));
         assert!(!provider_session_matches(Some(&expected), Some(&observed)));
     }
 }

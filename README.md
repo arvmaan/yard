@@ -43,7 +43,7 @@ tabs do not provide:
 | Component | v0.1 preview status |
 |---|---|
 | Interface | local browser app; light and dark themes |
-| Runtime | Herdr 0.8.0 |
+| Runtime | Herdr protocols 19 through 22 |
 | Persistence | local SQLite database and managed files |
 | Distribution | source-built single executable; no published or signed release |
 
@@ -131,7 +131,7 @@ Source-install prerequisites:
 
 Runtime prerequisites:
 
-- Herdr 0.8.0 available as `herdr`;
+- Herdr exposing protocol 19 through 22, available as `herdr`;
 - an authenticated agent provider supported by Herdr, such as Codex or Claude;
 - a running Herdr session containing the agents you want to operate.
 
@@ -413,8 +413,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for change and review expectations and
 Yard 0.1 is an early, single-user local tool:
 
 - there is no authentication, authorization, TLS, or remote deployment model;
-- Herdr 0.8.0 is the only runtime adapter;
-- there are no published installers or signed binaries;
+- Herdr protocols 19 through 22 are the only supported runtime adapter versions;
+- there are no packaged or signed binaries;
 - managed background lifecycle and automatic browser launch target Linux and
   macOS; Windows is not currently supported;
 - interrupted project creation, allocation, or handoff can retain a safety

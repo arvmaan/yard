@@ -67,9 +67,10 @@ pub use intervention::{
     PromptAcknowledgement, SendAssignmentPrompt, SendOrchestratorPrompt, TerminalOutput,
 };
 pub use inventory::{
-    FocusObservation, ObservedChildAgent, ObservedStatus, ObservedWorker, PaneObservation,
-    ProviderSessionRef, RuntimeInventory, RuntimeReconciliation, RuntimeSession, RuntimeSessions,
-    TabObservation, WorkspaceObservation, WorktreeObservation,
+    FocusObservation, ManagedRuntimeOccupant, ManagedRuntimeOccupantKind, ManagedRuntimeWorkspace,
+    ManagedRuntimeWorkspaceKind, ObservedChildAgent, ObservedStatus, ObservedWorker,
+    PaneObservation, ProviderSessionRef, RuntimeInventory, RuntimeReconciliation, RuntimeSession,
+    RuntimeSessions, RuntimeTopology, TabObservation, WorkspaceObservation, WorktreeObservation,
 };
 pub use orchestrator_replacement::{
     OldSessionDisposition, OrchestratorReplacementValidationError, ReplaceProjectOrchestrator,
@@ -91,14 +92,14 @@ pub use orchestrator_workflow_profile::{
 };
 pub use profile::{
     CreateWorkerProfile, ProfileValidationError, UpdateWorkerProfile, WorkerProfile,
-    WorkerProfileSpec, WorkerProfiles,
+    WorkerProfileSpec, WorkerProfiles, herdr_agent_name,
 };
 pub use project::{
-    CanvasPlacement, ConfirmedProjectCreation, CreateProject, CreateProjectFromProfile,
-    CreateWorkspaceProjectFromProfile, Project, ProjectPlacement, ProjectRuntimeBinding,
-    ProjectValidationError, ProjectWorkflowProfilePin, Projects, RuntimeObservationState,
-    RuntimeProcessState, UpdateProjectPlacement, UpdateProjectWorkflowProfile, Worker,
-    WorkerRuntimeBinding,
+    ArchiveProject, ArchivedProject, CanvasPlacement, ConfirmedProjectCreation, CreateProject,
+    CreateProjectFromProfile, CreateWorkspaceProjectFromProfile, DeleteProject, DeletedProject,
+    Project, ProjectPlacement, ProjectRuntimeBinding, ProjectValidationError,
+    ProjectWorkflowProfilePin, Projects, RuntimeObservationState, RuntimeProcessState,
+    UpdateProjectPlacement, UpdateProjectWorkflowProfile, Worker, WorkerRuntimeBinding,
 };
 pub use status_report::{
     MAX_STATUS_BLOCKER_BYTES, MAX_STATUS_BLOCKERS, MAX_STATUS_COMMAND_ID_BYTES,
@@ -110,8 +111,8 @@ pub use token_spend::{
     UpdateTokenSpendSettings,
 };
 pub use worker::{
-    EndWorkerSession, EndedWorkerSession, WorkerAvailability, WorkerCandidate, WorkerCandidates,
-    WorkerSessionValidationError,
+    DeleteWorker, DeletedWorker, EndWorkerSession, EndedWorkerSession, WorkerAvailability,
+    WorkerCandidate, WorkerCandidates, WorkerSessionValidationError,
 };
 pub use yard_orchestrator::{
     ConfigureYardOrchestrator, ConfiguredYardOrchestrator, ProvisionYardOrchestrator,

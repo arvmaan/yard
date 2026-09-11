@@ -149,6 +149,50 @@ pub struct RuntimeInventory {
     pub child_agents: Vec<ObservedChildAgent>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRuntimeWorkspaceKind {
+    YardCentral,
+    Coordination,
+    Provisioning,
+    Quarantined,
+    CleanupPending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRuntimeOccupantKind {
+    Provisioning,
+    Quarantined,
+    CleanupPending,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedRuntimeOccupant {
+    pub kind: ManagedRuntimeOccupantKind,
+    pub terminal_id: String,
+    pub tab_id: Option<String>,
+    pub pane_id: String,
+    pub label: String,
+    pub reason: String,
+    pub project_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedRuntimeWorkspace {
+    pub workspace_id: String,
+    pub kind: ManagedRuntimeWorkspaceKind,
+    pub label: String,
+    pub occupants: Vec<ManagedRuntimeOccupant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeTopology {
+    pub adapter: String,
+    pub session: String,
+    pub managed_workspaces: Vec<ManagedRuntimeWorkspace>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeReconciliation {
     pub adapter: String,

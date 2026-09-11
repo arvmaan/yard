@@ -27,10 +27,24 @@ import {
   sendOrchestratorPrompt,
 } from './api'
 import {
+  agentQuestionKey,
+  recordAgentQuestion,
+  type AgentQuestion,
+} from './agentQuestions'
+import {
   buildExecutionOrder,
   ORDER_TEMPLATES,
 } from './orderTemplates'
+import {
+  CollapsibleAgentOutput,
+  CollapsibleQuestion,
+} from './CollapsibleAgentOutput'
 import { promptRequiresNewCommand } from './promptPolicy'
+import {
+  normalizeTerminalOutput,
+  TERMINAL_OUTPUT_LINES,
+  TRUNCATED_TERMINAL_OUTPUT_LABEL,
+} from './terminalOutput'
 import { useModalDialog } from './useModalDialog'
 import type {
   Assignment,
@@ -39,9 +53,6 @@ import type {
   SendAssignmentPromptInput,
   SendOrchestratorPromptInput,
 } from './types'
-
-const GROUP_OUTPUT_LINES = 80
-const MAX_OUTPUT_CHARACTERS = 2200
 
 export type AgentGroupTarget =
   | {
@@ -81,7 +92,10 @@ interface ThreadMessage {
   kind: 'agent' | 'user' | 'error'
   label: string
   meta: string
+  question?: AgentQuestion
+  status?: ObservedStatus
   text: string
+  truncated?: boolean
 }
 
 function targetKey(target: AgentGroupTarget) {
@@ -94,12 +108,6 @@ function targetProjectName(target: AgentGroupTarget) {
   return target.kind === 'assignment'
     ? target.projectName
     : target.project.name
-}
-
-function outputExcerpt(text: string) {
-  const trimmed = text.trim()
-  if (trimmed.length <= MAX_OUTPUT_CHARACTERS) return trimmed
-  return `…${trimmed.slice(-MAX_OUTPUT_CHARACTERS)}`
 }
 
 function errorMessage(caught: unknown, fallback: string) {
@@ -202,20 +210,25 @@ export function AgentGroupChat({
               ? await fetchAssignmentTerminalOutput(
                   target.assignment.project_id,
                   target.assignment.id,
-                  GROUP_OUTPUT_LINES,
+                  TERMINAL_OUTPUT_LINES,
                 )
               : await fetchOrchestratorTerminalOutput(
                   target.project.id,
-                  GROUP_OUTPUT_LINES,
+                  TERMINAL_OUTPUT_LINES,
                 )
+          const text = normalizeTerminalOutput(output.text)
           return {
             id: `snapshot:${key}:${output.revision}`,
             kind: 'agent',
             label: target.label,
-            meta: `${targetProjectName(target)} · ${target.status}`,
-            text: output.text
-              ? outputExcerpt(output.text)
-              : 'No recent output.',
+            meta: `${targetProjectName(target)} · ${target.status}${
+              output.truncated
+                ? ` · ${TRUNCATED_TERMINAL_OUTPUT_LABEL}`
+                : ''
+            }`,
+            status: target.status,
+            text: text || 'No recent output.',
+            truncated: output.truncated,
           }
         } catch (caught) {
           return {
@@ -277,13 +290,33 @@ export function AgentGroupChat({
     const requestedGroup = groupKeyRef.current
     setSending(true)
     if (appendUserMessage) {
+      const question = {
+        askedAtUnixMs: Date.now(),
+        id: crypto.randomUUID(),
+        text,
+      }
+      recordAgentQuestion(
+        commands.map((command) =>
+          command.target.kind === 'assignment'
+            ? agentQuestionKey({
+                assignment: command.target.assignment,
+                kind: 'assignment',
+              })
+            : agentQuestionKey({
+                kind: 'orchestrator',
+                project: command.target.project,
+              }),
+        ),
+        question,
+      )
       setMessages((current) => [
         ...current,
         {
-          id: `user:${crypto.randomUUID()}`,
+          id: `user:${question.id}`,
           kind: 'user',
-          label: 'You',
+          label: 'Your question',
           meta: `${commands.length} recipient${commands.length === 1 ? '' : 's'}`,
+          question,
           text,
         },
       ])
@@ -364,6 +397,9 @@ export function AgentGroupChat({
     ({ requiresNewCommand }) => !requiresNewCommand,
   ).length
   const freshCount = failed.length - retryableCount
+  const knownQuestions = messages.flatMap((message) =>
+    message.kind === 'user' ? [message.text] : [],
+  )
 
   const updatePrompt = (text: string) => {
     setPromptText(text)
@@ -569,7 +605,7 @@ export function AgentGroupChat({
                 <header className="chat-thread__header">
                   <div>
                     <p className="eyebrow">Transcript</p>
-                    <h3>Recent activity</h3>
+                    <h3>Questions and answers</h3>
                   </div>
                   <button
                     aria-label="Refresh combined thread"
@@ -605,13 +641,36 @@ export function AgentGroupChat({
                     <article
                       className="chat-message"
                       data-kind={message.kind}
+                      data-question-id={message.question?.id}
                       key={message.id}
                     >
-                      <header>
-                        <strong>{message.label}</strong>
-                        <small>{message.meta}</small>
-                      </header>
-                      <p>{message.text}</p>
+                      {message.kind === 'agent' ? (
+                        <>
+                          <header>
+                            <strong>{message.label}</strong>
+                            <small>{message.meta}</small>
+                          </header>
+                          <CollapsibleAgentOutput
+                            knownQuestions={knownQuestions}
+                            status={message.status}
+                            text={message.text}
+                            truncated={message.truncated}
+                          />
+                        </>
+                      ) : message.kind === 'user' ? (
+                        <CollapsibleQuestion
+                          meta={message.meta}
+                          text={message.text}
+                        />
+                      ) : (
+                        <>
+                          <header>
+                            <strong>{message.label}</strong>
+                            <small>{message.meta}</small>
+                          </header>
+                          <p>{message.text}</p>
+                        </>
+                      )}
                     </article>
                   ))}
                 </div>

@@ -57,8 +57,14 @@ pub enum HerdrError {
         expected: &'static str,
         actual: String,
     },
-    #[error("Herdr protocol {actual} is incompatible; Yard requires {expected}")]
-    ProtocolMismatch { expected: u32, actual: u32 },
+    #[error(
+        "Herdr protocol {actual} is incompatible; Yard supports protocols {minimum} through {maximum}"
+    )]
+    ProtocolMismatch {
+        minimum: u32,
+        maximum: u32,
+        actual: u32,
+    },
     #[error("invalid Herdr topology: {0}")]
     InvalidTopology(String),
 }

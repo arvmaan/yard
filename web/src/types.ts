@@ -140,6 +140,36 @@ export interface RuntimeInventory {
   child_agents: ObservedChildAgent[]
 }
 
+export type ManagedRuntimeWorkspaceKind =
+  | 'yard_central'
+  | 'coordination'
+  | 'provisioning'
+  | 'quarantined'
+  | 'cleanup_pending'
+
+export interface ManagedRuntimeOccupant {
+  kind: 'provisioning' | 'quarantined' | 'cleanup_pending'
+  terminal_id: string
+  tab_id: string | null
+  pane_id: string
+  label: string
+  reason: string
+  project_name: string | null
+}
+
+export interface ManagedRuntimeWorkspace {
+  workspace_id: string
+  kind: ManagedRuntimeWorkspaceKind
+  label: string
+  occupants: ManagedRuntimeOccupant[]
+}
+
+export interface RuntimeTopology {
+  adapter: string
+  session: string
+  managed_workspaces: ManagedRuntimeWorkspace[]
+}
+
 export interface CanvasPlacement {
   x: number
   y: number
@@ -249,6 +279,38 @@ export interface RecoveredYardOrchestrator {
 
 export interface Projects {
   projects: Project[]
+}
+
+export interface ArchiveProjectInput {
+  command_id: string
+  actor: string
+  expected_project_version: string
+  expected_orchestrator_worker_id: string
+  expected_orchestrator_worker_version: string
+  expected_orchestrator_runtime_version: string | null
+}
+
+export interface ArchivedProject {
+  command_id: string
+  project_id: string
+  orchestrator_worker_id: string
+  archived_at_unix_ms: number
+  cleanup_pending: boolean
+  replayed: boolean
+}
+
+export interface DeleteProjectInput {
+  command_id: string
+  actor: string
+}
+
+export interface DeletedProject {
+  command_id: string
+  project_id: string
+  orchestrator_worker_id: string
+  deleted_at_unix_ms: number
+  cleanup_pending: boolean
+  replayed: boolean
 }
 
 export interface ChangeProjectOrchestratorInput {
@@ -512,6 +574,20 @@ export interface EndWorkerSessionInput {
 export interface EndedWorkerSession {
   command_id: string
   worker: Worker
+  cleanup_pending: boolean
+  replayed: boolean
+}
+
+export interface DeleteWorkerInput {
+  command_id: string
+  actor: string
+  expected_worker_version: string
+}
+
+export interface DeletedWorker {
+  command_id: string
+  worker_id: string
+  deleted_at_unix_ms: number
   cleanup_pending: boolean
   replayed: boolean
 }

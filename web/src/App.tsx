@@ -21,6 +21,7 @@ import {
   CircleStop,
   ChevronUp,
   FileCode2,
+  FolderArchive,
   FolderPlus,
   GitBranch,
   GripVertical,
@@ -31,6 +32,7 @@ import {
   Plus,
   RefreshCw,
   Server,
+  Trash2,
   Unlink,
   Wifi,
   WifiOff,
@@ -38,6 +40,7 @@ import {
 } from 'lucide-react'
 import {
   YardApiError,
+  archiveProject,
   changeProjectOrchestrator,
   confirmWorkerHandoff,
   confirmWorkerAssignment,
@@ -48,12 +51,15 @@ import {
   createProjectRelationship,
   createProjectWithWorkspace,
   createWorkerProfile,
+  deleteProject,
   deleteProjectRelationship,
+  deleteWorker,
   endWorkerSession,
   fetchAutomation,
   fetchAutomationRuns,
   fetchAutomations,
   fetchInventory,
+  fetchRuntimeTopology,
   fetchCoordinationNodeRoutes,
   fetchCoordinationNodes,
   fetchCoordinationSnapshots,
@@ -137,6 +143,9 @@ import {
   type ProjectStatusReports,
 } from './projectUpdates'
 import { EndWorkerSessionDialog } from './EndWorkerSessionDialog'
+import { ArchiveProjectDialog } from './ArchiveProjectDialog'
+import { DeleteProjectDialog } from './DeleteProjectDialog'
+import { DeleteWorkerDialog } from './DeleteWorkerDialog'
 import {
   HandoffDialog,
   type HandoffDetails,
@@ -202,6 +211,7 @@ import type {
   RuntimeObservationState,
   RuntimeProcessState,
   RuntimeSession,
+  RuntimeTopology,
   StatusReport,
   TokenSpendSettings,
   WorkerAvailability,
@@ -225,7 +235,7 @@ const ArtifactInspector = lazy(() =>
   })),
 )
 
-type Filter = 'all' | 'available' | 'allocated' | 'attention'
+type Filter = 'current' | 'available' | 'allocated' | 'attention' | 'history'
 type RailView = 'profiles' | 'workspaces' | 'workers'
 type ProjectCreationDetails =
   | {
@@ -250,10 +260,11 @@ interface WorkspaceProjectCreationDetails {
 }
 
 const FILTERS: Array<{ value: Filter; label: string }> = [
-  { value: 'all', label: 'All' },
+  { value: 'current', label: 'Current' },
   { value: 'available', label: 'Available' },
   { value: 'allocated', label: 'Allocated' },
   { value: 'attention', label: 'Attention' },
+  { value: 'history', label: 'History' },
 ]
 
 const STATUS_ICONS = {
@@ -299,7 +310,8 @@ const OBSERVATION_ICONS = {
 } satisfies Record<RuntimeObservationState, typeof CircleAlert>
 
 function matchesFilter(candidate: WorkerCandidate, filter: Filter) {
-  if (filter === 'all') return true
+  if (filter === 'current') return candidate.availability !== 'ended'
+  if (filter === 'history') return candidate.availability === 'ended'
   if (filter === 'available') {
     return (
       candidate.availability === 'unassigned_live' ||
@@ -357,6 +369,13 @@ function canEndCandidate(candidate: WorkerCandidate) {
     candidate.availability !== 'yard_orchestrator' &&
     candidate.availability !== 'orchestrator' &&
     candidate.availability !== 'assigned'
+  )
+}
+
+function canDeleteCandidate(candidate: WorkerCandidate) {
+  return (
+    candidate.availability === 'ended' ||
+    canEndCandidate(candidate)
   )
 }
 
@@ -710,6 +729,7 @@ function WorkerCandidateInspector({
   completedAssignment,
   observed,
   onAllocate,
+  onDelete,
   onEndSession,
   projects,
 }: {
@@ -718,6 +738,7 @@ function WorkerCandidateInspector({
   completedAssignment: Assignment | undefined
   observed: ObservedWorker | undefined
   onAllocate: (project: Project) => void
+  onDelete: () => void
   onEndSession: () => void
   projects: Project[]
 }) {
@@ -866,15 +887,25 @@ function WorkerCandidateInspector({
           </button>
         </div>
       ) : null}
-      {canEndCandidate(candidate) ? (
+      {canDeleteCandidate(candidate) ? (
         <div className="inspector-actions disposition-actions">
+          {canEndCandidate(candidate) ? (
+            <button
+              className="secondary-button"
+              onClick={onEndSession}
+              type="button"
+            >
+              <CircleStop aria-hidden="true" size={16} />
+              End session
+            </button>
+          ) : null}
           <button
             className="destructive-button"
-            onClick={onEndSession}
+            onClick={onDelete}
             type="button"
           >
-            <CircleStop aria-hidden="true" size={16} />
-            End session
+            <Trash2 aria-hidden="true" size={16} />
+            Delete worker
           </button>
         </div>
       ) : null}
@@ -918,6 +949,9 @@ function YardOrchestratorInspector({
   const isDedicated =
     worker?.runtime?.session === 'yard-orchestrator'
   const sessionStopped = isDedicated && sessionRunning === false
+  const agentStopped =
+    isDedicated && runtimeState.processState !== 'running'
+  const recoveryRequired = sessionStopped || agentStopped
 
   useEffect(() => {
     if (!eligibleProfiles.some((profile) => profile.id === profileId)) {
@@ -963,14 +997,14 @@ function YardOrchestratorInspector({
               </small>
             </span>
           </div>
-          {sessionStopped ? (
+          {recoveryRequired ? (
             <div className="inspector-actions yard-orchestrator-recovery">
               <div className="awaiting-disposition" role="status">
                 <CircleAlert aria-hidden="true" size={16} />
                 <span>
-                  <strong>Herdr session is offline</strong>
+                  <strong>{sessionStopped ? 'Herdr session is offline' : 'Superintendent agent is offline'}</strong>
                   <small>
-                    Restart and reconcile this orchestrator without replacing it.
+                    Restart this agent and reconcile it without replacing ownership.
                   </small>
                 </span>
               </div>
@@ -1320,6 +1354,8 @@ function ProjectInspector({
   accent,
   inventory,
   onAccentChange,
+  onArchive,
+  onDelete,
   onDisconnect,
   project,
   projects,
@@ -1329,6 +1365,8 @@ function ProjectInspector({
   accent: string
   inventory: RuntimeInventory | null
   onAccentChange: (accent: string) => void
+  onArchive: (trigger: HTMLButtonElement) => void
+  onDelete: (trigger: HTMLButtonElement) => void
   onDisconnect: (relationship: ProjectRelationship) => void
   project: Project
   projects: Project[]
@@ -1497,6 +1535,24 @@ function ProjectInspector({
         status={orchestratorState.status}
         target={{ kind: 'orchestrator', project }}
       />
+      <div className="inspector-actions disposition-actions">
+        <button
+          className="secondary-button"
+          onClick={(event) => onArchive(event.currentTarget)}
+          type="button"
+        >
+          <FolderArchive aria-hidden="true" size={16} />
+          Archive project
+        </button>
+        <button
+          className="destructive-button"
+          onClick={(event) => onDelete(event.currentTarget)}
+          type="button"
+        >
+          <Trash2 aria-hidden="true" size={16} />
+          Delete project
+        </button>
+      </div>
     </>
   )
 }
@@ -1583,11 +1639,13 @@ function ProfileInspector({
 function AssignmentInspector({
   assignment,
   inventory,
+  onDelete,
   onEndSession,
   onRecordCompletion,
 }: {
   assignment: Assignment
   inventory: RuntimeInventory | null
+  onDelete?: () => void
   onEndSession?: () => void
   onRecordCompletion: () => void
 }) {
@@ -1701,7 +1759,7 @@ function AssignmentInspector({
           </dl>
         </section>
       ) : null}
-      {receipt && onEndSession ? (
+      {receipt && (onEndSession || onDelete) ? (
         <div className="inspector-actions disposition-actions">
           <div className="awaiting-disposition" role="status">
             <CircleCheck aria-hidden="true" size={16} />
@@ -1713,18 +1771,33 @@ function AssignmentInspector({
               </small>
             </span>
           </div>
-          <button
-            className="destructive-button"
-            onClick={onEndSession}
-            type="button"
-          >
-            <CircleStop aria-hidden="true" size={16} />
-            End session
-          </button>
+          {onEndSession ? (
+            <button
+              className="secondary-button"
+              onClick={onEndSession}
+              type="button"
+            >
+              <CircleStop aria-hidden="true" size={16} />
+              End session
+            </button>
+          ) : null}
+          {onDelete ? (
+            <button
+              className="destructive-button"
+              onClick={onDelete}
+              type="button"
+            >
+              <Trash2 aria-hidden="true" size={16} />
+              Delete worker
+            </button>
+          ) : null}
         </div>
       ) : null}
       {assignment.lifecycle === 'active' ? (
         <div className="inspector-actions">
+          <small className="inspector-action-note">
+            Record completion before ending or deleting this worker.
+          </small>
           <button
             className="command-button"
             onClick={onRecordCompletion}
@@ -2167,6 +2240,8 @@ function App() {
   const [sessions, setSessions] = useState<RuntimeSession[]>([])
   const [selectedSession, setSelectedSession] = useState('')
   const [inventory, setInventory] = useState<RuntimeInventory | null>(null)
+  const [runtimeTopology, setRuntimeTopology] =
+    useState<RuntimeTopology | null>(null)
   const [projectTransferContexts, setProjectTransferContexts] = useState<
     Record<string, ProjectTransferContextEntry>
   >({})
@@ -2216,7 +2291,7 @@ function App() {
   const [projectStatusReports, setProjectStatusReports] =
     useState<ProjectStatusReports>({})
   const [projectPulseOpen, setProjectPulseOpen] = useState(false)
-  const [filter, setFilter] = useState<Filter>('all')
+  const [filter, setFilter] = useState<Filter>('current')
   const [railView, setRailView] = useState<RailView>('profiles')
   const [resourceShelfOpen, setResourceShelfOpen] = useState(true)
   const [selection, setSelection] = useState<CanvasSelection>(null)
@@ -2294,6 +2369,34 @@ function App() {
   } | null>(null)
   const [endSessionBusy, setEndSessionBusy] = useState(false)
   const [endSessionError, setEndSessionError] = useState<string | null>(null)
+  const [workerDeleteProposal, setWorkerDeleteProposal] = useState<{
+    candidate: WorkerCandidate
+    deleteCommandId: string
+    endCommandId: string
+  } | null>(null)
+  const [workerDeleteBusy, setWorkerDeleteBusy] = useState(false)
+  const [workerDeleteError, setWorkerDeleteError] = useState<string | null>(
+    null,
+  )
+  const [projectArchiveProposal, setProjectArchiveProposal] = useState<{
+    commandId: string
+    project: Project
+    returnFocus: HTMLButtonElement | null
+  } | null>(null)
+  const [projectArchiveBusy, setProjectArchiveBusy] = useState(false)
+  const [projectArchiveError, setProjectArchiveError] = useState<
+    string | null
+  >(null)
+  const [projectDeleteProposal, setProjectDeleteProposal] = useState<{
+    archiveCommandId: string
+    deleteCommandId: string
+    project: Project
+    returnFocus: HTMLButtonElement | null
+  } | null>(null)
+  const [projectDeleteBusy, setProjectDeleteBusy] = useState(false)
+  const [projectDeleteError, setProjectDeleteError] = useState<string | null>(
+    null,
+  )
   const [runtimeError, setRuntimeError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [actionNotice, setActionNotice] = useState<string | null>(null)
@@ -2494,11 +2597,15 @@ function App() {
     ) => {
       if (!session) {
         setInventory(null)
+        setRuntimeTopology(null)
         return
       }
       if (!background) {
         setRuntimeLoading(true)
         setInventory((current) =>
+          current?.session === session ? current : null,
+        )
+        setRuntimeTopology((current) =>
           current?.session === session ? current : null,
         )
         setSelection((current) =>
@@ -2516,8 +2623,12 @@ function App() {
         )
       }
       try {
-        const result = await fetchInventory(session, signal)
+        const [result, topology] = await Promise.all([
+          fetchInventory(session, signal),
+          fetchRuntimeTopology(session, signal),
+        ])
         setInventory((current) => reconcileInventorySnapshot(current, result))
+        setRuntimeTopology(topology)
         await Promise.all([loadWorkers(signal), loadYardOrchestrator(signal)])
         setRuntimeError(null)
       } catch (caught) {
@@ -3000,11 +3111,21 @@ function App() {
     [projects, selectedSession],
   )
   const availableWorkspaces = useMemo(
-    () =>
-      inventory?.workspaces.filter(
-        (workspace) => !boundWorkspaceIds.has(workspace.runtime_id),
-      ) ?? [],
-    [boundWorkspaceIds, inventory],
+    () => {
+      const managedWorkspaceIds = new Set(
+        runtimeTopology?.managed_workspaces.map(
+          (workspace) => workspace.workspace_id,
+        ) ?? [],
+      )
+      return (
+        inventory?.workspaces.filter(
+          (workspace) =>
+            !boundWorkspaceIds.has(workspace.runtime_id) &&
+            !managedWorkspaceIds.has(workspace.runtime_id),
+        ) ?? []
+      )
+    },
+    [boundWorkspaceIds, inventory, runtimeTopology],
   )
 
   const selectedObservedWorker =
@@ -3045,6 +3166,24 @@ function App() {
     selection?.kind === 'project'
       ? projects.find((project) => project.id === selection.id)
       : undefined
+  const projectArchiveActiveAssignmentCount = projectArchiveProposal
+    ? assignments.filter(
+        (assignment) =>
+          assignment.project_id === projectArchiveProposal.project.id &&
+          ['allocating', 'active', 'handing_off'].includes(
+            assignment.lifecycle,
+          ),
+      ).length
+    : 0
+  const projectDeleteActiveAssignmentCount = projectDeleteProposal
+    ? assignments.filter(
+        (assignment) =>
+          assignment.project_id === projectDeleteProposal.project.id &&
+          ['allocating', 'active', 'handing_off'].includes(
+            assignment.lifecycle,
+          ),
+      ).length
+    : 0
   const selectedProjectOrchestrator =
     selection?.kind === 'orchestrator'
       ? projects.find((project) => project.id === selection.projectId)
@@ -3863,6 +4002,310 @@ function App() {
     loadInventory,
     loadProjects,
     loadWorkers,
+    selectedSession,
+  ])
+
+  const proposeWorkerDelete = useCallback((candidate: WorkerCandidate) => {
+    if (!canDeleteCandidate(candidate)) return
+    setWorkerDeleteError(null)
+    setActionNotice(null)
+    setWorkerDeleteProposal({
+      candidate,
+      deleteCommandId: crypto.randomUUID(),
+      endCommandId: crypto.randomUUID(),
+    })
+  }, [])
+
+  const deleteSelectedWorker = useCallback(async () => {
+    if (!workerDeleteProposal) return
+    const { candidate, deleteCommandId, endCommandId } =
+      workerDeleteProposal
+    setWorkerDeleteBusy(true)
+    setWorkerDeleteError(null)
+    setActionError(null)
+    try {
+      let expectedWorkerVersion = candidate.worker.version
+      if (candidate.worker.desired_state !== 'ended') {
+        const ended = await endWorkerSession(candidate.worker.id, {
+          command_id: endCommandId,
+          actor: 'local-user',
+          expected_worker_version: candidate.worker.version,
+          ...(candidate.worker.runtime
+            ? {
+                expected_runtime_version:
+                  candidate.worker.runtime.version,
+              }
+            : {}),
+        })
+        expectedWorkerVersion = ended.worker.version
+      }
+      const result = await deleteWorker(candidate.worker.id, {
+        command_id: deleteCommandId,
+        actor: 'local-user',
+        expected_worker_version: expectedWorkerVersion,
+      })
+      setWorkerCandidates((current) =>
+        current.filter(
+          ({ worker }) => worker.id !== candidate.worker.id,
+        ),
+      )
+      setSelection((current) =>
+        current?.kind === 'worker' &&
+        current.id === candidate.worker.id
+          ? null
+          : current,
+      )
+      setWorkerDeleteProposal(null)
+      setActionNotice(
+        result.cleanup_pending
+          ? 'Worker deleted from Yard. Runtime cleanup continues in the background.'
+          : 'Worker deleted from Yard.',
+      )
+      await Promise.all([
+        loadProjects(),
+        loadWorkers(),
+        loadInventory(selectedSession),
+      ]).catch(() => undefined)
+    } catch (caught) {
+      const message =
+        caught instanceof Error ? caught.message : 'Delete worker failed'
+      const workers = await loadWorkers().catch(() => null)
+      const reconciled = workers?.find(
+        ({ worker }) => worker.id === candidate.worker.id,
+      )
+      if (!reconciled && workers) {
+        setWorkerDeleteProposal(null)
+        setSelection(null)
+        setActionNotice(
+          'Worker deleted from Yard. Runtime cleanup continues in the background if needed.',
+        )
+      } else {
+        if (reconciled) {
+          setWorkerDeleteProposal((current) =>
+            current ? { ...current, candidate: reconciled } : current,
+          )
+        }
+        setWorkerDeleteError(message)
+      }
+    } finally {
+      setWorkerDeleteBusy(false)
+    }
+  }, [
+    loadInventory,
+    loadProjects,
+    loadWorkers,
+    selectedSession,
+    workerDeleteProposal,
+  ])
+
+  const proposeProjectArchive = useCallback(
+    (project: Project, returnFocus: HTMLButtonElement) => {
+      setProjectArchiveError(null)
+      setActionNotice(null)
+      setProjectArchiveProposal({
+        commandId: crypto.randomUUID(),
+        project,
+        returnFocus,
+      })
+    },
+    [],
+  )
+
+  const archiveSelectedProject = useCallback(async () => {
+    if (!projectArchiveProposal) return
+    const { commandId, project } = projectArchiveProposal
+    setProjectArchiveBusy(true)
+    setProjectArchiveError(null)
+    setActionError(null)
+
+    const reconcileArchivedProject = async (cleanupPending: boolean) => {
+      setProjects((current) =>
+        current.filter((candidate) => candidate.id !== project.id),
+      )
+      setProjectRelationships((current) =>
+        current.filter(
+          (relationship) =>
+            relationship.source_project_id !== project.id &&
+            relationship.target_project_id !== project.id,
+        ),
+      )
+      setAssignments((current) =>
+        current.filter(
+          (assignment) => assignment.project_id !== project.id,
+        ),
+      )
+      setProjectStatusReports((current) => {
+        const next = { ...current }
+        delete next[project.id]
+        return next
+      })
+      clearProjectTransferContext(project.id)
+      setSelection(null)
+      setProjectArchiveProposal(null)
+      setActionNotice(
+        cleanupPending
+          ? 'Project archived. Verified orchestrator cleanup is queued.'
+          : 'Project archived.',
+      )
+      await Promise.all([
+        loadProjects(),
+        loadCoordination(),
+        loadWorkers(),
+        loadInventory(selectedSession),
+      ]).catch(() => undefined)
+    }
+
+    try {
+      const result = await archiveProject(project.id, {
+        command_id: commandId,
+        actor: 'local-user',
+        expected_project_version: project.version,
+        expected_orchestrator_worker_id: project.orchestrator.id,
+        expected_orchestrator_worker_version:
+          project.orchestrator.version,
+        expected_orchestrator_runtime_version:
+          project.orchestrator.runtime?.version ?? null,
+      })
+      await reconcileArchivedProject(result.cleanup_pending)
+    } catch (caught) {
+      const message =
+        caught instanceof Error ? caught.message : 'Project archive failed'
+      const activeProjects = await fetchProjects().catch(() => null)
+      if (
+        activeProjects &&
+        !activeProjects.projects.some(
+          (candidate) => candidate.id === project.id,
+        )
+      ) {
+        await reconcileArchivedProject(true)
+      } else {
+        setProjectArchiveError(message)
+      }
+    } finally {
+      setProjectArchiveBusy(false)
+    }
+  }, [
+    clearProjectTransferContext,
+    loadCoordination,
+    loadInventory,
+    loadProjects,
+    loadWorkers,
+    projectArchiveProposal,
+    selectedSession,
+  ])
+
+  const proposeProjectDelete = useCallback(
+    (project: Project, returnFocus: HTMLButtonElement) => {
+      setProjectDeleteError(null)
+      setActionNotice(null)
+      setProjectDeleteProposal({
+        archiveCommandId: crypto.randomUUID(),
+        deleteCommandId: crypto.randomUUID(),
+        project,
+        returnFocus,
+      })
+    },
+    [],
+  )
+
+  const deleteSelectedProject = useCallback(async () => {
+    if (!projectDeleteProposal) return
+    const { archiveCommandId, deleteCommandId, project } =
+      projectDeleteProposal
+    setProjectDeleteBusy(true)
+    setProjectDeleteError(null)
+    setActionError(null)
+
+    const reconcileDeletedProject = async (cleanupPending: boolean) => {
+      setProjects((current) =>
+        current.filter((candidate) => candidate.id !== project.id),
+      )
+      setProjectRelationships((current) =>
+        current.filter(
+          (relationship) =>
+            relationship.source_project_id !== project.id &&
+            relationship.target_project_id !== project.id,
+        ),
+      )
+      setAssignments((current) =>
+        current.filter(
+          (assignment) => assignment.project_id !== project.id,
+        ),
+      )
+      setWorkerCandidates((current) =>
+        current.filter(
+          ({ worker }) => worker.id !== project.orchestrator.id,
+        ),
+      )
+      setProjectStatusReports((current) => {
+        const next = { ...current }
+        delete next[project.id]
+        return next
+      })
+      clearProjectTransferContext(project.id)
+      setSelection(null)
+      setProjectDeleteProposal(null)
+      setActionNotice(
+        cleanupPending
+          ? 'Project deleted from Yard. Runtime cleanup continues in the background.'
+          : 'Project deleted from Yard.',
+      )
+      await Promise.all([
+        loadProjects(),
+        loadCoordination(),
+        loadWorkers(),
+        loadInventory(selectedSession),
+      ]).catch(() => undefined)
+    }
+
+    try {
+      await archiveProject(project.id, {
+        command_id: archiveCommandId,
+        actor: 'local-user',
+        expected_project_version: project.version,
+        expected_orchestrator_worker_id: project.orchestrator.id,
+        expected_orchestrator_worker_version:
+          project.orchestrator.version,
+        expected_orchestrator_runtime_version:
+          project.orchestrator.runtime?.version ?? null,
+      })
+      const result = await deleteProject(project.id, {
+        command_id: deleteCommandId,
+        actor: 'local-user',
+      })
+      await reconcileDeletedProject(result.cleanup_pending)
+    } catch (caught) {
+      const message =
+        caught instanceof Error ? caught.message : 'Delete project failed'
+      const [activeProjects, workers] = await Promise.all([
+        fetchProjects().catch(() => null),
+        loadWorkers().catch(() => null),
+      ])
+      const projectMissing =
+        activeProjects !== null &&
+        !activeProjects.projects.some(
+          (candidate) => candidate.id === project.id,
+        )
+      const orchestratorMissing =
+        workers !== null &&
+        !workers.some(
+          ({ worker }) => worker.id === project.orchestrator.id,
+        )
+      if (projectMissing && orchestratorMissing) {
+        await reconcileDeletedProject(true)
+      } else {
+        setProjectDeleteError(message)
+      }
+    } finally {
+      setProjectDeleteBusy(false)
+    }
+  }, [
+    clearProjectTransferContext,
+    loadCoordination,
+    loadInventory,
+    loadProjects,
+    loadWorkers,
+    projectDeleteProposal,
     selectedSession,
   ])
 
@@ -5416,6 +5859,7 @@ function App() {
           projectStatusReports={projectStatusReports}
           projects={projects}
           runtimeLoading={runtimeLoading}
+          runtimeTopology={runtimeTopology}
           selectedSession={selectedSession}
           theme={theme}
           visualMode={mapVisualMode}
@@ -5575,6 +6019,12 @@ function App() {
             onAccentChange={(accent) =>
               setProjectAccent(selectedProject.id, accent)
             }
+            onArchive={(trigger) =>
+              proposeProjectArchive(selectedProject, trigger)
+            }
+            onDelete={(trigger) =>
+              proposeProjectDelete(selectedProject, trigger)
+            }
             onDisconnect={(relationship) =>
               void disconnectProjects(relationship)
             }
@@ -5591,6 +6041,12 @@ function App() {
           <AssignmentInspector
             assignment={selectedAssignment}
             inventory={inventory}
+            onDelete={
+              selectedAssignmentCandidate &&
+              canDeleteCandidate(selectedAssignmentCandidate)
+                ? () => proposeWorkerDelete(selectedAssignmentCandidate)
+                : undefined
+            }
             onEndSession={
               selectedAssignmentCandidate &&
               canEndCandidate(selectedAssignmentCandidate)
@@ -5630,6 +6086,9 @@ function App() {
             }
             onEndSession={() =>
               proposeEndSession(selectedWorkerCandidate)
+            }
+            onDelete={() =>
+              proposeWorkerDelete(selectedWorkerCandidate)
             }
             projects={projects}
           />
@@ -5876,6 +6335,36 @@ function App() {
           onConfirm={completeAssignment}
         />
       ) : null}
+      {projectArchiveProposal ? (
+        <ArchiveProjectDialog
+          activeAssignmentCount={projectArchiveActiveAssignmentCount}
+          busy={projectArchiveBusy}
+          error={projectArchiveError}
+          onClose={() => {
+            if (projectArchiveBusy) return
+            setProjectArchiveError(null)
+            setProjectArchiveProposal(null)
+          }}
+          onConfirm={archiveSelectedProject}
+          project={projectArchiveProposal.project}
+          returnFocus={projectArchiveProposal.returnFocus}
+        />
+      ) : null}
+      {projectDeleteProposal ? (
+        <DeleteProjectDialog
+          activeAssignmentCount={projectDeleteActiveAssignmentCount}
+          busy={projectDeleteBusy}
+          error={projectDeleteError}
+          onClose={() => {
+            if (projectDeleteBusy) return
+            setProjectDeleteError(null)
+            setProjectDeleteProposal(null)
+          }}
+          onConfirm={deleteSelectedProject}
+          project={projectDeleteProposal.project}
+          returnFocus={projectDeleteProposal.returnFocus}
+        />
+      ) : null}
       {endSessionProposal ? (
         <EndWorkerSessionDialog
           busy={endSessionBusy}
@@ -5887,6 +6376,19 @@ function App() {
             setEndSessionProposal(null)
           }}
           onConfirm={endSession}
+        />
+      ) : null}
+      {workerDeleteProposal ? (
+        <DeleteWorkerDialog
+          busy={workerDeleteBusy}
+          candidate={workerDeleteProposal.candidate}
+          error={workerDeleteError}
+          onClose={() => {
+            if (workerDeleteBusy) return
+            setWorkerDeleteError(null)
+            setWorkerDeleteProposal(null)
+          }}
+          onConfirm={deleteSelectedWorker}
         />
       ) : null}
     </AgentWorkspaceContext.Provider>

@@ -1,4 +1,6 @@
 import type {
+  ArchiveProjectInput,
+  ArchivedProject,
   Artifact,
   ArtifactContent,
   Automation,
@@ -31,8 +33,12 @@ import type {
   CreateProjectFromProfileInput,
   CreateWorkerProfileInput,
   CreateWorkspaceProjectFromProfileInput,
+  DeletedProject,
   DeletedProjectRelationship,
+  DeletedWorker,
+  DeleteProjectInput,
   DeleteProjectRelationshipInput,
+  DeleteWorkerInput,
   EndedWorkerSession,
   EndWorkerSessionInput,
   ExternalTerminalLaunch,
@@ -51,6 +57,7 @@ import type {
   RecordCompletionReceiptInput,
   RuntimeInventory,
   RuntimeSessions,
+  RuntimeTopology,
   RunAutomationInput,
   SendAssignmentPromptInput,
   SendCoordinationNodePromptInput,
@@ -141,6 +148,16 @@ export function fetchInventory(
   )
 }
 
+export function fetchRuntimeTopology(
+  session: string,
+  signal?: AbortSignal,
+): Promise<RuntimeTopology> {
+  return requestJson(
+    `/api/v1/runtimes/herdr/sessions/${encodeURIComponent(session)}/topology`,
+    { signal },
+  )
+}
+
 export function fetchProjects(signal?: AbortSignal): Promise<Projects> {
   return requestJson('/api/v1/projects', { signal })
 }
@@ -152,6 +169,38 @@ export function fetchProject(
   return requestJson(
     `/api/v1/projects/${encodeURIComponent(projectId)}`,
     { signal },
+  )
+}
+
+export function archiveProject(
+  projectId: string,
+  command: ArchiveProjectInput,
+  signal?: AbortSignal,
+): Promise<ArchivedProject> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/archive`,
+    {
+      body: JSON.stringify(command),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal,
+    },
+  )
+}
+
+export function deleteProject(
+  projectId: string,
+  command: DeleteProjectInput,
+  signal?: AbortSignal,
+): Promise<DeletedProject> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/delete`,
+    {
+      body: JSON.stringify(command),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal,
+    },
   )
 }
 
@@ -621,6 +670,22 @@ export function endWorkerSession(
 ): Promise<EndedWorkerSession> {
   return requestJson(
     `/api/v1/workers/${encodeURIComponent(workerId)}/end-session`,
+    {
+      body: JSON.stringify(command),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal,
+    },
+  )
+}
+
+export function deleteWorker(
+  workerId: string,
+  command: DeleteWorkerInput,
+  signal?: AbortSignal,
+): Promise<DeletedWorker> {
+  return requestJson(
+    `/api/v1/workers/${encodeURIComponent(workerId)}/delete`,
     {
       body: JSON.stringify(command),
       headers: { 'Content-Type': 'application/json' },
