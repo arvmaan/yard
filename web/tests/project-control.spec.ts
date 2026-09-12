@@ -930,6 +930,7 @@ async function mockApi(
   await page.routeWebSocket(
     (url) => url.pathname.endsWith('/terminal'),
     (socket) => {
+      state.requestLog.push('terminal:websocket')
       state.terminalConnectionUrls.push(socket.url())
       state.terminalSockets.push(socket)
       socket.onMessage((message) => {
@@ -2310,6 +2311,7 @@ async function mockApi(
         lines: url.searchParams.get('lines'),
         projectId,
       })
+      state.requestLog.push('terminal:history')
       if (!current) {
         await route.fulfill({ status: 404 })
         return
@@ -6003,6 +6005,127 @@ test('shows agent activity error and empty states in chat', async ({
       conversation.evaluate((element) => element.getBoundingClientRect().height),
     )
     .toBe(initialHeight)
+})
+
+test('opens the terminal socket before history and replays sequenced live frames', async ({
+  page,
+}) => {
+  const state = await mockApi(page, {
+    terminalOutputDelayMs: 800,
+    terminalOutputText: 'history before the live frame',
+  })
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page
+    .getByRole('button', { name: 'Open terminal', exact: true })
+    .click()
+
+  const terminal = page.locator('.terminal-session')
+  const terminalRows = terminal.locator('.xterm-accessibility-tree')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  await expect.poll(() => state.terminalOutputRequests.length).toBe(1)
+  expect(state.requestLog.indexOf('terminal:websocket')).toBeLessThan(
+    state.requestLog.indexOf('terminal:history'),
+  )
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect(terminal).toHaveAttribute(
+    'data-history-state',
+    'loading',
+  )
+
+  const terminalUrl = new URL(state.terminalConnectionUrls[0])
+  const width = Number(terminalUrl.searchParams.get('cols'))
+  const height = Number(terminalUrl.searchParams.get('rows'))
+  state.terminalSockets[0].send(
+    JSON.stringify({
+      type: 'terminal.frame',
+      bytes: Buffer.from('\r\nlive frame one').toString('base64'),
+      seq: 1,
+      width,
+      height,
+      full: false,
+    }),
+  )
+  state.terminalSockets[0].send(
+    JSON.stringify({
+      type: 'terminal.frame',
+      bytes: Buffer.from('\r\nduplicate frame').toString('base64'),
+      seq: 1,
+      width,
+      height,
+      full: false,
+    }),
+  )
+  state.terminalSockets[0].send(
+    JSON.stringify({
+      type: 'terminal.frame',
+      bytes: Buffer.from('\r\nlive frame two').toString('base64'),
+      seq: 2,
+      width,
+      height,
+      full: false,
+    }),
+  )
+
+  await expect(terminal).toHaveAttribute('data-history-state', 'ready')
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '2')
+  await expect(terminalRows).toContainText(
+    'history before the live frame',
+  )
+  await expect(terminalRows).toContainText('live frame one')
+  await expect(terminalRows).toContainText('live frame two')
+  await expect(terminalRows).not.toContainText('duplicate frame')
+})
+
+test('keeps live terminal output available when history loading degrades', async ({
+  page,
+}) => {
+  const state = await mockApi(page, {
+    terminalOutputFails: true,
+  })
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page
+    .getByRole('button', { name: 'Open terminal', exact: true })
+    .click()
+
+  const terminal = page.locator('.terminal-session')
+  const terminalRows = terminal.locator('.xterm-accessibility-tree')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect(terminal).toHaveAttribute(
+    'data-history-state',
+    'degraded',
+  )
+  await expect(
+    terminal.locator('.terminal-session__status-text'),
+  ).toContainText('Connected · Earlier history unavailable')
+
+  const terminalUrl = new URL(state.terminalConnectionUrls[0])
+  state.terminalSockets[0].send(
+    JSON.stringify({
+      type: 'terminal.frame',
+      bytes: Buffer.from('live output without history').toString(
+        'base64',
+      ),
+      seq: 1,
+      width: Number(terminalUrl.searchParams.get('cols')),
+      height: Number(terminalUrl.searchParams.get('rows')),
+      full: true,
+    }),
+  )
+
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  await expect(terminalRows).toContainText(
+    'live output without history',
+  )
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
 })
 
 test('connects the assignment terminal and relays frames, input, resize, and release', async ({

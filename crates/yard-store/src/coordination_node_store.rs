@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use yard_domain::{
     CoordinationDeliveryStatus, CoordinationNode, CoordinationNodeCommandResult,
     CoordinationNodeKind, CoordinationNodePlacement, CoordinationNodePromptAcknowledgement,
@@ -18,6 +18,58 @@ use super::{
 };
 
 const MAX_ROUTE_LIST_LIMIT: usize = 500;
+
+pub(super) fn archive_project_attachments(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    actor: &str,
+    now: u64,
+) -> Result<(), ProjectStoreError> {
+    let attached_nodes = {
+        let mut statement = transaction.prepare(
+            "SELECT node.id, node.version
+               FROM coordination_nodes node
+               JOIN coordination_node_projects attached
+                 ON attached.node_id = node.id
+              WHERE attached.project_id = ?1
+              ORDER BY node.id",
+        )?;
+        statement
+            .query_map([project_id], |row| {
+                Ok((row.get::<_, String>(0)?, super::row_u64(row, 1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (node_id, current_version) in attached_nodes {
+        let next_version = current_version
+            .checked_add(1)
+            .ok_or(ProjectStoreError::VersionOverflow)?;
+        let rows = transaction.execute(
+            "UPDATE coordination_nodes
+                SET version = ?1, updated_at_unix_ms = ?2
+              WHERE id = ?3 AND version = ?4",
+            params![
+                to_i64(next_version)?,
+                to_i64(now)?,
+                node_id,
+                to_i64(current_version)?,
+            ],
+        )?;
+        if rows != 1 {
+            return Err(ProjectStoreError::CoordinationNodeVersionConflict { current_version });
+        }
+        insert_lifecycle_event(
+            transaction,
+            "coordination_node",
+            &node_id,
+            next_version,
+            "coordination_node_project_archived",
+            actor,
+            now,
+        )?;
+    }
+    Ok(())
+}
 
 pub(super) async fn list_nodes(
     store: &SqliteProjectStore,

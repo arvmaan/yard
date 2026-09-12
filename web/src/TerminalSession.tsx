@@ -47,6 +47,11 @@ type ConnectionState =
   | { kind: 'closed'; detail: string }
   | { kind: 'error'; detail: string }
 
+type TerminalHistoryState =
+  | { kind: 'loading'; detail: string }
+  | { kind: 'ready'; detail: string }
+  | { kind: 'degraded'; detail: string }
+
 interface FrameMetadata {
   seq: number
   width: number
@@ -211,6 +216,10 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
     kind: 'connecting',
     detail: 'Connecting',
   })
+  const [history, setHistory] = useState<TerminalHistoryState>({
+    kind: 'loading',
+    detail: 'Loading earlier history',
+  })
   const [connectionAttempt, setConnectionAttempt] = useState(0)
   const [frame, setFrame] = useState<FrameMetadata | null>(null)
   const assignmentId =
@@ -237,9 +246,16 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
     let pendingFrame: FrameMetadata | null = null
     let lastSequence = -1
     let lastSentSize = ''
+    let historyPending = true
+    let bufferedFrames: TerminalFrameMessage[] = []
+    let frameWriteQueue = Promise.resolve()
     const historyController = new AbortController()
 
     setConnection({ kind: 'connecting', detail: 'Connecting' })
+    setHistory({
+      kind: 'loading',
+      detail: 'Loading earlier history',
+    })
     setFrame(null)
 
     const terminal = new Terminal({
@@ -369,6 +385,97 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       passive: false,
     })
 
+    const closeForInvalidFrame = (detail: string) => {
+      setConnection({ kind: 'error', detail })
+      socket?.close(1000, 'Invalid terminal frame')
+    }
+
+    const queueFrame = (message: TerminalFrameMessage) => {
+      let bytes: Uint8Array
+      try {
+        bytes = decodeBase64(message.bytes)
+      } catch {
+        closeForInvalidFrame('Terminal frame could not be decoded')
+        return
+      }
+      frameWriteQueue = frameWriteQueue.then(async () => {
+        if (disposed) return
+        await writeTerminal(terminal, bytes)
+        if (disposed) return
+        pendingFrame = {
+          seq: message.seq,
+          width: message.width,
+          height: message.height,
+          full: message.full,
+        }
+        if (!frameAnimationFrame) {
+          frameAnimationFrame = window.requestAnimationFrame(() => {
+            frameAnimationFrame = 0
+            if (!disposed && pendingFrame) setFrame(pendingFrame)
+            pendingFrame = null
+          })
+        }
+      })
+    }
+
+    const acceptFrame = (message: TerminalFrameMessage) => {
+      if (message.seq <= lastSequence) return
+      lastSequence = message.seq
+      if (historyPending) {
+        bufferedFrames.push(message)
+        return
+      }
+      queueFrame(message)
+    }
+
+    const releaseBufferedFrames = () => {
+      if (!historyPending) return
+      historyPending = false
+      const frames = bufferedFrames
+      bufferedFrames = []
+      for (const message of frames) queueFrame(message)
+    }
+
+    const loadHistory = async () => {
+      try {
+        const terminalHistory = await fetchTerminalHistory(
+          targetKind,
+          projectId,
+          assignmentId,
+          nodeId,
+          historyController.signal,
+        )
+        if (disposed) return
+        const text = terminalHistoryText(terminalHistory.text)
+        if (text) {
+          await writeTerminal(terminal, text)
+          if (disposed) return
+          terminal.scrollToBottom()
+        }
+        setHistory({
+          kind: 'ready',
+          detail: 'Earlier history loaded',
+        })
+      } catch (caught: unknown) {
+        if (
+          disposed ||
+          (caught instanceof DOMException &&
+            caught.name === 'AbortError')
+        ) {
+          return
+        }
+        setHistory({
+          kind: 'degraded',
+          detail:
+            caught instanceof Error
+              ? caught.message
+              : 'Earlier history unavailable',
+        })
+      } finally {
+        if (!disposed) releaseBufferedFrames()
+      }
+    }
+
     connectAnimationFrame = window.requestAnimationFrame(() => {
       // A single animation frame after this effect runs can still land in
       // the same layout pass that just made the (previously hidden or
@@ -398,32 +505,7 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
           sendResize(true)
         }, 500)
 
-        const connect = async () => {
-          try {
-            const history = await fetchTerminalHistory(
-              targetKind,
-              projectId,
-              assignmentId,
-              nodeId,
-              historyController.signal,
-            )
-            if (disposed) return
-            const text = terminalHistoryText(history.text)
-            if (text) {
-              await writeTerminal(terminal, text)
-              terminal.scrollToBottom()
-            }
-          } catch (caught: unknown) {
-            if (
-              disposed ||
-              (caught instanceof DOMException &&
-                caught.name === 'AbortError')
-            ) {
-              return
-            }
-          }
-
-          if (disposed) return
+        const connect = () => {
           const url = targetKind === 'yard-orchestrator'
             ? yardOrchestratorTerminalWebSocketUrl(cols, rows)
             : targetKind === 'coordination-node' && nodeId
@@ -446,6 +528,7 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
             if (disposed) return
             setConnection({ kind: 'connected', detail: 'Connected' })
             sendResize(true)
+            void loadHistory()
           }
 
           socket.onmessage = (event) => {
@@ -464,31 +547,7 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
             }
 
             if (isTerminalFrameMessage(message)) {
-              if (message.seq <= lastSequence) return
-              lastSequence = message.seq
-              try {
-                const bytes = decodeBase64(message.bytes)
-                terminal.write(bytes)
-                pendingFrame = {
-                  seq: message.seq,
-                  width: message.width,
-                  height: message.height,
-                  full: message.full,
-                }
-                if (!frameAnimationFrame) {
-                  frameAnimationFrame = window.requestAnimationFrame(() => {
-                    frameAnimationFrame = 0
-                    if (!disposed && pendingFrame) setFrame(pendingFrame)
-                    pendingFrame = null
-                  })
-                }
-              } catch {
-                setConnection({
-                  kind: 'error',
-                  detail: 'Terminal frame could not be decoded',
-                })
-                socket?.close(1000, 'Invalid terminal frame')
-              }
+              acceptFrame(message)
               return
             }
 
@@ -525,7 +584,7 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
           }
         }
 
-        void connect()
+        connect()
       })
     })
 
@@ -599,6 +658,7 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       data-frame-height={frame?.height}
       data-frame-sequence={frame?.seq}
       data-frame-width={frame?.width}
+      data-history-state={history.kind}
       data-state={connection.kind}
       data-terminal-palette={palette}
       data-terminal-theme={theme}
@@ -620,9 +680,17 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
           aria-live="polite"
           className="terminal-session__status-text"
           role="status"
+          title={history.kind === 'degraded' ? history.detail : undefined}
         >
           <span aria-hidden="true" />
           {connection.detail}
+          {history.kind === 'loading' &&
+          connection.kind === 'connected'
+            ? ' · Loading earlier history'
+            : null}
+          {history.kind === 'degraded'
+            ? ' · Earlier history unavailable'
+            : null}
         </div>
         {connection.kind === 'closed' ? (
           <button

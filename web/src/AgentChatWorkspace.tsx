@@ -75,6 +75,10 @@ export type AgentChatTarget =
   | { kind: 'yard-orchestrator'; orchestrator: YardOrchestrator }
   | { kind: 'coordination-node'; node: CoordinationNode }
 
+function agentChatTargetKey(target: AgentChatTarget) {
+  return agentQuestionKey(target)
+}
+
 type PromptFeedback =
   | { kind: 'success'; message: string }
   | {
@@ -185,15 +189,8 @@ export function AgentChatWorkspace({
     yardOrchestrator?.worker?.id ??
     coordinationNode?.worker?.id ??
     ''
-  const targetKey =
-    target.kind === 'assignment'
-      ? `assignment:${assignmentId}:${assignment?.attempt.id}`
-      : target.kind === 'orchestrator'
-        ? `orchestrator:${projectId}:${workerId}`
-        : target.kind === 'yard-orchestrator'
-          ? `yard-orchestrator:${yardOrchestrator?.version}:${workerId}`
-          : `coordination-node:${coordinationNode?.id}:${coordinationNode?.version}:${workerId}`
-  const workspaceQuestionKey = agentQuestionKey(target)
+  const targetKey = agentChatTargetKey(target)
+  const workspaceQuestionKey = targetKey
   const recordedQuestion = useLatestAgentQuestion(workspaceQuestionKey)
   const targetRole =
     target.kind === 'yard-orchestrator'
@@ -263,7 +260,6 @@ export function AgentChatWorkspace({
   ]
   const outputController = useRef<AbortController | null>(null)
   const promptInFlight = useRef(false)
-  const targetKeyRef = useRef(targetKey)
   const retainedPromptCommand = useRef<RetainedPrompt | null>(null)
   const onCloseRef = useRef(onClose)
   const returnFocusRef = useRef(returnFocus)
@@ -278,11 +274,22 @@ export function AgentChatWorkspace({
       ? projects.find((candidate) => candidate.id === dispatchProjectId) ??
         null
       : null
+  const dispatchTargetKey = dispatchProject
+    ? agentChatTargetKey({
+        kind: 'orchestrator',
+        project: dispatchProject,
+      })
+    : null
   const promptTargetKey = dispatchProject
-    ? target.kind === 'coordination-node'
-      ? `coordination-route:${coordinationNode?.id}:${dispatchProject.id}:${dispatchProject.orchestrator.id}`
-      : `yard-route:${dispatchProject.id}:${dispatchProject.orchestrator.id}`
+    ? JSON.stringify([
+        target.kind === 'coordination-node'
+          ? 'coordination-route'
+          : 'yard-route',
+        targetKey,
+        dispatchTargetKey,
+      ])
     : targetKey
+  const promptTargetKeyRef = useRef(promptTargetKey)
   const activeContextLabel = dispatchProject?.name ?? contextLabel
   onCloseRef.current = onClose
   returnFocusRef.current = returnFocus
@@ -295,8 +302,8 @@ export function AgentChatWorkspace({
   })
 
   useLayoutEffect(() => {
-    targetKeyRef.current = targetKey
-  }, [targetKey])
+    promptTargetKeyRef.current = promptTargetKey
+  }, [promptTargetKey])
 
   const loadActivity = useCallback(async () => {
     outputController.current?.abort()
@@ -396,16 +403,19 @@ export function AgentChatWorkspace({
   useEffect(() => {
     outputController.current?.abort()
     outputController.current = null
-    promptInFlight.current = false
-    retainedPromptCommand.current = null
     setMessages([])
     setPromptText('')
-    setPromptFeedback(null)
-    setPromptBusy(false)
     setDispatchProjectId('')
     followMessagesRef.current = true
     return () => outputController.current?.abort()
   }, [targetKey])
+
+  useEffect(() => {
+    promptInFlight.current = false
+    retainedPromptCommand.current = null
+    setPromptFeedback(null)
+    setPromptBusy(false)
+  }, [promptTargetKey])
 
   useEffect(() => {
     if (!open) return
@@ -453,7 +463,7 @@ export function AgentChatWorkspace({
   const sendPrompt = async (forceNewCommand: boolean) => {
     const text = promptText.trim()
     if (!text || promptInFlight.current) return
-    const requestedTargetKey = targetKeyRef.current
+    const requestedTargetKey = promptTargetKeyRef.current
 
     const retainedCommand = retainedPromptCommand.current
     const canReuse =
@@ -617,7 +627,7 @@ export function AgentChatWorkspace({
       }
       // Prompt POSTs cannot be aborted after submission. Ignore their UI
       // result if the operator switched chat targets while one was in flight.
-      if (targetKeyRef.current !== requestedTargetKey) return
+      if (promptTargetKeyRef.current !== requestedTargetKey) return
       setPromptText('')
       retainedPromptCommand.current = null
       setPromptFeedback({
@@ -633,7 +643,7 @@ export function AgentChatWorkspace({
         void loadActivity()
       }, 800)
     } catch (caught) {
-      if (targetKeyRef.current !== requestedTargetKey) return
+      if (promptTargetKeyRef.current !== requestedTargetKey) return
       const feedback = {
         kind: 'error' as const,
         message: errorMessage(caught, 'Prompt acknowledgement failed'),
@@ -654,7 +664,7 @@ export function AgentChatWorkspace({
         },
       ])
     } finally {
-      if (targetKeyRef.current === requestedTargetKey) {
+      if (promptTargetKeyRef.current === requestedTargetKey) {
         promptInFlight.current = false
         setPromptBusy(false)
       }

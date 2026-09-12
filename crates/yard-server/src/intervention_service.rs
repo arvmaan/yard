@@ -844,7 +844,7 @@ impl InterventionService {
         if observed.workspace_id != runtime.workspace_id
             || observed.pane_id != runtime.pane_id
             || observed.tab_id != runtime.tab_id.as_deref().unwrap_or_default()
-            || !provider_session_matches(
+            || !active_provider_session_matches(
                 runtime.provider_session.as_ref(),
                 observed.provider_session.as_ref(),
             )
@@ -957,14 +957,11 @@ fn same_runtime_identity(left: &WorkerRuntimeBinding, right: &WorkerRuntimeBindi
         && left.provider_session == right.provider_session
 }
 
-fn provider_session_matches(
+fn active_provider_session_matches(
     expected: Option<&yard_domain::ProviderSessionRef>,
     observed: Option<&yard_domain::ProviderSessionRef>,
 ) -> bool {
-    !matches!(
-        (expected, observed),
-        (Some(expected), Some(observed)) if expected != observed
-    )
+    expected.is_none_or(|expected| observed == Some(expected))
 }
 
 #[derive(Debug, Error)]
@@ -1015,7 +1012,7 @@ pub enum InterventionServiceError {
 mod tests {
     use yard_domain::ProviderSessionRef;
 
-    use super::provider_session_matches;
+    use super::active_provider_session_matches;
 
     fn session(value: &str) -> ProviderSessionRef {
         ProviderSessionRef {
@@ -1030,17 +1027,23 @@ mod tests {
     fn legacy_binding_accepts_missing_or_newly_observed_provider_session() {
         let observed = session("observed");
 
-        assert!(provider_session_matches(None, None));
-        assert!(provider_session_matches(None, Some(&observed)));
+        assert!(active_provider_session_matches(None, None));
+        assert!(active_provider_session_matches(None, Some(&observed)));
     }
 
     #[test]
-    fn known_provider_session_accepts_missing_observation_but_rejects_change() {
+    fn known_provider_session_requires_an_exact_observation() {
         let expected = session("expected");
         let observed = session("observed");
 
-        assert!(provider_session_matches(Some(&expected), Some(&expected)));
-        assert!(provider_session_matches(Some(&expected), None));
-        assert!(!provider_session_matches(Some(&expected), Some(&observed)));
+        assert!(active_provider_session_matches(
+            Some(&expected),
+            Some(&expected)
+        ));
+        assert!(!active_provider_session_matches(Some(&expected), None));
+        assert!(!active_provider_session_matches(
+            Some(&expected),
+            Some(&observed)
+        ));
     }
 }

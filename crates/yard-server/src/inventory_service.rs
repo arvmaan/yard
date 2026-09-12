@@ -106,6 +106,27 @@ fn prompt_delivery_error(
     }
 }
 
+fn start_failure_error(
+    start: HerdrError,
+    rollback: String,
+    rollback_succeeded: bool,
+    started_runtime: Option<Box<yard_domain::WorkerRuntimeBinding>>,
+) -> RuntimeProvisionError {
+    let ambiguous = started_runtime.is_some();
+    let message = HerdrControlError::StartFailed {
+        start,
+        rollback,
+        rollback_succeeded,
+        started_runtime: started_runtime.clone(),
+    }
+    .to_string();
+    RuntimeProvisionError::AfterPreparation {
+        message,
+        ambiguous,
+        started_runtime,
+    }
+}
+
 #[async_trait]
 impl RuntimeControl for HerdrInventorySource {
     async fn ensure_session(
@@ -151,17 +172,12 @@ impl RuntimeControl for HerdrInventorySource {
                 rollback,
                 rollback_succeeded,
                 started_runtime,
-            }) => Err(RuntimeProvisionError::AfterPreparation {
-                message: HerdrControlError::StartFailed {
-                    start,
-                    rollback,
-                    rollback_succeeded,
-                    started_runtime: started_runtime.clone(),
-                }
-                .to_string(),
-                ambiguous: !rollback_succeeded,
+            }) => Err(start_failure_error(
+                start,
+                rollback,
+                rollback_succeeded,
                 started_runtime,
-            }),
+            )),
             Err(error) => Err(RuntimeProvisionError::BeforeWorker(error.to_string())),
         }
     }
@@ -212,17 +228,12 @@ impl RuntimeControl for HerdrInventorySource {
                 rollback,
                 rollback_succeeded,
                 started_runtime,
-            }) => Err(RuntimeProvisionError::AfterPreparation {
-                message: HerdrControlError::StartFailed {
-                    start,
-                    rollback,
-                    rollback_succeeded,
-                    started_runtime: started_runtime.clone(),
-                }
-                .to_string(),
-                ambiguous: !rollback_succeeded,
+            }) => Err(start_failure_error(
+                start,
+                rollback,
+                rollback_succeeded,
                 started_runtime,
-            }),
+            )),
             Err(HerdrControlError::Runtime(error)) => {
                 Err(RuntimeProvisionError::BeforeWorker(error.to_string()))
             }
@@ -293,17 +304,12 @@ impl RuntimeControl for HerdrInventorySource {
                 rollback,
                 rollback_succeeded,
                 started_runtime,
-            }) => Err(RuntimeProvisionError::AfterPreparation {
-                message: HerdrControlError::StartFailed {
-                    start,
-                    rollback,
-                    rollback_succeeded,
-                    started_runtime: started_runtime.clone(),
-                }
-                .to_string(),
-                ambiguous: !rollback_succeeded,
+            }) => Err(start_failure_error(
+                start,
+                rollback,
+                rollback_succeeded,
                 started_runtime,
-            }),
+            )),
             Err(error) => Err(RuntimeProvisionError::AfterPreparation {
                 message: error.to_string(),
                 ambiguous: true,
@@ -356,17 +362,12 @@ impl RuntimeControl for HerdrInventorySource {
                 rollback,
                 rollback_succeeded,
                 started_runtime,
-            }) => Err(RuntimeProvisionError::AfterPreparation {
-                message: HerdrControlError::StartFailed {
-                    start,
-                    rollback,
-                    rollback_succeeded,
-                    started_runtime: started_runtime.clone(),
-                }
-                .to_string(),
-                ambiguous: !rollback_succeeded,
+            }) => Err(start_failure_error(
+                start,
+                rollback,
+                rollback_succeeded,
                 started_runtime,
-            }),
+            )),
             Err(HerdrControlError::WorkspaceCreateFailed { source, ambiguous }) => {
                 Err(RuntimeProvisionError::AfterPreparation {
                     message: source.to_string(),
@@ -445,17 +446,12 @@ impl RuntimeControl for HerdrInventorySource {
                 rollback,
                 rollback_succeeded,
                 started_runtime,
-            }) => Err(RuntimeProvisionError::AfterPreparation {
-                message: HerdrControlError::StartFailed {
-                    start,
-                    rollback,
-                    rollback_succeeded,
-                    started_runtime: started_runtime.clone(),
-                }
-                .to_string(),
-                ambiguous: !rollback_succeeded,
+            }) => Err(start_failure_error(
+                start,
+                rollback,
+                rollback_succeeded,
                 started_runtime,
-            }),
+            )),
             Err(error) => Err(RuntimeProvisionError::AfterPreparation {
                 message: error.to_string(),
                 ambiguous: true,
@@ -906,8 +902,12 @@ mod tests {
         RuntimeInventory, TabObservation,
     };
 
-    use super::{RetirementResolution, retirement_outcome, retirement_resolution};
-    use crate::allocation_service::{RuntimeRetirementError, RuntimeRetirementRequest};
+    use super::{
+        RetirementResolution, retirement_outcome, retirement_resolution, start_failure_error,
+    };
+    use crate::allocation_service::{
+        RuntimeProvisionError, RuntimeRetirementError, RuntimeRetirementRequest,
+    };
 
     fn provider(value: &str) -> ProviderSessionRef {
         ProviderSessionRef {
@@ -973,6 +973,29 @@ mod tests {
             provider_session: Some(provider_session),
             owns_tab: true,
         }
+    }
+
+    #[test]
+    fn definite_start_rejection_remains_non_ambiguous_without_captured_runtime() {
+        let RuntimeProvisionError::AfterPreparation {
+            ambiguous,
+            started_runtime,
+            ..
+        } = start_failure_error(
+            yard_herdr::HerdrError::Api {
+                code: "agent_name_taken".to_owned(),
+                message: "agent name is already in use".to_owned(),
+            },
+            "not attempted; existing topology preserved".to_owned(),
+            false,
+            None,
+        )
+        else {
+            panic!("expected an after-preparation start failure");
+        };
+
+        assert!(!ambiguous);
+        assert!(started_runtime.is_none());
     }
 
     #[test]

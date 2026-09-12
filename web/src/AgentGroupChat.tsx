@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -98,10 +99,18 @@ interface ThreadMessage {
   truncated?: boolean
 }
 
-function targetKey(target: AgentGroupTarget) {
-  return target.kind === 'assignment'
-    ? `assignment:${target.assignment.id}:${target.assignment.attempt.id}`
-    : `orchestrator:${target.project.id}:${target.project.orchestrator.id}`
+function agentGroupTargetKey(target: AgentGroupTarget) {
+  return agentQuestionKey(
+    target.kind === 'assignment'
+      ? {
+          assignment: target.assignment,
+          kind: 'assignment',
+        }
+      : {
+          kind: 'orchestrator',
+          project: target.project,
+        },
+  )
 }
 
 function targetProjectName(target: AgentGroupTarget) {
@@ -168,11 +177,13 @@ export function AgentGroupChat({
   const stableTargets = useMemo(
     () =>
       [...targets].sort((left, right) =>
-        targetKey(left).localeCompare(targetKey(right)),
+        agentGroupTargetKey(left).localeCompare(
+          agentGroupTargetKey(right),
+        ),
       ),
     [targets],
   )
-  const groupKey = stableTargets.map(targetKey).join('|')
+  const groupKey = stableTargets.map(agentGroupTargetKey).join('|')
   const targetsRef = useRef(stableTargets)
   const groupKeyRef = useRef(groupKey)
   const [messages, setMessages] = useState<ThreadMessage[]>([])
@@ -203,7 +214,7 @@ export function AgentGroupChat({
     setSnapshotsLoading(true)
     const snapshots = await Promise.all(
       targetsRef.current.map(async (target): Promise<ThreadMessage> => {
-        const key = targetKey(target)
+        const key = agentGroupTargetKey(target)
         try {
           const output =
             target.kind === 'assignment'
@@ -250,7 +261,7 @@ export function AgentGroupChat({
     }
   }, [])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     targetsRef.current = stableTargets
     groupKeyRef.current = groupKey
   }, [groupKey, stableTargets])
@@ -265,6 +276,7 @@ export function AgentGroupChat({
     setDeliveries({})
     setMessages([])
     setPromptText('')
+    setSnapshotsLoading(false)
   }, [groupKey])
 
   useEffect(() => {
@@ -324,14 +336,14 @@ export function AgentGroupChat({
     setDeliveries((current) => {
       const next = { ...current }
       for (const command of commands) {
-        next[targetKey(command.target)] = { state: 'pending' }
+        next[agentGroupTargetKey(command.target)] = { state: 'pending' }
       }
       return next
     })
 
     await Promise.all(
       commands.map(async (command) => {
-        const key = targetKey(command.target)
+        const key = agentGroupTargetKey(command.target)
         try {
           await sendTargetCommand(command)
           if (groupKeyRef.current !== requestedGroup) return
@@ -363,7 +375,7 @@ export function AgentGroupChat({
     activeText.current = text
     const commands = stableTargets.map((target) => {
       const command = commandForTarget(target, text)
-      retainedCommands.current.set(targetKey(target), command)
+      retainedCommands.current.set(agentGroupTargetKey(target), command)
       return command
     })
     await dispatch(commands, text, true)
@@ -371,7 +383,7 @@ export function AgentGroupChat({
 
   const retryFailed = async (fresh: boolean) => {
     const commands = stableTargets.flatMap((target) => {
-      const key = targetKey(target)
+      const key = agentGroupTargetKey(target)
       const delivery = deliveries[key]
       if (
         delivery?.state !== 'failed' ||
@@ -429,7 +441,10 @@ export function AgentGroupChat({
       </div>
       <div className="group-chat-roster" aria-label="Selected agents">
         {stableTargets.map((target) => (
-          <span data-status={target.status} key={targetKey(target)}>
+          <span
+            data-status={target.status}
+            key={agentGroupTargetKey(target)}
+          >
             <Bot aria-hidden="true" size={13} />
             {target.label}
           </span>
@@ -511,7 +526,7 @@ export function AgentGroupChat({
                   {stableTargets.map((target) => (
                     <span
                       data-status={target.status}
-                      key={targetKey(target)}
+                      key={agentGroupTargetKey(target)}
                     >
                       <Bot aria-hidden="true" size={13} />
                       {target.label}
@@ -541,12 +556,13 @@ export function AgentGroupChat({
                 {Object.keys(deliveries).length > 0 ? (
                   <div className="group-delivery-results" role="status">
                     {stableTargets.map((target) => {
-                      const delivery = deliveries[targetKey(target)]
+                      const delivery =
+                        deliveries[agentGroupTargetKey(target)]
                       if (!delivery) return null
                       return (
                         <div
                           data-state={delivery.state}
-                          key={targetKey(target)}
+                          key={agentGroupTargetKey(target)}
                         >
                           {delivery.state === 'pending' ? (
                             <LoaderCircle

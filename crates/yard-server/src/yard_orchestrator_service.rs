@@ -61,6 +61,7 @@ enum RecoveryDelivery {
     },
     Restarted {
         restored: ObservedWorker,
+        runtime: Box<WorkerRuntimeBinding>,
     },
 }
 
@@ -357,13 +358,17 @@ impl YardOrchestratorService {
                 orchestrator: self.store.get_yard_orchestrator().await?,
             });
         }
-        let restored = match &delivery {
-            RecoveryDelivery::Prompt { restored, .. }
-            | RecoveryDelivery::Restarted { restored } => restored.clone(),
+        let (restored, expected_runtime) = match &delivery {
+            RecoveryDelivery::Prompt { restored, .. } => {
+                (restored.clone(), current_runtime.clone())
+            }
+            RecoveryDelivery::Restarted { restored, runtime } => {
+                (restored.clone(), runtime.as_ref().clone())
+            }
             RecoveryDelivery::Replayed => unreachable!(),
         };
         let (orchestrator, runtime) = match self
-            .verified_recovered_orchestrator(current_worker, current_runtime, &restored)
+            .verified_recovered_orchestrator(current_worker, &expected_runtime, &restored)
             .await
         {
             Ok(verified) => verified,
@@ -391,7 +396,7 @@ impl YardOrchestratorService {
                         if let Err(error) = self
                             .verified_recovered_orchestrator(
                                 current_worker,
-                                current_runtime,
+                                &expected_runtime,
                                 &restored,
                             )
                             .await
@@ -487,6 +492,9 @@ impl YardOrchestratorService {
         if !retained_dedicated_pane(&inventory, current_runtime) {
             return Err(YardOrchestratorServiceError::RecoveryBindingMissing);
         }
+        let restart_runtime = self
+            .current_recovery_runtime(current_worker, current_runtime)
+            .await?;
 
         let profile_id = current_worker
             .profile_id
@@ -515,24 +523,16 @@ impl YardOrchestratorService {
             return Ok(RecoveryDelivery::Replayed);
         }
         let prompt = lifecycle_prompt_text(&command.command_id, workflow, &prompt)?;
-        if let Err(error) = self
-            .runtime
-            .restart_worker(RuntimeWorkerRestartRequest {
-                command_id: command.command_id.clone(),
-                runtime: current_runtime.clone(),
-                agent_name: YARD_ORCHESTRATOR_AGENT_NAME.to_owned(),
-                kind: profile.spec.provider,
+        let restarted_runtime = self
+            .restart_dedicated_runtime(
+                command,
+                current_worker,
+                restart_runtime,
+                profile.spec.provider,
                 args,
                 prompt,
-            })
-            .await
-        {
-            let ambiguous = runtime_restart_outcome_ambiguous(&error);
-            self.store
-                .fail_yard_orchestrator_prompt(&command.command_id, &error.to_string(), ambiguous)
-                .await?;
-            return Err(runtime_error(error));
-        }
+            )
+            .await?;
 
         let refresh = self.reconciliation.refresh(YARD_ORCHESTRATOR_SESSION).await;
         let (inventory, _) = match refresh {
@@ -545,7 +545,10 @@ impl YardOrchestratorService {
             }
         };
         if let Some(restored) = dedicated_worker(&inventory, Some(current_worker)) {
-            return Ok(RecoveryDelivery::Restarted { restored });
+            return Ok(RecoveryDelivery::Restarted {
+                restored,
+                runtime: Box::new(restarted_runtime),
+            });
         }
         let error = if pending_dedicated_worker(&inventory, current_worker) {
             YardOrchestratorServiceError::RecoveryLaunchPending
@@ -556,6 +559,89 @@ impl YardOrchestratorService {
             .fail_yard_orchestrator_prompt(&command.command_id, &error.to_string(), true)
             .await?;
         Err(error)
+    }
+
+    async fn restart_dedicated_runtime(
+        &self,
+        command: &RecoverYardOrchestrator,
+        current_worker: &yard_domain::Worker,
+        previous_runtime: WorkerRuntimeBinding,
+        kind: String,
+        args: Vec<String>,
+        prompt: String,
+    ) -> Result<WorkerRuntimeBinding, YardOrchestratorServiceError> {
+        let restarted_runtime = match self
+            .runtime
+            .restart_worker(RuntimeWorkerRestartRequest {
+                command_id: command.command_id.clone(),
+                runtime: previous_runtime.clone(),
+                agent_name: YARD_ORCHESTRATOR_AGENT_NAME.to_owned(),
+                kind,
+                args,
+                prompt,
+            })
+            .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let ambiguous = runtime_restart_outcome_ambiguous(&error);
+                self.store
+                    .fail_yard_orchestrator_prompt(
+                        &command.command_id,
+                        &error.to_string(),
+                        ambiguous,
+                    )
+                    .await?;
+                return Err(runtime_error(error));
+            }
+        };
+        if !valid_restarted_runtime_transition(&previous_runtime, &restarted_runtime) {
+            let error = YardOrchestratorServiceError::RecoveryBindingAmbiguous;
+            self.store
+                .fail_yard_orchestrator_prompt(&command.command_id, &error.to_string(), true)
+                .await?;
+            return Err(error);
+        }
+        if let Err(error) = self
+            .store
+            .persist_worker_runtime_transition(
+                &current_worker.id,
+                previous_runtime,
+                restarted_runtime.clone(),
+            )
+            .await
+        {
+            self.store
+                .fail_yard_orchestrator_prompt(&command.command_id, &error.to_string(), true)
+                .await?;
+            return Err(error.into());
+        }
+        Ok(restarted_runtime)
+    }
+
+    async fn current_recovery_runtime(
+        &self,
+        current_worker: &yard_domain::Worker,
+        expected_runtime: &WorkerRuntimeBinding,
+    ) -> Result<WorkerRuntimeBinding, YardOrchestratorServiceError> {
+        let orchestrator = self.store.get_yard_orchestrator().await?;
+        let runtime = orchestrator
+            .worker
+            .as_ref()
+            .filter(|worker| worker.id == current_worker.id)
+            .and_then(|worker| worker.runtime.as_ref())
+            .ok_or(YardOrchestratorServiceError::RecoveryOwnershipChanged)?;
+        if !same_stable_runtime_identity(expected_runtime, runtime)
+            || runtime.observation_state != RuntimeObservationState::Observed
+            || runtime.process_state != RuntimeProcessState::Exited
+            || expected_runtime
+                .provider_session
+                .as_ref()
+                .is_some_and(|expected| runtime.provider_session.as_ref() != Some(expected))
+        {
+            return Err(YardOrchestratorServiceError::RecoveryBindingAmbiguous);
+        }
+        Ok(runtime.clone())
     }
 
     async fn begin_recovery_prompt(
@@ -586,10 +672,14 @@ impl YardOrchestratorService {
         current_runtime: &WorkerRuntimeBinding,
         restored: &ObservedWorker,
     ) -> Result<(YardOrchestrator, WorkerRuntimeBinding), YardOrchestratorServiceError> {
-        if current_runtime
-            .provider_session
-            .as_ref()
-            .is_some_and(|expected| restored.provider_session.as_ref() != Some(expected))
+        if restored.workspace_id != current_runtime.workspace_id
+            || restored.terminal_id != current_runtime.terminal_id
+            || Some(restored.tab_id.as_str()) != current_runtime.tab_id.as_deref()
+            || restored.pane_id != current_runtime.pane_id
+            || current_runtime
+                .provider_session
+                .as_ref()
+                .is_some_and(|expected| restored.provider_session.as_ref() != Some(expected))
         {
             return Err(YardOrchestratorServiceError::RecoveryBindingAmbiguous);
         }
@@ -603,8 +693,7 @@ impl YardOrchestratorService {
             .runtime
             .as_ref()
             .filter(|runtime| {
-                runtime.session == YARD_ORCHESTRATOR_SESSION
-                    && runtime.terminal_id == restored.terminal_id
+                same_stable_runtime_identity(current_runtime, runtime)
                     && runtime.observation_state == RuntimeObservationState::Observed
                     && runtime.process_state == RuntimeProcessState::Running
             })
@@ -998,6 +1087,40 @@ fn retained_dedicated_pane(inventory: &RuntimeInventory, runtime: &WorkerRuntime
     workspace_is_dedicated && pane_is_retained && !pane_has_agent
 }
 
+fn same_stable_runtime_identity(
+    expected: &WorkerRuntimeBinding,
+    observed: &WorkerRuntimeBinding,
+) -> bool {
+    expected.adapter == observed.adapter
+        && expected.session == observed.session
+        && expected.workspace_id == observed.workspace_id
+        && expected.terminal_id == observed.terminal_id
+        && expected.tab_id == observed.tab_id
+        && expected.pane_id == observed.pane_id
+        && expected.owns_tab == observed.owns_tab
+}
+
+fn valid_restarted_runtime_transition(
+    previous: &WorkerRuntimeBinding,
+    restarted: &WorkerRuntimeBinding,
+) -> bool {
+    same_stable_runtime_identity(previous, restarted)
+        && restarted.observation_state == RuntimeObservationState::Observed
+        && restarted.process_state == RuntimeProcessState::Running
+        && match (
+            previous.provider_session.as_ref(),
+            restarted.provider_session.as_ref(),
+        ) {
+            (Some(previous), Some(restarted)) => {
+                previous.source == restarted.source
+                    && previous.provider == restarted.provider
+                    && previous.kind == restarted.kind
+            }
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
+}
+
 fn validated_provider_args(
     profile: &yard_domain::WorkerProfile,
 ) -> Result<Vec<String>, YardOrchestratorServiceError> {
@@ -1177,6 +1300,7 @@ mod tests {
         /// deadline.
         never_ready: AtomicBool,
         omit_provider_session: AtomicBool,
+        restarted_provider_session: Mutex<Option<ProviderSessionRef>>,
         retirement_identity_misses: AtomicUsize,
         retirement_runtime_failures: AtomicUsize,
         retirement_guard_unavailable: AtomicBool,
@@ -1218,6 +1342,10 @@ mod tests {
             let mut runtime = Self::binding();
             if self.omit_provider_session.load(Ordering::SeqCst) {
                 runtime.provider_session = None;
+            } else if let Some(provider_session) =
+                self.restarted_provider_session.lock().unwrap().clone()
+            {
+                runtime.provider_session = Some(provider_session);
             }
             runtime
         }
@@ -1306,8 +1434,7 @@ mod tests {
                         cwd: Some("/tmp/yard-backend".to_owned()),
                         foreground_cwd: Some("/tmp/yard-backend".to_owned()),
                         tokens: BTreeMap::new(),
-                        provider_session: (!self.omit_provider_session.load(Ordering::SeqCst))
-                            .then(provider_session),
+                        provider_session: self.current_binding().provider_session,
                         revision: 1,
                     })
                     .into_iter()
@@ -1335,10 +1462,17 @@ mod tests {
             &self,
             request: RuntimeWorkerRestartRequest,
         ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            let mut runtime = request.runtime.clone();
+            runtime.provider_session = self.current_binding().provider_session;
+            runtime.observation_state = yard_domain::RuntimeObservationState::Observed;
+            runtime.process_state = yard_domain::RuntimeProcessState::Running;
+            runtime.status = ObservedStatus::Idle;
+            runtime.state_change_sequence = runtime.state_change_sequence.saturating_add(1);
+            runtime.revision = runtime.revision.saturating_add(1);
             self.restart_calls.lock().unwrap().push(request);
             self.live.store(true, Ordering::SeqCst);
             self.retained_shell.store(false, Ordering::SeqCst);
-            Ok(self.current_binding())
+            Ok(runtime)
         }
 
         async fn bootstrap_worker(
@@ -1466,11 +1600,15 @@ mod tests {
     }
 
     fn provider_session() -> ProviderSessionRef {
+        provider_session_with_value("yard-orchestrator-session")
+    }
+
+    fn provider_session_with_value(value: &str) -> ProviderSessionRef {
         ProviderSessionRef {
             source: "herdr:codex".to_owned(),
             provider: "codex".to_owned(),
             kind: "id".to_owned(),
-            value: "yard-orchestrator-session".to_owned(),
+            value: value.to_owned(),
         }
     }
 
@@ -1992,6 +2130,66 @@ mod tests {
 
         let prompts = runtime.prompt_requests.lock().unwrap();
         assert!(prompts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_persists_a_rotated_provider_session_before_verification() {
+        let runtime = Arc::new(DedicatedRuntime::live());
+        let (service, store, _temp, profile_id) = service(runtime.clone()).await;
+        let configured = service.provision(command(&profile_id)).await.unwrap();
+        let initial_runtime = configured
+            .orchestrator
+            .worker
+            .as_ref()
+            .and_then(|worker| worker.runtime.as_ref())
+            .unwrap();
+        assert_eq!(
+            initial_runtime.provider_session,
+            Some(provider_session_with_value("yard-orchestrator-session"))
+        );
+        runtime.live.store(false, Ordering::SeqCst);
+        runtime.retained_shell.store(true, Ordering::SeqCst);
+        *runtime.restarted_provider_session.lock().unwrap() = Some(provider_session_with_value(
+            "restarted-yard-orchestrator-session",
+        ));
+
+        let recovered = service
+            .recover(yard_domain::RecoverYardOrchestrator {
+                command_id: "recover-with-rotated-provider-session".to_owned(),
+                actor: "local-user".to_owned(),
+                expected_orchestrator_version: configured.orchestrator.version,
+            })
+            .await
+            .unwrap();
+
+        let expected = Some(provider_session_with_value(
+            "restarted-yard-orchestrator-session",
+        ));
+        assert_eq!(
+            recovered
+                .orchestrator
+                .worker
+                .as_ref()
+                .and_then(|worker| worker.runtime.as_ref())
+                .and_then(|runtime| runtime.provider_session.clone()),
+            expected
+        );
+        assert_eq!(
+            store
+                .get_yard_orchestrator()
+                .await
+                .unwrap()
+                .worker
+                .and_then(|worker| worker.runtime)
+                .and_then(|runtime| runtime.provider_session),
+            expected
+        );
+        assert_eq!(
+            runtime.restart_calls.lock().unwrap()[0]
+                .runtime
+                .provider_session,
+            Some(provider_session_with_value("yard-orchestrator-session"))
+        );
     }
 
     #[tokio::test]

@@ -497,6 +497,12 @@ pub trait YardStore: Send + Sync {
         command_id: &str,
         runtime: WorkerRuntimeBinding,
     ) -> Result<ConfirmedAllocation, ProjectStoreError>;
+    async fn persist_worker_runtime_transition(
+        &self,
+        worker_id: &str,
+        expected_runtime: WorkerRuntimeBinding,
+        runtime: WorkerRuntimeBinding,
+    ) -> Result<(), ProjectStoreError>;
     async fn activate_worker_allocation(
         &self,
         command_id: &str,
@@ -2651,6 +2657,12 @@ impl YardStore for SqliteProjectStore {
                     current_version: project.orchestrator.version,
                 });
             }
+            coordination_node_store::archive_project_attachments(
+                &transaction,
+                &project_id,
+                &command.actor,
+                now,
+            )?;
             let workspace_rows = transaction.execute(
                 "DELETE FROM project_workspace_bindings
                   WHERE project_id = ?1
@@ -2725,9 +2737,7 @@ impl YardStore for SqliteProjectStore {
                 transaction.commit()?;
                 return Ok(existing.deleted(cleanup_pending, true));
             }
-            if command_id_exists(&transaction, &command.command_id)?
-                || select_deleted_worker_command(&transaction, &command.command_id)?.is_some()
-            {
+            if command_id_exists(&transaction, &command.command_id)? {
                 return Err(ProjectStoreError::IdempotencyConflict);
             }
             if deleted_project_exists(&transaction, &project_id)? {
@@ -2746,14 +2756,22 @@ impl YardStore for SqliteProjectStore {
                 .ok_or(ProjectStoreError::WorkerNotFound)?;
             let now = unix_time_ms()?;
             transaction.execute(
+                "INSERT INTO command_acknowledgements (
+                    id, command_type, actor, status, error_message,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (
+                    ?1, 'project_delete', ?2, 'succeeded', NULL, ?3, ?3
+                 )",
+                params![command.command_id, command.actor, to_i64(now)?],
+            )?;
+            transaction.execute(
                 "INSERT INTO deleted_projects (
-                    project_id, command_id, actor, orchestrator_worker_id,
+                    project_id, command_id, orchestrator_worker_id,
                     deleted_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                 ) VALUES (?1, ?2, ?3, ?4)",
                 params![
                     project_id,
                     command.command_id,
-                    command.actor,
                     archived.orchestrator_worker_id,
                     to_i64(now)?,
                 ],
@@ -2761,13 +2779,12 @@ impl YardStore for SqliteProjectStore {
             if !deleted_worker_exists(&transaction, &archived.orchestrator_worker_id)? {
                 transaction.execute(
                     "INSERT INTO deleted_workers (
-                        worker_id, command_id, actor, expected_worker_version,
+                        worker_id, command_id, expected_worker_version,
                         deleted_at_unix_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                     ) VALUES (?1, ?2, ?3, ?4)",
                     params![
                         archived.orchestrator_worker_id,
                         command.command_id,
-                        command.actor,
                         to_i64(worker_version)?,
                         to_i64(now)?,
                     ],
@@ -4898,6 +4915,77 @@ impl YardStore for SqliteProjectStore {
             let allocation = select_confirmed_worker_allocation(&transaction, &command_id, false)?;
             transaction.commit()?;
             Ok(allocation)
+        })
+        .await
+    }
+
+    async fn persist_worker_runtime_transition(
+        &self,
+        worker_id: &str,
+        expected_runtime: WorkerRuntimeBinding,
+        runtime: WorkerRuntimeBinding,
+    ) -> Result<(), ProjectStoreError> {
+        let worker_id = worker_id.trim().to_owned();
+        let expected_runtime = expected_runtime.normalize()?;
+        let runtime = runtime.normalize()?;
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let worker = select_worker_candidate(&transaction, &worker_id)?
+                .map(|candidate| candidate.worker)
+                .ok_or(ProjectStoreError::WorkerNotFound)?;
+            let current_runtime = worker
+                .runtime
+                .as_ref()
+                .ok_or(ProjectStoreError::RuntimeBindingMissing)?;
+            if current_runtime.version != expected_runtime.version
+                || !same_stable_runtime_identity(current_runtime, &expected_runtime)
+                || current_runtime.provider_session != expected_runtime.provider_session
+            {
+                return Err(ProjectStoreError::RuntimeBindingVersionConflict);
+            }
+            if !same_stable_runtime_identity(current_runtime, &runtime)
+                || runtime.observation_state != RuntimeObservationState::Observed
+                || runtime.process_state != RuntimeProcessState::Running
+                || !valid_provider_session_transition(
+                    current_runtime.provider_session.as_ref(),
+                    runtime.provider_session.as_ref(),
+                )
+            {
+                return Err(ProjectStoreError::RuntimeBindingTransitionMismatch);
+            }
+            ensure_worker_binding_available_for(&transaction, &worker_id, &runtime)?;
+            let now = unix_time_ms()?;
+            replace_worker_runtime_binding(&transaction, &worker_id, &runtime, now)?;
+            let next_worker_version = worker
+                .version
+                .checked_add(1)
+                .ok_or(ProjectStoreError::VersionOverflow)?;
+            let rows = transaction.execute(
+                "UPDATE workers
+                    SET version = ?1, updated_at_unix_ms = ?2
+                  WHERE id = ?3 AND version = ?4",
+                params![
+                    to_i64(next_worker_version)?,
+                    to_i64(now)?,
+                    worker_id,
+                    to_i64(worker.version)?,
+                ],
+            )?;
+            if rows != 1 {
+                return Err(ProjectStoreError::RuntimeBindingVersionConflict);
+            }
+            insert_lifecycle_event(
+                &transaction,
+                "worker",
+                &worker_id,
+                next_worker_version,
+                "runtime_binding_restarted",
+                "herdr",
+                now,
+            )?;
+            transaction.commit()?;
+            Ok(())
         })
         .await
     }
@@ -7727,9 +7815,7 @@ impl YardStore for SqliteProjectStore {
                 transaction.commit()?;
                 return Ok(existing.deleted(cleanup_pending, true));
             }
-            if command_id_exists(&transaction, &command.command_id)?
-                || select_deleted_project_command(&transaction, &command.command_id)?.is_some()
-            {
+            if command_id_exists(&transaction, &command.command_id)? {
                 return Err(ProjectStoreError::IdempotencyConflict);
             }
             if deleted_worker_exists(&transaction, &worker_id)? {
@@ -7749,14 +7835,22 @@ impl YardStore for SqliteProjectStore {
 
             let now = unix_time_ms()?;
             transaction.execute(
+                "INSERT INTO command_acknowledgements (
+                    id, command_type, actor, status, error_message,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (
+                    ?1, 'worker_delete', ?2, 'succeeded', NULL, ?3, ?3
+                 )",
+                params![command.command_id, command.actor, to_i64(now)?],
+            )?;
+            transaction.execute(
                 "INSERT INTO deleted_workers (
-                    worker_id, command_id, actor, expected_worker_version,
+                    worker_id, command_id, expected_worker_version,
                     deleted_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                 ) VALUES (?1, ?2, ?3, ?4)",
                 params![
                     worker_id,
                     command.command_id,
-                    command.actor,
                     to_i64(command.expected_worker_version)?,
                     to_i64(now)?,
                 ],
@@ -11800,10 +11894,18 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         current = 27;
     }
     if current == 27 {
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute_batch(VISIBILITY_DELETIONS_MIGRATION)?;
-        ensure_foreign_keys(&transaction)?;
-        transaction.commit()?;
+        connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let migration = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(VISIBILITY_DELETIONS_MIGRATION)?;
+            ensure_foreign_keys(&transaction)?;
+            transaction.commit()?;
+            Ok::<(), ProjectStoreError>(())
+        })();
+        let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
+        migration?;
+        foreign_keys?;
     }
     ensure_foreign_keys(connection)?;
     Ok(())
@@ -13732,10 +13834,13 @@ fn select_deleted_project_command(
 ) -> Result<Option<StoredDeletedProject>, ProjectStoreError> {
     connection
         .query_row(
-            "SELECT project_id, command_id, actor, orchestrator_worker_id,
-                    deleted_at_unix_ms
-               FROM deleted_projects
-              WHERE command_id = ?1",
+            "SELECT deleted.project_id, deleted.command_id, command.actor,
+                    deleted.orchestrator_worker_id, deleted.deleted_at_unix_ms
+               FROM deleted_projects deleted
+               JOIN command_acknowledgements command
+                 ON command.id = deleted.command_id
+              WHERE deleted.command_id = ?1
+                AND command.command_type = 'project_delete'",
             [command_id],
             |row| {
                 Ok(StoredDeletedProject {
@@ -13798,10 +13903,13 @@ fn select_deleted_worker_command(
 ) -> Result<Option<StoredDeletedWorker>, ProjectStoreError> {
     connection
         .query_row(
-            "SELECT worker_id, command_id, actor, expected_worker_version,
-                    deleted_at_unix_ms
-               FROM deleted_workers
-              WHERE command_id = ?1",
+            "SELECT deleted.worker_id, deleted.command_id, command.actor,
+                    deleted.expected_worker_version, deleted.deleted_at_unix_ms
+               FROM deleted_workers deleted
+               JOIN command_acknowledgements command
+                 ON command.id = deleted.command_id
+              WHERE deleted.command_id = ?1
+                AND command.command_type = 'worker_delete'",
             [command_id],
             |row| {
                 Ok(StoredDeletedWorker {
@@ -16522,6 +16630,34 @@ fn replace_worker_runtime_binding(
     Ok(())
 }
 
+fn same_stable_runtime_identity(
+    expected: &WorkerRuntimeBinding,
+    observed: &WorkerRuntimeBinding,
+) -> bool {
+    expected.adapter == observed.adapter
+        && expected.session == observed.session
+        && expected.workspace_id == observed.workspace_id
+        && expected.terminal_id == observed.terminal_id
+        && expected.tab_id == observed.tab_id
+        && expected.pane_id == observed.pane_id
+        && expected.owns_tab == observed.owns_tab
+}
+
+fn valid_provider_session_transition(
+    previous: Option<&ProviderSessionRef>,
+    restarted: Option<&ProviderSessionRef>,
+) -> bool {
+    match (previous, restarted) {
+        (Some(previous), Some(restarted)) => {
+            previous.source == restarted.source
+                && previous.provider == restarted.provider
+                && previous.kind == restarted.kind
+        }
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
 fn select_worker_candidate(
     connection: &Connection,
     worker_id: &str,
@@ -18588,6 +18724,8 @@ pub enum ProjectStoreError {
     StaleRuntimeSnapshot,
     #[error("runtime binding changed during reconciliation")]
     RuntimeBindingVersionConflict,
+    #[error("the restarted runtime does not match the worker's stable runtime identity")]
+    RuntimeBindingTransitionMismatch,
     #[error("project placement version conflict; current version is {current_version}")]
     VersionConflict { current_version: u64 },
     #[error("project placement version cannot be incremented")]
@@ -31101,6 +31239,76 @@ mod tests {
         }
     }
 
+    async fn create_archived_project(
+        store: &SqliteProjectStore,
+        workspace_id: &str,
+        terminal_id: &str,
+        command_id: &str,
+    ) -> Project {
+        let (project_draft, mut runtime) = draft(workspace_id, terminal_id);
+        runtime.last_observed_at_unix_ms = super::unix_time_ms().unwrap();
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        store
+            .archive_project(&project.id, archive_command(&project, command_id))
+            .await
+            .unwrap();
+        project
+    }
+
+    async fn create_ended_worker(
+        store: &SqliteProjectStore,
+        workspace_id: &str,
+        terminal_id: &str,
+        command_id: &str,
+    ) -> (String, u64) {
+        let observed_at_unix_ms = super::unix_time_ms().unwrap();
+        store
+            .reconcile_runtime_inventory(inventory(
+                observed_at_unix_ms,
+                vec![observed_worker(
+                    terminal_id,
+                    workspace_id,
+                    &format!("{workspace_id}-tab"),
+                    &format!("{workspace_id}-pane"),
+                    Some(provider_session(&format!("{workspace_id}-session"))),
+                )],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let candidate = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| {
+                candidate
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.terminal_id == terminal_id)
+            })
+            .unwrap();
+        let ended = store
+            .end_worker_session(
+                &candidate.worker.id,
+                EndWorkerSession {
+                    command_id: command_id.to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_worker_version: candidate.worker.version,
+                    expected_runtime_version: candidate
+                        .worker
+                        .runtime
+                        .as_ref()
+                        .map(|runtime| runtime.version),
+                },
+            )
+            .await
+            .unwrap();
+        (ended.worker.id, ended.worker.version)
+    }
+
     fn project_automation(
         project: &Project,
         automation_id: &str,
@@ -31411,6 +31619,207 @@ mod tests {
                 .await
                 .unwrap()
                 .replayed
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_commands_reject_existing_global_command_ids() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let project = create_archived_project(
+            &store,
+            "occupied-project-delete",
+            "occupied-project-delete-terminal",
+            "occupied-project-delete-command",
+        )
+        .await;
+        assert!(matches!(
+            store
+                .delete_project(
+                    &project.id,
+                    DeleteProject {
+                        command_id: "occupied-project-delete-command".to_owned(),
+                        actor: "local-user".to_owned(),
+                    },
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+
+        let (worker_id, worker_version) = create_ended_worker(
+            &store,
+            "occupied-worker-delete",
+            "occupied-worker-delete-terminal",
+            "occupied-worker-delete-command",
+        )
+        .await;
+        assert!(matches!(
+            store
+                .delete_worker(
+                    &worker_id,
+                    DeleteWorker {
+                        command_id: "occupied-worker-delete-command".to_owned(),
+                        actor: "local-user".to_owned(),
+                        expected_worker_version: worker_version,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_command_ids_cannot_be_reused_by_other_operations() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let deleted_project = create_archived_project(
+            &store,
+            "ledger-project-delete",
+            "ledger-project-delete-terminal",
+            "archive-ledger-project-delete",
+        )
+        .await;
+        let project_delete = DeleteProject {
+            command_id: "ledger-project-delete-command".to_owned(),
+            actor: "local-user".to_owned(),
+        };
+        store
+            .delete_project(&deleted_project.id, project_delete.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .delete_worker(
+                    &deleted_project.orchestrator.id,
+                    DeleteWorker {
+                        command_id: project_delete.command_id.clone(),
+                        actor: project_delete.actor.clone(),
+                        expected_worker_version: deleted_project.orchestrator.version + 1,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+        let live_project = {
+            let (draft, runtime) = draft("after-project-delete", "after-project-delete-terminal");
+            store.create_project(draft, runtime).await.unwrap()
+        };
+        assert!(matches!(
+            store
+                .archive_project(
+                    &live_project.id,
+                    archive_command(&live_project, &project_delete.command_id),
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+
+        let (worker_id, worker_version) = create_ended_worker(
+            &store,
+            "ledger-worker-delete",
+            "ledger-worker-delete-terminal",
+            "end-ledger-worker-delete",
+        )
+        .await;
+        let worker_delete = DeleteWorker {
+            command_id: "ledger-worker-delete-command".to_owned(),
+            actor: "local-user".to_owned(),
+            expected_worker_version: worker_version,
+        };
+        store
+            .delete_worker(&worker_id, worker_delete.clone())
+            .await
+            .unwrap();
+        let archived_project = create_archived_project(
+            &store,
+            "after-worker-delete",
+            "after-worker-delete-terminal",
+            "archive-after-worker-delete",
+        )
+        .await;
+        assert!(matches!(
+            store
+                .delete_project(
+                    &archived_project.id,
+                    DeleteProject {
+                        command_id: worker_delete.command_id,
+                        actor: worker_delete.actor,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+    }
+
+    #[tokio::test]
+    async fn archiving_project_versions_coordination_node_attachment_changes() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) = draft("node-archive", "node-archive-terminal");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        let node_id = Uuid::now_v7().to_string();
+        let created = store
+            .create_coordination_node(
+                &node_id,
+                None,
+                Some(
+                    temp.path()
+                        .join("knowledge")
+                        .join(&node_id)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                create_node_command(
+                    "create-node-before-archive",
+                    CoordinationNodeKind::KnowledgeStore,
+                    vec![project.id.clone()],
+                ),
+            )
+            .await
+            .unwrap()
+            .node;
+
+        let archive = archive_command(&project, "archive-node-project");
+        store
+            .archive_project(&project.id, archive.clone())
+            .await
+            .unwrap();
+        let after_archive = store.get_coordination_node(&node_id).await.unwrap();
+        assert!(after_archive.attached_project_ids.is_empty());
+        assert_eq!(after_archive.version, created.version + 1);
+        assert!(matches!(
+            store
+                .update_coordination_node(
+                    &node_id,
+                    UpdateCoordinationNode {
+                        command_id: "stale-update-after-archive".to_owned(),
+                        actor: "local-user".to_owned(),
+                        expected_version: created.version,
+                        name: created.name,
+                        attached_project_ids: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CoordinationNodeVersionConflict { current_version }
+                if current_version == after_archive.version
+        ));
+
+        assert!(
+            store
+                .archive_project(&project.id, archive)
+                .await
+                .unwrap()
+                .replayed
+        );
+        assert_eq!(
+            store.get_coordination_node(&node_id).await.unwrap().version,
+            after_archive.version
         );
     }
 

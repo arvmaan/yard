@@ -451,6 +451,12 @@ async fn start_agent_at_socket(
         Ok(started) => started,
         Err(start) => {
             let rollback_covers_started_runtime = rollback.covers_started_runtime();
+            let started_runtime =
+                if rollback_covers_started_runtime || runtime_creation_outcome_ambiguous(&start) {
+                    Some(request.prepared.clone())
+                } else {
+                    None
+                };
             return Err(start_failure_after_rollback(
                 config,
                 socket_path,
@@ -458,7 +464,7 @@ async fn start_agent_at_socket(
                 &rollback,
                 start,
                 rollback_covers_started_runtime,
-                Some(request.prepared.clone()),
+                started_runtime,
             )
             .await);
         }
@@ -1521,7 +1527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_pane_start_failure_preserves_runtime_as_unverified() {
+    async fn definite_existing_pane_start_rejection_does_not_capture_runtime() {
         let temp = tempfile::TempDir::new().unwrap();
         let socket_path = temp.path().join("herdr.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
@@ -1540,8 +1546,8 @@ mod tests {
                         serde_json::json!({
                             "id": id,
                             "error": {
-                                "code": "agent_start_failed",
-                                "message": "provider exited during startup"
+                                "code": "agent_name_taken",
+                                "message": "agent name is already in use"
                             }
                         })
                     )
@@ -1554,13 +1560,60 @@ mod tests {
             request_timeout: Duration::from_secs(1),
             ..HerdrConfig::default()
         };
+        let error = start_agent_at_socket(
+            &config,
+            &socket_path,
+            StartPreparedAgentRequest {
+                command_id: "retained-start-failure".to_owned(),
+                prepared: runtime_topology("workspace-1", "tab-1", "pane-1", "terminal-1"),
+                agent_name: "yard-orchestrator".to_owned(),
+                kind: "codex".to_owned(),
+                args: Vec::new(),
+                prompt: "Coordinate projects.".to_owned(),
+            },
+            StartRollback::None,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        let HerdrControlError::StartFailed {
+            rollback,
+            rollback_succeeded,
+            started_runtime: None,
+            ..
+        } = error
+        else {
+            panic!("expected definite retained-pane start rejection");
+        };
+        assert!(!rollback_succeeded);
+        assert_eq!(rollback, "not attempted; existing topology preserved");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_existing_pane_start_failure_preserves_runtime_as_unverified() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, _writer) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "agent.start");
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_millis(100),
+            ..HerdrConfig::default()
+        };
         let prepared = runtime_topology("workspace-1", "tab-1", "pane-1", "terminal-1");
 
         let error = start_agent_at_socket(
             &config,
             &socket_path,
             StartPreparedAgentRequest {
-                command_id: "retained-start-failure".to_owned(),
+                command_id: "ambiguous-retained-start-failure".to_owned(),
                 prepared: prepared.clone(),
                 agent_name: "yard-orchestrator".to_owned(),
                 kind: "codex".to_owned(),
@@ -1580,7 +1633,7 @@ mod tests {
             ..
         } = error
         else {
-            panic!("expected retained-pane start failure");
+            panic!("expected ambiguous retained-pane start failure");
         };
         assert!(!rollback_succeeded);
         assert_eq!(rollback, "not attempted; existing topology preserved");
@@ -2222,13 +2275,13 @@ mod tests {
     }
 
     #[test]
-    fn classifies_workspace_creation_transport_ambiguity() {
+    fn classifies_runtime_creation_transport_ambiguity() {
         assert!(runtime_creation_outcome_ambiguous(
             &HerdrError::SocketTimeout
         ));
         assert!(!runtime_creation_outcome_ambiguous(&HerdrError::Api {
-            code: "workspace_create_failed".to_owned(),
-            message: "invalid directory".to_owned(),
+            code: "agent_name_taken".to_owned(),
+            message: "agent name is already in use".to_owned(),
         }));
     }
 

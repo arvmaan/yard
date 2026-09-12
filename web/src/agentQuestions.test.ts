@@ -6,7 +6,11 @@ import {
   latestAgentQuestion,
   recordAgentQuestion,
 } from './agentQuestions'
-import type { Assignment, WorkerRuntimeBinding } from './types'
+import type {
+  Assignment,
+  Project,
+  WorkerRuntimeBinding,
+} from './types'
 
 function assignmentTarget({
   attemptId = 'attempt-1',
@@ -45,6 +49,29 @@ function assignmentTarget({
   }
 }
 
+function orchestratorTarget({
+  providerSessionValue = 'provider-session-1',
+  terminalId = 'terminal-1',
+}: {
+  providerSessionValue?: string
+  terminalId?: string
+} = {}): AgentChatTarget {
+  const assignment = assignmentTarget({
+    providerSessionValue,
+    terminalId,
+  })
+  if (assignment.kind !== 'assignment') {
+    throw new Error('Assignment fixture is invalid')
+  }
+  return {
+    kind: 'orchestrator',
+    project: {
+      id: 'project-1',
+      orchestrator: assignment.assignment.worker,
+    } as unknown as Project,
+  }
+}
+
 describe('agent questions', () => {
   it('scopes question state to the active runtime incarnation', () => {
     const current = agentQuestionKey(assignmentTarget())
@@ -61,6 +88,24 @@ describe('agent questions', () => {
       ),
     ).not.toBe(current)
     expect(agentQuestionKey(assignmentTarget())).toBe(current)
+  })
+
+  it('scopes project orchestrator state to the active runtime incarnation', () => {
+    const current = agentQuestionKey(orchestratorTarget())
+
+    expect(
+      agentQuestionKey(
+        orchestratorTarget({ terminalId: 'terminal-2' }),
+      ),
+    ).not.toBe(current)
+    expect(
+      agentQuestionKey(
+        orchestratorTarget({
+          providerSessionValue: 'provider-session-2',
+        }),
+      ),
+    ).not.toBe(current)
+    expect(agentQuestionKey(orchestratorTarget())).toBe(current)
   })
 
   it('clears only the expected recorded question', () => {

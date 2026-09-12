@@ -3648,12 +3648,12 @@ mod tests {
                         revision: 1,
                     },
                     ObservedWorker {
-                        runtime_id: "terminal-yard-promptallocationcommand".to_owned(),
-                        terminal_id: "terminal-yard-promptallocationcommand".to_owned(),
+                        runtime_id: "terminal-yard-prompta-345234a24b29951c".to_owned(),
+                        terminal_id: "terminal-yard-prompta-345234a24b29951c".to_owned(),
                         workspace_id: "workspace-1".to_owned(),
-                        tab_id: "tab-yard-promptallocationcommand".to_owned(),
-                        pane_id: "pane-yard-promptallocationcommand".to_owned(),
-                        name: Some("yard-promptallocationcommand".to_owned()),
+                        tab_id: "tab-yard-prompta-345234a24b29951c".to_owned(),
+                        pane_id: "pane-yard-prompta-345234a24b29951c".to_owned(),
+                        name: Some("yard-prompta-345234a24b29951c".to_owned()),
                         provider: Some("codex".to_owned()),
                         display_provider: Some("Codex".to_owned()),
                         status: ObservedStatus::Idle,
@@ -3665,17 +3665,17 @@ mod tests {
                         foreground_cwd: Some("/tmp/runtime-api".to_owned()),
                         tokens: BTreeMap::new(),
                         provider_session: Some(provider_session(
-                            "yard-promptallocationcommand-session",
+                            "yard-prompta-345234a24b29951c-session",
                         )),
                         revision: 2,
                     },
                     ObservedWorker {
-                        runtime_id: "terminal-yard-allocationcommand1".to_owned(),
-                        terminal_id: "terminal-yard-allocationcommand1".to_owned(),
+                        runtime_id: "terminal-yard-allocat-b3e512e61b8af4f5".to_owned(),
+                        terminal_id: "terminal-yard-allocat-b3e512e61b8af4f5".to_owned(),
                         workspace_id: "workspace-1".to_owned(),
-                        tab_id: "tab-yard-allocationcommand1".to_owned(),
-                        pane_id: "pane-yard-allocationcommand1".to_owned(),
-                        name: Some("yard-allocationcommand1".to_owned()),
+                        tab_id: "tab-yard-allocat-b3e512e61b8af4f5".to_owned(),
+                        pane_id: "pane-yard-allocat-b3e512e61b8af4f5".to_owned(),
+                        name: Some("yard-allocat-b3e512e61b8af4f5".to_owned()),
                         provider: Some("codex".to_owned()),
                         display_provider: Some("Codex".to_owned()),
                         status: ObservedStatus::Idle,
@@ -3686,7 +3686,9 @@ mod tests {
                         cwd: Some("/tmp/runtime-api".to_owned()),
                         foreground_cwd: Some("/tmp/runtime-api".to_owned()),
                         tokens: BTreeMap::new(),
-                        provider_session: Some(provider_session("yard-allocationcommand1-session")),
+                        provider_session: Some(provider_session(
+                            "yard-allocat-b3e512e61b8af4f5-session",
+                        )),
                         revision: 3,
                     },
                 ],
@@ -3711,7 +3713,8 @@ mod tests {
             for worker in &mut inventory.workers {
                 if matches!(
                     worker.terminal_id.as_str(),
-                    "terminal-yard-promptallocationcommand" | "terminal-yard-allocationcommand1"
+                    "terminal-yard-prompta-345234a24b29951c"
+                        | "terminal-yard-allocat-b3e512e61b8af4f5"
                 ) {
                     worker.provider_session = None;
                 }
@@ -3793,12 +3796,12 @@ mod tests {
         ) -> Result<RuntimeInventory, InventoryServiceError> {
             let mut inventory = FakeInventory.inventory(session_name).await?;
             inventory.workers.push(ObservedWorker {
-                runtime_id: "terminal-yard-profileprojectcommand".to_owned(),
-                terminal_id: "terminal-yard-profileprojectcommand".to_owned(),
+                runtime_id: "terminal-yard-profile-0434dae47c8a42aa".to_owned(),
+                terminal_id: "terminal-yard-profile-0434dae47c8a42aa".to_owned(),
                 workspace_id: "workspace-1".to_owned(),
-                tab_id: "tab-yard-profileprojectcommand".to_owned(),
-                pane_id: "pane-yard-profileprojectcommand".to_owned(),
-                name: Some("yard-profileprojectcommand".to_owned()),
+                tab_id: "tab-yard-profile-0434dae47c8a42aa".to_owned(),
+                pane_id: "pane-yard-profile-0434dae47c8a42aa".to_owned(),
+                name: Some("yard-profile-0434dae47c8a42aa".to_owned()),
                 provider: Some("codex".to_owned()),
                 display_provider: Some("Codex".to_owned()),
                 status: ObservedStatus::Idle,
@@ -3809,7 +3812,7 @@ mod tests {
                 cwd: Some("/tmp/runtime-api".to_owned()),
                 foreground_cwd: Some("/tmp/runtime-api".to_owned()),
                 tokens: BTreeMap::new(),
-                provider_session: Some(provider_session("yard-profileprojectcommand-session")),
+                provider_session: Some(provider_session("yard-profile-0434dae47c8a42aa-session")),
                 revision: 4,
             });
             Ok(inventory)
@@ -3834,7 +3837,7 @@ mod tests {
                 order: 2,
                 label: "Workspace API".to_owned(),
                 focused: false,
-                active_tab_id: "tab-yard-workspaceprojectcommand".to_owned(),
+                active_tab_id: "tab-yard-workspa-e5f71e104d6dc952".to_owned(),
                 pane_count: 1,
                 tab_count: 1,
                 status: ObservedStatus::Idle,
@@ -3848,12 +3851,12 @@ mod tests {
                 }),
             });
             inventory.workers.push(ObservedWorker {
-                runtime_id: "terminal-yard-workspaceprojectcommand".to_owned(),
-                terminal_id: "terminal-yard-workspaceprojectcommand".to_owned(),
+                runtime_id: "terminal-yard-workspa-e5f71e104d6dc952".to_owned(),
+                terminal_id: "terminal-yard-workspa-e5f71e104d6dc952".to_owned(),
                 workspace_id: "workspace-created".to_owned(),
-                tab_id: "tab-yard-workspaceprojectcommand".to_owned(),
-                pane_id: "pane-yard-workspaceprojectcommand".to_owned(),
-                name: Some("yard-workspaceprojectcommand".to_owned()),
+                tab_id: "tab-yard-workspa-e5f71e104d6dc952".to_owned(),
+                pane_id: "pane-yard-workspa-e5f71e104d6dc952".to_owned(),
+                name: Some("yard-workspa-e5f71e104d6dc952".to_owned()),
                 provider: Some("codex".to_owned()),
                 display_provider: Some("Codex".to_owned()),
                 status: ObservedStatus::Idle,
@@ -3864,7 +3867,7 @@ mod tests {
                 cwd: Some("/tmp/workspace-api".to_owned()),
                 foreground_cwd: Some("/tmp/workspace-api".to_owned()),
                 tokens: BTreeMap::new(),
-                provider_session: Some(provider_session("yard-workspaceprojectcommand-session")),
+                provider_session: Some(provider_session("yard-workspa-e5f71e104d6dc952-session")),
                 revision: 5,
             });
             Ok(inventory)
@@ -3982,12 +3985,12 @@ mod tests {
                     revision: 4,
                 },
                 ObservedWorker {
-                    runtime_id: "terminal-yard-handoffcommand1".to_owned(),
-                    terminal_id: "terminal-yard-handoffcommand1".to_owned(),
+                    runtime_id: "terminal-yard-handoff-5072292f455abdff".to_owned(),
+                    terminal_id: "terminal-yard-handoff-5072292f455abdff".to_owned(),
                     workspace_id: "workspace-2".to_owned(),
-                    tab_id: "tab-yard-handoffcommand1".to_owned(),
-                    pane_id: "pane-yard-handoffcommand1".to_owned(),
-                    name: Some("yard-handoffcommand1".to_owned()),
+                    tab_id: "tab-yard-handoff-5072292f455abdff".to_owned(),
+                    pane_id: "pane-yard-handoff-5072292f455abdff".to_owned(),
+                    name: Some("yard-handoff-5072292f455abdff".to_owned()),
                     provider: Some("codex".to_owned()),
                     display_provider: Some("Codex".to_owned()),
                     status: ObservedStatus::Idle,
@@ -3998,16 +4001,18 @@ mod tests {
                     cwd: Some("/tmp/target-api".to_owned()),
                     foreground_cwd: Some("/tmp/target-api".to_owned()),
                     tokens: BTreeMap::new(),
-                    provider_session: Some(provider_session("yard-handoffcommand1-session")),
+                    provider_session: Some(provider_session(
+                        "yard-handoff-5072292f455abdff-session",
+                    )),
                     revision: 5,
                 },
                 ObservedWorker {
-                    runtime_id: "terminal-yard-replacecommand1".to_owned(),
-                    terminal_id: "terminal-yard-replacecommand1".to_owned(),
+                    runtime_id: "terminal-yard-replace-fa0a6b32d50a8ac9".to_owned(),
+                    terminal_id: "terminal-yard-replace-fa0a6b32d50a8ac9".to_owned(),
                     workspace_id: "workspace-2".to_owned(),
-                    tab_id: "tab-yard-replacecommand1".to_owned(),
-                    pane_id: "pane-yard-replacecommand1".to_owned(),
-                    name: Some("yard-replacecommand1".to_owned()),
+                    tab_id: "tab-yard-replace-fa0a6b32d50a8ac9".to_owned(),
+                    pane_id: "pane-yard-replace-fa0a6b32d50a8ac9".to_owned(),
+                    name: Some("yard-replace-fa0a6b32d50a8ac9".to_owned()),
                     provider: Some("codex".to_owned()),
                     display_provider: Some("Codex".to_owned()),
                     status: ObservedStatus::Idle,
@@ -4018,7 +4023,9 @@ mod tests {
                     cwd: Some("/tmp/target-api".to_owned()),
                     foreground_cwd: Some("/tmp/target-api".to_owned()),
                     tokens: BTreeMap::new(),
-                    provider_session: Some(provider_session("yard-replacecommand1-session")),
+                    provider_session: Some(provider_session(
+                        "yard-replace-fa0a6b32d50a8ac9-session",
+                    )),
                     revision: 6,
                 },
             ]);
@@ -4042,7 +4049,7 @@ mod tests {
             let replacement = inventory
                 .workers
                 .iter_mut()
-                .find(|worker| worker.terminal_id == "terminal-yard-replacecommand1")
+                .find(|worker| worker.terminal_id == "terminal-yard-replace-fa0a6b32d50a8ac9")
                 .unwrap();
             replacement.provider_session = Some(provider_session("different-replacement-session"));
             Ok(inventory)
@@ -4667,7 +4674,7 @@ mod tests {
             let (workspace_id, tab_id) = if request.pane_id == "pane-1" {
                 ("workspace-1", "tab-1")
             } else {
-                ("workspace-1", "tab-yard-allocationcommand1")
+                ("workspace-1", "tab-yard-allocat-b3e512e61b8af4f5")
             };
             let text = self
                 .outputs
@@ -4816,7 +4823,7 @@ mod tests {
             let tab_id = if request.pane_id == "pane-1" {
                 "tab-1"
             } else {
-                "tab-yard-promptallocationcommand"
+                "tab-yard-prompta-345234a24b29951c"
             };
             Ok(RuntimeOutputResult {
                 pane_id: request.pane_id,
@@ -5473,7 +5480,8 @@ mod tests {
             .unwrap()
             .iter()
             .find(|candidate| {
-                candidate["worker"]["runtime"]["terminal_id"] == "terminal-yard-handoffcommand1"
+                candidate["worker"]["runtime"]["terminal_id"]
+                    == "terminal-yard-handoff-5072292f455abdff"
             })
             .unwrap();
         assert_eq!(candidate["availability"], "unassigned_live");
@@ -5548,7 +5556,7 @@ mod tests {
         assert_eq!(replacement["cleanup_pending"], false);
         assert_eq!(
             replacement["project"]["orchestrator"]["runtime"]["terminal_id"],
-            "terminal-yard-replacecommand1"
+            "terminal-yard-replace-fa0a6b32d50a8ac9"
         );
         assert!(
             runtime.claim_seen_before_start.load(Ordering::SeqCst),
@@ -5631,7 +5639,7 @@ mod tests {
         let replacement = response_json(response).await;
         assert_eq!(
             replacement["project"]["orchestrator"]["runtime"]["terminal_id"],
-            "terminal-yard-replacecommand1"
+            "terminal-yard-replace-fa0a6b32d50a8ac9"
         );
         assert_eq!(runtime.start_calls.load(Ordering::SeqCst), 1);
         let retirements = runtime.retirement_calls.lock().unwrap();
@@ -5773,8 +5781,8 @@ mod tests {
             captured,
             (
                 "ambiguous".to_owned(),
-                "terminal-yard-replacecommand1".to_owned(),
-                Some("yard-replacecommand1-session".to_owned())
+                "terminal-yard-replace-fa0a6b32d50a8ac9".to_owned(),
+                Some("yard-replace-fa0a6b32d50a8ac9-session".to_owned())
             )
         );
     }
@@ -6255,11 +6263,11 @@ mod tests {
         assert_eq!(retirements.len(), 1);
         assert_eq!(
             retirements[0].terminal_id,
-            "terminal-yard-promptallocationcommand"
+            "terminal-yard-prompta-345234a24b29951c"
         );
         assert_eq!(
             retirements[0].tab_id.as_deref(),
-            Some("tab-yard-promptallocationcommand")
+            Some("tab-yard-prompta-345234a24b29951c")
         );
         assert!(retirements[0].owns_tab);
     }
@@ -7399,7 +7407,7 @@ mod tests {
         );
         assert_eq!(
             created["project"]["orchestrator"]["runtime"]["terminal_id"],
-            "terminal-yard-profileprojectcommand"
+            "terminal-yard-profile-0434dae47c8a42aa"
         );
         assert_eq!(runtime.provision_calls.load(Ordering::SeqCst), 1);
         {
@@ -7518,7 +7526,7 @@ mod tests {
         let authoritative_before: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM worker_runtime_bindings
-                  WHERE terminal_id = 'terminal-yard-profileprojectcommand'",
+                  WHERE terminal_id = 'terminal-yard-profile-0434dae47c8a42aa'",
                 [],
                 |row| row.get(0),
             )
@@ -7541,7 +7549,7 @@ mod tests {
         let authoritative_after: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM worker_runtime_bindings
-                  WHERE terminal_id = 'terminal-yard-profileprojectcommand'",
+                  WHERE terminal_id = 'terminal-yard-profile-0434dae47c8a42aa'",
                 [],
                 |row| row.get(0),
             )
@@ -7632,7 +7640,7 @@ mod tests {
                         EXISTS (
                             SELECT 1 FROM worker_runtime_bindings binding
                              WHERE binding.terminal_id =
-                                   'terminal-yard-profileprojectcommand'
+                                   'terminal-yard-profile-0434dae47c8a42aa'
                         ),
                         EXISTS (
                             SELECT 1
@@ -7665,7 +7673,7 @@ mod tests {
                 1,
                 0,
                 1,
-                Some("yard-profileprojectcommand-session".to_owned())
+                Some("yard-profile-0434dae47c8a42aa-session".to_owned())
             )
         );
     }
@@ -7745,7 +7753,7 @@ mod tests {
                         EXISTS (
                             SELECT 1 FROM worker_runtime_bindings binding
                              WHERE binding.terminal_id =
-                                   'terminal-yard-profileprojectcommand'
+                                   'terminal-yard-profile-0434dae47c8a42aa'
                         )
                    FROM command_acknowledgements command
                   WHERE command.id = 'profile-project-command'",
@@ -7813,7 +7821,7 @@ mod tests {
         );
         assert_eq!(
             created["project"]["orchestrator"]["runtime"]["terminal_id"],
-            "terminal-yard-workspaceprojectcommand"
+            "terminal-yard-workspa-e5f71e104d6dc952"
         );
         assert_eq!(runtime.bootstrap_calls.load(Ordering::SeqCst), 1);
         {
@@ -8024,7 +8032,7 @@ mod tests {
         let authoritative: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM worker_runtime_bindings
-                  WHERE terminal_id = 'terminal-yard-profileprojectcommand'",
+                  WHERE terminal_id = 'terminal-yard-profile-0434dae47c8a42aa'",
                 [],
                 |row| row.get(0),
             )
@@ -8130,7 +8138,7 @@ mod tests {
         let authoritative: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM worker_runtime_bindings
-                  WHERE terminal_id = 'terminal-yard-workspaceprojectcommand'",
+                  WHERE terminal_id = 'terminal-yard-workspa-e5f71e104d6dc952'",
                 [],
                 |row| row.get(0),
             )
@@ -8227,14 +8235,14 @@ mod tests {
             captured,
             (
                 "ambiguous".to_owned(),
-                "terminal-yard-profileprojectcommand".to_owned(),
-                "pane-yard-profileprojectcommand".to_owned()
+                "terminal-yard-profile-0434dae47c8a42aa".to_owned(),
+                "pane-yard-profile-0434dae47c8a42aa".to_owned()
             )
         );
         let authoritative: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM worker_runtime_bindings
-                  WHERE terminal_id = 'terminal-yard-profileprojectcommand'",
+                  WHERE terminal_id = 'terminal-yard-profile-0434dae47c8a42aa'",
                 [],
                 |row| row.get(0),
             )
@@ -8936,7 +8944,7 @@ mod tests {
             .iter()
             .find(|candidate| {
                 candidate["worker"]["runtime"]["terminal_id"]
-                    == "terminal-yard-promptallocationcommand"
+                    == "terminal-yard-prompta-345234a24b29951c"
             })
             .unwrap();
         let worker_id = candidate["worker"]["id"].as_str().unwrap();
@@ -9095,7 +9103,7 @@ mod tests {
             .iter()
             .find(|candidate| {
                 candidate["worker"]["runtime"]["terminal_id"]
-                    == "terminal-yard-promptallocationcommand"
+                    == "terminal-yard-prompta-345234a24b29951c"
             })
             .unwrap();
         assert_eq!(candidate["availability"], "unassigned_live");
@@ -9317,7 +9325,7 @@ mod tests {
         assert_eq!(resumed["assignment"]["worker"]["id"], worker_id);
         assert_eq!(
             resumed["assignment"]["worker"]["runtime"]["terminal_id"],
-            "terminal-yard-promptallocationcommand"
+            "terminal-yard-prompta-345234a24b29951c"
         );
         assert_eq!(resumed["assignment"]["lifecycle"], "active");
     }
@@ -9538,8 +9546,8 @@ mod tests {
         assert_eq!(
             trusted,
             (
-                "terminal-yard-allocationcommand1".to_owned(),
-                "pane-yard-allocationcommand1".to_owned()
+                "terminal-yard-allocat-b3e512e61b8af4f5".to_owned(),
+                "pane-yard-allocat-b3e512e61b8af4f5".to_owned()
             )
         );
         let quarantined: (String, String, String) = connection
@@ -9557,14 +9565,14 @@ mod tests {
             quarantined,
             (
                 "ambiguous".to_owned(),
-                "terminal-yard-promptallocationcommand".to_owned(),
+                "terminal-yard-prompta-345234a24b29951c".to_owned(),
                 "mismatched-resume-pane".to_owned()
             )
         );
         let unverified_authoritative: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM worker_runtime_bindings
-                  WHERE terminal_id = 'terminal-yard-promptallocationcommand'",
+                  WHERE terminal_id = 'terminal-yard-prompta-345234a24b29951c'",
                 [],
                 |row| row.get(0),
             )
@@ -10293,7 +10301,7 @@ mod tests {
             .iter()
             .find(|candidate| {
                 candidate["worker"]["runtime"]["terminal_id"]
-                    == "terminal-yard-promptallocationcommand"
+                    == "terminal-yard-prompta-345234a24b29951c"
             })
             .unwrap();
         let configure = serde_json::json!({
@@ -10789,7 +10797,8 @@ mod tests {
             .unwrap()
             .iter()
             .find(|candidate| {
-                candidate["worker"]["runtime"]["terminal_id"] == "terminal-yard-allocationcommand1"
+                candidate["worker"]["runtime"]["terminal_id"]
+                    == "terminal-yard-allocat-b3e512e61b8af4f5"
             })
             .unwrap();
         let configured = response_json(
@@ -10923,14 +10932,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         reporting.set_output(
-            "pane-yard-allocationcommand1",
+            "pane-yard-allocat-b3e512e61b8af4f5",
             status_line("forged-yard-command", "idle"),
         );
         assert_null_status_report(
             &get_json(&app, "/api/v1/yard/orchestrator/terminal-output?lines=120").await,
         );
         reporting.set_output(
-            "pane-yard-allocationcommand1",
+            "pane-yard-allocat-b3e512e61b8af4f5",
             status_line("runtime-yard-prompt", "needs_attention"),
         );
         let central_output =
@@ -11987,7 +11996,8 @@ mod tests {
             .unwrap()
             .iter()
             .find(|candidate| {
-                candidate["worker"]["runtime"]["terminal_id"] == "terminal-yard-allocationcommand1"
+                candidate["worker"]["runtime"]["terminal_id"]
+                    == "terminal-yard-allocat-b3e512e61b8af4f5"
             })
             .unwrap();
         let initial_yard = get_json(&app, "/api/v1/yard/orchestrator").await;
