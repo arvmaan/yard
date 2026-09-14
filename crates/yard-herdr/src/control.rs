@@ -17,7 +17,8 @@ use crate::{
 
 const AGENT_START_TIMEOUT_MS: u64 = 30_000;
 const AGENT_START_READY_TIMEOUT: Duration = Duration::from_secs(5);
-const AGENT_PROMPT_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const AGENT_PROMPT_READY_TIMEOUT: Duration = Duration::from_millis(AGENT_START_TIMEOUT_MS);
+const HERDR_PANE_READ_MAX_LINES: u32 = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionAgentRequest {
@@ -129,10 +130,14 @@ pub enum HerdrControlError {
         rollback_succeeded: bool,
         started_runtime: Option<Box<WorkerRuntimeBinding>>,
     },
-    #[error("Herdr created the worker but initial prompt delivery failed: {source}")]
+    #[error(
+        "Herdr created the worker but initial prompt delivery failed: {source}; runtime rollback: {rollback}"
+    )]
     PromptDeliveryFailed {
-        runtime: Box<WorkerRuntimeBinding>,
         source: HerdrError,
+        rollback: String,
+        rollback_succeeded: bool,
+        started_runtime: Option<Box<WorkerRuntimeBinding>>,
     },
 }
 
@@ -344,6 +349,14 @@ pub(crate) async fn start_prepared_agent(
     start_prepared_agent_at_socket(config, &session.socket_path, request).await
 }
 
+pub(crate) async fn start_existing_agent(
+    config: &HerdrConfig,
+    request: StartPreparedAgentRequest,
+) -> Result<ProvisionedAgent, HerdrControlError> {
+    let session = running_session(config, &request.prepared.session).await?;
+    start_agent_at_socket(config, &session.socket_path, request, StartRollback::None).await
+}
+
 pub(crate) async fn start_prepared_workspace_agent(
     config: &HerdrConfig,
     request: StartPreparedAgentRequest,
@@ -384,8 +397,15 @@ async fn start_prepared_agent_at_socket(
 }
 
 enum StartRollback {
+    None,
     Tab(String),
     Workspace(String),
+}
+
+impl StartRollback {
+    fn covers_started_runtime(&self) -> bool {
+        !matches!(self, Self::None)
+    }
 }
 
 async fn start_agent_at_socket(
@@ -430,58 +450,44 @@ async fn start_agent_at_socket(
     let started = match started {
         Ok(started) => started,
         Err(start) => {
+            let rollback_covers_started_runtime = rollback.covers_started_runtime();
+            let started_runtime =
+                runtime_creation_outcome_ambiguous(&start).then(|| request.prepared.clone());
             return Err(start_failure_after_rollback(
                 config,
                 socket_path,
                 &request.command_id,
-                rollback,
+                &rollback,
                 start,
-                true,
-                Some(request.prepared.clone()),
+                rollback_covers_started_runtime,
+                started_runtime,
             )
             .await);
         }
     };
     let runtime =
-        validate_started_topology(config, socket_path, &request, rollback, started).await?;
+        validate_started_topology(config, socket_path, &request, &rollback, started).await?;
 
-    let prompt_result = prompt_when_ready(
+    let prompt_result = deliver_prompt_when_ready(
         config,
         socket_path,
         &request.command_id,
         &runtime.pane_id,
         &request.prompt,
+        AGENT_PROMPT_READY_TIMEOUT,
     )
     .await;
     match prompt_result {
-        Ok(result) => match expect_result_type(&result, "agent_prompted") {
-            Ok(()) => Ok(ProvisionedAgent { runtime }),
-            Err(source) => Err(HerdrControlError::PromptDeliveryFailed {
-                runtime: Box::new(runtime),
-                source,
-            }),
-        },
-        Err(source) if is_definitely_not_submitted(&source) => {
-            match send_prompt_to_pane(
-                config,
-                socket_path,
-                &request.command_id,
-                &runtime.pane_id,
-                &request.prompt,
-            )
-            .await
-            {
-                Ok(()) => Ok(ProvisionedAgent { runtime }),
-                Err(source) => Err(HerdrControlError::PromptDeliveryFailed {
-                    runtime: Box::new(runtime),
-                    source,
-                }),
-            }
-        }
-        Err(source) => Err(HerdrControlError::PromptDeliveryFailed {
-            runtime: Box::new(runtime),
+        Ok(()) => Ok(ProvisionedAgent { runtime }),
+        Err(source) => Err(prompt_failure_after_rollback(
+            config,
+            socket_path,
+            &request.command_id,
+            &rollback,
             source,
-        }),
+            runtime,
+        )
+        .await),
     }
 }
 
@@ -489,7 +495,7 @@ async fn validate_started_topology(
     config: &HerdrConfig,
     socket_path: &std::path::Path,
     request: &StartPreparedAgentRequest,
-    rollback: StartRollback,
+    rollback: &StartRollback,
     started: AgentStarted,
 ) -> Result<WorkerRuntimeBinding, HerdrControlError> {
     let runtime = runtime_binding(&request.prepared.session, started.agent);
@@ -516,7 +522,7 @@ async fn start_failure_after_rollback(
     config: &HerdrConfig,
     socket_path: &std::path::Path,
     command_id: &str,
-    rollback: StartRollback,
+    rollback: &StartRollback,
     start: HerdrError,
     rollback_covers_started_runtime: bool,
     started_runtime: Option<WorkerRuntimeBinding>,
@@ -530,10 +536,10 @@ async fn start_failure_after_rollback(
     };
     let rollback = rollback_result.map_or_else(
         |error| error.to_string(),
-        |()| {
-            if rollback_covers_started_runtime {
-                "succeeded".to_owned()
-            } else {
+        |()| match rollback {
+            StartRollback::None => "not attempted; existing topology preserved".to_owned(),
+            _ if rollback_covers_started_runtime => "succeeded".to_owned(),
+            _ => {
                 "prepared topology closed; mismatched started runtime remains unverified".to_owned()
             }
         },
@@ -543,6 +549,43 @@ async fn start_failure_after_rollback(
         rollback,
         rollback_succeeded,
         started_runtime: started_runtime.map(Box::new),
+    }
+}
+
+async fn prompt_failure_after_rollback(
+    config: &HerdrConfig,
+    socket_path: &std::path::Path,
+    command_id: &str,
+    rollback: &StartRollback,
+    source: HerdrError,
+    runtime: WorkerRuntimeBinding,
+) -> HerdrControlError {
+    if !prompt_definitely_not_submitted(&source) || !rollback.covers_started_runtime() {
+        return HerdrControlError::PromptDeliveryFailed {
+            source,
+            rollback: if rollback.covers_started_runtime() {
+                "not attempted; prompt submission outcome is unknown".to_owned()
+            } else {
+                "not attempted; existing topology preserved".to_owned()
+            },
+            rollback_succeeded: false,
+            started_runtime: Some(Box::new(runtime)),
+        };
+    }
+
+    match rollback_start(config, socket_path, command_id, rollback).await {
+        Ok(()) => HerdrControlError::PromptDeliveryFailed {
+            source,
+            rollback: "succeeded".to_owned(),
+            rollback_succeeded: true,
+            started_runtime: None,
+        },
+        Err(error) => HerdrControlError::PromptDeliveryFailed {
+            source,
+            rollback: error.to_string(),
+            rollback_succeeded: false,
+            started_runtime: Some(Box::new(runtime)),
+        },
     }
 }
 
@@ -606,13 +649,15 @@ async fn read_pane_at_socket(
     socket_path: &std::path::Path,
     request: ReadPaneRequest,
 ) -> Result<PaneOutput, HerdrError> {
+    let request_id = request.request_id.as_str();
+    let pane_id = request.pane_id.as_str();
     let result = request_command(
         config,
         socket_path,
-        &format!("yard:{}:read", request.request_id),
+        &format!("yard:{request_id}:read"),
         "pane.read",
         json!({
-            "pane_id": request.pane_id,
+            "pane_id": pane_id,
             "source": "recent_unwrapped",
             "lines": request.lines,
             "format": "text",
@@ -623,7 +668,119 @@ async fn read_pane_at_socket(
     .await?;
     expect_result_type(&result, "pane_read")?;
     let result: PaneRead = serde_json::from_value(result).map_err(HerdrError::CommandDecode)?;
-    Ok(result.read)
+    let mut output = result.read;
+    if request.lines > HERDR_PANE_READ_MAX_LINES
+        && output.truncated
+        && let Ok(Some(history)) = read_retained_pane_history(
+            config,
+            socket_path,
+            request_id,
+            pane_id,
+            request.lines,
+            &output,
+        )
+        .await
+    {
+        output.text = history.text;
+        output.truncated = history.truncated;
+    }
+    Ok(output)
+}
+
+async fn read_retained_pane_history(
+    config: &HerdrConfig,
+    socket_path: &std::path::Path,
+    request_id: &str,
+    pane_id: &str,
+    lines: u32,
+    output: &PaneOutput,
+) -> Result<Option<RetainedPaneHistory>, HerdrError> {
+    let result = request_command(
+        config,
+        socket_path,
+        &format!("yard:{request_id}:read-info"),
+        "pane.get",
+        json!({ "pane_id": pane_id }),
+        config.request_timeout,
+    )
+    .await?;
+    expect_result_type(&result, "pane_info")?;
+    let result: PaneInfoResult =
+        serde_json::from_value(result).map_err(HerdrError::CommandDecode)?;
+    if result.pane.pane_id != pane_id
+        || result.pane.workspace_id != output.workspace_id
+        || result.pane.tab_id != output.tab_id
+    {
+        return Ok(None);
+    }
+    let Some(scroll) = result.pane.scroll else {
+        return Ok(None);
+    };
+    let total_rows = scroll
+        .max_offset_from_bottom
+        .saturating_add(scroll.viewport_rows);
+    if total_rows <= u64::from(HERDR_PANE_READ_MAX_LINES) || total_rows == 0 {
+        return Ok(None);
+    }
+    let start_row = total_rows.saturating_sub(u64::from(lines));
+    let end_row = total_rows.saturating_sub(1);
+    let Ok(start_row) = u32::try_from(start_row) else {
+        return Ok(None);
+    };
+    let Ok(end_row) = u32::try_from(end_row) else {
+        return Ok(None);
+    };
+
+    let result = request_command(
+        config,
+        socket_path,
+        &format!("yard:{request_id}:read-line-end"),
+        "pane.copy_motion",
+        json!({
+            "pane_id": pane_id,
+            "cursor": {
+                "row": end_row,
+                "col": 0
+            },
+            "motion": "line_end"
+        }),
+        config.request_timeout,
+    )
+    .await?;
+    expect_result_type(&result, "pane_copy_motion")?;
+    let motion: PaneCopyMotion =
+        serde_json::from_value(result).map_err(HerdrError::CommandDecode)?;
+    if motion.pane_id != pane_id || motion.cursor.row != end_row {
+        return Ok(None);
+    }
+
+    let result = request_command(
+        config,
+        socket_path,
+        &format!("yard:{request_id}:read-selection"),
+        "pane.selection.read",
+        json!({
+            "pane_id": pane_id,
+            "anchor": {
+                "row": start_row,
+                "col": 0
+            },
+            "cursor": motion.cursor,
+            "content_revision": motion.content_revision
+        }),
+        config.request_timeout,
+    )
+    .await?;
+    expect_result_type(&result, "pane_selection")?;
+    let selection: PaneSelection =
+        serde_json::from_value(result).map_err(HerdrError::CommandDecode)?;
+    if selection.pane_id != pane_id || selection.text.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(RetainedPaneHistory {
+        text: selection.text,
+        truncated: start_row > 0,
+    }))
 }
 
 async fn running_session(
@@ -641,14 +798,35 @@ async fn running_session(
     Ok(session)
 }
 
+async fn deliver_prompt_when_ready(
+    config: &HerdrConfig,
+    socket_path: &std::path::Path,
+    command_id: &str,
+    pane_id: &str,
+    prompt: &str,
+    ready_timeout: Duration,
+) -> Result<(), HerdrError> {
+    let result = prompt_when_ready(
+        config,
+        socket_path,
+        command_id,
+        pane_id,
+        prompt,
+        ready_timeout,
+    )
+    .await?;
+    expect_result_type(&result, "agent_prompted")
+}
+
 async fn prompt_when_ready(
     config: &HerdrConfig,
     socket_path: &std::path::Path,
     command_id: &str,
     pane_id: &str,
     prompt: &str,
+    ready_timeout: Duration,
 ) -> Result<serde_json::Value, HerdrError> {
-    let deadline = Instant::now() + AGENT_PROMPT_READY_TIMEOUT;
+    let deadline = Instant::now() + ready_timeout;
     let mut attempt = 1_u32;
     loop {
         let result = request_command(
@@ -667,7 +845,7 @@ async fn prompt_when_ready(
         match result {
             Ok(result) => return Ok(result),
             Err(error) => {
-                let retryable = is_definitely_not_submitted(&error);
+                let retryable = is_prompt_readiness_retryable(&error);
                 if !retryable || Instant::now() >= deadline {
                     return Err(error);
                 }
@@ -678,35 +856,20 @@ async fn prompt_when_ready(
     }
 }
 
-async fn send_prompt_to_pane(
-    config: &HerdrConfig,
-    socket_path: &std::path::Path,
-    command_id: &str,
-    pane_id: &str,
-    prompt: &str,
-) -> Result<(), HerdrError> {
-    let result = request_command(
-        config,
-        socket_path,
-        &format!("yard:{command_id}:pane-prompt"),
-        "pane.send_input",
-        json!({
-            "pane_id": pane_id,
-            "text": prompt,
-            "keys": ["enter"]
-        }),
-        config.request_timeout,
-    )
-    .await?;
-    expect_result_type(&result, "ok")
-}
-
-fn is_definitely_not_submitted(error: &HerdrError) -> bool {
+fn is_prompt_readiness_retryable(error: &HerdrError) -> bool {
     matches!(
         error,
         HerdrError::Api { code, .. }
             if code == "agent_not_ready" || code == "agent_not_found"
     )
+}
+
+fn prompt_definitely_not_submitted(error: &HerdrError) -> bool {
+    is_prompt_readiness_retryable(error)
+        || matches!(
+            error,
+            HerdrError::Api { code, .. } if code == "agent_blocked"
+        )
 }
 
 fn runtime_creation_outcome_ambiguous(error: &HerdrError) -> bool {
@@ -720,12 +883,13 @@ async fn rollback_start(
     config: &HerdrConfig,
     socket_path: &std::path::Path,
     command_id: &str,
-    rollback: StartRollback,
+    rollback: &StartRollback,
 ) -> Result<(), HerdrError> {
     match rollback {
-        StartRollback::Tab(tab_id) => close_tab(config, socket_path, command_id, &tab_id).await,
+        StartRollback::None => Ok(()),
+        StartRollback::Tab(tab_id) => close_tab(config, socket_path, command_id, tab_id).await,
         StartRollback::Workspace(workspace_id) => {
-            close_workspace(config, socket_path, command_id, &workspace_id).await
+            close_workspace(config, socket_path, command_id, workspace_id).await
         }
     }
 }
@@ -745,7 +909,7 @@ async fn close_tab(
         config.request_timeout,
     )
     .await?;
-    expect_result_type(&result, "tab_closed")
+    expect_tab_close_result(&result)
 }
 
 async fn close_workspace(
@@ -783,6 +947,22 @@ fn expect_result_type(
         Ok(())
     } else {
         Err(HerdrError::UnexpectedResult { expected, actual })
+    }
+}
+
+fn expect_tab_close_result(result: &serde_json::Value) -> Result<(), HerdrError> {
+    let actual = result
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    if actual == "ok" || actual == "tab_closed" {
+        Ok(())
+    } else {
+        Err(HerdrError::UnexpectedResult {
+            expected: "ok or tab_closed",
+            actual,
+        })
     }
 }
 
@@ -878,6 +1058,49 @@ struct PaneRead {
     read: PaneOutput,
 }
 
+#[derive(Debug, Deserialize)]
+struct PaneInfoResult {
+    pane: PaneHistoryInfo,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneHistoryInfo {
+    pane_id: String,
+    workspace_id: String,
+    tab_id: String,
+    scroll: Option<PaneScrollInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneScrollInfo {
+    max_offset_from_bottom: u64,
+    viewport_rows: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneCopyMotion {
+    pane_id: String,
+    cursor: PaneTextPoint,
+    content_revision: u64,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+struct PaneTextPoint {
+    row: u32,
+    col: u16,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneSelection {
+    pane_id: String,
+    text: String,
+}
+
+struct RetainedPaneHistory {
+    text: String,
+    truncated: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -889,10 +1112,12 @@ mod tests {
 
     use super::{
         BootstrapAgentRequest, HerdrControlError, PrepareAgentRequest, PromptAgentRequest,
-        ProvisionAgentRequest, ReadPaneRequest, StartPreparedAgentRequest,
-        bootstrap_agent_at_socket, prepare_agent_at_socket, prompt_agent_at_socket,
-        provision_agent_at_socket, read_pane_at_socket, retained_prepared_topology,
-        runtime_creation_outcome_ambiguous, start_prepared_agent_at_socket,
+        ProvisionAgentRequest, ReadPaneRequest, StartPreparedAgentRequest, StartRollback,
+        bootstrap_agent_at_socket, close_tab, close_workspace, deliver_prompt_when_ready,
+        expect_tab_close_result, prepare_agent_at_socket, prompt_agent_at_socket,
+        prompt_definitely_not_submitted, prompt_failure_after_rollback, provision_agent_at_socket,
+        read_pane_at_socket, retained_prepared_topology, runtime_creation_outcome_ambiguous,
+        start_agent_at_socket, start_prepared_agent_at_socket,
     };
     use crate::{HerdrConfig, HerdrError};
     use yard_domain::{
@@ -924,6 +1149,106 @@ mod tests {
         }
     }
 
+    fn started_claude_response(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "result": {
+                "type": "agent_started",
+                "agent": {
+                    "terminal_id": "terminal-1",
+                    "name": "yard-blocked",
+                    "agent": "claude",
+                    "display_agent": "Claude",
+                    "agent_status": "idle",
+                    "tokens": {},
+                    "agent_session": {
+                        "source": "herdr:claude",
+                        "agent": "claude",
+                        "kind": "id",
+                        "value": "session-1"
+                    },
+                    "workspace_id": "workspace-1",
+                    "tab_id": "tab-1",
+                    "pane_id": "pane-1",
+                    "focused": false,
+                    "launch_pending": false,
+                    "interactive_ready": true,
+                    "state_change_seq": 2,
+                    "cwd": "/tmp/project",
+                    "foreground_cwd": "/tmp/project",
+                    "revision": 2
+                }
+            }
+        })
+    }
+
+    fn extended_history_result(step: usize, request: &serde_json::Value) -> serde_json::Value {
+        match step {
+            0 => {
+                assert_eq!(request["method"], "pane.read");
+                assert_eq!(request["params"]["lines"], 10_000);
+                serde_json::json!({
+                    "type": "pane_read",
+                    "read": {
+                        "pane_id": "pane-1",
+                        "workspace_id": "workspace-1",
+                        "tab_id": "tab-1",
+                        "source": "recent_unwrapped",
+                        "format": "text",
+                        "text": "latest 1000 lines",
+                        "revision": 0,
+                        "truncated": true
+                    }
+                })
+            }
+            1 => {
+                assert_eq!(request["method"], "pane.get");
+                assert_eq!(request["params"]["pane_id"], "pane-1");
+                serde_json::json!({
+                    "type": "pane_info",
+                    "pane": {
+                        "pane_id": "pane-1",
+                        "workspace_id": "workspace-1",
+                        "tab_id": "tab-1",
+                        "scroll": {
+                            "max_offset_from_bottom": 11_976,
+                            "offset_from_bottom": 0,
+                            "viewport_rows": 24
+                        }
+                    }
+                })
+            }
+            2 => {
+                assert_eq!(request["method"], "pane.copy_motion");
+                assert_eq!(request["params"]["cursor"]["row"], 11_999);
+                assert_eq!(request["params"]["cursor"]["col"], 0);
+                assert_eq!(request["params"]["motion"], "line_end");
+                serde_json::json!({
+                    "type": "pane_copy_motion",
+                    "pane_id": "pane-1",
+                    "cursor": {
+                        "row": 11_999,
+                        "col": 72
+                    },
+                    "content_revision": 44
+                })
+            }
+            _ => {
+                assert_eq!(request["method"], "pane.selection.read");
+                assert_eq!(request["params"]["anchor"]["row"], 2_000);
+                assert_eq!(request["params"]["anchor"]["col"], 0);
+                assert_eq!(request["params"]["cursor"]["row"], 11_999);
+                assert_eq!(request["params"]["cursor"]["col"], 72);
+                assert_eq!(request["params"]["content_revision"], 44);
+                serde_json::json!({
+                    "type": "pane_selection",
+                    "pane_id": "pane-1",
+                    "text": "selected 10000 lines"
+                })
+            }
+        }
+    }
+
     #[test]
     fn started_agent_must_retain_the_prepared_topology() {
         let prepared = runtime_topology("workspace-1", "tab-1", "pane-1", "terminal-1");
@@ -932,6 +1257,512 @@ mod tests {
         assert!(!retained_prepared_topology(
             &prepared,
             &runtime_topology("workspace-2", "tab-1", "pane-1", "terminal-1"),
+        ));
+    }
+
+    #[test]
+    fn classifies_only_explicitly_unsent_prompt_errors_for_rollback() {
+        for code in ["agent_blocked", "agent_not_ready", "agent_not_found"] {
+            assert!(prompt_definitely_not_submitted(&HerdrError::Api {
+                code: code.to_owned(),
+                message: "prompt was not submitted".to_owned(),
+            }));
+        }
+        assert!(!prompt_definitely_not_submitted(&HerdrError::SocketTimeout));
+    }
+
+    #[tokio::test]
+    async fn uncertain_prompt_submission_preserves_started_runtime_without_rollback() {
+        let runtime = runtime_topology("workspace-1", "tab-1", "pane-1", "terminal-1");
+        let error = prompt_failure_after_rollback(
+            &HerdrConfig::default(),
+            std::path::Path::new("/unused/herdr.sock"),
+            "uncertain-prompt",
+            &StartRollback::Tab("tab-1".to_owned()),
+            HerdrError::SocketTimeout,
+            runtime,
+        )
+        .await;
+
+        assert!(matches!(
+            error,
+            HerdrControlError::PromptDeliveryFailed {
+                rollback,
+                rollback_succeeded: false,
+                started_runtime: Some(runtime),
+                ..
+            } if rollback == "not attempted; prompt submission outcome is unknown"
+                && runtime.terminal_id == "terminal-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn blocked_prompt_closes_the_yard_owned_tab_without_raw_input() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            for step in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].as_str().unwrap();
+                let response = match step {
+                    0 => {
+                        assert_eq!(request["method"], "agent.start");
+                        started_claude_response(id)
+                    }
+                    1 => {
+                        assert_eq!(request["method"], "agent.prompt");
+                        serde_json::json!({
+                            "id": id,
+                            "error": {
+                                "code": "agent_blocked",
+                                "message": "permission prompt requires operator input"
+                            }
+                        })
+                    }
+                    _ => {
+                        assert_eq!(request["method"], "tab.close");
+                        assert_eq!(request["params"]["tab_id"], "tab-1");
+                        serde_json::json!({
+                            "id": id,
+                            "result": { "type": "ok" }
+                        })
+                    }
+                };
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let error = start_prepared_agent_at_socket(
+            &config,
+            &socket_path,
+            StartPreparedAgentRequest {
+                command_id: "blocked".to_owned(),
+                prepared: runtime_topology("workspace-1", "tab-1", "pane-1", "terminal-1"),
+                agent_name: "yard-blocked".to_owned(),
+                kind: "claude".to_owned(),
+                args: vec!["--permission-mode".to_owned(), "auto".to_owned()],
+                prompt: "Continue.".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(
+            error,
+            HerdrControlError::PromptDeliveryFailed {
+                rollback_succeeded: true,
+                started_runtime: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn blocked_prompt_preserves_existing_topology() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            for step in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].as_str().unwrap();
+                let response = if step == 0 {
+                    assert_eq!(request["method"], "agent.start");
+                    started_claude_response(id)
+                } else {
+                    assert_eq!(request["method"], "agent.prompt");
+                    serde_json::json!({
+                        "id": id,
+                        "error": {
+                            "code": "agent_blocked",
+                            "message": "permission prompt requires operator input"
+                        }
+                    })
+                };
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let error = start_agent_at_socket(
+            &config,
+            &socket_path,
+            StartPreparedAgentRequest {
+                command_id: "blocked-existing".to_owned(),
+                prepared: runtime_topology("workspace-1", "tab-1", "pane-1", "terminal-1"),
+                agent_name: "yard-blocked".to_owned(),
+                kind: "claude".to_owned(),
+                args: Vec::new(),
+                prompt: "Continue.".to_owned(),
+            },
+            StartRollback::None,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(
+            error,
+            HerdrControlError::PromptDeliveryFailed {
+                rollback,
+                rollback_succeeded: false,
+                started_runtime: Some(runtime),
+                ..
+            } if rollback == "not attempted; existing topology preserved"
+                && runtime.terminal_id == "terminal-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_prompt_rollback_retains_the_started_runtime() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            for step in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].as_str().unwrap();
+                let response = match step {
+                    0 => started_claude_response(id),
+                    1 => serde_json::json!({
+                        "id": id,
+                        "error": {
+                            "code": "agent_blocked",
+                            "message": "permission prompt requires operator input"
+                        }
+                    }),
+                    _ => {
+                        assert_eq!(request["method"], "tab.close");
+                        serde_json::json!({
+                            "id": id,
+                            "error": {
+                                "code": "tab_close_failed",
+                                "message": "tab is still busy"
+                            }
+                        })
+                    }
+                };
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let error = start_prepared_agent_at_socket(
+            &config,
+            &socket_path,
+            StartPreparedAgentRequest {
+                command_id: "blocked-close-failed".to_owned(),
+                prepared: runtime_topology("workspace-1", "tab-1", "pane-1", "terminal-1"),
+                agent_name: "yard-blocked".to_owned(),
+                kind: "claude".to_owned(),
+                args: Vec::new(),
+                prompt: "Continue.".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(
+            error,
+            HerdrControlError::PromptDeliveryFailed {
+                rollback_succeeded: false,
+                started_runtime: Some(runtime),
+                ..
+            } if runtime.terminal_id == "terminal-1"
+        ));
+    }
+
+    #[test]
+    fn tab_close_result_accepts_legacy_and_herdr_0_8_2_shapes() {
+        expect_tab_close_result(&serde_json::json!({ "type": "tab_closed" })).unwrap();
+        expect_tab_close_result(&serde_json::json!({ "type": "ok" })).unwrap();
+    }
+
+    #[tokio::test]
+    async fn definite_existing_pane_start_rejection_does_not_capture_runtime() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "agent.start");
+            let id = request["id"].as_str().unwrap();
+            writer
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::json!({
+                            "id": id,
+                            "error": {
+                                "code": "agent_name_taken",
+                                "message": "agent name is already in use"
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+        let error = start_agent_at_socket(
+            &config,
+            &socket_path,
+            StartPreparedAgentRequest {
+                command_id: "retained-start-failure".to_owned(),
+                prepared: runtime_topology("workspace-1", "tab-1", "pane-1", "terminal-1"),
+                agent_name: "yard-orchestrator".to_owned(),
+                kind: "codex".to_owned(),
+                args: Vec::new(),
+                prompt: "Coordinate projects.".to_owned(),
+            },
+            StartRollback::None,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        let HerdrControlError::StartFailed {
+            rollback,
+            rollback_succeeded,
+            started_runtime: None,
+            ..
+        } = error
+        else {
+            panic!("expected definite retained-pane start rejection");
+        };
+        assert!(!rollback_succeeded);
+        assert_eq!(rollback, "not attempted; existing topology preserved");
+    }
+
+    #[tokio::test]
+    async fn definite_start_rejection_with_failed_cleanup_does_not_capture_runtime() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            for expected_method in ["agent.start", "tab.close"] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], expected_method);
+                let id = request["id"].as_str().unwrap();
+                let response = if expected_method == "agent.start" {
+                    serde_json::json!({
+                        "id": id,
+                        "error": {
+                            "code": "agent_name_taken",
+                            "message": "agent name is already in use"
+                        }
+                    })
+                } else {
+                    serde_json::json!({
+                        "id": id,
+                        "error": {
+                            "code": "tab_close_failed",
+                            "message": "tab is still busy"
+                        }
+                    })
+                };
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let error = start_prepared_agent_at_socket(
+            &config,
+            &socket_path,
+            StartPreparedAgentRequest {
+                command_id: "rejected-start-failed-cleanup".to_owned(),
+                prepared: runtime_topology("workspace-1", "tab-1", "pane-1", "terminal-1"),
+                agent_name: "yard-orchestrator".to_owned(),
+                kind: "codex".to_owned(),
+                args: Vec::new(),
+                prompt: "Coordinate projects.".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        let HerdrControlError::StartFailed {
+            rollback,
+            rollback_succeeded,
+            started_runtime,
+            ..
+        } = error
+        else {
+            panic!("expected definite start rejection with failed cleanup");
+        };
+        assert!(!rollback_succeeded);
+        assert!(started_runtime.is_none());
+        assert!(rollback.contains("tab_close_failed"));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_existing_pane_start_failure_preserves_runtime_as_unverified() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, _writer) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "agent.start");
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_millis(100),
+            ..HerdrConfig::default()
+        };
+        let prepared = runtime_topology("workspace-1", "tab-1", "pane-1", "terminal-1");
+
+        let error = start_agent_at_socket(
+            &config,
+            &socket_path,
+            StartPreparedAgentRequest {
+                command_id: "ambiguous-retained-start-failure".to_owned(),
+                prepared: prepared.clone(),
+                agent_name: "yard-orchestrator".to_owned(),
+                kind: "codex".to_owned(),
+                args: Vec::new(),
+                prompt: "Coordinate projects.".to_owned(),
+            },
+            StartRollback::None,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        let HerdrControlError::StartFailed {
+            rollback,
+            rollback_succeeded,
+            started_runtime: Some(started_runtime),
+            ..
+        } = error
+        else {
+            panic!("expected ambiguous retained-pane start failure");
+        };
+        assert!(!rollback_succeeded);
+        assert_eq!(rollback, "not attempted; existing topology preserved");
+        assert_eq!(*started_runtime, prepared);
+    }
+
+    #[tokio::test]
+    async fn unavailable_agent_prompt_never_falls_back_to_raw_pane_input() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "agent.prompt");
+            let id = request["id"].as_str().unwrap();
+            writer
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::json!({
+                            "id": id,
+                            "error": {
+                                "code": "agent_not_found",
+                                "message": "agent launch exited"
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let error = deliver_prompt_when_ready(
+            &config,
+            &socket_path,
+            "retained-prompt-failure",
+            "pane-1",
+            "Coordinate projects.",
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(
+            error,
+            HerdrError::Api { code, .. } if code == "agent_not_found"
         ));
     }
 
@@ -1212,6 +2043,207 @@ mod tests {
         assert!(created.runtime.owns_tab);
     }
 
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn herdr_0_8_2_workspace_control_contract_matches_protocol_20() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let fixtures: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/v0.8.2/control.json"))
+                .unwrap();
+        let server = tokio::spawn(async move {
+            for step in 0..5 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].as_str().unwrap();
+                let fixture = match step {
+                    0 => {
+                        assert_eq!(request["method"], "workspace.create");
+                        assert_eq!(request["params"]["cwd"], "/tmp/protocol-20-project");
+                        assert_eq!(request["params"]["label"], "Protocol 20");
+                        assert_eq!(request["params"]["focus"], false);
+                        assert_eq!(request["params"]["env"], serde_json::json!({}));
+                        "workspace_created"
+                    }
+                    1 => {
+                        assert_eq!(request["method"], "agent.start");
+                        assert_eq!(request["params"]["name"], "yard-protocol20");
+                        assert_eq!(request["params"]["kind"], "claude");
+                        assert_eq!(request["params"]["pane_id"], "w20:p1");
+                        assert_eq!(
+                            request["params"]["args"],
+                            serde_json::json!(["--permission-mode", "auto"])
+                        );
+                        assert_eq!(request["params"]["timeout_ms"], 30_000);
+                        "agent_started"
+                    }
+                    2 => {
+                        assert_eq!(request["method"], "agent.prompt");
+                        assert_eq!(request["params"]["target"], "w20:p1");
+                        assert_eq!(
+                            request["params"]["text"],
+                            "Coordinate protocol 20 compatibility."
+                        );
+                        assert!(request["params"]["wait"].is_null());
+                        "agent_prompted"
+                    }
+                    3 => {
+                        assert_eq!(request["method"], "pane.read");
+                        assert_eq!(request["params"]["pane_id"], "w20:p1");
+                        assert_eq!(request["params"]["source"], "recent_unwrapped");
+                        assert_eq!(request["params"]["lines"], 1_000);
+                        assert_eq!(request["params"]["format"], "text");
+                        assert_eq!(request["params"]["strip_ansi"], true);
+                        "pane_read"
+                    }
+                    _ => {
+                        assert_eq!(request["method"], "workspace.close");
+                        assert_eq!(request["params"]["workspace_id"], "w20");
+                        "ok"
+                    }
+                };
+                let response = serde_json::json!({
+                    "id": id,
+                    "result": fixtures[fixture].clone()
+                });
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let created = bootstrap_agent_at_socket(
+            &config,
+            &socket_path,
+            BootstrapAgentRequest {
+                command_id: "protocol-20".to_owned(),
+                session: "default".to_owned(),
+                workspace_label: "Protocol 20".to_owned(),
+                cwd: "/tmp/protocol-20-project".to_owned(),
+                agent_name: "yard-protocol20".to_owned(),
+                kind: "claude".to_owned(),
+                args: vec!["--permission-mode".to_owned(), "auto".to_owned()],
+                prompt: "Coordinate protocol 20 compatibility.".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        let output = read_pane_at_socket(
+            &config,
+            &socket_path,
+            ReadPaneRequest {
+                request_id: "protocol-20".to_owned(),
+                session: "default".to_owned(),
+                pane_id: created.runtime.pane_id.clone(),
+                lines: 1_000,
+            },
+        )
+        .await
+        .unwrap();
+        close_workspace(
+            &config,
+            &socket_path,
+            "protocol-20",
+            &created.runtime.workspace_id,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(created.runtime.workspace_id, "w20");
+        assert_eq!(created.runtime.tab_id.as_deref(), Some("w20:t1"));
+        assert_eq!(created.runtime.pane_id, "w20:p1");
+        assert_eq!(
+            created
+                .runtime
+                .provider_session
+                .as_ref()
+                .map(|session| session.value.as_str()),
+            Some("session_protocol20")
+        );
+        assert_eq!(output.text, "Protocol 20 control output");
+        assert!(!output.truncated);
+    }
+
+    #[tokio::test]
+    async fn herdr_0_8_2_tab_control_accepts_ok_close_result() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let fixtures: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/v0.8.2/control.json"))
+                .unwrap();
+        let server = tokio::spawn(async move {
+            for step in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].as_str().unwrap();
+                let fixture = if step == 0 {
+                    assert_eq!(request["method"], "tab.create");
+                    assert_eq!(request["params"]["workspace_id"], "w20");
+                    assert_eq!(request["params"]["cwd"], "/tmp/protocol-20-project");
+                    assert_eq!(request["params"]["label"], "Protocol 20 worker");
+                    "tab_created"
+                } else {
+                    assert_eq!(request["method"], "tab.close");
+                    assert_eq!(request["params"]["tab_id"], "w20:t2");
+                    "ok"
+                };
+                let response = serde_json::json!({
+                    "id": id,
+                    "result": fixtures[fixture].clone()
+                });
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let prepared = prepare_agent_at_socket(
+            &config,
+            &socket_path,
+            PrepareAgentRequest {
+                command_id: "protocol-20-tab".to_owned(),
+                session: "default".to_owned(),
+                workspace_id: "w20".to_owned(),
+                cwd: "/tmp/protocol-20-project".to_owned(),
+                tab_label: "Protocol 20 worker".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        close_tab(
+            &config,
+            &socket_path,
+            "protocol-20-tab",
+            prepared.runtime.tab_id.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(prepared.runtime.tab_id.as_deref(), Some("w20:t2"));
+        assert_eq!(prepared.runtime.pane_id, "w20:p2");
+        assert_eq!(prepared.runtime.terminal_id, "term_protocol20_tab");
+    }
+
     #[tokio::test]
     async fn rolls_back_created_workspace_when_agent_start_fails() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -1311,13 +2343,13 @@ mod tests {
     }
 
     #[test]
-    fn classifies_workspace_creation_transport_ambiguity() {
+    fn classifies_runtime_creation_transport_ambiguity() {
         assert!(runtime_creation_outcome_ambiguous(
             &HerdrError::SocketTimeout
         ));
         assert!(!runtime_creation_outcome_ambiguous(&HerdrError::Api {
-            code: "workspace_create_failed".to_owned(),
-            message: "invalid directory".to_owned(),
+            code: "agent_name_taken".to_owned(),
+            message: "agent name is already in use".to_owned(),
         }));
     }
 
@@ -1794,5 +2826,52 @@ mod tests {
         assert_eq!(output.text, "tests pass");
         assert_eq!(output.revision, 0);
         assert!(!output.truncated);
+    }
+
+    #[tokio::test]
+    async fn reads_extended_history_through_an_uncapped_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            for step in 0..4 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].as_str().unwrap();
+                let result = extended_history_result(step, &request);
+                let response = serde_json::json!({
+                    "id": id,
+                    "result": result
+                });
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let output = read_pane_at_socket(
+            &config,
+            &socket_path,
+            ReadPaneRequest {
+                request_id: "request-extended".to_owned(),
+                session: "default".to_owned(),
+                pane_id: "pane-1".to_owned(),
+                lines: 10_000,
+            },
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(output.text, "selected 10000 lines");
+        assert!(output.truncated);
     }
 }

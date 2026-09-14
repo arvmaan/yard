@@ -226,6 +226,19 @@ mod tests {
         assert_eq!(snapshot.agents.len(), 1);
     }
 
+    #[test]
+    fn decodes_herdr_0_8_2_protocol_20_snapshot() {
+        let snapshot =
+            decode_snapshot(include_bytes!("../tests/fixtures/v0.8.2/snapshot.json")).unwrap();
+
+        assert_eq!(snapshot.version, "0.8.2");
+        assert_eq!(snapshot.protocol, 20);
+        assert_eq!(snapshot.workspaces[0].workspace_id, "w20");
+        assert_eq!(snapshot.tabs[0].tab_id, "w20:t1");
+        assert_eq!(snapshot.panes[0].terminal_id, "term_protocol20");
+        assert_eq!(snapshot.agents[0].name.as_deref(), Some("yard-protocol20"));
+    }
+
     #[tokio::test]
     async fn frames_snapshot_request_as_ndjson() {
         let temp = tempfile::tempdir().unwrap();

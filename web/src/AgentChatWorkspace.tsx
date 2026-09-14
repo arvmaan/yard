@@ -31,10 +31,27 @@ import {
   sendYardOrchestratorRoute,
 } from './api'
 import {
+  agentQuestionKey,
+  agentQuestionsMatch,
+  recordAgentQuestion,
+  type AgentQuestion,
+  useLatestAgentQuestion,
+} from './agentQuestions'
+import {
   buildExecutionOrder,
   ORDER_TEMPLATES,
 } from './orderTemplates'
+import {
+  CollapsibleAgentOutput,
+  CollapsibleQuestion,
+} from './CollapsibleAgentOutput'
 import { promptRequiresNewCommand } from './promptPolicy'
+import {
+  normalizeTerminalOutput,
+  parseTerminalTranscript,
+  TERMINAL_OUTPUT_LINES,
+  TRUNCATED_TERMINAL_OUTPUT_LABEL,
+} from './terminalOutput'
 import { useModalDialog } from './useModalDialog'
 import type {
   Assignment,
@@ -52,17 +69,18 @@ import type {
   YardOrchestratorRoute,
 } from './types'
 
-const OUTPUT_LINES = 160
-const MAX_ACTIVITY_CHARACTERS = 8000
-
 export type AgentChatTarget =
   | { kind: 'assignment'; assignment: Assignment }
   | { kind: 'orchestrator'; project: Project }
   | { kind: 'yard-orchestrator'; orchestrator: YardOrchestrator }
   | { kind: 'coordination-node'; node: CoordinationNode }
 
+function agentChatTargetKey(target: AgentChatTarget) {
+  return agentQuestionKey(target)
+}
+
 type PromptFeedback =
-  | { kind: 'success' }
+  | { kind: 'success'; message: string }
   | {
       kind: 'error'
       message: string
@@ -110,25 +128,21 @@ type RetainedPrompt =
 
 interface ChatMessage {
   id: string
-  kind: 'agent' | 'user' | 'system' | 'error'
+  kind: 'agent' | 'user' | 'error'
   label: string
   meta: string
+  question?: AgentQuestion
   text: string
+  truncated?: boolean
 }
 
 function errorMessage(caught: unknown, fallback: string) {
   return caught instanceof Error ? caught.message : fallback
 }
 
-function activityExcerpt(text: string) {
-  const trimmed = text.trim()
-  if (trimmed.length <= MAX_ACTIVITY_CHARACTERS) return trimmed
-  return `...${trimmed.slice(-MAX_ACTIVITY_CHARACTERS)}`
-}
-
 function activitySegments(text: string) {
-  const excerpt = activityExcerpt(text).replace(/\r\n?/g, '\n')
-  return excerpt ? [excerpt] : []
+  const normalized = normalizeTerminalOutput(text)
+  return normalized ? [normalized] : []
 }
 
 export function AgentChatWorkspace({
@@ -175,14 +189,9 @@ export function AgentChatWorkspace({
     yardOrchestrator?.worker?.id ??
     coordinationNode?.worker?.id ??
     ''
-  const targetKey =
-    target.kind === 'assignment'
-      ? `assignment:${assignmentId}:${assignment?.attempt.id}`
-      : target.kind === 'orchestrator'
-        ? `orchestrator:${projectId}:${workerId}`
-        : target.kind === 'yard-orchestrator'
-          ? `yard-orchestrator:${yardOrchestrator?.version}:${workerId}`
-          : `coordination-node:${coordinationNode?.id}:${coordinationNode?.version}:${workerId}`
+  const targetKey = agentChatTargetKey(target)
+  const workspaceQuestionKey = targetKey
+  const recordedQuestion = useLatestAgentQuestion(workspaceQuestionKey)
   const targetRole =
     target.kind === 'yard-orchestrator'
       ? 'Superintendent'
@@ -206,9 +215,51 @@ export function AgentChatWorkspace({
   const [dispatchProjectId, setDispatchProjectId] = useState('')
   const [promptFeedback, setPromptFeedback] =
     useState<PromptFeedback>(null)
+  const activityMessages = messages.filter(
+    (message) => message.kind === 'agent',
+  )
+  const transcriptQuestions = activityMessages.flatMap((message) =>
+    parseTerminalTranscript(
+      message.text,
+      status,
+      message.truncated,
+    ).turns.flatMap((turn) => turn.question ? [turn.question] : []),
+  )
+  const recordedQuestionMessage =
+    recordedQuestion &&
+    !messages.some(
+      (message) => message.question?.id === recordedQuestion.id,
+    )
+      ? {
+          id: `question:${recordedQuestion.id}`,
+          kind: 'user' as const,
+          label: 'Your question',
+          meta: 'Sent from another Yard control',
+          question: recordedQuestion,
+          text: recordedQuestion.text,
+        }
+      : null
+  const questionMessages = [
+    ...(recordedQuestionMessage ? [recordedQuestionMessage] : []),
+    ...messages.filter((message) => message.kind === 'user'),
+  ]
+  const pendingQuestions = questionMessages.filter(
+    (message) =>
+      !transcriptQuestions.some((question) =>
+        agentQuestionsMatch(question, message.text),
+      ),
+  )
+  const threadMessages = [
+    ...activityMessages,
+    ...pendingQuestions,
+    ...messages.filter(
+      (message) =>
+        message.kind === 'error' &&
+        message.id.startsWith('activity:error:'),
+    ),
+  ]
   const outputController = useRef<AbortController | null>(null)
   const promptInFlight = useRef(false)
-  const targetKeyRef = useRef(targetKey)
   const retainedPromptCommand = useRef<RetainedPrompt | null>(null)
   const onCloseRef = useRef(onClose)
   const returnFocusRef = useRef(returnFocus)
@@ -223,18 +274,23 @@ export function AgentChatWorkspace({
       ? projects.find((candidate) => candidate.id === dispatchProjectId) ??
         null
       : null
+  const dispatchTargetKey = dispatchProject
+    ? agentChatTargetKey({
+        kind: 'orchestrator',
+        project: dispatchProject,
+      })
+    : null
   const promptTargetKey = dispatchProject
-    ? target.kind === 'coordination-node'
-      ? `coordination-route:${coordinationNode?.id}:${dispatchProject.id}:${dispatchProject.orchestrator.id}`
-      : `yard-route:${dispatchProject.id}:${dispatchProject.orchestrator.id}`
+    ? JSON.stringify([
+        target.kind === 'coordination-node'
+          ? 'coordination-route'
+          : 'yard-route',
+        targetKey,
+        dispatchTargetKey,
+      ])
     : targetKey
+  const promptTargetKeyRef = useRef(promptTargetKey)
   const activeContextLabel = dispatchProject?.name ?? contextLabel
-  const activeTargetRole = dispatchProject
-    ? `project orchestrator via ${
-        target.kind === 'coordination-node' ? 'workstream' : 'Yard'
-      }`
-    : targetRole
-
   onCloseRef.current = onClose
   returnFocusRef.current = returnFocus
   useModalDialog({
@@ -246,8 +302,8 @@ export function AgentChatWorkspace({
   })
 
   useLayoutEffect(() => {
-    targetKeyRef.current = targetKey
-  }, [targetKey])
+    promptTargetKeyRef.current = promptTargetKey
+  }, [promptTargetKey])
 
   const loadActivity = useCallback(async () => {
     outputController.current?.abort()
@@ -261,23 +317,23 @@ export function AgentChatWorkspace({
           ? await fetchAssignmentTerminalOutput(
               projectId,
               assignmentId,
-              OUTPUT_LINES,
+              TERMINAL_OUTPUT_LINES,
               controller.signal,
             )
           : target.kind === 'orchestrator'
             ? await fetchOrchestratorTerminalOutput(
                 projectId,
-                OUTPUT_LINES,
+                TERMINAL_OUTPUT_LINES,
                 controller.signal,
               )
             : target.kind === 'coordination-node' && coordinationNode
               ? await fetchCoordinationNodeTerminalOutput(
                   coordinationNode.id,
-                  OUTPUT_LINES,
+                  TERMINAL_OUTPUT_LINES,
                   controller.signal,
                 )
             : await fetchYardOrchestratorTerminalOutput(
-                OUTPUT_LINES,
+                TERMINAL_OUTPUT_LINES,
                 controller.signal,
               )
       if (controller.signal.aborted) return
@@ -293,8 +349,13 @@ export function AgentChatWorkspace({
         meta:
           allSegments.length > 1
             ? `Agent output ${index + 1}/${allSegments.length} · rev ${output.revision}`
-            : `Agent output · rev ${output.revision}`,
+            : `Agent output${
+                output.truncated
+                  ? ` · ${TRUNCATED_TERMINAL_OUTPUT_LABEL}`
+                  : ''
+              } · rev ${output.revision}`,
         text,
+        truncated: output.truncated,
       }))
       setMessages((current) => [
         ...current.filter(
@@ -342,16 +403,19 @@ export function AgentChatWorkspace({
   useEffect(() => {
     outputController.current?.abort()
     outputController.current = null
-    promptInFlight.current = false
-    retainedPromptCommand.current = null
     setMessages([])
     setPromptText('')
-    setPromptFeedback(null)
-    setPromptBusy(false)
     setDispatchProjectId('')
     followMessagesRef.current = true
     return () => outputController.current?.abort()
   }, [targetKey])
+
+  useEffect(() => {
+    promptInFlight.current = false
+    retainedPromptCommand.current = null
+    setPromptFeedback(null)
+    setPromptBusy(false)
+  }, [promptTargetKey])
 
   useEffect(() => {
     if (!open) return
@@ -399,7 +463,7 @@ export function AgentChatWorkspace({
   const sendPrompt = async (forceNewCommand: boolean) => {
     const text = promptText.trim()
     if (!text || promptInFlight.current) return
-    const requestedTargetKey = targetKeyRef.current
+    const requestedTargetKey = promptTargetKeyRef.current
 
     const retainedCommand = retainedPromptCommand.current
     const canReuse =
@@ -500,13 +564,33 @@ export function AgentChatWorkspace({
 
     retainedPromptCommand.current = retained
     if (!canReuse) {
+      const question = {
+        askedAtUnixMs: Date.now(),
+        id: retained.command.command_id,
+        text,
+      }
+      recordAgentQuestion(
+        [
+          workspaceQuestionKey,
+          ...(dispatchProject
+            ? [
+                agentQuestionKey({
+                  kind: 'orchestrator',
+                  project: dispatchProject,
+                }),
+              ]
+            : []),
+        ],
+        question,
+      )
       setMessages((current) => [
         ...current,
         {
           id: `user:${retained.command.command_id}`,
           kind: 'user',
-          label: 'You',
+          label: 'Your question',
           meta: forceNewCommand ? 'New command' : activeContextLabel,
+          question,
           text,
         },
       ])
@@ -543,37 +627,23 @@ export function AgentChatWorkspace({
       }
       // Prompt POSTs cannot be aborted after submission. Ignore their UI
       // result if the operator switched chat targets while one was in flight.
-      if (targetKeyRef.current !== requestedTargetKey) return
-      setMessages((current) => [
-        ...current.filter(
-          (message) =>
-            message.id !== `delivery:${retained.command.command_id}`,
-        ),
-        {
-          id: `delivery:${retained.command.command_id}`,
-          kind: 'system',
-          label:
-            retained.kind === 'yard-route' ||
-            retained.kind === 'coordination-route'
-              ? 'Routed'
-              : 'Delivered',
-          meta: activeTargetRole,
-          text:
-            retained.kind === 'yard-route' ||
-            retained.kind === 'coordination-route'
-              ? `${target.kind === 'coordination-node' ? 'Workstream' : 'Yard'} delivered this order to ${activeContextLabel}.`
-              : 'The agent accepted this order.',
-        },
-      ])
+      if (promptTargetKeyRef.current !== requestedTargetKey) return
       setPromptText('')
       retainedPromptCommand.current = null
-      setPromptFeedback({ kind: 'success' })
+      setPromptFeedback({
+        kind: 'success',
+        message:
+          retained.kind === 'yard-route' ||
+          retained.kind === 'coordination-route'
+            ? `${target.kind === 'coordination-node' ? 'Workstream' : 'Yard'} delivered this order to ${activeContextLabel}.`
+            : 'Order delivered to the agent.',
+      })
       refreshTimer.current = window.setTimeout(() => {
         refreshTimer.current = null
         void loadActivity()
       }, 800)
     } catch (caught) {
-      if (targetKeyRef.current !== requestedTargetKey) return
+      if (promptTargetKeyRef.current !== requestedTargetKey) return
       const feedback = {
         kind: 'error' as const,
         message: errorMessage(caught, 'Prompt acknowledgement failed'),
@@ -594,7 +664,7 @@ export function AgentChatWorkspace({
         },
       ])
     } finally {
-      if (targetKeyRef.current === requestedTargetKey) {
+      if (promptTargetKeyRef.current === requestedTargetKey) {
         promptInFlight.current = false
         setPromptBusy(false)
       }
@@ -764,7 +834,7 @@ export function AgentChatWorkspace({
             <header className="chat-thread__header">
               <div>
                 <p className="eyebrow">Transcript</p>
-                <h3>Recent activity</h3>
+                <h3>Questions and answers</h3>
               </div>
               <button
                 aria-label="Refresh agent activity"
@@ -797,17 +867,33 @@ export function AgentChatWorkspace({
                   Loading recent agent activity
                 </div>
               ) : null}
-              {messages.map((message) => (
+              {threadMessages.map((message) => (
                 <article
                   className="chat-message"
                   data-kind={message.kind}
+                  data-question-id={message.question?.id}
                   key={message.id}
                 >
-                  <header>
-                    <strong>{message.label}</strong>
-                    <small>{message.meta}</small>
-                  </header>
-                  <p>{message.text}</p>
+                  {message.kind === 'agent' ? (
+                    <CollapsibleAgentOutput
+                      status={status}
+                      text={message.text}
+                      truncated={message.truncated}
+                    />
+                  ) : message.kind === 'user' ? (
+                    <CollapsibleQuestion
+                      meta={message.meta}
+                      text={message.text}
+                    />
+                  ) : (
+                    <>
+                      <header>
+                        <strong>{message.label}</strong>
+                        <small>{message.meta}</small>
+                      </header>
+                      <p>{message.text}</p>
+                    </>
+                  )}
                 </article>
               ))}
             </div>
@@ -864,7 +950,7 @@ export function AgentChatWorkspace({
               {promptFeedback.kind === 'success' ? (
                 <>
                   <CircleCheck aria-hidden="true" size={15} />
-                  <span>Order delivered to the agent.</span>
+                  <span>{promptFeedback.message}</span>
                 </>
               ) : (
                 <>

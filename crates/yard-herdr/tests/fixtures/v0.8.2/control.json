@@ -1,0 +1,145 @@
+{
+  "workspace_created": {
+    "type": "workspace_created",
+    "workspace": {
+      "workspace_id": "w20",
+      "number": 1,
+      "label": "Protocol 20",
+      "focused": false,
+      "pane_count": 1,
+      "tab_count": 1,
+      "active_tab_id": "w20:t1",
+      "agent_status": "unknown"
+    },
+    "tab": {
+      "tab_id": "w20:t1",
+      "workspace_id": "w20",
+      "number": 1,
+      "label": "1",
+      "focused": false,
+      "pane_count": 1,
+      "agent_status": "unknown"
+    },
+    "root_pane": {
+      "pane_id": "w20:p1",
+      "terminal_id": "term_protocol20",
+      "workspace_id": "w20",
+      "tab_id": "w20:t1",
+      "focused": false,
+      "cwd": "/tmp/protocol-20-project",
+      "foreground_cwd": "/tmp/protocol-20-project",
+      "agent_status": "unknown",
+      "scroll": {
+        "offset_from_bottom": 0,
+        "max_offset_from_bottom": 0,
+        "viewport_rows": 40
+      },
+      "revision": 1
+    }
+  },
+  "tab_created": {
+    "type": "tab_created",
+    "tab": {
+      "tab_id": "w20:t2",
+      "workspace_id": "w20",
+      "number": 2,
+      "label": "Protocol 20 worker",
+      "focused": false,
+      "pane_count": 1,
+      "agent_status": "unknown"
+    },
+    "root_pane": {
+      "pane_id": "w20:p2",
+      "terminal_id": "term_protocol20_tab",
+      "workspace_id": "w20",
+      "tab_id": "w20:t2",
+      "focused": false,
+      "cwd": "/tmp/protocol-20-project",
+      "foreground_cwd": "/tmp/protocol-20-project",
+      "agent_status": "unknown",
+      "scroll": {
+        "offset_from_bottom": 0,
+        "max_offset_from_bottom": 0,
+        "viewport_rows": 40
+      },
+      "revision": 1
+    }
+  },
+  "agent_started": {
+    "type": "agent_started",
+    "agent": {
+      "terminal_id": "term_protocol20",
+      "name": "yard-protocol20",
+      "agent": "claude",
+      "title": "Claude Code",
+      "terminal_title": "Claude Code",
+      "terminal_title_stripped": "Claude Code",
+      "display_agent": "Claude Code",
+      "agent_status": "idle",
+      "agent_session": {
+        "source": "herdr:claude",
+        "agent": "claude",
+        "kind": "id",
+        "value": "session_protocol20"
+      },
+      "workspace_id": "w20",
+      "tab_id": "w20:t1",
+      "pane_id": "w20:p1",
+      "focused": false,
+      "interactive_ready": true,
+      "state_change_seq": 1,
+      "cwd": "/tmp/protocol-20-project",
+      "foreground_cwd": "/tmp/protocol-20-project",
+      "revision": 2
+    },
+    "argv": [
+      "claude",
+      "--permission-mode",
+      "auto"
+    ]
+  },
+  "agent_prompted": {
+    "type": "agent_prompted",
+    "agent": {
+      "terminal_id": "term_protocol20",
+      "name": "yard-protocol20",
+      "agent": "claude",
+      "title": "Claude Code",
+      "terminal_title": "Claude Code",
+      "terminal_title_stripped": "Claude Code",
+      "display_agent": "Claude Code",
+      "agent_status": "working",
+      "agent_session": {
+        "source": "herdr:claude",
+        "agent": "claude",
+        "kind": "id",
+        "value": "session_protocol20"
+      },
+      "workspace_id": "w20",
+      "tab_id": "w20:t1",
+      "pane_id": "w20:p1",
+      "focused": false,
+      "interactive_ready": true,
+      "state_change_seq": 2,
+      "cwd": "/tmp/protocol-20-project",
+      "foreground_cwd": "/tmp/protocol-20-project",
+      "revision": 3
+    }
+  },
+  "pane_read": {
+    "type": "pane_read",
+    "read": {
+      "pane_id": "w20:p1",
+      "workspace_id": "w20",
+      "tab_id": "w20:t1",
+      "source": "recent_unwrapped",
+      "format": "text",
+      "text": "Protocol 20 control output",
+      "revision": 3,
+      "truncated": false
+    }
+  },
+  "ok": {
+    "type": "ok"
+  }
+}

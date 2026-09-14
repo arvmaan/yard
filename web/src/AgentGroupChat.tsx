@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -27,10 +28,24 @@ import {
   sendOrchestratorPrompt,
 } from './api'
 import {
+  agentQuestionKey,
+  recordAgentQuestion,
+  type AgentQuestion,
+} from './agentQuestions'
+import {
   buildExecutionOrder,
   ORDER_TEMPLATES,
 } from './orderTemplates'
+import {
+  CollapsibleAgentOutput,
+  CollapsibleQuestion,
+} from './CollapsibleAgentOutput'
 import { promptRequiresNewCommand } from './promptPolicy'
+import {
+  normalizeTerminalOutput,
+  TERMINAL_OUTPUT_LINES,
+  TRUNCATED_TERMINAL_OUTPUT_LABEL,
+} from './terminalOutput'
 import { useModalDialog } from './useModalDialog'
 import type {
   Assignment,
@@ -39,9 +54,6 @@ import type {
   SendAssignmentPromptInput,
   SendOrchestratorPromptInput,
 } from './types'
-
-const GROUP_OUTPUT_LINES = 80
-const MAX_OUTPUT_CHARACTERS = 2200
 
 export type AgentGroupTarget =
   | {
@@ -81,25 +93,30 @@ interface ThreadMessage {
   kind: 'agent' | 'user' | 'error'
   label: string
   meta: string
+  question?: AgentQuestion
+  status?: ObservedStatus
   text: string
+  truncated?: boolean
 }
 
-function targetKey(target: AgentGroupTarget) {
-  return target.kind === 'assignment'
-    ? `assignment:${target.assignment.id}:${target.assignment.attempt.id}`
-    : `orchestrator:${target.project.id}:${target.project.orchestrator.id}`
+function agentGroupTargetKey(target: AgentGroupTarget) {
+  return agentQuestionKey(
+    target.kind === 'assignment'
+      ? {
+          assignment: target.assignment,
+          kind: 'assignment',
+        }
+      : {
+          kind: 'orchestrator',
+          project: target.project,
+        },
+  )
 }
 
 function targetProjectName(target: AgentGroupTarget) {
   return target.kind === 'assignment'
     ? target.projectName
     : target.project.name
-}
-
-function outputExcerpt(text: string) {
-  const trimmed = text.trim()
-  if (trimmed.length <= MAX_OUTPUT_CHARACTERS) return trimmed
-  return `…${trimmed.slice(-MAX_OUTPUT_CHARACTERS)}`
 }
 
 function errorMessage(caught: unknown, fallback: string) {
@@ -160,11 +177,13 @@ export function AgentGroupChat({
   const stableTargets = useMemo(
     () =>
       [...targets].sort((left, right) =>
-        targetKey(left).localeCompare(targetKey(right)),
+        agentGroupTargetKey(left).localeCompare(
+          agentGroupTargetKey(right),
+        ),
       ),
     [targets],
   )
-  const groupKey = stableTargets.map(targetKey).join('|')
+  const groupKey = stableTargets.map(agentGroupTargetKey).join('|')
   const targetsRef = useRef(stableTargets)
   const groupKeyRef = useRef(groupKey)
   const [messages, setMessages] = useState<ThreadMessage[]>([])
@@ -195,27 +214,32 @@ export function AgentGroupChat({
     setSnapshotsLoading(true)
     const snapshots = await Promise.all(
       targetsRef.current.map(async (target): Promise<ThreadMessage> => {
-        const key = targetKey(target)
+        const key = agentGroupTargetKey(target)
         try {
           const output =
             target.kind === 'assignment'
               ? await fetchAssignmentTerminalOutput(
                   target.assignment.project_id,
                   target.assignment.id,
-                  GROUP_OUTPUT_LINES,
+                  TERMINAL_OUTPUT_LINES,
                 )
               : await fetchOrchestratorTerminalOutput(
                   target.project.id,
-                  GROUP_OUTPUT_LINES,
+                  TERMINAL_OUTPUT_LINES,
                 )
+          const text = normalizeTerminalOutput(output.text)
           return {
             id: `snapshot:${key}:${output.revision}`,
             kind: 'agent',
             label: target.label,
-            meta: `${targetProjectName(target)} · ${target.status}`,
-            text: output.text
-              ? outputExcerpt(output.text)
-              : 'No recent output.',
+            meta: `${targetProjectName(target)} · ${target.status}${
+              output.truncated
+                ? ` · ${TRUNCATED_TERMINAL_OUTPUT_LABEL}`
+                : ''
+            }`,
+            status: target.status,
+            text: text || 'No recent output.',
+            truncated: output.truncated,
           }
         } catch (caught) {
           return {
@@ -237,7 +261,7 @@ export function AgentGroupChat({
     }
   }, [])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     targetsRef.current = stableTargets
     groupKeyRef.current = groupKey
   }, [groupKey, stableTargets])
@@ -252,6 +276,7 @@ export function AgentGroupChat({
     setDeliveries({})
     setMessages([])
     setPromptText('')
+    setSnapshotsLoading(false)
   }, [groupKey])
 
   useEffect(() => {
@@ -277,13 +302,33 @@ export function AgentGroupChat({
     const requestedGroup = groupKeyRef.current
     setSending(true)
     if (appendUserMessage) {
+      const question = {
+        askedAtUnixMs: Date.now(),
+        id: crypto.randomUUID(),
+        text,
+      }
+      recordAgentQuestion(
+        commands.map((command) =>
+          command.target.kind === 'assignment'
+            ? agentQuestionKey({
+                assignment: command.target.assignment,
+                kind: 'assignment',
+              })
+            : agentQuestionKey({
+                kind: 'orchestrator',
+                project: command.target.project,
+              }),
+        ),
+        question,
+      )
       setMessages((current) => [
         ...current,
         {
-          id: `user:${crypto.randomUUID()}`,
+          id: `user:${question.id}`,
           kind: 'user',
-          label: 'You',
+          label: 'Your question',
           meta: `${commands.length} recipient${commands.length === 1 ? '' : 's'}`,
+          question,
           text,
         },
       ])
@@ -291,14 +336,14 @@ export function AgentGroupChat({
     setDeliveries((current) => {
       const next = { ...current }
       for (const command of commands) {
-        next[targetKey(command.target)] = { state: 'pending' }
+        next[agentGroupTargetKey(command.target)] = { state: 'pending' }
       }
       return next
     })
 
     await Promise.all(
       commands.map(async (command) => {
-        const key = targetKey(command.target)
+        const key = agentGroupTargetKey(command.target)
         try {
           await sendTargetCommand(command)
           if (groupKeyRef.current !== requestedGroup) return
@@ -330,7 +375,7 @@ export function AgentGroupChat({
     activeText.current = text
     const commands = stableTargets.map((target) => {
       const command = commandForTarget(target, text)
-      retainedCommands.current.set(targetKey(target), command)
+      retainedCommands.current.set(agentGroupTargetKey(target), command)
       return command
     })
     await dispatch(commands, text, true)
@@ -338,7 +383,7 @@ export function AgentGroupChat({
 
   const retryFailed = async (fresh: boolean) => {
     const commands = stableTargets.flatMap((target) => {
-      const key = targetKey(target)
+      const key = agentGroupTargetKey(target)
       const delivery = deliveries[key]
       if (
         delivery?.state !== 'failed' ||
@@ -364,6 +409,9 @@ export function AgentGroupChat({
     ({ requiresNewCommand }) => !requiresNewCommand,
   ).length
   const freshCount = failed.length - retryableCount
+  const knownQuestions = messages.flatMap((message) =>
+    message.kind === 'user' ? [message.text] : [],
+  )
 
   const updatePrompt = (text: string) => {
     setPromptText(text)
@@ -393,7 +441,10 @@ export function AgentGroupChat({
       </div>
       <div className="group-chat-roster" aria-label="Selected agents">
         {stableTargets.map((target) => (
-          <span data-status={target.status} key={targetKey(target)}>
+          <span
+            data-status={target.status}
+            key={agentGroupTargetKey(target)}
+          >
             <Bot aria-hidden="true" size={13} />
             {target.label}
           </span>
@@ -475,7 +526,7 @@ export function AgentGroupChat({
                   {stableTargets.map((target) => (
                     <span
                       data-status={target.status}
-                      key={targetKey(target)}
+                      key={agentGroupTargetKey(target)}
                     >
                       <Bot aria-hidden="true" size={13} />
                       {target.label}
@@ -505,12 +556,13 @@ export function AgentGroupChat({
                 {Object.keys(deliveries).length > 0 ? (
                   <div className="group-delivery-results" role="status">
                     {stableTargets.map((target) => {
-                      const delivery = deliveries[targetKey(target)]
+                      const delivery =
+                        deliveries[agentGroupTargetKey(target)]
                       if (!delivery) return null
                       return (
                         <div
                           data-state={delivery.state}
-                          key={targetKey(target)}
+                          key={agentGroupTargetKey(target)}
                         >
                           {delivery.state === 'pending' ? (
                             <LoaderCircle
@@ -569,7 +621,7 @@ export function AgentGroupChat({
                 <header className="chat-thread__header">
                   <div>
                     <p className="eyebrow">Transcript</p>
-                    <h3>Recent activity</h3>
+                    <h3>Questions and answers</h3>
                   </div>
                   <button
                     aria-label="Refresh combined thread"
@@ -605,13 +657,36 @@ export function AgentGroupChat({
                     <article
                       className="chat-message"
                       data-kind={message.kind}
+                      data-question-id={message.question?.id}
                       key={message.id}
                     >
-                      <header>
-                        <strong>{message.label}</strong>
-                        <small>{message.meta}</small>
-                      </header>
-                      <p>{message.text}</p>
+                      {message.kind === 'agent' ? (
+                        <>
+                          <header>
+                            <strong>{message.label}</strong>
+                            <small>{message.meta}</small>
+                          </header>
+                          <CollapsibleAgentOutput
+                            knownQuestions={knownQuestions}
+                            status={message.status}
+                            text={message.text}
+                            truncated={message.truncated}
+                          />
+                        </>
+                      ) : message.kind === 'user' ? (
+                        <CollapsibleQuestion
+                          meta={message.meta}
+                          text={message.text}
+                        />
+                      ) : (
+                        <>
+                          <header>
+                            <strong>{message.label}</strong>
+                            <small>{message.meta}</small>
+                          </header>
+                          <p>{message.text}</p>
+                        </>
+                      )}
                     </article>
                   ))}
                 </div>

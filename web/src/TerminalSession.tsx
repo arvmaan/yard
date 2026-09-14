@@ -1,13 +1,27 @@
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import { RefreshCw } from 'lucide-react'
-import { type CSSProperties, useEffect, useRef, useState } from 'react'
+import {
+  type CSSProperties,
+  useEffect,
+  useRef,
+  useState,
+} from 'react'
 import {
   assignmentTerminalWebSocketUrl,
   coordinationNodeTerminalWebSocketUrl,
+  fetchAssignmentTerminalOutput,
+  fetchCoordinationNodeTerminalOutput,
+  fetchOrchestratorTerminalOutput,
+  fetchYardOrchestratorTerminalOutput,
   orchestratorTerminalWebSocketUrl,
   yardOrchestratorTerminalWebSocketUrl,
 } from './api'
+import { chunkTerminalInput } from './terminalInput'
+import {
+  reflowTerminalHistory,
+  TERMINAL_HISTORY_LINES,
+} from './terminalOutput'
 import {
   applyTerminalPalette,
   readTerminalPalette,
@@ -32,6 +46,11 @@ type ConnectionState =
   | { kind: 'connected'; detail: string }
   | { kind: 'closed'; detail: string }
   | { kind: 'error'; detail: string }
+
+type TerminalHistoryState =
+  | { kind: 'loading'; detail: string }
+  | { kind: 'ready'; detail: string }
+  | { kind: 'degraded'; detail: string }
 
 interface FrameMetadata {
   seq: number
@@ -61,9 +80,94 @@ export type TerminalTarget =
       workerId: string
     }
 
+interface TerminalHistory {
+  text: string
+  truncated: boolean
+}
+
+const TERMINAL_SCROLLBACK_LINES = 100_000
+
+async function fetchTerminalHistory(
+  targetKind: TerminalTarget['kind'],
+  projectId: string | null,
+  assignmentId: string | null,
+  nodeId: string | null,
+  signal: AbortSignal,
+): Promise<TerminalHistory> {
+  if (targetKind === 'assignment' && projectId && assignmentId) {
+    return fetchAssignmentTerminalOutput(
+      projectId,
+      assignmentId,
+      TERMINAL_HISTORY_LINES,
+      signal,
+    )
+  }
+  if (targetKind === 'orchestrator' && projectId) {
+    return fetchOrchestratorTerminalOutput(
+      projectId,
+      TERMINAL_HISTORY_LINES,
+      signal,
+    )
+  }
+  if (targetKind === 'coordination-node' && nodeId) {
+    return fetchCoordinationNodeTerminalOutput(
+      nodeId,
+      TERMINAL_HISTORY_LINES,
+      signal,
+    )
+  }
+  if (targetKind === 'yard-orchestrator') {
+    return fetchYardOrchestratorTerminalOutput(
+      TERMINAL_HISTORY_LINES,
+      signal,
+    )
+  }
+  throw new Error('Terminal history target is incomplete')
+}
+
+function writeTerminal(
+  terminal: Terminal,
+  data: string | Uint8Array,
+): Promise<void> {
+  return new Promise((resolve) => terminal.write(data, resolve))
+}
+
+function terminalHistoryText(text: string) {
+  const normalized = reflowTerminalHistory(text)
+  return normalized ? normalized.replace(/\n/g, '\r\n') : ''
+}
+
 function decodeBase64(value: string): Uint8Array {
   const decoded = atob(value)
   return Uint8Array.from(decoded, (character) => character.charCodeAt(0))
+}
+
+function preserveScrollbackInFullFrame(bytes: Uint8Array) {
+  const escape = String.fromCharCode(27)
+  let binary = ''
+  for (let offset = 0; offset < bytes.length; offset += 32_768) {
+    binary += String.fromCharCode(
+      ...bytes.subarray(offset, offset + 32_768),
+    )
+  }
+  let sanitized = binary
+    .split(`${escape}[2J`)
+    .join(`${escape}[H${escape}[0J`)
+    .split(`${escape}[3J`)
+    .join('')
+    .split(`${escape}c`)
+    .join(`${escape}[0m${escape}[H${escape}[0J`)
+  for (const mode of ['47', '1047', '1049']) {
+    sanitized = sanitized
+      .split(`${escape}[?${mode}h`)
+      .join('')
+      .split(`${escape}[?${mode}l`)
+      .join('')
+  }
+  return Uint8Array.from(
+    sanitized,
+    (character) => character.charCodeAt(0),
+  )
 }
 
 function isTerminalFrameMessage(
@@ -141,6 +245,10 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
     kind: 'connecting',
     detail: 'Connecting',
   })
+  const [history, setHistory] = useState<TerminalHistoryState>({
+    kind: 'loading',
+    detail: 'Loading earlier history',
+  })
   const [connectionAttempt, setConnectionAttempt] = useState(0)
   const [frame, setFrame] = useState<FrameMetadata | null>(null)
   const assignmentId =
@@ -167,9 +275,26 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
     let pendingFrame: FrameMetadata | null = null
     let lastSequence = -1
     let lastSentSize = ''
-    let receivedInitialFrame = false
+    let historyPending = true
+    let bufferedFrames: TerminalFrameMessage[] = []
+    let frameWriteQueue = Promise.resolve()
+    let initialFullFrameResolved = false
+    let resolveInitialFullFrame:
+      | ((message: TerminalFrameMessage | null) => void)
+      | null = null
+    let historyFrameTimer = 0
+    const initialFullFrame = new Promise<TerminalFrameMessage | null>(
+      (resolve) => {
+        resolveInitialFullFrame = resolve
+      },
+    )
+    const historyController = new AbortController()
 
     setConnection({ kind: 'connecting', detail: 'Connecting' })
+    setHistory({
+      kind: 'loading',
+      detail: 'Loading earlier history',
+    })
     setFrame(null)
 
     const terminal = new Terminal({
@@ -183,7 +308,7 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       lineHeight: 1.2,
       minimumContrastRatio: 4.5,
       screenReaderMode: true,
-      scrollback: 10000,
+      scrollback: TERMINAL_SCROLLBACK_LINES,
       smoothScrollDuration: 0,
       theme: resolveTerminalTheme(readTheme(), readTerminalPalette()),
     })
@@ -271,7 +396,11 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
 
     const inputSubscription = terminal.onData((text) => {
       if (socket) {
-        sendMessage(socket, { type: 'terminal.input', text })
+        for (const chunk of chunkTerminalInput(text)) {
+          if (!sendMessage(socket, { type: 'terminal.input', text: chunk })) {
+            break
+          }
+        }
       }
     })
     const handleWheel = (event: WheelEvent) => {
@@ -294,6 +423,127 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       capture: true,
       passive: false,
     })
+
+    const closeForInvalidFrame = (detail: string) => {
+      setConnection({ kind: 'error', detail })
+      socket?.close(1000, 'Invalid terminal frame')
+    }
+
+    const queueFrame = (message: TerminalFrameMessage) => {
+      let bytes: Uint8Array
+      try {
+        bytes = decodeBase64(message.bytes)
+      } catch {
+        closeForInvalidFrame('Terminal frame could not be decoded')
+        return
+      }
+      if (message.full) {
+        bytes = preserveScrollbackInFullFrame(bytes)
+      }
+      frameWriteQueue = frameWriteQueue.then(async () => {
+        if (disposed) return
+        await writeTerminal(terminal, bytes)
+        if (disposed) return
+        pendingFrame = {
+          seq: message.seq,
+          width: message.width,
+          height: message.height,
+          full: message.full,
+        }
+        if (!frameAnimationFrame) {
+          frameAnimationFrame = window.requestAnimationFrame(() => {
+            frameAnimationFrame = 0
+            if (!disposed && pendingFrame) setFrame(pendingFrame)
+            pendingFrame = null
+          })
+        }
+      })
+    }
+
+    const acceptFrame = (message: TerminalFrameMessage) => {
+      if (message.seq <= lastSequence) return
+      lastSequence = message.seq
+      if (message.full && !initialFullFrameResolved) {
+        initialFullFrameResolved = true
+        resolveInitialFullFrame?.(message)
+        resolveInitialFullFrame = null
+      }
+      if (historyPending) {
+        bufferedFrames.push(message)
+        return
+      }
+      queueFrame(message)
+    }
+
+    const releaseBufferedFrames = () => {
+      if (!historyPending) return
+      historyPending = false
+      const frames = bufferedFrames
+      bufferedFrames = []
+      for (const message of frames) queueFrame(message)
+    }
+
+    const loadHistory = async () => {
+      try {
+        const terminalHistory = await fetchTerminalHistory(
+          targetKind,
+          projectId,
+          assignmentId,
+          nodeId,
+          historyController.signal,
+        )
+        if (disposed) return
+        const initialFrame = await Promise.race([
+          initialFullFrame,
+          new Promise<null>((resolve) => {
+            historyFrameTimer = window.setTimeout(() => resolve(null), 500)
+          }),
+        ])
+        if (historyFrameTimer) {
+          window.clearTimeout(historyFrameTimer)
+          historyFrameTimer = 0
+        }
+        if (disposed) return
+        const text = terminalHistoryText(terminalHistory.text)
+        if (text) {
+          await writeTerminal(terminal, text)
+          if (disposed) return
+          if (initialFrame) {
+            await writeTerminal(
+              terminal,
+              '\r\n'.repeat(
+                Math.max(initialFrame.height, terminal.rows) + 1,
+              ),
+            )
+            if (disposed) return
+          }
+          terminal.scrollToBottom()
+        }
+        setHistory({
+          kind: 'ready',
+          detail: terminalHistory.truncated
+            ? `Latest ${TERMINAL_HISTORY_LINES.toLocaleString()} lines loaded`
+            : 'Earlier history loaded',
+        })
+      } catch (caught: unknown) {
+        if (
+          disposed ||
+          (caught instanceof DOMException &&
+            caught.name === 'AbortError')
+        ) {
+          return
+        }
+        setHistory({
+          kind: 'degraded',
+          detail:
+            caught instanceof Error
+              ? caught.message
+              : 'Earlier history unavailable',
+        })
+      } finally {
+        if (!disposed) releaseBufferedFrames()
+      }
+    }
 
     connectAnimationFrame = window.requestAnimationFrame(() => {
       // A single animation frame after this effect runs can still land in
@@ -324,110 +574,92 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
           sendResize(true)
         }, 500)
 
-        const url = targetKind === 'yard-orchestrator'
-          ? yardOrchestratorTerminalWebSocketUrl(cols, rows)
-          : targetKind === 'coordination-node' && nodeId
-            ? coordinationNodeTerminalWebSocketUrl(nodeId, cols, rows)
-          : targetKind === 'assignment' && assignmentId && projectId
-            ? assignmentTerminalWebSocketUrl(
-                projectId,
-                assignmentId,
-                cols,
-                rows,
-              )
-            : orchestratorTerminalWebSocketUrl(projectId ?? '', cols, rows)
-        socket = new WebSocket(url)
+        const connect = () => {
+          const url = targetKind === 'yard-orchestrator'
+            ? yardOrchestratorTerminalWebSocketUrl(cols, rows)
+            : targetKind === 'coordination-node' && nodeId
+              ? coordinationNodeTerminalWebSocketUrl(nodeId, cols, rows)
+            : targetKind === 'assignment' && assignmentId && projectId
+              ? assignmentTerminalWebSocketUrl(
+                  projectId,
+                  assignmentId,
+                  cols,
+                  rows,
+                )
+              : orchestratorTerminalWebSocketUrl(
+                  projectId ?? '',
+                  cols,
+                  rows,
+                )
+          socket = new WebSocket(url)
 
-        socket.onopen = () => {
-          if (disposed) return
-          setConnection({ kind: 'connected', detail: 'Connected' })
-          sendResize(true)
-        }
-
-        socket.onmessage = (event) => {
-          if (disposed || typeof event.data !== 'string') return
-
-          let message: TerminalServerMessage
-          try {
-            message = JSON.parse(event.data) as TerminalServerMessage
-          } catch {
-            setConnection({
-              kind: 'error',
-              detail: 'Terminal protocol error',
-            })
-            socket?.close(1000, 'Protocol error')
-            return
+          socket.onopen = () => {
+            if (disposed) return
+            setConnection({ kind: 'connected', detail: 'Connected' })
+            sendResize(true)
+            void loadHistory()
           }
 
-          if (isTerminalFrameMessage(message)) {
-            if (message.seq <= lastSequence) return
-            lastSequence = message.seq
+          socket.onmessage = (event) => {
+            if (disposed || typeof event.data !== 'string') return
+
+            let message: TerminalServerMessage
             try {
-              // Reset only for the first authoritative snapshot. Later full
-              // frames may follow resize/reconnect state and must not erase
-              // bytes already accepted for this lease.
-              if (message.full && !receivedInitialFrame) terminal.reset()
-              terminal.write(decodeBase64(message.bytes))
-              receivedInitialFrame = true
-              pendingFrame = {
-                seq: message.seq,
-                width: message.width,
-                height: message.height,
-                full: message.full,
-              }
-              if (!frameAnimationFrame) {
-                frameAnimationFrame = window.requestAnimationFrame(() => {
-                  frameAnimationFrame = 0
-                  if (!disposed && pendingFrame) setFrame(pendingFrame)
-                  pendingFrame = null
-                })
-              }
+              message = JSON.parse(event.data) as TerminalServerMessage
             } catch {
               setConnection({
                 kind: 'error',
-                detail: 'Terminal frame could not be decoded',
+                detail: 'Terminal protocol error',
               })
-              socket?.close(1000, 'Invalid terminal frame')
+              socket?.close(1000, 'Protocol error')
+              return
             }
-            return
+
+            if (isTerminalFrameMessage(message)) {
+              acceptFrame(message)
+              return
+            }
+
+            if (message.type === 'terminal.closed') {
+              released = true
+              setConnection({
+                kind: 'closed',
+                detail: message.reason ?? message.code ?? 'Session closed',
+              })
+              socket?.close(1000)
+            }
           }
 
-          if (message.type === 'terminal.closed') {
-            released = true
-            setConnection({
-              kind: 'closed',
-              detail: message.reason ?? message.code ?? 'Session closed',
+          socket.onerror = () => {
+            if (!disposed) {
+              setConnection({
+                kind: 'error',
+                detail: 'Terminal connection unavailable',
+              })
+            }
+          }
+
+          socket.onclose = (event) => {
+            if (disposed) return
+            setConnection((current) => {
+              if (current.kind === 'closed' || current.kind === 'error') {
+                return current
+              }
+              return {
+                kind: 'closed',
+                detail: event.reason || 'Terminal connection closed',
+              }
             })
-            socket?.close(1000)
           }
         }
 
-        socket.onerror = () => {
-          if (!disposed) {
-            setConnection({
-              kind: 'error',
-              detail: 'Terminal connection unavailable',
-            })
-          }
-        }
-
-        socket.onclose = (event) => {
-          if (disposed) return
-          setConnection((current) => {
-            if (current.kind === 'closed' || current.kind === 'error') {
-              return current
-            }
-            return {
-              kind: 'closed',
-              detail: event.reason || 'Terminal connection closed',
-            }
-          })
-        }
+        connect()
       })
     })
 
     return () => {
       disposed = true
+      historyController.abort()
       resizeObserver.disconnect()
       inputSubscription.dispose()
       terminalThemeHandlers.forEach((handler) => handler.dispose())
@@ -448,6 +680,14 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       }
       if (frameAnimationFrame) {
         window.cancelAnimationFrame(frameAnimationFrame)
+      }
+      if (historyFrameTimer) {
+        window.clearTimeout(historyFrameTimer)
+      }
+      if (!initialFullFrameResolved) {
+        initialFullFrameResolved = true
+        resolveInitialFullFrame?.(null)
+        resolveInitialFullFrame = null
       }
       if (socket) {
         socket.onclose = null
@@ -495,6 +735,7 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       data-frame-height={frame?.height}
       data-frame-sequence={frame?.seq}
       data-frame-width={frame?.width}
+      data-history-state={history.kind}
       data-state={connection.kind}
       data-terminal-palette={palette}
       data-terminal-theme={theme}
@@ -516,9 +757,17 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
           aria-live="polite"
           className="terminal-session__status-text"
           role="status"
+          title={history.kind === 'degraded' ? history.detail : undefined}
         >
           <span aria-hidden="true" />
           {connection.detail}
+          {history.kind === 'loading' &&
+          connection.kind === 'connected'
+            ? ' · Loading earlier history'
+            : null}
+          {history.kind === 'degraded'
+            ? ' · Earlier history unavailable'
+            : null}
         </div>
         {connection.kind === 'closed' ? (
           <button

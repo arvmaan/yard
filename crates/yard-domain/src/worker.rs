@@ -71,6 +71,40 @@ pub struct EndedWorkerSession {
     pub replayed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteWorker {
+    pub command_id: String,
+    pub actor: String,
+    #[serde(with = "crate::serde_u64")]
+    pub expected_worker_version: u64,
+}
+
+impl DeleteWorker {
+    /// Normalize and validate an irreversible worker visibility deletion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerSessionValidationError`] when a required value is
+    /// blank or oversized, or the optimistic version is zero.
+    pub fn normalize(mut self) -> Result<Self, WorkerSessionValidationError> {
+        self.command_id = bounded_required("command_id", &self.command_id, MAX_COMMAND_ID_BYTES)?;
+        self.actor = bounded_required("actor", &self.actor, MAX_ACTOR_BYTES)?;
+        if self.expected_worker_version == 0 {
+            return Err(WorkerSessionValidationError::InvalidVersion);
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedWorker {
+    pub command_id: String,
+    pub worker_id: String,
+    pub deleted_at_unix_ms: u64,
+    pub cleanup_pending: bool,
+    pub replayed: bool,
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum WorkerSessionValidationError {
     #[error("{field} is required")]

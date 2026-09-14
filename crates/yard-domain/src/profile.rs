@@ -4,6 +4,38 @@ use thiserror::Error;
 const MAX_NAME_BYTES: usize = 120;
 const MAX_VALUE_BYTES: usize = 512;
 const MAX_LIST_ITEMS: usize = 64;
+const MAX_HERDR_AGENT_NAME_BYTES: usize = 29;
+const HERDR_AGENT_NAME_PREFIX: &str = "yard-";
+const HERDR_AGENT_NAME_HASH_CHARS: usize = 16;
+
+#[must_use]
+pub fn herdr_agent_name(command_id: &str) -> String {
+    let readable_bytes = MAX_HERDR_AGENT_NAME_BYTES
+        - HERDR_AGENT_NAME_PREFIX.len()
+        - HERDR_AGENT_NAME_HASH_CHARS
+        - 1;
+    let readable: String = command_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .take(readable_bytes)
+        .collect();
+    let readable = if readable.is_empty() {
+        "worker"
+    } else {
+        readable.as_str()
+    };
+    let hash = stable_command_id_hash(command_id);
+    format!("{HERDR_AGENT_NAME_PREFIX}{readable}-{hash:016x}")
+}
+
+fn stable_command_id_hash(command_id: &str) -> u64 {
+    command_id
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerProfileSpec {
@@ -169,6 +201,7 @@ fn normalize_list(
 mod tests {
     use super::{
         CreateWorkerProfile, ProfileValidationError, UpdateWorkerProfile, WorkerProfileSpec,
+        herdr_agent_name,
     };
 
     fn spec() -> WorkerProfileSpec {
@@ -208,5 +241,43 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, ProfileValidationError::InvalidVersion);
+    }
+
+    #[test]
+    fn derives_bounded_herdr_agent_name_from_command_id() {
+        assert_eq!(
+            herdr_agent_name("B7204888-76C8-4159-BB53-5F24FEAF7AC5"),
+            "yard-b720488-b9b3f88531b588d8"
+        );
+        assert_eq!(herdr_agent_name("---"), "yard-worker-de7cc417de1b3246");
+    }
+
+    #[test]
+    fn distinguishes_command_ids_with_shared_normalized_prefixes() {
+        let first = herdr_agent_name("allocation-command-with-a-shared-prefix-0001");
+        let second = herdr_agent_name("allocation-command-with-a-shared-prefix-0002");
+
+        assert_ne!(first, second);
+        assert!(first.len() <= super::MAX_HERDR_AGENT_NAME_BYTES);
+        assert!(second.len() <= super::MAX_HERDR_AGENT_NAME_BYTES);
+    }
+
+    #[test]
+    fn distinguishes_command_ids_that_normalize_to_the_same_text() {
+        let names = [
+            herdr_agent_name("Command-ID"),
+            herdr_agent_name("command_id"),
+            herdr_agent_name("COMMAND ID"),
+        ];
+
+        assert_eq!(
+            names.iter().collect::<std::collections::HashSet<_>>().len(),
+            3
+        );
+        assert!(
+            names
+                .iter()
+                .all(|name| name.len() <= super::MAX_HERDR_AGENT_NAME_BYTES)
+        );
     }
 }

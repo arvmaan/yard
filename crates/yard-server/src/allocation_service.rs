@@ -7,6 +7,7 @@ use yard_domain::{
     ConfirmedAllocation, ConfirmedWorkerHandoff, HandoffTargetRole, ProviderSessionRef,
     RecordCompletionReceipt, RecordedCompletionReceipt, RuntimeObservationState,
     RuntimeProcessState, Worker, WorkerCandidates, WorkerProfile, WorkerRuntimeBinding,
+    herdr_agent_name,
 };
 use yard_store::{
     BeginProfileAllocation, BeginWorkerAllocation, BeginWorkerHandoff, ProjectStoreError, YardStore,
@@ -50,6 +51,16 @@ pub struct RuntimeSessionRequest {
     pub startup_cwd: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeWorkerRestartRequest {
+    pub command_id: String,
+    pub runtime: WorkerRuntimeBinding,
+    pub agent_name: String,
+    pub kind: String,
+    pub args: Vec<String>,
+    pub prompt: String,
+}
+
 #[derive(Debug, Error)]
 pub enum RuntimeProvisionError {
     #[error("{0}")]
@@ -89,7 +100,7 @@ pub enum RuntimeRetirementError {
     #[error("the captured runtime identity is not currently observable")]
     IdentityNotObserved,
     #[error(
-        "Herdr protocol 19 cannot atomically guard tab.close or pane.close by runtime identity"
+        "the installed Herdr protocol cannot atomically guard tab.close or pane.close by runtime identity"
     )]
     AtomicIdentityGuardUnavailable,
 }
@@ -102,6 +113,15 @@ pub trait RuntimeControl: Send + Sync {
     ) -> Result<(), RuntimeProvisionError> {
         Err(RuntimeProvisionError::BeforeWorker(
             "runtime does not support named session startup".to_owned(),
+        ))
+    }
+
+    async fn restart_worker(
+        &self,
+        _request: RuntimeWorkerRestartRequest,
+    ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+        Err(RuntimeProvisionError::BeforeWorker(
+            "runtime does not support restarting a worker in an existing pane".to_owned(),
         ))
     }
 
@@ -1068,11 +1088,6 @@ impl AllocationService {
                 "Yard worker runtime is not observed and running".to_owned(),
             ));
         }
-        let provider_session = runtime.provider_session.as_ref().ok_or_else(|| {
-            AllocationServiceError::RuntimeBindingUnverified(
-                "Yard worker has no stable provider session".to_owned(),
-            )
-        })?;
         let inventory = self.source.inventory(&runtime.session).await?;
         let observed = inventory
             .workers
@@ -1086,7 +1101,10 @@ impl AllocationService {
         if observed.workspace_id != runtime.workspace_id
             || observed.pane_id != runtime.pane_id
             || Some(observed.tab_id.as_str()) != runtime.tab_id.as_deref()
-            || observed.provider_session.as_ref() != Some(provider_session)
+            || runtime
+                .provider_session
+                .as_ref()
+                .is_some_and(|expected| observed.provider_session.as_ref() != Some(expected))
         {
             return Err(AllocationServiceError::RuntimeBindingUnverified(
                 "Herdr worker topology or provider identity changed".to_owned(),
@@ -1124,26 +1142,33 @@ impl AllocationService {
         if observed.workspace_id != runtime.workspace_id
             || observed.pane_id != runtime.pane_id
             || Some(observed.tab_id.as_str()) != runtime.tab_id.as_deref()
+            || runtime
+                .provider_session
+                .as_ref()
+                .is_some_and(|expected| observed.provider_session.as_ref() != Some(expected))
         {
             return Err(AllocationServiceError::RuntimeBindingUnverified(
-                "Provisioned Herdr topology changed before Yard could persist it".to_owned(),
+                "Provisioned Herdr topology or provider identity changed before Yard could persist it"
+                    .to_owned(),
             ));
         }
-        let provider_session = observed.provider_session.clone().ok_or_else(|| {
-            AllocationServiceError::RuntimeBindingUnverified(
-                "Herdr did not report a provider session for the provisioned worker".to_owned(),
-            )
-        })?;
-        if runtime
-            .provider_session
-            .as_ref()
-            .is_some_and(|expected| expected != &provider_session)
-        {
-            return Err(AllocationServiceError::RuntimeBindingUnverified(
-                "Herdr reported a different provider session after provisioning".to_owned(),
-            ));
+        if let Some(provider_session) = observed.provider_session.clone() {
+            if runtime
+                .provider_session
+                .as_ref()
+                .is_some_and(|expected| expected != &provider_session)
+            {
+                return Err(AllocationServiceError::RuntimeBindingUnverified(
+                    "Herdr reported a different provider session after provisioning".to_owned(),
+                ));
+            }
+            runtime.provider_session = Some(provider_session);
         }
-        runtime.provider_session = Some(provider_session);
+        runtime.observation_state = RuntimeObservationState::Observed;
+        runtime.process_state = RuntimeProcessState::Running;
+        runtime.status = observed.status;
+        runtime.state_change_sequence = observed.state_change_sequence;
+        runtime.revision = observed.revision;
         runtime.last_observed_at_unix_ms = inventory.observed_at_unix_ms;
         Ok(runtime)
     }
@@ -1203,14 +1228,15 @@ pub(crate) fn validate_supported_profile(profile: &WorkerProfile) -> Result<(), 
     if profile.spec.sandbox_policy != "runtime_default" {
         return Err("This Yard slice only supports runtime_default sandbox policy".to_owned());
     }
-    if !matches!(
-        profile.spec.permission_policy.as_str(),
-        "runtime_default" | "yolo"
-    ) {
-        return Err(format!(
-            "Permission policy '{}' is not supported",
-            profile.spec.permission_policy
-        ));
+    match profile.spec.permission_policy.as_str() {
+        "runtime_default" | "yolo" => {}
+        "auto" if profile.spec.provider == "claude" => {}
+        "auto" => {
+            return Err("The auto permission policy is only supported for Claude".to_owned());
+        }
+        policy => {
+            return Err(format!("Permission policy '{policy}' is not supported"));
+        }
     }
     if !profile.spec.tools.is_empty()
         || !profile.spec.skills.is_empty()
@@ -1228,8 +1254,11 @@ pub(crate) fn provider_args(
     profile: &WorkerProfile,
 ) -> Result<Vec<String>, AllocationServiceError> {
     let mut args = Vec::new();
-    if profile.spec.permission_policy == "yolo" {
-        match profile.spec.provider.as_str() {
+    if profile.spec.provider == "codex" {
+        args.push("--no-alt-screen".to_owned());
+    }
+    match profile.spec.permission_policy.as_str() {
+        "yolo" => match profile.spec.provider.as_str() {
             "codex" => args.push("--yolo".to_owned()),
             "claude" => args.push("--dangerously-skip-permissions".to_owned()),
             provider => {
@@ -1237,7 +1266,17 @@ pub(crate) fn provider_args(
                     "The yolo permission policy is not mapped for Herdr agent kind '{provider}'"
                 )));
             }
+        },
+        "auto" if profile.spec.provider == "claude" => {
+            args.push("--permission-mode".to_owned());
+            args.push("auto".to_owned());
         }
+        "auto" => {
+            return Err(AllocationServiceError::UnsupportedProfile(
+                "The auto permission policy is only supported for Claude".to_owned(),
+            ));
+        }
+        _ => {}
     }
     if let Some(model) = profile.spec.model.as_ref() {
         match profile.spec.provider.as_str() {
@@ -1260,17 +1299,7 @@ pub(crate) fn provider_args(
 }
 
 pub(crate) fn agent_name(command_id: &str) -> String {
-    let suffix: String = command_id
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .flat_map(char::to_lowercase)
-        .take(24)
-        .collect();
-    if suffix.is_empty() {
-        "yard-worker".to_owned()
-    } else {
-        format!("yard-{suffix}")
-    }
+    herdr_agent_name(command_id)
 }
 
 pub(crate) fn assignment_prompt(objective: &str, role: &str, profile: &WorkerProfile) -> String {
@@ -1291,7 +1320,7 @@ pub(crate) fn assignment_prompt(objective: &str, role: &str, profile: &WorkerPro
 mod tests {
     use yard_domain::{WorkerProfile, WorkerProfileSpec};
 
-    use super::{AllocationServiceError, provider_args};
+    use super::{AllocationServiceError, provider_args, validate_supported_profile};
 
     fn profile(provider: &str, permission_policy: &str, model: Option<&str>) -> WorkerProfile {
         WorkerProfile {
@@ -1321,14 +1350,16 @@ mod tests {
     fn provider_args_map_explicit_permissions_and_models() {
         let codex = provider_args(&profile("codex", "yolo", Some("gpt-5.4"))).unwrap();
         let claude = provider_args(&profile("claude", "yolo", Some("sonnet"))).unwrap();
+        let claude_auto = provider_args(&profile("claude", "auto", None)).unwrap();
         let runtime_default = provider_args(&profile("codex", "runtime_default", None)).unwrap();
 
-        assert_eq!(codex, ["--yolo", "-m", "gpt-5.4"]);
+        assert_eq!(codex, ["--no-alt-screen", "--yolo", "-m", "gpt-5.4"]);
         assert_eq!(
             claude,
             ["--dangerously-skip-permissions", "--model", "sonnet"]
         );
-        assert!(runtime_default.is_empty());
+        assert_eq!(claude_auto, ["--permission-mode", "auto"]);
+        assert_eq!(runtime_default, ["--no-alt-screen"]);
     }
 
     #[test]
@@ -1339,6 +1370,23 @@ mod tests {
             error,
             AllocationServiceError::UnsupportedProfile(message)
                 if message.contains("not mapped")
+        ));
+    }
+
+    #[test]
+    fn auto_permission_policy_is_claude_only() {
+        assert!(validate_supported_profile(&profile("claude", "auto", None)).is_ok());
+        assert!(validate_supported_profile(&profile("codex", "runtime_default", None)).is_ok());
+        assert!(validate_supported_profile(&profile("codex", "yolo", None)).is_ok());
+
+        let validation = validate_supported_profile(&profile("codex", "auto", None)).unwrap_err();
+        let mapping = provider_args(&profile("codex", "auto", None)).unwrap_err();
+
+        assert!(validation.contains("only supported for Claude"));
+        assert!(matches!(
+            mapping,
+            AllocationServiceError::UnsupportedProfile(message)
+                if message.contains("only supported for Claude")
         ));
     }
 }

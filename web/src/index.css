@@ -31,6 +31,7 @@ body {
 }
 
 .terminal-session {
+  position: relative;
   width: 100%;
   min-width: 0;
   overflow: hidden;

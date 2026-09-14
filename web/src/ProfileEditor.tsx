@@ -7,6 +7,7 @@ import type {
 import {
   createWorkerProfileEditorState,
   workerProfileEditorReducer,
+  workerProfilePermissionOptions,
   WORKER_PROFILE_TEMPLATES,
 } from './workerProfileTemplates'
 import { useModalDialog } from './useModalDialog'
@@ -265,8 +266,11 @@ export function ProfileEditor({
                 }
                 value={spec.permission_policy}
               >
-                <option value="runtime_default">Runtime default</option>
-                <option value="yolo">Full access</option>
+                {workerProfilePermissionOptions(spec.provider).map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
               </select>
             </label>
           </div>

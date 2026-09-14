@@ -16,9 +16,10 @@ pub(crate) fn normalize(
     observed_at_unix_ms: u64,
     config: &HerdrConfig,
 ) -> Result<RuntimeInventory, HerdrError> {
-    if snapshot.protocol != config.expected_protocol {
+    if !config.supported_protocols.contains(&snapshot.protocol) {
         return Err(HerdrError::ProtocolMismatch {
-            expected: config.expected_protocol,
+            minimum: *config.supported_protocols.start(),
+            maximum: *config.supported_protocols.end(),
             actual: snapshot.protocol,
         });
     }
@@ -267,7 +268,12 @@ fn invalid(message: String) -> HerdrError {
 
 #[cfg(test)]
 mod tests {
-    use crate::{HerdrConfig, HerdrError, socket::decode_snapshot};
+    use crate::{
+        HerdrConfig, HerdrError,
+        config::{MAX_HERDR_PROTOCOL, MIN_HERDR_PROTOCOL},
+        socket::decode_snapshot,
+    };
+    use yard_domain::ObservedStatus;
 
     use super::normalize;
 
@@ -291,19 +297,75 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_herdr_0_8_2_protocol_20_snapshot() {
+        let snapshot =
+            decode_snapshot(include_bytes!("../tests/fixtures/v0.8.2/snapshot.json")).unwrap();
+
+        let inventory = normalize(
+            snapshot,
+            "default",
+            1_788_500_000_000,
+            &HerdrConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(inventory.runtime_version, "0.8.2");
+        assert_eq!(inventory.protocol, 20);
+        assert_eq!(inventory.focus.workspace_id.as_deref(), Some("w20"));
+        assert_eq!(inventory.focus.tab_id.as_deref(), Some("w20:t1"));
+        assert_eq!(inventory.focus.pane_id.as_deref(), Some("w20:p1"));
+        assert_eq!(inventory.workspaces[0].runtime_id, "w20");
+        assert_eq!(
+            inventory.workspaces[0]
+                .worktree
+                .as_ref()
+                .map(|worktree| worktree.repository_name.as_str()),
+            Some("protocol-20-project")
+        );
+        assert_eq!(inventory.panes[0].provider.as_deref(), Some("claude"));
+        assert_eq!(
+            inventory.panes[0].display_provider.as_deref(),
+            Some("Claude Code")
+        );
+        assert_eq!(
+            inventory.panes[0]
+                .tokens
+                .get("yard_role")
+                .map(String::as_str),
+            Some("implementer")
+        );
+        assert_eq!(
+            inventory.workers[0].name.as_deref(),
+            Some("yard-protocol20")
+        );
+        assert_eq!(inventory.workers[0].status, ObservedStatus::Working);
+        assert!(inventory.workers[0].interactive_ready);
+        assert_eq!(inventory.workers[0].state_change_sequence, 73);
+        assert_eq!(
+            inventory.workers[0]
+                .provider_session
+                .as_ref()
+                .map(|session| session.value.as_str()),
+            Some("session_protocol20")
+        );
+    }
+
+    #[test]
     fn rejects_protocol_mismatch() {
         let mut snapshot =
             decode_snapshot(include_bytes!("../tests/fixtures/v0.8.0/snapshot.json")).unwrap();
-        snapshot.protocol = 20;
+        let unsupported_protocol = MAX_HERDR_PROTOCOL + 1;
+        snapshot.protocol = unsupported_protocol;
 
         let error = normalize(snapshot, "default", 1, &HerdrConfig::default()).unwrap_err();
 
         assert!(matches!(
             error,
             HerdrError::ProtocolMismatch {
-                expected: 19,
-                actual: 20
-            }
+                minimum: MIN_HERDR_PROTOCOL,
+                maximum: MAX_HERDR_PROTOCOL,
+                actual
+            } if actual == unsupported_protocol
         ));
     }
 

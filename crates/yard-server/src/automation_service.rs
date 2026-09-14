@@ -8,7 +8,7 @@ use uuid::Uuid;
 use yard_domain::{
     AssignmentLifecycle, AttemptLifecycle, AutomaticSummaryRequestKind, Automation,
     AutomationCommandResult, AutomationRun, AutomationRunCommandResult, AutomationRunTrigger,
-    AutomationRuns, AutomationScope, Automations, CreateAutomation, DailySchedule,
+    AutomationRuns, AutomationScope, Automations, CreateAutomation, DailySchedule, ObservedStatus,
     RunAutomationNow, SendAssignmentPrompt, SendCoordinationNodePrompt, SendOrchestratorPrompt,
     SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SetAutomationPaused, TokenSpendSettings,
     UpdateAutomation, UpdateAutomationPlacement, UpdateTokenSpendSettings,
@@ -458,16 +458,21 @@ impl AutomationService {
             return Ok(());
         }
         for project in self.store.list_projects().await?.projects {
-            if project.orchestrator.runtime.is_none()
-                || !self
-                    .store
-                    .claim_automatic_summary_request(
-                        AutomaticSummaryRequestKind::SuperintendentProject,
-                        &project.id,
-                        now_unix_ms,
-                        AUTOMATIC_SUMMARY_INTERVAL_MS,
-                    )
-                    .await?
+            let Some(runtime) = project.orchestrator.runtime.as_ref() else {
+                continue;
+            };
+            if !matches!(runtime.status, ObservedStatus::Idle | ObservedStatus::Done) {
+                continue;
+            }
+            if !self
+                .store
+                .claim_automatic_summary_request(
+                    AutomaticSummaryRequestKind::SuperintendentProject,
+                    &project.id,
+                    now_unix_ms,
+                    AUTOMATIC_SUMMARY_INTERVAL_MS,
+                )
+                .await?
             {
                 continue;
             }
@@ -516,16 +521,24 @@ impl AutomationService {
             {
                 if assignment.lifecycle != AssignmentLifecycle::Active
                     || assignment.attempt.lifecycle != AttemptLifecycle::Active
-                    || assignment.worker.runtime.is_none()
-                    || !self
-                        .store
-                        .claim_automatic_summary_request(
-                            AutomaticSummaryRequestKind::ProjectWorker,
-                            &assignment.id,
-                            now_unix_ms,
-                            AUTOMATIC_SUMMARY_INTERVAL_MS,
-                        )
-                        .await?
+                {
+                    continue;
+                }
+                let Some(runtime) = assignment.worker.runtime.as_ref() else {
+                    continue;
+                };
+                if !matches!(runtime.status, ObservedStatus::Idle | ObservedStatus::Done) {
+                    continue;
+                }
+                if !self
+                    .store
+                    .claim_automatic_summary_request(
+                        AutomaticSummaryRequestKind::ProjectWorker,
+                        &assignment.id,
+                        now_unix_ms,
+                        AUTOMATIC_SUMMARY_INTERVAL_MS,
+                    )
+                    .await?
                 {
                     continue;
                 }

@@ -3,6 +3,7 @@ import {
   createWorkerProfileEditorState,
   emptyWorkerProfile,
   workerProfileEditorReducer,
+  workerProfilePermissionOptions,
   WORKER_PROFILE_TEMPLATES,
 } from './workerProfileTemplates'
 
@@ -147,5 +148,36 @@ describe('profile editor template state', () => {
     })
 
     expect(state.spec.default_role).toBe('database-migration-lead')
+  })
+
+  it('offers automatic permissions only for Claude', () => {
+    expect(workerProfilePermissionOptions('claude')).toEqual([
+      { label: 'Runtime default', value: 'runtime_default' },
+      { label: 'Auto (Claude)', value: 'auto' },
+      { label: 'Full access', value: 'yolo' },
+    ])
+    expect(workerProfilePermissionOptions('codex')).toEqual([
+      { label: 'Runtime default', value: 'runtime_default' },
+      { label: 'Full access', value: 'yolo' },
+    ])
+  })
+
+  it('resets Claude auto permissions when the provider changes', () => {
+    let state = createWorkerProfileEditorState(null)
+    state = workerProfileEditorReducer(state, {
+      patch: { provider: 'claude' },
+      type: 'update-spec',
+    })
+    state = workerProfileEditorReducer(state, {
+      patch: { permission_policy: 'auto' },
+      type: 'update-spec',
+    })
+    expect(state.spec.permission_policy).toBe('auto')
+
+    state = workerProfileEditorReducer(state, {
+      patch: { provider: 'codex' },
+      type: 'update-spec',
+    })
+    expect(state.spec.permission_policy).toBe('runtime_default')
   })
 })

@@ -2,11 +2,12 @@ use std::{sync::Arc, time::Duration};
 
 use thiserror::Error;
 use tokio::time::{Instant, sleep};
+use tracing::warn;
 use yard_domain::{
-    ConfirmedProjectCreation, CreateProject, CreateProjectFromProfile,
-    CreateWorkspaceProjectFromProfile, Project, Projects, RuntimeObservationState,
-    RuntimeProcessState, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
-    WorkerRuntimeBinding,
+    ArchiveProject, ArchivedProject, ConfirmedProjectCreation, CreateProject,
+    CreateProjectFromProfile, CreateWorkspaceProjectFromProfile, DeleteProject, DeletedProject,
+    Project, Projects, RuntimeObservationState, RuntimeProcessState, UpdateProjectPlacement,
+    UpdateProjectWorkflowProfile, WorkerRuntimeBinding,
 };
 use yard_store::{
     BeginProfileProjectCreation, BeginWorkspaceProjectCreation, ProjectStoreError, YardStore,
@@ -18,6 +19,7 @@ use crate::allocation_service::{
     validate_supported_profile,
 };
 use crate::inventory_service::{InventoryServiceError, InventorySource};
+use crate::runtime_cleanup_service::RuntimeCleanupService;
 use crate::status_protocol::{with_orchestrator_status_contract, with_orchestrator_workflow};
 
 const RUNTIME_IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -27,6 +29,7 @@ pub struct ProjectService {
     source: Arc<dyn InventorySource>,
     runtime: Arc<dyn RuntimeControl>,
     store: Arc<dyn YardStore>,
+    cleanup: RuntimeCleanupService,
 }
 
 impl ProjectService {
@@ -36,10 +39,12 @@ impl ProjectService {
         runtime: Arc<dyn RuntimeControl>,
         store: Arc<dyn YardStore>,
     ) -> Self {
+        let cleanup = RuntimeCleanupService::new(Arc::clone(&runtime), Arc::clone(&store));
         Self {
             source,
             runtime,
             store,
+            cleanup,
         }
     }
 
@@ -60,6 +65,63 @@ impl ProjectService {
     /// project store cannot be read.
     pub async fn get(&self, project_id: &str) -> Result<Project, ProjectServiceError> {
         self.store.get_project(project_id).await.map_err(Into::into)
+    }
+
+    /// Archive a durable project and immediately attempt cleanup of its
+    /// orchestrator runtime.
+    ///
+    /// The project and its historical work remain in storage, while active
+    /// project queries stop returning it. Runtime cleanup failures remain
+    /// durably queued for the background retry loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectServiceError`] for stale input, active project work,
+    /// pending orchestrator interventions, or persistence failure.
+    pub async fn archive(
+        &self,
+        project_id: &str,
+        command: ArchiveProject,
+    ) -> Result<ArchivedProject, ProjectServiceError> {
+        let command_id = command.command_id.clone();
+        let mut archived = self.store.archive_project(project_id, command).await?;
+        if !archived.cleanup_pending {
+            return Ok(archived);
+        }
+
+        match self.cleanup.process_command(&command_id).await {
+            Ok(report) if report.attempted > 0 => {
+                archived.cleanup_pending = report.failed > 0;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    command_id,
+                    project_id,
+                    error = %error,
+                    "Immediate archived-project runtime cleanup failed; durable retry remains pending"
+                );
+            }
+        }
+        Ok(archived)
+    }
+
+    /// Permanently remove an archived project and its orchestrator from normal
+    /// Yard UI queries while retaining durable audit and cleanup records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectServiceError`] when the project is not archived, was
+    /// already deleted, or persistence fails.
+    pub async fn delete(
+        &self,
+        project_id: &str,
+        command: DeleteProject,
+    ) -> Result<DeletedProject, ProjectServiceError> {
+        self.store
+            .delete_project(project_id, command)
+            .await
+            .map_err(Into::into)
     }
 
     /// Pin a project to one immutable workflow-profile revision.

@@ -132,4 +132,21 @@ mod tests {
         assert!(sessions[0].running);
         assert!(!sessions[1].running);
     }
+
+    #[test]
+    fn parses_herdr_0_8_2_session_inventory() {
+        let sessions =
+            parse_sessions(include_bytes!("../tests/fixtures/v0.8.2/sessions.json")).unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].name, "default");
+        assert!(sessions[0].is_default);
+        assert!(sessions[0].running);
+        assert_eq!(
+            sessions[0].socket_path.to_string_lossy(),
+            "/tmp/herdr/default/herdr.sock"
+        );
+        assert!(!sessions[1].is_default);
+        assert!(!sessions[1].running);
+    }
 }

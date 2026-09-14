@@ -70,23 +70,21 @@ impl ReplaceProjectOrchestrator {
             .map_err(|error| {
                 OrchestratorReplacementValidationError::InvalidRuntime(error.to_string())
             })?;
-        let provider = self
-            .expected_orchestrator_runtime
-            .provider_session
-            .as_mut()
-            .ok_or(OrchestratorReplacementValidationError::MissingProviderIdentity)?;
-        provider.source = required("provider_session.source", &provider.source, MAX_ROLE_BYTES)?;
-        provider.provider = required(
-            "provider_session.provider",
-            &provider.provider,
-            MAX_ROLE_BYTES,
-        )?;
-        provider.kind = required("provider_session.kind", &provider.kind, MAX_ROLE_BYTES)?;
-        provider.value = required(
-            "provider_session.value",
-            &provider.value,
-            MAX_ARTIFACT_REF_BYTES,
-        )?;
+        if let Some(provider) = self.expected_orchestrator_runtime.provider_session.as_mut() {
+            provider.source =
+                required("provider_session.source", &provider.source, MAX_ROLE_BYTES)?;
+            provider.provider = required(
+                "provider_session.provider",
+                &provider.provider,
+                MAX_ROLE_BYTES,
+            )?;
+            provider.kind = required("provider_session.kind", &provider.kind, MAX_ROLE_BYTES)?;
+            provider.value = required(
+                "provider_session.value",
+                &provider.value,
+                MAX_ARTIFACT_REF_BYTES,
+            )?;
+        }
         if self.expected_orchestrator_runtime.owns_tab
             && self.expected_orchestrator_runtime.tab_id.is_none()
         {
@@ -124,8 +122,6 @@ pub enum OrchestratorReplacementValidationError {
     InvalidVersion,
     #[error("expected_orchestrator_runtime is invalid: {0}")]
     InvalidRuntime(String),
-    #[error("expected_orchestrator_runtime must include a provider session identity")]
-    MissingProviderIdentity,
     #[error("a runtime that owns its tab must include tab_id")]
     InvalidTabOwnership,
 }
@@ -227,13 +223,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_runtime_without_provider_identity() {
+    fn accepts_legacy_runtime_without_provider_identity() {
         let mut command = command();
         command.expected_orchestrator_runtime.provider_session = None;
 
-        assert_eq!(
-            command.normalize(),
-            Err(OrchestratorReplacementValidationError::MissingProviderIdentity)
+        let command = command.normalize().unwrap();
+
+        assert!(
+            command
+                .expected_orchestrator_runtime
+                .provider_session
+                .is_none()
         );
     }
 

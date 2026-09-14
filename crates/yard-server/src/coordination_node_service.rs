@@ -33,7 +33,8 @@ use crate::{
         validate_supported_profile,
     },
     intervention_service::{
-        RuntimeIntervention, RuntimeInterventionError, RuntimeOutputRequest, RuntimePromptRequest,
+        MAX_TERMINAL_OUTPUT_LINES, RuntimeIntervention, RuntimeInterventionError,
+        RuntimeOutputRequest, RuntimePromptRequest,
     },
     inventory_service::{InventoryServiceError, InventorySource},
     reconciliation_service::{ReconciliationService, ReconciliationServiceError},
@@ -299,10 +300,7 @@ impl CoordinationNodeService {
                 ));
             }
             observed = Some(
-                match self
-                    .reconcile_provisioned_worker(&node, &runtime.terminal_id)
-                    .await
-                {
+                match self.reconcile_provisioned_worker(&node, &runtime).await {
                     Ok(observed) => observed,
                     Err(error) => {
                         self.store
@@ -614,7 +612,7 @@ impl CoordinationNodeService {
         node_id: &str,
         lines: u32,
     ) -> Result<CoordinationNodeTerminalOutput, CoordinationNodeServiceError> {
-        if !(1..=1_000).contains(&lines) {
+        if !(1..=MAX_TERMINAL_OUTPUT_LINES).contains(&lines) {
             return Err(CoordinationNodeServiceError::InvalidLineCount);
         }
         let node = self.store.get_coordination_node(node_id).await?;
@@ -850,13 +848,29 @@ impl CoordinationNodeService {
     async fn reconcile_provisioned_worker(
         &self,
         node: &CoordinationNode,
-        terminal_id: &str,
+        runtime: &WorkerRuntimeBinding,
     ) -> Result<yard_domain::ObservedWorker, CoordinationNodeServiceError> {
         let deadline = Instant::now() + RUNTIME_IDENTITY_TIMEOUT;
         loop {
             let (inventory, _) = self.reconciliation.refresh(COORDINATION_SESSION).await?;
-            if let Some(worker) = dedicated_worker(&inventory, node)
-                .filter(|worker| worker.terminal_id == terminal_id)
+            let workspace_matches = inventory.workspaces.iter().any(|workspace| {
+                workspace.runtime_id == runtime.workspace_id
+                    && workspace.label == workspace_label(&node.id)
+            });
+            if inventory.adapter == runtime.adapter
+                && inventory.session == runtime.session
+                && workspace_matches
+                && let Some(worker) = inventory.workers.into_iter().find(|worker| {
+                    worker.name.as_deref() == Some(agent_name(&node.id).as_str())
+                        && worker.workspace_id == runtime.workspace_id
+                        && worker.terminal_id == runtime.terminal_id
+                        && Some(worker.tab_id.as_str()) == runtime.tab_id.as_deref()
+                        && worker.pane_id == runtime.pane_id
+                        && worker.interactive_ready
+                        && runtime.provider_session.as_ref().is_none_or(|expected| {
+                            worker.provider_session.as_ref() == Some(expected)
+                        })
+                })
             {
                 return Ok(worker);
             }
@@ -984,7 +998,6 @@ fn dedicated_worker(
             worker.name.as_deref() == Some(agent_name(&node.id).as_str())
                 && workspaces.contains(worker.workspace_id.as_str())
                 && worker.interactive_ready
-                && worker.provider_session.is_some()
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1257,7 +1270,7 @@ pub enum CoordinationNodeServiceError {
     RuntimeBindingStale,
     #[error("scheduled automatic summaries are disabled")]
     AutomaticTokenSpendDisabled,
-    #[error("lines must be between 1 and 1000")]
+    #[error("lines must be between 1 and 10000")]
     InvalidLineCount,
     #[error("unsupported worker profile: {0}")]
     UnsupportedProfile(String),
@@ -1300,8 +1313,9 @@ mod tests {
         CreateProject, CreateWorkerProfile, FocusObservation, ObservedStatus, ObservedWorker,
         ProjectRuntimeBinding, ProviderSessionRef, ProvisionCoordinationNode,
         RequestCoordinationSnapshot, RuntimeInventory, RuntimeObservationState,
-        RuntimeProcessState, RuntimeSession, RuntimeSessions, SnapshotCollectionStatus,
-        TransferProjectOrchestrator, WorkerProfileSpec, WorkerRuntimeBinding, WorkspaceObservation,
+        RuntimeProcessState, RuntimeSession, RuntimeSessions, SendCoordinationNodePrompt,
+        SnapshotCollectionStatus, TransferProjectOrchestrator, WorkerProfileSpec,
+        WorkerRuntimeBinding, WorkspaceObservation,
     };
     use yard_store::{SqliteProjectStore, YardStore};
 
@@ -1326,6 +1340,7 @@ mod tests {
     #[derive(Default)]
     struct FakeRuntime {
         live: AtomicBool,
+        omit_provider_session: AtomicBool,
         observed_at: AtomicU64,
         session_requests: Mutex<Vec<RuntimeSessionRequest>>,
         bootstrap: Mutex<Option<RuntimeWorkspaceProvisionRequest>>,
@@ -1415,14 +1430,18 @@ mod tests {
                     .as_ref()
                     .filter(|_| live)
                     .map(|request| {
-                        vec![observed_worker(
+                        let mut worker = observed_worker(
                             "coordination-terminal",
                             "coordination-workspace",
                             "coordination-tab",
                             "coordination-pane",
                             &request.agent_name,
                             "coordination-provider-session",
-                        )]
+                        );
+                        if self.omit_provider_session.load(Ordering::SeqCst) {
+                            worker.provider_session = None;
+                        }
+                        vec![worker]
                     })
                     .unwrap_or_default(),
             ))
@@ -1448,7 +1467,11 @@ mod tests {
                 return Err(error);
             }
             self.live.store(true, Ordering::SeqCst);
-            Ok(Self::coordination_binding())
+            let mut runtime = Self::coordination_binding();
+            if self.omit_provider_session.load(Ordering::SeqCst) {
+                runtime.provider_session = None;
+            }
+            Ok(runtime)
         }
 
         async fn provision_worker(
@@ -1578,7 +1601,8 @@ mod tests {
         assert!(provisioned.node.worker.is_some());
         assert!(replayed.replayed);
         let cwd = created.node.cwd.unwrap();
-        assert!(Path::new(&cwd).starts_with(temp.path().join("coordination")));
+        let coordination_root = fs::canonicalize(temp.path().join("coordination")).unwrap();
+        assert!(Path::new(&cwd).starts_with(coordination_root));
         assert!(Path::new(&cwd).is_dir());
         let sessions = runtime.session_requests.lock().unwrap();
         assert_eq!(sessions[0].session, COORDINATION_SESSION);
@@ -1652,6 +1676,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provisions_interactive_workstream_without_provider_session() {
+        let (service, store, runtime, _temp) = setup().await;
+        runtime.omit_provider_session.store(true, Ordering::SeqCst);
+        let created = service
+            .create(create_command(
+                CoordinationNodeKind::Workstream,
+                Vec::new(),
+                "create-workstream-without-provider-session",
+            ))
+            .await
+            .unwrap();
+        let profile = store.create_worker_profile(profile()).await.unwrap();
+
+        let provisioned = service
+            .provision(
+                &created.node.id,
+                ProvisionCoordinationNode {
+                    command_id: "provision-workstream-without-provider-session".to_owned(),
+                    actor: "local-user".to_owned(),
+                    profile_id: profile.id,
+                    expected_profile_version: profile.version,
+                    expected_node_version: created.node.version,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(provisioned.node.worker.is_some());
+    }
+
+    #[tokio::test]
+    async fn rejects_prompt_after_provider_session_disappears() {
+        let (service, store, runtime, _temp) = setup().await;
+        let created = service
+            .create(create_command(
+                CoordinationNodeKind::Workstream,
+                Vec::new(),
+                "create-workstream-before-provider-session-disappears",
+            ))
+            .await
+            .unwrap();
+        let profile = store.create_worker_profile(profile()).await.unwrap();
+        let provisioned = service
+            .provision(
+                &created.node.id,
+                ProvisionCoordinationNode {
+                    command_id: "provision-workstream-before-provider-session-disappears"
+                        .to_owned(),
+                    actor: "local-user".to_owned(),
+                    profile_id: profile.id,
+                    expected_profile_version: profile.version,
+                    expected_node_version: created.node.version,
+                },
+            )
+            .await
+            .unwrap()
+            .node;
+        let worker_id = provisioned.worker.as_ref().unwrap().id.clone();
+        runtime.omit_provider_session.store(true, Ordering::SeqCst);
+
+        let error = service
+            .prompt(
+                &provisioned.id,
+                SendCoordinationNodePrompt {
+                    command_id: "prompt-workstream-without-provider-session".to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_node_version: provisioned.version,
+                    worker_id,
+                    text: "Report current blockers.".to_owned(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CoordinationNodeServiceError::RuntimeBindingStale
+        ));
+        assert!(runtime.prompts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn snapshot_prompts_exact_managed_path_and_never_create_receipts() {
         let (service, store, runtime, temp) = setup().await;
         let project = store
@@ -1700,7 +1806,8 @@ mod tests {
         assert_eq!(snapshot.progress.completed, 0);
         assert_eq!(snapshot.progress.total, 1);
         let project_folder = PathBuf::from(&snapshot.projects[0].folder_path);
-        assert!(project_folder.starts_with(temp.path().join("knowledge")));
+        let knowledge_root = fs::canonicalize(temp.path().join("knowledge")).unwrap();
+        assert!(project_folder.starts_with(knowledge_root));
         {
             let prompts = runtime.prompts.lock().unwrap();
             assert_eq!(prompts.len(), 1);
@@ -2024,7 +2131,9 @@ mod tests {
 
         assert_eq!(
             created,
-            physical_home.join("knowledge/nodes/0198a81c-3773-7c60-b7d2-ff795ad88ad1")
+            fs::canonicalize(physical_home)
+                .unwrap()
+                .join("knowledge/nodes/0198a81c-3773-7c60-b7d2-ff795ad88ad1")
         );
     }
 

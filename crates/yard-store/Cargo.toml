@@ -13,6 +13,7 @@ description = "SQLite persistence for the Yard agent control plane"
 async-trait.workspace = true
 fs2.workspace = true
 rusqlite.workspace = true
+rustix.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -481,7 +481,7 @@ mod tests {
         assert_eq!(
             persistence.failure.lock().unwrap().as_ref(),
             Some(&(
-                "Herdr protocol 19 cannot atomically guard tab.close or pane.close by runtime identity"
+                "the installed Herdr protocol cannot atomically guard tab.close or pane.close by runtime identity"
                     .to_owned(),
                 60_000,
             ))

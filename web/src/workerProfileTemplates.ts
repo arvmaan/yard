@@ -7,6 +7,20 @@ export interface WorkerProfileTemplate {
   spec: WorkerProfileSpec
 }
 
+const BASE_PERMISSION_OPTIONS = [
+  { label: 'Runtime default', value: 'runtime_default' },
+  { label: 'Full access', value: 'yolo' },
+] as const
+
+export function workerProfilePermissionOptions(provider: string) {
+  if (provider !== 'claude') return BASE_PERMISSION_OPTIONS
+  return [
+    BASE_PERMISSION_OPTIONS[0],
+    { label: 'Auto (Claude)', value: 'auto' },
+    BASE_PERMISSION_OPTIONS[1],
+  ] as const
+}
+
 const BASE_PROFILE: WorkerProfileSpec = {
   name: '',
   runtime_adapter: 'herdr',
@@ -124,10 +138,15 @@ export function workerProfileEditorReducer(
       if (!spec) return state
       return { spec, templateId: action.templateId }
     }
-    case 'update-spec':
+    case 'update-spec': {
+      const spec = { ...state.spec, ...action.patch }
+      if (spec.provider !== 'claude' && spec.permission_policy === 'auto') {
+        spec.permission_policy = 'runtime_default'
+      }
       return {
         ...state,
-        spec: { ...state.spec, ...action.patch },
+        spec,
       }
+    }
   }
 }

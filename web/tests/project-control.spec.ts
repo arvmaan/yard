@@ -6,6 +6,7 @@ import {
   type WebSocketRoute,
 } from '@playwright/test'
 import type {
+  ArchiveProjectInput,
   Artifact,
   Assignment,
   Automation,
@@ -31,6 +32,7 @@ import type {
   ProvisionYardOrchestratorInput,
   RecoverYardOrchestratorInput,
   ResetOrchestratorWorkflowProfileInput,
+  RuntimeTopology,
   ProvisionCoordinationNodeInput,
   RecordCompletionReceiptInput,
   RunAutomationInput,
@@ -427,12 +429,14 @@ interface MockState {
   projectRequests: number
   projectDetailRequests: number
   projectOrchestratorCommands: ChangeProjectOrchestratorInput[]
+  projectArchiveCommands: ArchiveProjectInput[]
   assignmentRequests: number
   profiles: ReturnType<typeof profile>[]
   workerCandidates: WorkerCandidate[]
   workerRequests: number
   assignments: Assignment[]
   runtimeInventory: typeof inventory
+  runtimeTopology: RuntimeTopology
   runtimeSessions: Array<{
     name: string
     is_default: boolean
@@ -621,6 +625,7 @@ async function mockApi(
   page: Page,
   options: {
     allocationFailsOnce?: boolean
+    archiveDependency?: 'unfinished_handoff' | 'snapshot_collection_pending'
     handoffFailsOnce?: boolean
     betaFails?: boolean
     completionDelayMs?: number
@@ -715,6 +720,7 @@ async function mockApi(
     projectRequests: 0,
     projectDetailRequests: 0,
     projectOrchestratorCommands: [],
+    projectArchiveCommands: [],
     assignmentRequests: 0,
     profiles: initialProfileState,
     workerCandidates: initialWorkerCandidates(
@@ -733,6 +739,11 @@ async function mockApi(
       child_agents: inventory.child_agents.map((candidate) => ({
         ...candidate,
       })),
+    },
+    runtimeTopology: {
+      adapter: 'herdr',
+      session: 'alpha',
+      managed_workspaces: [],
     },
     runtimeSessions: sessions.sessions.map((session) => ({ ...session })),
     inventoryFailure: false,
@@ -919,6 +930,7 @@ async function mockApi(
   await page.routeWebSocket(
     (url) => url.pathname.endsWith('/terminal'),
     (socket) => {
+      state.requestLog.push('terminal:websocket')
       state.terminalConnectionUrls.push(socket.url())
       state.terminalSockets.push(socket)
       socket.onMessage((message) => {
@@ -1682,6 +1694,9 @@ async function mockApi(
     const placementMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)\/placement$/,
     )
+    const archiveMatch = url.pathname.match(
+      /^\/api\/v1\/projects\/([^/]+)\/archive$/,
+    )
     const orchestratorTransferMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)\/orchestrator$/,
     )
@@ -1715,6 +1730,113 @@ async function mockApi(
     const projectDetailMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)$/,
     )
+
+    if (archiveMatch && request.method() === 'POST') {
+      const projectId = decodeURIComponent(archiveMatch[1])
+      const input = request.postDataJSON() as ArchiveProjectInput
+      const projectIndex = state.projects.findIndex(
+        (candidate) => candidate.id === projectId,
+      )
+      const archived = state.projects[projectIndex]
+      if (
+        !archived ||
+        input.expected_project_version !== archived.version ||
+        input.expected_orchestrator_worker_id !== archived.orchestrator.id ||
+        input.expected_orchestrator_worker_version !==
+          archived.orchestrator.version ||
+        input.expected_orchestrator_runtime_version !==
+          (archived.orchestrator.runtime?.version ?? null)
+      ) {
+        await route.fulfill({ status: 409 })
+        return
+      }
+      const hasActiveAssignments = state.assignments.some(
+        (candidate) =>
+          candidate.project_id === projectId &&
+          ['allocating', 'active', 'handing_off'].includes(
+            candidate.lifecycle,
+          ),
+      )
+      if (hasActiveAssignments) {
+        await route.fulfill({
+          status: 409,
+          json: {
+            error: {
+              code: 'project_has_archive_dependencies',
+              message:
+                'Complete or hand off active assignments before archiving',
+            },
+          },
+        })
+        return
+      }
+      if (options.archiveDependency) {
+        await route.fulfill({
+          status: 409,
+          json: {
+            error: {
+              code:
+                options.archiveDependency === 'unfinished_handoff'
+                  ? 'project_archive_handoff_in_progress'
+                  : 'project_archive_snapshot_collection_pending',
+              message:
+                options.archiveDependency === 'unfinished_handoff'
+                  ? 'A worker handoff targeting this project is still in progress'
+                  : 'A coordination snapshot has not finished collecting this project',
+            },
+          },
+        })
+        return
+      }
+
+      state.projectArchiveCommands.push(input)
+      state.projects.splice(projectIndex, 1)
+      state.projectRelationships = state.projectRelationships.filter(
+        (relationship) =>
+          relationship.source_project_id !== projectId &&
+          relationship.target_project_id !== projectId,
+      )
+      const orchestratorIndex = state.workerCandidates.findIndex(
+        (candidate) =>
+          candidate.worker.id === archived.orchestrator.id,
+      )
+      if (orchestratorIndex >= 0) {
+        const candidate = state.workerCandidates[orchestratorIndex]
+        state.workerCandidates[orchestratorIndex] = {
+          ...candidate,
+          availability: 'ended',
+          project_id: null,
+          assignment_id: null,
+          reason: 'Session ended by project archive',
+          worker: {
+            ...candidate.worker,
+            desired_state: 'ended',
+            runtime: null,
+            version: String(Number(candidate.worker.version) + 1),
+            updated_at_unix_ms: Date.now(),
+          },
+        }
+      }
+      if (archived.orchestrator.runtime) {
+        state.runtimeInventory.workers =
+          state.runtimeInventory.workers.filter(
+            (worker) =>
+              worker.terminal_id !==
+              archived.orchestrator.runtime?.terminal_id,
+          )
+      }
+      await route.fulfill({
+        json: {
+          command_id: input.command_id,
+          project_id: projectId,
+          orchestrator_worker_id: archived.orchestrator.id,
+          archived_at_unix_ms: Date.now(),
+          cleanup_pending: true,
+          replayed: false,
+        },
+      })
+      return
+    }
 
     if (projectDetailMatch && request.method() === 'GET') {
       const projectId = decodeURIComponent(projectDetailMatch[1])
@@ -2189,6 +2311,7 @@ async function mockApi(
         lines: url.searchParams.get('lines'),
         projectId,
       })
+      state.requestLog.push('terminal:history')
       if (!current) {
         await route.fulfill({ status: 404 })
         return
@@ -3128,6 +3251,21 @@ async function mockApi(
       })
       return
     }
+    const topologyMatch = path.match(/\/sessions\/([^/]+)\/topology$/)
+    if (topologyMatch) {
+      const session = decodeURIComponent(topologyMatch[1])
+      await route.fulfill({
+        json:
+          state.runtimeTopology.session === session
+            ? state.runtimeTopology
+            : {
+                adapter: 'herdr',
+                session,
+                managed_workspaces: [],
+              },
+      })
+      return
+    }
     if (
       route.request().method() === 'POST' &&
       path.endsWith('/open-ghostty')
@@ -3553,6 +3691,27 @@ function seedActiveAssignment(
   )
   state.assignments.push(seeded)
   return seeded
+}
+
+function codexTranscript({
+  answer,
+  question,
+  work,
+}: {
+  answer: string
+  question: string
+  work: string[]
+}) {
+  return [
+    `› ${question}`,
+    '',
+    '• I’m checking the current state.',
+    '',
+    '• Explored',
+    ...work.map((line, index) => `${index === 0 ? '  └' : '   '} ${line}`),
+    '',
+    `• ${answer}`,
+  ].join('\n')
 }
 
 function seedAssignedCandidateAssignment(state: MockState) {
@@ -4861,6 +5020,332 @@ test('creates a project workspace and orchestrator from the empty inspector', as
   expect(state.workspaceProjectCommands).toHaveLength(1)
 })
 
+test('archives a project and moves its orchestrator to worker history', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
+  await page
+    .getByRole('button', { name: 'Archive project', exact: true })
+    .click()
+  const dialog = page.getByRole('dialog', { name: 'Archive project' })
+  await expect(dialog).toContainText(
+    'release its workspace binding, end its orchestrator, and retain its durable history',
+  )
+  await dialog
+    .getByRole('button', { name: 'Archive project', exact: true })
+    .click()
+
+  await expect.poll(() => state.projectArchiveCommands.length).toBe(1)
+  expect(state.projectArchiveCommands[0]).toMatchObject({
+    actor: 'local-user',
+    expected_project_version: '1',
+    expected_orchestrator_worker_id: 'project-1-orchestrator',
+    expected_orchestrator_worker_version: '1',
+    expected_orchestrator_runtime_version: '1',
+  })
+  await expect(page.locator('.project-region')).toHaveCount(1)
+  await expect(
+    page.getByText(
+      'Project archived. Verified orchestrator cleanup is queued.',
+    ),
+  ).toBeVisible()
+  expect(
+    state.workerCandidates.find(
+      (candidate) =>
+        candidate.worker.id === 'project-1-orchestrator',
+    )?.availability,
+  ).toBe('ended')
+})
+
+for (const dependency of [
+  'unfinished_handoff',
+  'snapshot_collection_pending',
+] as const) {
+  test(`keeps a project visible when archive is blocked by ${dependency}`, async ({
+    page,
+  }) => {
+    const state = await mockApi(page, { archiveDependency: dependency })
+    await page.setViewportSize({ width: 1280, height: 800 })
+    await page.goto('/')
+
+    await page
+      .locator('[data-id="project:project-1"]')
+      .dispatchEvent('click')
+    await page
+      .getByRole('button', { name: 'Archive project', exact: true })
+      .click()
+    const dialog = page.getByRole('dialog', { name: 'Archive project' })
+    await dialog
+      .getByRole('button', { name: 'Archive project', exact: true })
+      .click()
+
+    await expect(dialog).toBeVisible()
+    await expect(dialog).toContainText(
+      dependency === 'unfinished_handoff'
+        ? 'A worker handoff targeting this project is still in progress'
+        : 'A coordination snapshot has not finished collecting this project',
+    )
+    await expect(page.locator('.project-region')).toHaveCount(2)
+    expect(state.projectArchiveCommands).toHaveLength(0)
+  })
+}
+
+test('renders central cleanup and Superintendent despite a project workspace collision', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const centralWorker = durableWorker(
+    'yard-central-worker',
+    'wA:t1',
+    null,
+    'wA',
+    'alpha',
+    false,
+  )
+  state.yardOrchestrator = {
+    worker: centralWorker,
+    version: '2',
+    workflow_profile_version: '1',
+    created_at_unix_ms: 1_786_400_000_000,
+    updated_at_unix_ms: 1_786_400_000_000,
+  }
+  state.runtimeInventory.workspaces.push(
+    {
+      runtime_id: 'wA',
+      order: 5,
+      label: 'wA',
+      focused: false,
+      active_tab_id: 'wA:tab-wA:t1',
+      pane_count: 2,
+      tab_count: 2,
+      status: 'working',
+      tokens: {},
+      worktree: null,
+    },
+    {
+      runtime_id: 'provisioning-workspace',
+      order: 6,
+      label: 'Provisioning',
+      focused: false,
+      active_tab_id: 'provisioning-tab',
+      pane_count: 1,
+      tab_count: 1,
+      status: 'working',
+      tokens: {},
+      worktree: null,
+    },
+    {
+      runtime_id: 'quarantined-workspace',
+      order: 7,
+      label: 'Quarantined',
+      focused: false,
+      active_tab_id: 'quarantined-tab',
+      pane_count: 1,
+      tab_count: 1,
+      status: 'blocked',
+      tokens: {},
+      worktree: null,
+    },
+    {
+      runtime_id: 'coordination-workspace',
+      order: 8,
+      label: 'Coordination',
+      focused: false,
+      active_tab_id: 'coordination-tab',
+      pane_count: 1,
+      tab_count: 1,
+      status: 'working',
+      tokens: {},
+      worktree: null,
+    },
+  )
+  state.runtimeInventory.workers.push(
+    {
+      ...worker(20, 'wA', 'working'),
+      runtime_id: 'wA:t1',
+      terminal_id: 'wA:t1',
+      tab_id: 'wA:tab-wA:t1',
+      pane_id: 'wA:pane-wA:t1',
+      name: 'Superintendent',
+    },
+    {
+      ...worker(21, 'wA', 'idle'),
+      runtime_id: 'wA:t2',
+      terminal_id: 'wA:t2',
+      tab_id: 'wA:tab-wA:t2',
+      pane_id: 'wA:pane-wA:t2',
+      name: 'BISImplementationTest',
+    },
+    {
+      ...worker(22, 'provisioning-workspace', 'working'),
+      runtime_id: 'provisioning-terminal',
+      terminal_id: 'provisioning-terminal',
+      tab_id: 'provisioning-tab',
+      pane_id: 'provisioning-pane',
+      name: 'Pending project runtime',
+    },
+    {
+      ...worker(23, 'quarantined-workspace', 'blocked'),
+      runtime_id: 'quarantined-terminal',
+      terminal_id: 'quarantined-terminal',
+      tab_id: 'quarantined-tab',
+      pane_id: 'quarantined-pane',
+      name: 'Quarantined project runtime',
+    },
+    {
+      ...worker(24, 'coordination-workspace', 'working'),
+      runtime_id: 'coordination-terminal',
+      terminal_id: 'coordination-terminal',
+      tab_id: 'coordination-tab',
+      pane_id: 'coordination-pane',
+      name: 'Coordination runtime',
+    },
+  )
+  const now = 1_786_400_000_000
+  state.coordinationNodes.push({
+    id: 'coordination-node',
+    name: 'Yard coordination',
+    kind: 'workstream',
+    placement: {
+      geometry: { x: 420, y: 24, width: 116, height: 116 },
+      version: '1',
+      updated_at_unix_ms: now,
+    },
+    attached_project_ids: [],
+    worker: durableWorker(
+      'coordination-worker',
+      'coordination-terminal',
+      null,
+      'coordination-workspace',
+    ),
+    cwd: '/tmp/yard/coordination',
+    folder_path: null,
+    version: '1',
+    created_by: 'local-user',
+    created_at_unix_ms: now,
+    updated_at_unix_ms: now,
+  })
+  state.runtimeTopology = {
+    adapter: 'herdr',
+    session: 'alpha',
+    managed_workspaces: [
+      {
+        workspace_id: 'wA',
+        kind: 'yard_central',
+        label: 'Yard central',
+        occupants: [
+          {
+            kind: 'cleanup_pending',
+            terminal_id: 'wA:t2',
+            tab_id: 'wA:tab-wA:t2',
+            pane_id: 'wA:pane-wA:t2',
+            label: 'Archived runtime—cleanup pending',
+            reason: 'project_archive',
+            project_name: 'BISImplementationTest',
+          },
+        ],
+      },
+      {
+        workspace_id: 'provisioning-workspace',
+        kind: 'provisioning',
+        label: 'Runtime provisioning pending',
+        occupants: [
+          {
+            kind: 'provisioning',
+            terminal_id: 'provisioning-terminal',
+            tab_id: 'provisioning-tab',
+            pane_id: 'provisioning-pane',
+            label: 'Provisioned runtime—binding pending',
+            reason: 'runtime_provisioning',
+            project_name: 'Pending project',
+          },
+        ],
+      },
+      {
+        workspace_id: 'quarantined-workspace',
+        kind: 'quarantined',
+        label: 'Provisioned runtime quarantined',
+        occupants: [
+          {
+            kind: 'quarantined',
+            terminal_id: 'quarantined-terminal',
+            tab_id: 'quarantined-tab',
+            pane_id: 'quarantined-pane',
+            label: 'Provisioned runtime—quarantined',
+            reason: 'provisioning_quarantine',
+            project_name: 'Quarantined project',
+          },
+        ],
+      },
+      {
+        workspace_id: 'coordination-workspace',
+        kind: 'coordination',
+        label: 'Yard coordination',
+        occupants: [],
+      },
+    ],
+  }
+  state.projects[0] = {
+    ...state.projects[0],
+    runtime: {
+      ...state.projects[0].runtime,
+      adapter: 'herdr',
+      session: 'alpha',
+      workspace_id: 'wA',
+    },
+  }
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  const central = page.locator(
+    '.runtime-workspace-region[data-managed-kind="yard_central"]',
+  )
+  await expect(central).toHaveCount(1)
+  await expect(central).toContainText('Yard central')
+  await expect(central).toContainText('1 cleanup pending')
+  await expect(page.locator('[data-id="workspace:wA"]')).toHaveCount(1)
+  await expect(page.locator('[data-id="yard-orchestrator"]')).toHaveCount(1)
+  await expect(page.locator('[data-id="worker:wA:t2"]')).toHaveCount(0)
+  await expect(
+    page.locator('.worker-marker').filter({
+      hasText: 'BISImplementationTest',
+    }),
+  ).toHaveCount(0)
+  await expect(
+    page.locator(
+      '.runtime-workspace-region[data-managed-kind="provisioning"]',
+    ),
+  ).toContainText('1 provisioning')
+  await expect(
+    page.locator(
+      '.runtime-workspace-region[data-managed-kind="quarantined"]',
+    ),
+  ).toContainText('1 quarantined')
+  await expect(
+    page.locator(
+      '.runtime-workspace-region[data-managed-kind="coordination"]',
+    ),
+  ).toHaveCount(0)
+  await expect(
+    page.locator('[data-id="worker:provisioning-terminal"]'),
+  ).toHaveCount(0)
+  await expect(
+    page.locator('[data-id="worker:quarantined-terminal"]'),
+  ).toHaveCount(0)
+
+  await page.getByRole('tab', { name: 'Workspaces' }).click()
+  await expect(page.locator('.workspace-list')).not.toContainText(
+    'Yard central',
+  )
+  await expect(page.locator('.workspace-row')).toHaveCount(4)
+})
+
 test('adopts an observed workspace and keeps it after reload', async ({ page }) => {
   const state = await mockApi(page)
   await page.setViewportSize({ width: 1280, height: 800 })
@@ -5300,10 +5785,15 @@ test('loads recent assignment activity when the chat opens', async ({
   const state = await mockApi(page, {
     terminalOutputDelayMs: 150,
     terminalOutputText: (readCount) =>
-      Array.from(
-        { length: 240 },
-        (_, index) => `build ${readCount}: check ${index + 1} still running`,
-      ).join('\n'),
+      codexTranscript({
+        answer: `Build ${readCount} checks are ready for owner review.`,
+        question: `What is build ${readCount} doing?`,
+        work: Array.from(
+          { length: 240 },
+          (_, index) =>
+            `build ${readCount}: check ${index + 1} still running`,
+        ),
+      }),
     terminalOutputTruncated: true,
   })
   seedActiveAssignment(state)
@@ -5324,13 +5814,44 @@ test('loads recent assignment activity when the chat opens', async ({
   await expect(page.getByText('Loading recent agent activity')).toBeVisible()
   const conversation = page.getByLabel('Agent conversation')
   await expect(conversation).toContainText('still running')
+  await expect(conversation).toContainText(
+    'build 1: check 240 still running',
+  )
+  const questionDisclosure = conversation.locator(
+    'details.agent-output__entry[data-kind="question"]',
+  )
+  await expect(questionDisclosure).toContainText(
+    'What is build 1 doing?',
+  )
+  await expect(questionDisclosure).not.toHaveAttribute('open', '')
+  await expect(
+    questionDisclosure.locator('.agent-output__question-text'),
+  ).toBeHidden()
+  const answerDisclosure = conversation.locator(
+    'details.agent-output__entry[data-kind="answer"]',
+  )
+  await expect(answerDisclosure).toContainText(
+    'Build 1 checks are ready for owner review.',
+  )
+  await expect(answerDisclosure).not.toHaveAttribute('open', '')
+  await expect(
+    answerDisclosure.locator('.agent-output__entry-body'),
+  ).toBeHidden()
+  await answerDisclosure.locator(':scope > summary').click()
+  await expect(answerDisclosure).toHaveAttribute('open', '')
+  await expect(
+    answerDisclosure.locator('.agent-output__entry-body'),
+  ).toBeVisible()
+  await expect(answerDisclosure.locator('pre')).toContainText(
+    'build 1: check 1 still running',
+  )
   const initialText = await conversation.textContent()
   expect(
     state.terminalOutputRequests.every(
       (request) =>
         request.projectId === 'project-1' &&
         request.assignmentId === 'assignment-1' &&
-        request.lines === '160',
+        request.lines === '1000',
     ),
   ).toBe(true)
 
@@ -5344,7 +5865,7 @@ test('loads recent assignment activity when the chat opens', async ({
         (element) => element.scrollHeight - element.clientHeight,
       ),
     )
-    .toBeGreaterThan(100)
+    .toBeGreaterThan(0)
   await messages.evaluate((element) => {
     element.scrollTop = 0
     element.dispatchEvent(new Event('scroll'))
@@ -5362,9 +5883,15 @@ test('loads recent assignment activity when the chat opens', async ({
   await page
     .getByRole('button', { name: 'Open chat', exact: true })
     .click()
+  const reopenedAnswer = conversation.locator(
+    'details.agent-output__entry[data-kind="answer"]',
+  )
+  await expect(reopenedAnswer.locator(':scope > summary')).toBeVisible()
+  await expect(reopenedAnswer).not.toHaveAttribute('open', '')
+  await expect(reopenedAnswer.locator('pre')).toBeHidden()
   await expect
     .poll(() => messages.evaluate((element) => element.scrollTop))
-    .toBeGreaterThan(100)
+    .toBe(0)
 
   const overflow = await page.evaluate(() => {
     const workspace = document.querySelector<HTMLElement>('.chat-workspace')
@@ -5383,7 +5910,7 @@ test('loads recent assignment activity when the chat opens', async ({
   expect(overflow.workspaceHorizontal).toBeLessThanOrEqual(0)
 })
 
-test('keeps one terminal output snapshot in one chat bubble', async ({
+test('keeps one terminal output snapshot in one collapsed answer', async ({
   page,
 }) => {
   const state = await mockApi(page, {
@@ -5419,7 +5946,24 @@ test('keeps one terminal output snapshot in one chat bubble', async ({
   await expect(outputBubbles).toContainText(
     'Ready for owner review.',
   )
-  await expect(outputBubbles).toContainText('Agent output · rev')
+  const answerDisclosure = outputBubbles.locator(
+    'details.agent-output__entry[data-kind="answer"]',
+  )
+  await expect(answerDisclosure).not.toHaveAttribute('open', '')
+  await expect(answerDisclosure.locator('.agent-output__markdown')).toBeHidden()
+  await answerDisclosure.locator(':scope > summary').click()
+  await expect(answerDisclosure.locator('.agent-output__markdown')).toBeVisible()
+  await expect(
+    answerDisclosure.locator('.agent-output__markdown pre'),
+  ).toContainText('first result\n\nsecond result')
+  const fullTranscript = answerDisclosure.locator(
+    'details.agent-output__transcript',
+  )
+  await expect(fullTranscript).not.toHaveAttribute('open', '')
+  await fullTranscript.locator(':scope > summary').click()
+  await expect(fullTranscript.locator('pre')).toContainText(
+    'Ready for owner review.',
+  )
   const bubbleWidth = await outputBubbles.evaluate((element) => {
     const thread = element.parentElement
     if (!thread) return Number.POSITIVE_INFINITY
@@ -5460,7 +6004,13 @@ test('shows agent activity error and empty states in chat', async ({
   await page
     .getByRole('button', { name: 'Refresh agent activity' })
     .click()
-  await expect(page.getByText('No recent agent output.')).toBeVisible()
+  const emptyOutput = conversation.locator(
+    'details.agent-output__entry[data-kind="answer"]',
+  )
+  await expect(emptyOutput.locator('summary')).toContainText(
+    'No recent agent output.',
+  )
+  await expect(emptyOutput).not.toHaveAttribute('open', '')
   await expect
     .poll(() =>
       conversation.evaluate((element) => element.getBoundingClientRect().height),
@@ -5468,10 +6018,165 @@ test('shows agent activity error and empty states in chat', async ({
     .toBe(initialHeight)
 })
 
+test('opens the terminal socket before history and replays sequenced live frames', async ({
+  page,
+}) => {
+  const state = await mockApi(page, {
+    terminalOutputDelayMs: 800,
+    terminalOutputText: 'history before the live frame',
+  })
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page
+    .getByRole('button', { name: 'Open terminal', exact: true })
+    .click()
+
+  const terminal = page.locator('.terminal-session')
+  const terminalRows = terminal.locator('.xterm-accessibility-tree')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  await expect.poll(() => state.terminalOutputRequests.length).toBe(1)
+  expect(state.requestLog.indexOf('terminal:websocket')).toBeLessThan(
+    state.requestLog.indexOf('terminal:history'),
+  )
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect(terminal).toHaveAttribute(
+    'data-history-state',
+    'loading',
+  )
+
+  const terminalUrl = new URL(state.terminalConnectionUrls[0])
+  const width = Number(terminalUrl.searchParams.get('cols'))
+  const height = Number(terminalUrl.searchParams.get('rows'))
+  state.terminalSockets[0].send(
+    JSON.stringify({
+      type: 'terminal.frame',
+      bytes: Buffer.from('\u001b[2J\u001b[Hlive frame one').toString(
+        'base64',
+      ),
+      seq: 1,
+      width,
+      height,
+      full: true,
+    }),
+  )
+  state.terminalSockets[0].send(
+    JSON.stringify({
+      type: 'terminal.frame',
+      bytes: Buffer.from('\r\nduplicate frame').toString('base64'),
+      seq: 1,
+      width,
+      height,
+      full: false,
+    }),
+  )
+  state.terminalSockets[0].send(
+    JSON.stringify({
+      type: 'terminal.frame',
+      bytes: Buffer.from('\r\nlive frame two').toString('base64'),
+      seq: 2,
+      width,
+      height,
+      full: false,
+    }),
+  )
+
+  await expect(terminal).toHaveAttribute('data-history-state', 'ready')
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '2')
+  await expect(terminalRows).toContainText('live frame one')
+  await expect(terminalRows).toContainText('live frame two')
+  await expect(terminalRows).not.toContainText('duplicate frame')
+  const accessibleRows = terminalRows.locator('[role="listitem"]')
+  await expect
+    .poll(async () => {
+      const visibleRows = await accessibleRows.count()
+      const bufferRows = Number(
+        await accessibleRows.first().getAttribute('aria-setsize'),
+      )
+      return bufferRows - visibleRows
+    })
+    .toBeGreaterThan(0)
+  await terminal.locator('.terminal-session__viewport').dispatchEvent(
+    'wheel',
+    {
+      deltaMode: 0,
+      deltaY: -100_000,
+    },
+  )
+  await expect
+    .poll(() =>
+      accessibleRows.first().getAttribute('aria-posinset'),
+    )
+    .toBe('1')
+  await expect(terminalRows).toContainText(
+    'history before the live frame',
+  )
+})
+
+test('keeps live terminal output available when history loading degrades', async ({
+  page,
+}) => {
+  const state = await mockApi(page, {
+    terminalOutputFails: true,
+  })
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page
+    .getByRole('button', { name: 'Open terminal', exact: true })
+    .click()
+
+  const terminal = page.locator('.terminal-session')
+  const terminalRows = terminal.locator('.xterm-accessibility-tree')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect(terminal).toHaveAttribute(
+    'data-history-state',
+    'degraded',
+  )
+  await expect(
+    terminal.locator('.terminal-session__status-text'),
+  ).toContainText('Connected · Earlier history unavailable')
+
+  const terminalUrl = new URL(state.terminalConnectionUrls[0])
+  state.terminalSockets[0].send(
+    JSON.stringify({
+      type: 'terminal.frame',
+      bytes: Buffer.from('live output without history').toString(
+        'base64',
+      ),
+      seq: 1,
+      width: Number(terminalUrl.searchParams.get('cols')),
+      height: Number(terminalUrl.searchParams.get('rows')),
+      full: true,
+    }),
+  )
+
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  await expect(terminalRows).toContainText(
+    'live output without history',
+  )
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+})
+
 test('connects the assignment terminal and relays frames, input, resize, and release', async ({
   page,
 }, testInfo) => {
-  const state = await mockApi(page)
+  const state = await mockApi(page, {
+    terminalOutputText: codexTranscript({
+      answer: 'The build is ready for owner review.',
+      question: 'Why is the build stalled?',
+      work: Array.from(
+        { length: 80 },
+        (_, index) => `seeded terminal history ${index + 1}`,
+      ),
+    }),
+    terminalOutputTruncated: true,
+  })
   seedActiveAssignment(state)
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
@@ -5485,10 +6190,77 @@ test('connects the assignment terminal and relays frames, input, resize, and rel
   await openTerminal.click()
   const terminal = page.locator('.terminal-session')
   await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect(terminal.locator('.terminal-session__context')).toHaveCount(0)
+  const terminalRows = terminal.locator('.xterm-accessibility-tree')
+  await expect(terminalRows).toContainText(
+    'The build is ready for owner review.',
+  )
+  await terminal.locator('.xterm-scrollable-element').hover()
+  await page.mouse.wheel(0, -100000)
+  await expect(terminalRows).toContainText('seeded terminal history 1')
+  await page.mouse.wheel(0, 100000)
+  await expect(terminalRows).toContainText(
+    'The build is ready for owner review.',
+  )
+  const liveViewportHeight = await terminal
+    .locator('.terminal-session__viewport')
+    .evaluate((element) => element.getBoundingClientRect().height)
+  const terminalLayout = await terminal.evaluate((element) => {
+    const content = element.parentElement
+    const viewport = element.querySelector<HTMLElement>(
+      '.terminal-session__viewport',
+    )
+    const status = element.querySelector<HTMLElement>(
+      '.terminal-session__status',
+    )
+    const contentRect = content?.getBoundingClientRect()
+    const terminalRect = element.getBoundingClientRect()
+    const viewportRect = viewport?.getBoundingClientRect()
+    const statusRect = status?.getBoundingClientRect()
+    return {
+      contentHeight: contentRect?.height ?? Number.NaN,
+      statusBottom: statusRect?.bottom ?? Number.NaN,
+      terminalBottom: terminalRect.bottom,
+      terminalHeight: terminalRect.height,
+      terminalTop: terminalRect.top,
+      viewportTop: viewportRect?.top ?? Number.NaN,
+    }
+  })
+  expect(
+    Math.abs(
+      terminalLayout.terminalHeight - terminalLayout.contentHeight,
+    ),
+  ).toBeLessThanOrEqual(1)
+  expect(
+    Math.abs(terminalLayout.viewportTop - terminalLayout.terminalTop),
+  ).toBeLessThanOrEqual(1)
+  expect(
+    Math.abs(
+      terminalLayout.statusBottom - terminalLayout.terminalBottom,
+    ),
+  ).toBeLessThanOrEqual(1)
+  await expect
+    .poll(() =>
+      terminal
+        .locator('.terminal-session__viewport')
+        .evaluate((element) => element.getBoundingClientRect().height),
+    )
+    .toBe(liveViewportHeight)
   await expect.poll(() => state.terminalSockets.length).toBe(1)
+  expect(state.terminalOutputRequests).toEqual([
+    {
+      assignmentId: 'assignment-1',
+      lines: '10000',
+      projectId: 'project-1',
+    },
+  ])
   await expect(
     page.getByRole('dialog', { name: 'Implementer' }),
   ).toBeVisible()
+  const terminalViewport = terminal.locator('.xterm-scrollable-element')
+  const historyScrollHeight = await terminalViewport.evaluate(
+    (element) => element.scrollHeight,
+  )
 
   const url = new URL(state.terminalConnectionUrls[0])
   expect(url.protocol).toBe('ws:')
@@ -5547,10 +6319,7 @@ test('connects the assignment terminal and relays frames, input, resize, and rel
     JSON.stringify({
       type: 'terminal.frame',
       bytes: Buffer.from(
-        `${Array.from(
-          { length: 140 },
-          (_, index) => `history line ${index + 1}`,
-        ).join('\r\n')}\r\n\u001b[32mterminal ready\u001b[0m`,
+        '\u001b[2J\u001b[H\u001b[32mterminal ready\u001b[0m',
       ).toString('base64'),
       seq: 7,
       width: cols,
@@ -5562,12 +6331,16 @@ test('connects the assignment terminal and relays frames, input, resize, and rel
   await expect(terminal.locator('.xterm-screen')).toContainText(
     'terminal ready',
   )
-  const terminalRows = terminal.locator('.xterm-accessibility-tree')
   await expect(terminalRows).toContainText('terminal ready')
+  await expect
+    .poll(() =>
+      terminalViewport.evaluate((element) => element.scrollHeight),
+    )
+    .toBe(historyScrollHeight)
   await terminal.locator('.xterm-scrollable-element').hover()
-  await page.mouse.wheel(0, -1200)
+  await page.mouse.wheel(0, -rows * 40)
   await expect(terminalRows).not.toContainText('terminal ready')
-  await expect(terminalRows).toContainText('history line')
+  await expect(terminalRows).toContainText('seeded terminal history')
   state.terminalSockets[0].send(
     JSON.stringify({
       type: 'terminal.frame',
@@ -5584,7 +6357,7 @@ test('connects the assignment terminal and relays frames, input, resize, and rel
   await expect(terminalRows).not.toContainText(
     'new output while reviewing history',
   )
-  await expect(terminalRows).toContainText('history line')
+  await expect(terminalRows).toContainText('seeded terminal history')
 
   state.terminalSockets[0].send(
     JSON.stringify({
@@ -6312,7 +7085,7 @@ test('provisions a dedicated Superintendent and shows project updates', async ({
   await expect(page.getByLabel('Agent conversation')).toContainText(
     'Reviewing attention across the Yard portfolio.',
   )
-  expect(state.yardOrchestratorOutputRequests).toEqual(['160'])
+  expect(state.yardOrchestratorOutputRequests).toEqual(['10000', '1000'])
 
   await page
     .getByLabel('Message', { exact: true })
@@ -8811,9 +9584,16 @@ test('controls the project orchestrator terminal, output, and prompt idempotentl
   )
   expect(
     state.orchestratorTerminalOutputRequests.filter(
-      (request) => request.lines === '160',
+      (request) => request.lines === '1000',
     ),
-  ).toEqual([{ projectId: 'project-1', lines: '160' }])
+  ).toEqual([
+    { projectId: 'project-1', lines: '1000' },
+  ])
+  expect(
+    state.orchestratorTerminalOutputRequests.some(
+      (request) => request.lines === '10000',
+    ),
+  ).toBe(true)
 
   const prompt = page.getByLabel('Message', { exact: true })
   const submit = page.getByRole('button', {
@@ -8831,6 +9611,14 @@ test('controls the project orchestrator terminal, output, and prompt idempotentl
   await expect(
     page.getByText('Order delivered to the agent.'),
   ).toBeVisible()
+  const conversation = page.getByLabel('Agent conversation')
+  const questionDisclosure = conversation.locator(
+    'details.agent-output__entry[data-kind="question"]',
+  )
+  await expect(questionDisclosure).toContainText(
+    'Rebalance attention toward the blocked worker.',
+  )
+  await expect(questionDisclosure).not.toHaveAttribute('open', '')
 
   expect(state.orchestratorPromptCommands[0]).toMatchObject({
     actor: 'local-user',
@@ -8851,6 +9639,16 @@ test('controls the project orchestrator terminal, output, and prompt idempotentl
   expect(state.orchestratorPromptReplayCommandIds).toEqual([
     retainedCommandId,
   ])
+
+  await page.getByRole('button', { name: 'Close chat' }).click()
+  await page
+    .getByRole('button', { name: 'Open terminal', exact: true })
+    .click()
+  const reopenedTerminal = page.locator('.terminal-session')
+  await expect(reopenedTerminal).toHaveAttribute('data-state', 'connected')
+  await expect(
+    reopenedTerminal.locator('.terminal-session__context'),
+  ).toHaveCount(0)
 
   await page.setViewportSize({ width: 390, height: 844 })
 })
@@ -9926,6 +10724,14 @@ test('submits a direct prompt payload and reports only acknowledgement', async (
     'Order delivered to the agent.',
   )
   await expect(prompt).toHaveValue('')
+  const conversation = page.getByLabel('Agent conversation')
+  const questionDisclosure = conversation.locator(
+    'details.agent-output__entry[data-kind="question"]',
+  )
+  await expect(questionDisclosure).toContainText(
+    'Re-run the focused test and report the result.',
+  )
+  await expect(questionDisclosure).not.toHaveAttribute('open', '')
   expect(state.promptCommands).toHaveLength(1)
   expect(state.promptCommands[0]).toMatchObject({
     actor: 'local-user',
@@ -9980,7 +10786,14 @@ test('selects multiple agents and broadcasts one sourced group order', async ({
 }, testInfo) => {
   const state = await mockApi(page, {
     terminalOutputText: (readCount) =>
-      `Recent agent activity ${readCount}`,
+      codexTranscript({
+        answer: `Agent ${readCount} is ready for the next task.`,
+        question: `What is agent ${readCount} doing?`,
+        work: Array.from(
+          { length: 60 },
+          (_, index) => `group output ${readCount}.${index + 1}`,
+        ),
+      }),
   })
   seedActiveAssignment(state)
   await page.setViewportSize({ width: 1280, height: 800 })
@@ -10032,10 +10845,34 @@ test('selects multiple agents and broadcasts one sourced group order', async ({
   await expect(
     thread.getByText('API migration orchestrator'),
   ).toBeVisible()
+  const snapshots = thread.locator('.chat-message[data-kind="agent"]')
+  await expect(snapshots).toHaveCount(2)
+  const answerDisclosures = snapshots.locator(
+    'details.agent-output__entry[data-kind="answer"]',
+  )
+  await expect(answerDisclosures).toHaveCount(2)
   await expect(
-    thread.getByText(/^Recent agent activity \d+$/),
-  ).toHaveCount(2)
+    answerDisclosures.first(),
+  ).toContainText('Agent 1 is ready for the next task.')
+  await expect(answerDisclosures.nth(0).locator('pre')).toBeHidden()
+  await expect(answerDisclosures.nth(1).locator('pre')).toBeHidden()
+  await answerDisclosures.nth(0).locator('summary').click()
+  await answerDisclosures.nth(1).locator('summary').click()
+  await expect(answerDisclosures.nth(0).locator('pre')).toBeVisible()
+  await expect(answerDisclosures.nth(1).locator('pre')).toBeVisible()
+  await expect(
+    answerDisclosures.nth(0).locator('pre'),
+  ).toContainText('group output 1.1')
+  await expect(
+    answerDisclosures.nth(1).locator('pre'),
+  ).toContainText('group output 1.60')
   expect(state.terminalOutputRequests).toHaveLength(1)
+  expect(state.terminalOutputRequests[0]?.lines).toBe('1000')
+  expect(
+    state.orchestratorTerminalOutputRequests.some(
+      (request) => request.lines === '1000',
+    ),
+  ).toBe(true)
 
   const prompt = page.getByLabel('Message', { exact: true })
   await page
@@ -10062,6 +10899,9 @@ test('selects multiple agents and broadcasts one sourced group order', async ({
   expect(state.promptCommands[0].command_id).not.toBe(
     state.orchestratorPromptCommands[0].command_id,
   )
+  await expect(
+    thread.locator('.chat-message[data-kind="user"]'),
+  ).toContainText('Question')
   await expect(
     thread.locator('.chat-message[data-kind="user"]'),
   ).toContainText('2 recipients')
@@ -10236,7 +11076,13 @@ test('keeps assignment intervention controls within the mobile inspector', async
     'data-frame-sequence',
     '1',
   )
-  expect(state.terminalOutputRequests).toHaveLength(0)
+  expect(state.terminalOutputRequests).toEqual([
+    {
+      assignmentId: 'assignment-1',
+      lines: '10000',
+      projectId: 'project-1',
+    },
+  ])
   const terminalOverflow = await page.evaluate(() => {
     const workspace = document.querySelector<HTMLElement>(
       '.agent-workspace-shell',
@@ -10493,6 +11339,10 @@ test('records a durable manual completion receipt', async ({ page }) => {
     expected_worker_version: endingCandidate.worker.version,
     expected_runtime_version: endingCandidate.worker.runtime?.version,
   })
+  await page
+    .getByLabel('Filter workers')
+    .getByRole('button', { name: 'History', exact: true })
+    .click()
   await expect(
     page.locator(
       '.worker-row[data-worker-id="assignment-1-worker"][data-availability="ended"]',
@@ -10665,6 +11515,10 @@ test('reports queued runtime cleanup after ending a session', async ({
   await expect(
     page.getByText('Session ended. Verified runtime cleanup is queued.'),
   ).toBeVisible()
+  await page
+    .getByLabel('Filter workers')
+    .getByRole('button', { name: 'History', exact: true })
+    .click()
   await expect(
     page.locator(
       '.worker-row[data-worker-id="worker-resumable"][data-availability="ended"]',

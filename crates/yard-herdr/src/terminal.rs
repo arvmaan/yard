@@ -646,6 +646,10 @@ mod tests {
         time::Duration,
     };
 
+    use rustix::{
+        io::Errno,
+        process::{Pid, test_kill_process},
+    };
     use tokio::{
         io::BufReader,
         time::{sleep, timeout},
@@ -891,14 +895,13 @@ exec sleep 30
         let terminal = HerdrTerminal::spawn(&config, request).unwrap();
         let pid_path = PathBuf::from(format!("{}.pid", binary.display()));
         wait_for_file(&pid_path).await;
-        let pid = fs::read_to_string(&pid_path).unwrap();
-        let process_path = PathBuf::from(format!("/proc/{}", pid.trim()));
-        assert!(process_path.exists());
+        let pid = fixture_pid(&pid_path);
+        assert!(process_exists(pid));
 
         drop(terminal);
 
         timeout(Duration::from_secs(3), async {
-            while process_path.exists() {
+            while process_exists(pid) {
                 sleep(Duration::from_millis(10)).await;
             }
         })
@@ -929,14 +932,13 @@ exec sleep 30
         let terminal = HerdrTerminal::spawn(&config, request).unwrap();
         let pid_path = PathBuf::from(format!("{}.pid", binary.display()));
         wait_for_file(&pid_path).await;
-        let pid = fs::read_to_string(&pid_path).unwrap();
-        let process_path = PathBuf::from(format!("/proc/{}", pid.trim()));
+        let pid = fixture_pid(&pid_path);
 
         assert!(matches!(
             terminal.close().await,
             Err(HerdrTerminalError::CloseTimeout)
         ));
-        assert!(!process_path.exists(), "closed controller should be reaped");
+        assert!(!process_exists(pid), "closed controller should be reaped");
     }
 
     fn write_script(directory: &Path, name: &str, body: &str) -> PathBuf {
@@ -958,5 +960,22 @@ exec sleep 30
         })
         .await
         .expect("controller fixture should create its marker file");
+    }
+
+    fn fixture_pid(path: &Path) -> Pid {
+        let raw = fs::read_to_string(path)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        Pid::from_raw(raw).expect("controller fixture should report a positive process ID")
+    }
+
+    fn process_exists(pid: Pid) -> bool {
+        match test_kill_process(pid) {
+            Ok(()) | Err(Errno::PERM) => true,
+            Err(Errno::SRCH) => false,
+            Err(error) => panic!("failed to inspect controller process: {error}"),
+        }
     }
 }

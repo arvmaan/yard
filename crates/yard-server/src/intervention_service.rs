@@ -21,6 +21,8 @@ use crate::status_protocol::{
     with_orchestrator_workflow,
 };
 
+pub(crate) const MAX_TERMINAL_OUTPUT_LINES: u32 = 10_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePromptRequest {
     pub command_id: String,
@@ -649,7 +651,7 @@ impl InterventionService {
         assignment_id: &str,
         lines: u32,
     ) -> Result<TerminalOutput, InterventionServiceError> {
-        if !(1..=1_000).contains(&lines) {
+        if !(1..=MAX_TERMINAL_OUTPUT_LINES).contains(&lines) {
             return Err(InterventionServiceError::InvalidLineCount);
         }
         let assignment = self.assignment(project_id, assignment_id).await?;
@@ -703,7 +705,7 @@ impl InterventionService {
         project_id: &str,
         lines: u32,
     ) -> Result<OrchestratorTerminalOutput, InterventionServiceError> {
-        if !(1..=1_000).contains(&lines) {
+        if !(1..=MAX_TERMINAL_OUTPUT_LINES).contains(&lines) {
             return Err(InterventionServiceError::InvalidLineCount);
         }
         let project = self.project(project_id).await?;
@@ -759,7 +761,7 @@ impl InterventionService {
         &self,
         lines: u32,
     ) -> Result<YardOrchestratorTerminalOutput, InterventionServiceError> {
-        if !(1..=1_000).contains(&lines) {
+        if !(1..=MAX_TERMINAL_OUTPUT_LINES).contains(&lines) {
             return Err(InterventionServiceError::InvalidLineCount);
         }
         let orchestrator = self.store.get_yard_orchestrator().await?;
@@ -842,7 +844,7 @@ impl InterventionService {
         if observed.workspace_id != runtime.workspace_id
             || observed.pane_id != runtime.pane_id
             || observed.tab_id != runtime.tab_id.as_deref().unwrap_or_default()
-            || !provider_session_matches(
+            || !active_provider_session_matches(
                 runtime.provider_session.as_ref(),
                 observed.provider_session.as_ref(),
             )
@@ -955,11 +957,11 @@ fn same_runtime_identity(left: &WorkerRuntimeBinding, right: &WorkerRuntimeBindi
         && left.provider_session == right.provider_session
 }
 
-fn provider_session_matches(
+fn active_provider_session_matches(
     expected: Option<&yard_domain::ProviderSessionRef>,
     observed: Option<&yard_domain::ProviderSessionRef>,
 ) -> bool {
-    expected.is_none_or(|expected| observed == Some(expected))
+    expected == observed
 }
 
 #[derive(Debug, Error)]
@@ -1002,7 +1004,7 @@ pub enum InterventionServiceError {
     YardOrchestratorChanged,
     #[error("the requested automatic token-spend behavior is disabled")]
     AutomaticTokenSpendDisabled,
-    #[error("lines must be between 1 and 1000")]
+    #[error("lines must be between 1 and 10000")]
     InvalidLineCount,
 }
 
@@ -1010,7 +1012,7 @@ pub enum InterventionServiceError {
 mod tests {
     use yard_domain::ProviderSessionRef;
 
-    use super::provider_session_matches;
+    use super::active_provider_session_matches;
 
     fn session(value: &str) -> ProviderSessionRef {
         ProviderSessionRef {
@@ -1022,20 +1024,26 @@ mod tests {
     }
 
     #[test]
-    fn legacy_binding_accepts_missing_or_newly_observed_provider_session() {
+    fn provider_session_requires_an_exact_observation() {
         let observed = session("observed");
 
-        assert!(provider_session_matches(None, None));
-        assert!(provider_session_matches(None, Some(&observed)));
+        assert!(active_provider_session_matches(None, None));
+        assert!(!active_provider_session_matches(None, Some(&observed)));
     }
 
     #[test]
-    fn known_provider_session_must_still_match() {
+    fn known_provider_session_requires_an_exact_observation() {
         let expected = session("expected");
         let observed = session("observed");
 
-        assert!(provider_session_matches(Some(&expected), Some(&expected)));
-        assert!(!provider_session_matches(Some(&expected), None));
-        assert!(!provider_session_matches(Some(&expected), Some(&observed)));
+        assert!(active_provider_session_matches(
+            Some(&expected),
+            Some(&expected)
+        ));
+        assert!(!active_provider_session_matches(Some(&expected), None));
+        assert!(!active_provider_session_matches(
+            Some(&expected),
+            Some(&observed)
+        ));
     }
 }
