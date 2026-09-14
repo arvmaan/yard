@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { parseTerminalTranscript } from './terminalOutput'
+import {
+  parseTerminalTranscript,
+  reflowTerminalHistory,
+} from './terminalOutput'
 
 describe('parseTerminalTranscript', () => {
   it('separates Codex progress and tool activity from the final answer', () => {
@@ -257,7 +260,7 @@ describe('parseTerminalTranscript', () => {
     })
   })
 
-  it('falls back to raw output when shell activity follows an agent turn', () => {
+  it('keeps agent Q&A when shell activity follows an agent turn', () => {
     const text = [
       '› Run the build.',
       '• The build passes.',
@@ -267,10 +270,16 @@ describe('parseTerminalTranscript', () => {
     const transcript = parseTerminalTranscript(text, 'done')
 
     expect(transcript).toEqual({
-      latestQuestion: null,
-      preamble: text,
-      structured: false,
-      turns: [],
+      latestQuestion: 'Run the build.',
+      preamble: '',
+      structured: true,
+      turns: [
+        {
+          answer: 'The build passes.',
+          question: 'Run the build.',
+          work: '',
+        },
+      ],
     })
   })
 
@@ -373,5 +382,36 @@ describe('parseTerminalTranscript', () => {
       question: 'Audit the retry logic.',
       work: '⏺ Read(retry.ts)',
     })
+  })
+
+  it('reflows retained prose without flattening commands or trees', () => {
+    const text = [
+      'SuperNova is Amazon’s internal DNS delegation',
+      'service for names under amazon.dev and',
+      'aws.dev.',
+      '',
+      '- amazon.dev: Amazon/SuperNova-managed parent',
+      '  namespace.',
+      '',
+      'AWS_PROFILE=bis-personal-bmp \\',
+      'brazil-runtime-exec bmp-fake',
+      '',
+      'amazon.dev',
+      '└─ lionsgate.amazon.dev',
+    ].join('\n')
+
+    expect(reflowTerminalHistory(text)).toBe(
+      [
+        'SuperNova is Amazon’s internal DNS delegation service for names under amazon.dev and aws.dev.',
+        '',
+        '- amazon.dev: Amazon/SuperNova-managed parent namespace.',
+        '',
+        'AWS_PROFILE=bis-personal-bmp \\',
+        'brazil-runtime-exec bmp-fake',
+        '',
+        'amazon.dev',
+        '└─ lionsgate.amazon.dev',
+      ].join('\n'),
+    )
   })
 })

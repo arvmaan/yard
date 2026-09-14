@@ -452,11 +452,7 @@ async fn start_agent_at_socket(
         Err(start) => {
             let rollback_covers_started_runtime = rollback.covers_started_runtime();
             let started_runtime =
-                if rollback_covers_started_runtime || runtime_creation_outcome_ambiguous(&start) {
-                    Some(request.prepared.clone())
-                } else {
-                    None
-                };
+                runtime_creation_outcome_ambiguous(&start).then(|| request.prepared.clone());
             return Err(start_failure_after_rollback(
                 config,
                 socket_path,
@@ -1588,6 +1584,78 @@ mod tests {
         };
         assert!(!rollback_succeeded);
         assert_eq!(rollback, "not attempted; existing topology preserved");
+    }
+
+    #[tokio::test]
+    async fn definite_start_rejection_with_failed_cleanup_does_not_capture_runtime() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            for expected_method in ["agent.start", "tab.close"] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], expected_method);
+                let id = request["id"].as_str().unwrap();
+                let response = if expected_method == "agent.start" {
+                    serde_json::json!({
+                        "id": id,
+                        "error": {
+                            "code": "agent_name_taken",
+                            "message": "agent name is already in use"
+                        }
+                    })
+                } else {
+                    serde_json::json!({
+                        "id": id,
+                        "error": {
+                            "code": "tab_close_failed",
+                            "message": "tab is still busy"
+                        }
+                    })
+                };
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let error = start_prepared_agent_at_socket(
+            &config,
+            &socket_path,
+            StartPreparedAgentRequest {
+                command_id: "rejected-start-failed-cleanup".to_owned(),
+                prepared: runtime_topology("workspace-1", "tab-1", "pane-1", "terminal-1"),
+                agent_name: "yard-orchestrator".to_owned(),
+                kind: "codex".to_owned(),
+                args: Vec::new(),
+                prompt: "Coordinate projects.".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        let HerdrControlError::StartFailed {
+            rollback,
+            rollback_succeeded,
+            started_runtime,
+            ..
+        } = error
+        else {
+            panic!("expected definite start rejection with failed cleanup");
+        };
+        assert!(!rollback_succeeded);
+        assert!(started_runtime.is_none());
+        assert!(rollback.contains("tab_close_failed"));
     }
 
     #[tokio::test]

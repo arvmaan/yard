@@ -1,14 +1,23 @@
 import {
   CheckCircle2,
   ChevronRight,
+  FileText,
   MessageCircleQuestion,
   Wrench,
 } from 'lucide-react'
+import {
+  lazy,
+  Suspense,
+  useState,
+  type ReactNode,
+} from 'react'
 import {
   parseTerminalTranscript,
   type TerminalTranscriptTurn,
 } from './terminalOutput'
 import type { ObservedStatus } from './types'
+
+const AgentMarkdown = lazy(() => import('./AgentMarkdown'))
 
 function comparableQuestion(text: string) {
   return text.trim().replace(/\s+/g, ' ')
@@ -35,6 +44,56 @@ function lineLabel(text: string) {
   return `${lineCount} line${lineCount === 1 ? '' : 's'}`
 }
 
+function MarkdownContent({ text }: { text: string }) {
+  return (
+    <Suspense
+      fallback={
+        <div className="agent-output__markdown-loading">
+          Rendering response
+        </div>
+      }
+    >
+      <AgentMarkdown text={text} />
+    </Suspense>
+  )
+}
+
+function CollapsibleEntry({
+  children,
+  kind,
+  summary,
+}: {
+  children: ReactNode
+  kind: 'answer' | 'question'
+  summary: ReactNode
+}) {
+  const [open, setOpen] = useState(false)
+  return (
+    <details
+      className="agent-output__entry"
+      data-kind={kind}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+      open={open}
+    >
+      {summary}
+      {open ? children : null}
+    </details>
+  )
+}
+
+function FullTranscript({ text }: { text: string }) {
+  return (
+    <details className="agent-output__transcript">
+      <summary>
+        <FileText aria-hidden="true" size={13} />
+        <span>Full terminal transcript</span>
+        <small>{lineLabel(text)}</small>
+      </summary>
+      <pre>{text}</pre>
+    </details>
+  )
+}
+
 export function CollapsibleQuestion({
   meta,
   text,
@@ -43,16 +102,22 @@ export function CollapsibleQuestion({
   text: string
 }) {
   return (
-    <details className="agent-output__entry" data-kind="question">
-      <summary>
-        <ChevronRight aria-hidden="true" size={13} />
-        <MessageCircleQuestion aria-hidden="true" size={13} />
-        <strong>Question</strong>
-        <span>{compactPreview(text)}</span>
-        {meta ? <small>{meta}</small> : null}
-      </summary>
-      <p className="agent-output__question-text">{text}</p>
-    </details>
+    <CollapsibleEntry
+      kind="question"
+      summary={
+        <summary>
+          <ChevronRight aria-hidden="true" size={13} />
+          <MessageCircleQuestion aria-hidden="true" size={13} />
+          <strong>Question</strong>
+          <span>{compactPreview(text)}</span>
+          {meta ? <small>{meta}</small> : null}
+        </summary>
+      }
+    >
+      <div className="agent-output__question-text">
+        <MarkdownContent text={text} />
+      </div>
+    </CollapsibleEntry>
   )
 }
 
@@ -66,33 +131,34 @@ function CollapsibleAnswer({
   if (!totalOutput) return null
 
   return (
-    <details className="agent-output__entry" data-kind="answer">
-      <summary>
-        <ChevronRight aria-hidden="true" size={13} />
-        {turn.answer ? (
-          <CheckCircle2 aria-hidden="true" size={13} />
-        ) : (
-          <Wrench aria-hidden="true" size={13} />
-        )}
-        <strong>Answer</strong>
-        <span>{preview}</span>
-        <small>{lineLabel(totalOutput)}</small>
-      </summary>
+    <CollapsibleEntry
+      kind="answer"
+      summary={
+        <summary>
+          <ChevronRight aria-hidden="true" size={13} />
+          {turn.answer ? (
+            <CheckCircle2 aria-hidden="true" size={13} />
+          ) : (
+            <Wrench aria-hidden="true" size={13} />
+          )}
+          <strong>Answer</strong>
+          <span>{preview}</span>
+          <small>{lineLabel(totalOutput)}</small>
+        </summary>
+      }
+    >
       <div className="agent-output__entry-body">
         {turn.answer ? (
           <section className="agent-output__final-answer">
-            <strong>Answer</strong>
-            <p>{turn.answer}</p>
+            <span className="agent-output__section-label">Response</span>
+            <MarkdownContent text={turn.answer} />
           </section>
         ) : null}
         {turn.work ? (
-          <section className="agent-output__total-output">
-            <strong>Total output</strong>
-            <pre>{totalOutput}</pre>
-          </section>
+          <FullTranscript text={totalOutput} />
         ) : null}
       </div>
-    </details>
+    </CollapsibleEntry>
   )
 }
 
@@ -118,16 +184,26 @@ function AgentTurn({
 
 function RawOutput({ text }: { text: string }) {
   return (
-    <details className="agent-output__entry" data-kind="answer">
-      <summary>
-        <ChevronRight aria-hidden="true" size={13} />
-        <CheckCircle2 aria-hidden="true" size={13} />
-        <strong>Answer</strong>
-        <span>{compactPreview(text)}</span>
-        <small>{lineLabel(text)}</small>
-      </summary>
-      <pre className="agent-output__raw">{text}</pre>
-    </details>
+    <CollapsibleEntry
+      kind="answer"
+      summary={
+        <summary>
+          <ChevronRight aria-hidden="true" size={13} />
+          <CheckCircle2 aria-hidden="true" size={13} />
+          <strong>Answer</strong>
+          <span>{compactPreview(text)}</span>
+          <small>{lineLabel(text)}</small>
+        </summary>
+      }
+    >
+      <div className="agent-output__entry-body">
+        <section className="agent-output__final-answer">
+          <span className="agent-output__section-label">Response</span>
+          <MarkdownContent text={text} />
+        </section>
+        <FullTranscript text={text} />
+      </div>
+    </CollapsibleEntry>
   )
 }
 

@@ -961,7 +961,7 @@ fn active_provider_session_matches(
     expected: Option<&yard_domain::ProviderSessionRef>,
     observed: Option<&yard_domain::ProviderSessionRef>,
 ) -> bool {
-    expected.is_none_or(|expected| observed == Some(expected))
+    expected == observed
 }
 
 #[derive(Debug, Error)]
@@ -1024,11 +1024,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_binding_accepts_missing_or_newly_observed_provider_session() {
+    fn provider_session_requires_an_exact_observation() {
         let observed = session("observed");
 
         assert!(active_provider_session_matches(None, None));
-        assert!(active_provider_session_matches(None, Some(&observed)));
+        assert!(!active_provider_session_matches(None, Some(&observed)));
     }
 
     #[test]

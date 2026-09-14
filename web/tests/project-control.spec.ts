@@ -5837,7 +5837,7 @@ test('loads recent assignment activity when the chat opens', async ({
   await expect(
     answerDisclosure.locator('.agent-output__entry-body'),
   ).toBeHidden()
-  await answerDisclosure.locator('summary').click()
+  await answerDisclosure.locator(':scope > summary').click()
   await expect(answerDisclosure).toHaveAttribute('open', '')
   await expect(
     answerDisclosure.locator('.agent-output__entry-body'),
@@ -5886,7 +5886,7 @@ test('loads recent assignment activity when the chat opens', async ({
   const reopenedAnswer = conversation.locator(
     'details.agent-output__entry[data-kind="answer"]',
   )
-  await expect(reopenedAnswer.locator('summary')).toBeVisible()
+  await expect(reopenedAnswer.locator(':scope > summary')).toBeVisible()
   await expect(reopenedAnswer).not.toHaveAttribute('open', '')
   await expect(reopenedAnswer.locator('pre')).toBeHidden()
   await expect
@@ -5950,9 +5950,20 @@ test('keeps one terminal output snapshot in one collapsed answer', async ({
     'details.agent-output__entry[data-kind="answer"]',
   )
   await expect(answerDisclosure).not.toHaveAttribute('open', '')
-  await expect(answerDisclosure.locator('.agent-output__raw')).toBeHidden()
-  await answerDisclosure.locator('summary').click()
-  await expect(answerDisclosure.locator('.agent-output__raw')).toBeVisible()
+  await expect(answerDisclosure.locator('.agent-output__markdown')).toBeHidden()
+  await answerDisclosure.locator(':scope > summary').click()
+  await expect(answerDisclosure.locator('.agent-output__markdown')).toBeVisible()
+  await expect(
+    answerDisclosure.locator('.agent-output__markdown pre'),
+  ).toContainText('first result\n\nsecond result')
+  const fullTranscript = answerDisclosure.locator(
+    'details.agent-output__transcript',
+  )
+  await expect(fullTranscript).not.toHaveAttribute('open', '')
+  await fullTranscript.locator(':scope > summary').click()
+  await expect(fullTranscript.locator('pre')).toContainText(
+    'Ready for owner review.',
+  )
   const bubbleWidth = await outputBubbles.evaluate((element) => {
     const thread = element.parentElement
     if (!thread) return Number.POSITIVE_INFINITY
@@ -6042,11 +6053,13 @@ test('opens the terminal socket before history and replays sequenced live frames
   state.terminalSockets[0].send(
     JSON.stringify({
       type: 'terminal.frame',
-      bytes: Buffer.from('\r\nlive frame one').toString('base64'),
+      bytes: Buffer.from('\u001b[2J\u001b[Hlive frame one').toString(
+        'base64',
+      ),
       seq: 1,
       width,
       height,
-      full: false,
+      full: true,
     }),
   )
   state.terminalSockets[0].send(
@@ -6072,12 +6085,34 @@ test('opens the terminal socket before history and replays sequenced live frames
 
   await expect(terminal).toHaveAttribute('data-history-state', 'ready')
   await expect(terminal).toHaveAttribute('data-frame-sequence', '2')
-  await expect(terminalRows).toContainText(
-    'history before the live frame',
-  )
   await expect(terminalRows).toContainText('live frame one')
   await expect(terminalRows).toContainText('live frame two')
   await expect(terminalRows).not.toContainText('duplicate frame')
+  const accessibleRows = terminalRows.locator('[role="listitem"]')
+  await expect
+    .poll(async () => {
+      const visibleRows = await accessibleRows.count()
+      const bufferRows = Number(
+        await accessibleRows.first().getAttribute('aria-setsize'),
+      )
+      return bufferRows - visibleRows
+    })
+    .toBeGreaterThan(0)
+  await terminal.locator('.terminal-session__viewport').dispatchEvent(
+    'wheel',
+    {
+      deltaMode: 0,
+      deltaY: -100_000,
+    },
+  )
+  await expect
+    .poll(() =>
+      accessibleRows.first().getAttribute('aria-posinset'),
+    )
+    .toBe('1')
+  await expect(terminalRows).toContainText(
+    'history before the live frame',
+  )
 })
 
 test('keeps live terminal output available when history loading degrades', async ({

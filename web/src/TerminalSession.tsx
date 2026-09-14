@@ -19,7 +19,7 @@ import {
 } from './api'
 import { chunkTerminalInput } from './terminalInput'
 import {
-  normalizeTerminalOutput,
+  reflowTerminalHistory,
   TERMINAL_HISTORY_LINES,
 } from './terminalOutput'
 import {
@@ -82,6 +82,7 @@ export type TerminalTarget =
 
 interface TerminalHistory {
   text: string
+  truncated: boolean
 }
 
 const TERMINAL_SCROLLBACK_LINES = 100_000
@@ -132,13 +133,41 @@ function writeTerminal(
 }
 
 function terminalHistoryText(text: string) {
-  const normalized = normalizeTerminalOutput(text)
+  const normalized = reflowTerminalHistory(text)
   return normalized ? normalized.replace(/\n/g, '\r\n') : ''
 }
 
 function decodeBase64(value: string): Uint8Array {
   const decoded = atob(value)
   return Uint8Array.from(decoded, (character) => character.charCodeAt(0))
+}
+
+function preserveScrollbackInFullFrame(bytes: Uint8Array) {
+  const escape = String.fromCharCode(27)
+  let binary = ''
+  for (let offset = 0; offset < bytes.length; offset += 32_768) {
+    binary += String.fromCharCode(
+      ...bytes.subarray(offset, offset + 32_768),
+    )
+  }
+  let sanitized = binary
+    .split(`${escape}[2J`)
+    .join(`${escape}[H${escape}[0J`)
+    .split(`${escape}[3J`)
+    .join('')
+    .split(`${escape}c`)
+    .join(`${escape}[0m${escape}[H${escape}[0J`)
+  for (const mode of ['47', '1047', '1049']) {
+    sanitized = sanitized
+      .split(`${escape}[?${mode}h`)
+      .join('')
+      .split(`${escape}[?${mode}l`)
+      .join('')
+  }
+  return Uint8Array.from(
+    sanitized,
+    (character) => character.charCodeAt(0),
+  )
 }
 
 function isTerminalFrameMessage(
@@ -249,6 +278,16 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
     let historyPending = true
     let bufferedFrames: TerminalFrameMessage[] = []
     let frameWriteQueue = Promise.resolve()
+    let initialFullFrameResolved = false
+    let resolveInitialFullFrame:
+      | ((message: TerminalFrameMessage | null) => void)
+      | null = null
+    let historyFrameTimer = 0
+    const initialFullFrame = new Promise<TerminalFrameMessage | null>(
+      (resolve) => {
+        resolveInitialFullFrame = resolve
+      },
+    )
     const historyController = new AbortController()
 
     setConnection({ kind: 'connecting', detail: 'Connecting' })
@@ -398,6 +437,9 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
         closeForInvalidFrame('Terminal frame could not be decoded')
         return
       }
+      if (message.full) {
+        bytes = preserveScrollbackInFullFrame(bytes)
+      }
       frameWriteQueue = frameWriteQueue.then(async () => {
         if (disposed) return
         await writeTerminal(terminal, bytes)
@@ -421,6 +463,11 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
     const acceptFrame = (message: TerminalFrameMessage) => {
       if (message.seq <= lastSequence) return
       lastSequence = message.seq
+      if (message.full && !initialFullFrameResolved) {
+        initialFullFrameResolved = true
+        resolveInitialFullFrame?.(message)
+        resolveInitialFullFrame = null
+      }
       if (historyPending) {
         bufferedFrames.push(message)
         return
@@ -446,15 +493,37 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
           historyController.signal,
         )
         if (disposed) return
+        const initialFrame = await Promise.race([
+          initialFullFrame,
+          new Promise<null>((resolve) => {
+            historyFrameTimer = window.setTimeout(() => resolve(null), 500)
+          }),
+        ])
+        if (historyFrameTimer) {
+          window.clearTimeout(historyFrameTimer)
+          historyFrameTimer = 0
+        }
+        if (disposed) return
         const text = terminalHistoryText(terminalHistory.text)
         if (text) {
           await writeTerminal(terminal, text)
           if (disposed) return
+          if (initialFrame) {
+            await writeTerminal(
+              terminal,
+              '\r\n'.repeat(
+                Math.max(initialFrame.height, terminal.rows) + 1,
+              ),
+            )
+            if (disposed) return
+          }
           terminal.scrollToBottom()
         }
         setHistory({
           kind: 'ready',
-          detail: 'Earlier history loaded',
+          detail: terminalHistory.truncated
+            ? `Latest ${TERMINAL_HISTORY_LINES.toLocaleString()} lines loaded`
+            : 'Earlier history loaded',
         })
       } catch (caught: unknown) {
         if (
@@ -611,6 +680,14 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       }
       if (frameAnimationFrame) {
         window.cancelAnimationFrame(frameAnimationFrame)
+      }
+      if (historyFrameTimer) {
+        window.clearTimeout(historyFrameTimer)
+      }
+      if (!initialFullFrameResolved) {
+        initialFullFrameResolved = true
+        resolveInitialFullFrame?.(null)
+        resolveInitialFullFrame = null
       }
       if (socket) {
         socket.onclose = null

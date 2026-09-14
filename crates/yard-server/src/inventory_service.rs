@@ -976,17 +976,17 @@ mod tests {
     }
 
     #[test]
-    fn definite_start_rejection_remains_non_ambiguous_without_captured_runtime() {
+    fn definite_start_rejection_with_failed_cleanup_remains_non_ambiguous() {
         let RuntimeProvisionError::AfterPreparation {
+            message,
             ambiguous,
             started_runtime,
-            ..
         } = start_failure_error(
             yard_herdr::HerdrError::Api {
                 code: "agent_name_taken".to_owned(),
                 message: "agent name is already in use".to_owned(),
             },
-            "not attempted; existing topology preserved".to_owned(),
+            "Herdr API tab_close_failed: tab is still busy".to_owned(),
             false,
             None,
         )
@@ -996,6 +996,7 @@ mod tests {
 
         assert!(!ambiguous);
         assert!(started_runtime.is_none());
+        assert!(message.contains("tab_close_failed"));
     }
 
     #[test]

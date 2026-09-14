@@ -11,6 +11,49 @@ export function normalizeTerminalOutput(text: string) {
   ).join('\n')
 }
 
+const TERMINAL_STRUCTURE_LINE =
+  /^(?:\s*$|\s{4,}|[›❯•⏺└├│]|[-*+]\s|\d+[.)]\s|#{1,6}\s|`{3}|~~~|\||[$#>]\s)/
+const TERMINAL_LIST_LINE = /^(?:[-*+]\s|\d+[.)]\s)/
+const TERMINAL_PROSE_CONTINUATION = /^[A-Za-z0-9("'`]/
+const TERMINAL_SENTENCE_END = /[.!?;:)\]}>'"`]$/
+
+function canReflowTerminalLines(current: string, next: string) {
+  const currentText = current.trimEnd()
+  const nextText = next.trim()
+  if (!currentText || !nextText || currentText.length < 32) return false
+  const wrappedListItem =
+    TERMINAL_LIST_LINE.test(currentText) &&
+    /^\s{1,3}\S/.test(next) &&
+    !TERMINAL_SENTENCE_END.test(currentText)
+  if (wrappedListItem) return true
+  if (
+    currentText.endsWith('\\') ||
+    TERMINAL_SENTENCE_END.test(currentText) ||
+    TERMINAL_STRUCTURE_LINE.test(currentText)
+  ) {
+    return false
+  }
+  if (/^\s{4,}/.test(next) || !TERMINAL_PROSE_CONTINUATION.test(nextText)) {
+    return false
+  }
+  return true
+}
+
+export function reflowTerminalHistory(text: string) {
+  const lines = normalizeTerminalOutput(text).split('\n')
+  const reflowed: string[] = []
+  for (const line of lines) {
+    const previous = reflowed.at(-1)
+    if (previous !== undefined && canReflowTerminalLines(previous, line)) {
+      reflowed[reflowed.length - 1] =
+        `${previous.trimEnd()} ${line.trim()}`
+    } else {
+      reflowed.push(line)
+    }
+  }
+  return reflowed.join('\n')
+}
+
 export interface TerminalTranscriptTurn {
   answer: string
   question: string
@@ -196,25 +239,18 @@ export function parseTerminalTranscript(
   const promptCandidates = lines.flatMap((line, index) =>
     PROMPT_LINE.test(line) ? [index] : [],
   )
-  const promptStarts = promptCandidates.filter((start, index) =>
-    lines
-      .slice(start + 1, promptCandidates[index + 1] ?? lines.length)
-      .some((line) =>
-        (CODEX_PROMPT_LINE.test(lines[start])
-          ? CODEX_ASSISTANT_LINE
-          : CLAUDE_ASSISTANT_LINE
-        ).test(line),
-      ),
-  )
-  if (promptStarts.length !== promptCandidates.length) {
-    return {
-      latestQuestion: null,
-      preamble: normalized,
-      structured: false,
-      turns: [],
-    }
-  }
-  if (promptStarts.length === 0) {
+  const promptSegments = promptCandidates.flatMap((start, index) => {
+    const end = promptCandidates[index + 1] ?? lines.length
+    const assistantLine = CODEX_PROMPT_LINE.test(lines[start])
+      ? CODEX_ASSISTANT_LINE
+      : CLAUDE_ASSISTANT_LINE
+    return lines.slice(start + 1, end).some((line) =>
+      assistantLine.test(line),
+    )
+      ? [{ end, start }]
+      : []
+  })
+  if (promptSegments.length === 0) {
     if (truncated && lines.some((line) => ASSISTANT_LINE.test(line))) {
       return {
         latestQuestion: null,
@@ -231,14 +267,14 @@ export function parseTerminalTranscript(
     }
   }
 
-  const turns = promptStarts.map((start, index) =>
+  const turns = promptSegments.map(({ end, start }, index) =>
     parseTurn(
-      lines.slice(start, promptStarts[index + 1] ?? lines.length),
-      index === promptStarts.length - 1 ? status : 'done',
+      lines.slice(start, end),
+      index === promptSegments.length - 1 ? status : 'done',
     ),
   )
   let preamble = cleanTranscriptLines(
-    lines.slice(0, promptStarts[0]),
+    lines.slice(0, promptSegments[0].start),
   ).join('\n')
   if (truncated && preamble) {
     turns[0] = {
