@@ -1914,6 +1914,32 @@ impl From<ProjectServiceError> for ApiError {
                 code: "invalid_orchestrator_workflow_profile",
                 message: error.to_string(),
             },
+            ProjectServiceError::RepositoryRootUnavailable(message)
+            | ProjectServiceError::RepositoryNotGitWorktree(message) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid_repository_root",
+                message,
+            },
+            ProjectServiceError::RepositoryIdentityUnavailable(message) => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "repository_identity_unavailable",
+                message,
+            },
+            ProjectServiceError::RepositoryIdentityChanged => Self {
+                status: StatusCode::CONFLICT,
+                code: "repository_identity_changed",
+                message: "Repository relink would change Git identity".to_owned(),
+            },
+            ProjectServiceError::Store(ProjectStoreError::ProjectRepositoryNotFound) => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "project_repository_not_found",
+                message: "Project repository was not found".to_owned(),
+            },
+            ProjectServiceError::Store(ProjectStoreError::ProjectRepositoryAlreadyLinked) => Self {
+                status: StatusCode::CONFLICT,
+                code: "project_repository_already_linked",
+                message: "Repository root is already linked to this project".to_owned(),
+            },
             ProjectServiceError::UnsupportedRuntimeAdapter(adapter) => Self {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "unsupported_runtime_adapter",
@@ -3580,6 +3606,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn repository_service_errors_map_fail_closed() {
+        let cases = [
+            (
+                ProjectServiceError::RepositoryRootUnavailable("missing".to_owned()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_repository_root",
+            ),
+            (
+                ProjectServiceError::RepositoryNotGitWorktree("not-git".to_owned()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_repository_root",
+            ),
+            (
+                ProjectServiceError::RepositoryIdentityUnavailable("timeout".to_owned()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repository_identity_unavailable",
+            ),
+            (
+                ProjectServiceError::RepositoryIdentityChanged,
+                StatusCode::CONFLICT,
+                "repository_identity_changed",
+            ),
+        ];
+
+        for (error, status, code) in cases {
+            let error = ApiError::from(error);
+            assert_eq!(error.status, status);
+            assert_eq!(error.code, code);
+        }
+    }
+
     struct FakeInventory;
 
     #[async_trait]
@@ -5006,6 +5064,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(terminal_head.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn legacy_workspace_change_routes_are_unavailable() {
+        let (app, _temp) = test_router().await;
+
+        for uri in [
+            "/api/v1/runtimes/herdr/sessions/default/workspaces/workspace-1/changes?terminal_id=terminal-1",
+            "/api/v1/runtimes/herdr/sessions/default/workspaces/workspace-1/files/content?terminal_id=terminal-1&path=README.md",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert!(
+                response.headers().get(header::CONTENT_TYPE).is_none(),
+                "{uri}",
+            );
+        }
     }
 
     async fn handoff_test_router() -> (Router, TempDir, Arc<ClaimCheckingRuntime>) {

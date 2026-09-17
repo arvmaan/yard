@@ -7490,6 +7490,55 @@ test('recovers a stopped dedicated Superintendent session without replacing it',
   )
 })
 
+test('keeps the CWD-derived file browser unavailable', async ({
+  page,
+}, testInfo) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open chat', exact: true }).click()
+  await page.getByRole('tab', { name: 'Files', exact: true }).click()
+
+  const filesWorkspace = page.getByLabel('Files for Implementer')
+  await expect(filesWorkspace).toBeVisible()
+  await expect(filesWorkspace).toContainText(
+    'Repository browsing is not available yet',
+  )
+  await expect(filesWorkspace).toContainText(
+    'Yard no longer infers repository identity from terminal directories.',
+  )
+  await expect(filesWorkspace.getByLabel('Repository directory')).toHaveCount(0)
+  await expect(
+    filesWorkspace.getByRole('button', { name: 'Browse' }),
+  ).toHaveCount(0)
+  expect(
+    await page.evaluate(() =>
+      Object.keys(window.localStorage).filter((key) =>
+        key.startsWith('yard:files-directory:'),
+      ),
+    ),
+  ).toEqual([])
+  await page.screenshot({
+    path: testInfo.outputPath('repository-files-unavailable-desktop.png'),
+    fullPage: true,
+  })
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(filesWorkspace).toBeVisible()
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth - window.innerWidth,
+    ),
+  ).toBeLessThanOrEqual(0)
+  await page.screenshot({
+    path: testInfo.outputPath('repository-files-unavailable-mobile.png'),
+    fullPage: true,
+  })
+})
+
 test('uses full-screen chat and terminal modes with a Herdr window navigator', async ({
   page,
 }, testInfo) => {

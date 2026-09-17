@@ -8,7 +8,7 @@ import type { AgentWindowRole } from './agentWindowNavigator'
 
 export type TerminalPresentation = 'focus' | 'terminal'
 export const DEFAULT_TERMINAL_PRESENTATION: TerminalPresentation = 'terminal'
-export type AgentWorkspaceMode = 'chat' | 'terminal'
+export type AgentWorkspaceMode = 'changes' | 'chat' | 'terminal'
 export type AgentWorkspaceView = AgentWorkspaceMode | 'map'
 
 export function isTerminalWorkspaceMode(

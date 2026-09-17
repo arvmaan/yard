@@ -97,9 +97,10 @@ pub use profile::{
 pub use project::{
     ArchiveProject, ArchivedProject, CanvasPlacement, ConfirmedProjectCreation, CreateProject,
     CreateProjectFromProfile, CreateWorkspaceProjectFromProfile, DeleteProject, DeletedProject,
-    Project, ProjectPlacement, ProjectRuntimeBinding, ProjectValidationError,
-    ProjectWorkflowProfilePin, Projects, RuntimeObservationState, RuntimeProcessState,
-    UpdateProjectPlacement, UpdateProjectWorkflowProfile, Worker, WorkerRuntimeBinding,
+    Project, ProjectPlacement, ProjectRepositories, ProjectRepository, ProjectRuntimeBinding,
+    ProjectValidationError, ProjectWorkflowProfilePin, Projects, RuntimeObservationState,
+    RuntimeProcessState, SetProjectRepository, UpdateProjectPlacement,
+    UpdateProjectWorkflowProfile, Worker, WorkerRuntimeBinding,
 };
 pub use status_report::{
     MAX_STATUS_BLOCKER_BYTES, MAX_STATUS_BLOCKERS, MAX_STATUS_COMMAND_ID_BYTES,

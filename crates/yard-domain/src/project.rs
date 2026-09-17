@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use thiserror::Error;
 
 use crate::{ObservedStatus, ProviderSessionRef, WorkerDesiredState};
@@ -6,6 +7,7 @@ use crate::{ObservedStatus, ProviderSessionRef, WorkerDesiredState};
 const MAX_PROJECT_NAME_BYTES: usize = 120;
 const MAX_PROJECT_COMMAND_BYTES: usize = 120;
 const MAX_PROJECT_CWD_BYTES: usize = 4_096;
+const MAX_PROJECT_REPOSITORY_PATH_BYTES: usize = 4_096;
 const MAX_PROJECT_OBJECTIVE_BYTES: usize = 16_000;
 const MIN_PROJECT_WIDTH: f64 = 322.0;
 const MAX_PROJECT_WIDTH: f64 = 2_400.0;
@@ -170,6 +172,47 @@ pub struct Project {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Projects {
     pub projects: Vec<Project>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRepository {
+    pub id: String,
+    pub project_id: String,
+    pub root_path: String,
+    pub git_common_dir: String,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRepositories {
+    pub repositories: Vec<ProjectRepository>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetProjectRepository {
+    pub root_path: String,
+}
+
+impl SetProjectRepository {
+    /// Normalize and validate a project repository checkout root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectValidationError`] when the path is blank, relative, or
+    /// oversized.
+    pub fn normalize(mut self) -> Result<Self, ProjectValidationError> {
+        self.root_path = bounded_required(
+            "root_path",
+            &self.root_path,
+            MAX_PROJECT_REPOSITORY_PATH_BYTES,
+        )?;
+        if !Path::new(&self.root_path).is_absolute() {
+            return Err(ProjectValidationError::InvalidRepositoryRoot);
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,6 +502,8 @@ pub enum ProjectValidationError {
     InvalidVersion,
     #[error("worker runtime binding does not match the project workspace binding")]
     RuntimeBindingMismatch,
+    #[error("repository root must be an absolute path")]
+    InvalidRepositoryRoot,
 }
 
 fn required(field: &'static str, value: &str) -> Result<String, ProjectValidationError> {
@@ -491,7 +536,8 @@ mod tests {
     use super::{
         ArchiveProject, CanvasPlacement, CreateProject, CreateProjectFromProfile,
         CreateWorkspaceProjectFromProfile, MAX_PROJECT_CWD_BYTES, ProjectRuntimeBinding,
-        ProjectValidationError, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
+        ProjectValidationError, SetProjectRepository, UpdateProjectPlacement,
+        UpdateProjectWorkflowProfile,
     };
 
     fn placement() -> CanvasPlacement {
@@ -539,6 +585,34 @@ mod tests {
         assert_eq!(project.name, "Runtime API");
         assert_eq!(project.runtime.adapter, "herdr");
         assert_eq!(project.orchestrator_observed_worker_id, "terminal-1");
+    }
+
+    #[test]
+    fn repository_roots_are_absolute_and_trimmed() {
+        let repository = SetProjectRepository {
+            root_path: " /tmp/yard ".to_owned(),
+        }
+        .normalize()
+        .unwrap();
+        assert_eq!(repository.root_path, "/tmp/yard");
+
+        assert!(matches!(
+            SetProjectRepository {
+                root_path: "relative".to_owned(),
+            }
+            .normalize(),
+            Err(ProjectValidationError::InvalidRepositoryRoot),
+        ));
+    }
+
+    #[test]
+    fn repository_roots_reject_caller_supplied_identity() {
+        let error = serde_json::from_str::<SetProjectRepository>(
+            r#"{"root_path":"/tmp/yard","git_common_dir":"/forged"}"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown field `git_common_dir`"));
     }
 
     #[test]

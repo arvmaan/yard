@@ -6175,7 +6175,9 @@ function App() {
               returnFocus: activeAgentWorkspaceTarget.returnFocus,
             })
             setTerminalPresentation(DEFAULT_TERMINAL_PRESENTATION)
-            setAgentWorkspaceMode('terminal')
+            setAgentWorkspaceMode((current) =>
+              current === 'changes' ? 'changes' : 'terminal',
+            )
           }}
           presentation={terminalPresentation}
           inventory={inventory}

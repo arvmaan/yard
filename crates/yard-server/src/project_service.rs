@@ -1,12 +1,22 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 
 use thiserror::Error;
-use tokio::time::{Instant, sleep};
+use tokio::{
+    fs,
+    process::Command,
+    time::{Instant, sleep, timeout},
+};
 use tracing::warn;
 use yard_domain::{
     ArchiveProject, ArchivedProject, ConfirmedProjectCreation, CreateProject,
     CreateProjectFromProfile, CreateWorkspaceProjectFromProfile, DeleteProject, DeletedProject,
-    Project, Projects, RuntimeObservationState, RuntimeProcessState, UpdateProjectPlacement,
+    Project, ProjectRepositories, ProjectRepository, Projects, RuntimeObservationState,
+    RuntimeProcessState, SetProjectRepository, UpdateProjectPlacement,
     UpdateProjectWorkflowProfile, WorkerRuntimeBinding,
 };
 use yard_store::{
@@ -23,6 +33,8 @@ use crate::runtime_cleanup_service::RuntimeCleanupService;
 use crate::status_protocol::{with_orchestrator_status_contract, with_orchestrator_workflow};
 
 const RUNTIME_IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
+const REPOSITORY_IDENTITY_TIMEOUT: Duration = Duration::from_secs(2);
+const REPOSITORY_IDENTITY_OUTPUT_LIMIT: usize = 16 * 1024;
 
 #[derive(Clone)]
 pub struct ProjectService {
@@ -65,6 +77,110 @@ impl ProjectService {
     /// project store cannot be read.
     pub async fn get(&self, project_id: &str) -> Result<Project, ProjectServiceError> {
         self.store.get_project(project_id).await.map_err(Into::into)
+    }
+
+    /// List repository checkouts linked to an active project.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectServiceError`] when the project is unavailable.
+    pub async fn list_repositories(
+        &self,
+        project_id: &str,
+    ) -> Result<ProjectRepositories, ProjectServiceError> {
+        self.store
+            .list_project_repositories(project_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Read one repository checkout linked to an active project.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectServiceError`] for missing projects or repositories.
+    pub async fn get_repository(
+        &self,
+        project_id: &str,
+        repository_id: &str,
+    ) -> Result<ProjectRepository, ProjectServiceError> {
+        self.store
+            .get_project_repository(project_id, repository_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Link a validated Git checkout to an active project.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectServiceError`] for invalid paths, non-Git directories,
+    /// duplicate links, missing projects, or unavailable identity checks.
+    pub async fn link_repository(
+        &self,
+        project_id: &str,
+        repository_id: &str,
+        repository: SetProjectRepository,
+    ) -> Result<ProjectRepository, ProjectServiceError> {
+        self.store.get_project(project_id).await?;
+        let identity = resolve_repository_identity(repository).await?;
+        self.store
+            .create_project_repository(
+                project_id,
+                repository_id,
+                &identity.root_path,
+                &identity.git_common_dir,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Relink a repository association to another checkout of the same Git
+    /// common directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectServiceError`] for invalid paths, missing ownership, or
+    /// an identity-changing relink.
+    pub async fn relink_repository(
+        &self,
+        project_id: &str,
+        repository_id: &str,
+        repository: SetProjectRepository,
+    ) -> Result<ProjectRepository, ProjectServiceError> {
+        let current = self
+            .store
+            .get_project_repository(project_id, repository_id)
+            .await?;
+        let identity = resolve_repository_identity(repository).await?;
+        if identity.git_common_dir != current.git_common_dir {
+            return Err(ProjectServiceError::RepositoryIdentityChanged);
+        }
+        self.store
+            .update_project_repository(
+                project_id,
+                repository_id,
+                &identity.root_path,
+                &identity.git_common_dir,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Remove a repository association from an active project.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectServiceError`] for missing ownership or storage errors.
+    pub async fn unlink_repository(
+        &self,
+        project_id: &str,
+        repository_id: &str,
+    ) -> Result<ProjectRepository, ProjectServiceError> {
+        self.store
+            .delete_project_repository(project_id, repository_id)
+            .await
+            .map_err(Into::into)
     }
 
     /// Archive a durable project and immediately attempt cleanup of its
@@ -768,6 +884,129 @@ impl ProjectService {
     }
 }
 
+struct RepositoryIdentity {
+    root_path: String,
+    git_common_dir: String,
+}
+
+async fn resolve_repository_identity(
+    repository: SetProjectRepository,
+) -> Result<RepositoryIdentity, ProjectServiceError> {
+    let repository = repository.normalize()?;
+    let requested = PathBuf::from(&repository.root_path);
+    let canonical_requested = fs::canonicalize(&requested).await.map_err(|_| {
+        ProjectServiceError::RepositoryRootUnavailable(repository.root_path.clone())
+    })?;
+    if !fs::metadata(&canonical_requested)
+        .await
+        .map_err(|_| ProjectServiceError::RepositoryRootUnavailable(repository.root_path.clone()))?
+        .is_dir()
+    {
+        return Err(ProjectServiceError::RepositoryRootUnavailable(
+            repository.root_path,
+        ));
+    }
+
+    let root = canonical_git_directory(
+        git_repository_path(&canonical_requested, "--show-toplevel").await?,
+    )
+    .await?;
+    if !canonical_requested.starts_with(&root) {
+        return Err(ProjectServiceError::RepositoryNotGitWorktree(
+            canonical_requested.display().to_string(),
+        ));
+    }
+    let git_common_dir = canonical_git_directory(
+        git_repository_path(&canonical_requested, "--git-common-dir").await?,
+    )
+    .await?;
+
+    Ok(RepositoryIdentity {
+        root_path: path_string(root)?,
+        git_common_dir: path_string(git_common_dir)?,
+    })
+}
+
+async fn git_repository_path(cwd: &Path, argument: &str) -> Result<PathBuf, ProjectServiceError> {
+    let mut command = Command::new("git");
+    command
+        .args([
+            "--no-optional-locks",
+            "-c",
+            "color.ui=false",
+            "-c",
+            "core.fsmonitor=false",
+            "rev-parse",
+            "--path-format=absolute",
+            argument,
+        ])
+        .current_dir(cwd)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = timeout(REPOSITORY_IDENTITY_TIMEOUT, command.output())
+        .await
+        .map_err(|_| {
+            ProjectServiceError::RepositoryIdentityUnavailable(
+                "Git identity check timed out".to_owned(),
+            )
+        })?
+        .map_err(|error| ProjectServiceError::RepositoryIdentityUnavailable(error.to_string()))?;
+    if output.stdout.len() > REPOSITORY_IDENTITY_OUTPUT_LIMIT
+        || output.stderr.len() > REPOSITORY_IDENTITY_OUTPUT_LIMIT
+    {
+        return Err(ProjectServiceError::RepositoryIdentityUnavailable(
+            "Git identity output exceeded the limit".to_owned(),
+        ));
+    }
+    if !output.status.success() {
+        return Err(ProjectServiceError::RepositoryNotGitWorktree(
+            cwd.display().to_string(),
+        ));
+    }
+    let output = String::from_utf8(output.stdout).map_err(|_| {
+        ProjectServiceError::RepositoryIdentityUnavailable(
+            "Git returned a non-UTF-8 repository path".to_owned(),
+        )
+    })?;
+    let output = output.trim_end_matches(['\r', '\n']);
+    if output.is_empty() || output.contains('\r') || output.contains('\n') {
+        return Err(ProjectServiceError::RepositoryIdentityUnavailable(
+            "Git returned an invalid repository path".to_owned(),
+        ));
+    }
+    Ok(PathBuf::from(output))
+}
+
+async fn canonical_git_directory(path: PathBuf) -> Result<PathBuf, ProjectServiceError> {
+    let canonical = fs::canonicalize(&path)
+        .await
+        .map_err(|error| ProjectServiceError::RepositoryIdentityUnavailable(error.to_string()))?;
+    if !fs::metadata(&canonical)
+        .await
+        .map_err(|error| ProjectServiceError::RepositoryIdentityUnavailable(error.to_string()))?
+        .is_dir()
+    {
+        return Err(ProjectServiceError::RepositoryIdentityUnavailable(
+            "Git identity is not a directory".to_owned(),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn path_string(path: PathBuf) -> Result<String, ProjectServiceError> {
+    path.into_os_string().into_string().map_err(|_| {
+        ProjectServiceError::RepositoryIdentityUnavailable(
+            "Repository identity is not valid UTF-8".to_owned(),
+        )
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum ProjectServiceError {
     #[error(transparent)]
@@ -802,4 +1041,315 @@ pub enum ProjectServiceError {
     RuntimeBindingUnverified(String),
     #[error("worker was created but orchestrator objective delivery failed: {0}")]
     ObjectiveDeliveryFailed(String),
+    #[error("repository root is unavailable: {0}")]
+    RepositoryRootUnavailable(String),
+    #[error("path is not a Git worktree: {0}")]
+    RepositoryNotGitWorktree(String),
+    #[error("repository identity is unavailable: {0}")]
+    RepositoryIdentityUnavailable(String),
+    #[error("repository relink would change Git identity")]
+    RepositoryIdentityChanged,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs as std_fs, process::Command as StdCommand};
+
+    use async_trait::async_trait;
+    use tempfile::TempDir;
+    use yard_domain::{
+        CanvasPlacement, ObservedStatus, ProjectRuntimeBinding, RuntimeInventory, RuntimeSessions,
+    };
+    use yard_store::SqliteProjectStore;
+
+    use super::*;
+
+    struct UnusedInventory;
+
+    #[async_trait]
+    impl InventorySource for UnusedInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            unreachable!("repository tests do not inspect runtime inventory")
+        }
+
+        async fn inventory(
+            &self,
+            _session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            unreachable!("repository tests do not inspect runtime inventory")
+        }
+    }
+
+    struct UnusedRuntime;
+
+    #[async_trait]
+    impl RuntimeControl for UnusedRuntime {
+        async fn provision_worker(
+            &self,
+            _request: RuntimeProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            unreachable!("repository tests do not provision workers")
+        }
+    }
+
+    async fn service(
+        temp: &TempDir,
+        suffix: &str,
+    ) -> (ProjectService, Arc<SqliteProjectStore>, Project) {
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let project = store
+            .create_project(
+                CreateProject {
+                    name: format!("Repository {suffix}"),
+                    runtime: ProjectRuntimeBinding {
+                        adapter: "herdr".to_owned(),
+                        session: "default".to_owned(),
+                        workspace_id: format!("workspace-{suffix}"),
+                    },
+                    orchestrator_observed_worker_id: format!("terminal-{suffix}"),
+                    placement: CanvasPlacement {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 322.0,
+                        height: 240.0,
+                    },
+                },
+                WorkerRuntimeBinding {
+                    adapter: "herdr".to_owned(),
+                    session: "default".to_owned(),
+                    workspace_id: format!("workspace-{suffix}"),
+                    terminal_id: format!("terminal-{suffix}"),
+                    tab_id: Some(format!("tab-{suffix}")),
+                    pane_id: format!("pane-{suffix}"),
+                    provider_session: None,
+                    owns_tab: false,
+                    observation_state: RuntimeObservationState::Observed,
+                    process_state: RuntimeProcessState::Running,
+                    status: ObservedStatus::Idle,
+                    state_change_sequence: 1,
+                    revision: 1,
+                    version: 1,
+                    last_observed_at_unix_ms: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let service = ProjectService::new(
+            Arc::new(UnusedInventory),
+            Arc::new(UnusedRuntime),
+            store.clone(),
+        );
+        (service, store, project)
+    }
+
+    fn init_repository(path: &Path) {
+        std_fs::create_dir_all(path).unwrap();
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "--quiet"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            StdCommand::new("git")
+                .current_dir(path)
+                .args([
+                    "-c",
+                    "user.name=Yard Tests",
+                    "-c",
+                    "user.email=yard@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "--quiet",
+                    "-m",
+                    "initial",
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn add_worktree(repository: &Path, worktree: &Path) {
+        assert!(
+            StdCommand::new("git")
+                .current_dir(repository)
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(worktree)
+                .arg("HEAD")
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repository_identity_is_derived_and_preserved_across_relinks() {
+        let temp = TempDir::new().unwrap();
+        let (service, store, project) = service(&temp, "identity").await;
+        let repository = temp.path().join("repository");
+        init_repository(&repository);
+        std_fs::create_dir(repository.join("nested")).unwrap();
+        let alias = temp.path().join("repository-alias");
+        std::os::unix::fs::symlink(&repository, &alias).unwrap();
+
+        let linked = service
+            .link_repository(
+                &project.id,
+                "repository-1",
+                SetProjectRepository {
+                    root_path: alias.join("nested").to_string_lossy().into_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            linked.root_path,
+            std_fs::canonicalize(&repository).unwrap().to_string_lossy()
+        );
+        assert_eq!(
+            linked.git_common_dir,
+            std_fs::canonicalize(repository.join(".git"))
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert!(matches!(
+            service
+                .link_repository(
+                    &project.id,
+                    "repository-alias",
+                    SetProjectRepository {
+                        root_path: repository.to_string_lossy().into_owned(),
+                    },
+                )
+                .await,
+            Err(ProjectServiceError::Store(
+                ProjectStoreError::ProjectRepositoryAlreadyLinked
+            )),
+        ));
+
+        let worktree = temp.path().join("worktree");
+        add_worktree(&repository, &worktree);
+        let relinked = service
+            .relink_repository(
+                &project.id,
+                &linked.id,
+                SetProjectRepository {
+                    root_path: worktree.to_string_lossy().into_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(relinked.git_common_dir, linked.git_common_dir);
+
+        let other = temp.path().join("other-repository");
+        init_repository(&other);
+        assert!(matches!(
+            service
+                .relink_repository(
+                    &project.id,
+                    &linked.id,
+                    SetProjectRepository {
+                        root_path: other.to_string_lossy().into_owned(),
+                    },
+                )
+                .await,
+            Err(ProjectServiceError::RepositoryIdentityChanged),
+        ));
+
+        store
+            .create_project_repository(
+                &project.id,
+                "repository-forged",
+                &std_fs::canonicalize(&other).unwrap().to_string_lossy(),
+                "/forged/common-dir",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .relink_repository(
+                    &project.id,
+                    "repository-forged",
+                    SetProjectRepository {
+                        root_path: other.to_string_lossy().into_owned(),
+                    },
+                )
+                .await,
+            Err(ProjectServiceError::RepositoryIdentityChanged),
+        ));
+    }
+
+    #[tokio::test]
+    async fn repository_identity_rejects_unusable_roots() {
+        let temp = TempDir::new().unwrap();
+        let (service, _store, project) = service(&temp, "invalid").await;
+
+        let relative = service
+            .link_repository(
+                &project.id,
+                "relative",
+                SetProjectRepository {
+                    root_path: "relative".to_owned(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            relative,
+            Err(ProjectServiceError::InvalidProject(
+                yard_domain::ProjectValidationError::InvalidRepositoryRoot
+            )),
+        ));
+
+        let missing = temp.path().join("missing");
+        assert!(matches!(
+            service
+                .link_repository(
+                    &project.id,
+                    "missing",
+                    SetProjectRepository {
+                        root_path: missing.to_string_lossy().into_owned(),
+                    },
+                )
+                .await,
+            Err(ProjectServiceError::RepositoryRootUnavailable(_)),
+        ));
+
+        let file = temp.path().join("file");
+        std_fs::write(&file, "not a directory").unwrap();
+        assert!(matches!(
+            service
+                .link_repository(
+                    &project.id,
+                    "file",
+                    SetProjectRepository {
+                        root_path: file.to_string_lossy().into_owned(),
+                    },
+                )
+                .await,
+            Err(ProjectServiceError::RepositoryRootUnavailable(_)),
+        ));
+
+        let directory = temp.path().join("not-git");
+        std_fs::create_dir(&directory).unwrap();
+        assert!(matches!(
+            service
+                .link_repository(
+                    &project.id,
+                    "not-git",
+                    SetProjectRepository {
+                        root_path: directory.to_string_lossy().into_owned(),
+                    },
+                )
+                .await,
+            Err(ProjectServiceError::RepositoryNotGitWorktree(_)),
+        ));
+    }
 }

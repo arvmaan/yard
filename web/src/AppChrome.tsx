@@ -12,6 +12,7 @@ import {
   ChevronDown,
   CircleAlert,
   FileCode2,
+  Files,
   FolderPlus,
   LoaderCircle,
   Map as MapIcon,
@@ -289,6 +290,17 @@ export function GlobalCommandBar({
         >
           <SquareTerminal aria-hidden="true" size={14} />
           <span>Terminal</span>
+        </button>
+        <button
+          aria-selected={agentWorkspaceMode === 'changes'}
+          disabled={!activeAgentWorkspaceTarget}
+          onClick={() => onAgentWorkspaceModeChange('changes')}
+          role="tab"
+          title="Files"
+          type="button"
+        >
+          <Files aria-hidden="true" size={14} />
+          <span>Files</span>
         </button>
       </div>
 

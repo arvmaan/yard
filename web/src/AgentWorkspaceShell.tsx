@@ -293,7 +293,8 @@ export function AgentWorkspaceShell({
     (count, group) => count + group.targets.length,
     0,
   )
-  const closeLabel = mode === 'chat' ? 'chat' : 'terminal'
+  const closeLabel =
+    mode === 'chat' ? 'chat' : mode === 'changes' ? 'files' : 'terminal'
 
   return (
     <section
@@ -665,6 +666,28 @@ export function AgentWorkspaceShell({
           target={activeTarget.target}
           variant="workspace"
         />
+        {mode === 'changes' ? (
+          <section
+            aria-label={"Files for " + activeTarget.label}
+            className="changes-workspace"
+          >
+            <header className="changes-workspace__header">
+              <GitBranch aria-hidden="true" size={14} />
+              <span>
+                <strong>Repository files</strong>
+                <small>{activeTarget.label}</small>
+              </span>
+            </header>
+            <div className="changes-workspace__state" role="status">
+              <strong>Repository browsing is not available yet</strong>
+              <span>
+                Yard no longer infers repository identity from terminal
+                directories. Repository-backed browsing will return in the next
+                slice.
+              </span>
+            </div>
+          </section>
+        ) : null}
         {terminalVisible ? (
           <Suspense
             fallback={

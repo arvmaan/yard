@@ -39,22 +39,23 @@ use yard_domain::{
     ManagedRuntimeWorkspaceKind, ObservedStatus, ObservedWorker, OldSessionDisposition,
     OrchestratorPromptAcknowledgement, OrchestratorWorkflowProfile, OrchestratorWorkflowProfiles,
     PaneObservation, PreparedAgentProfile, Project, ProjectPlacement, ProjectRelationship,
-    ProjectRelationshipKind, ProjectRelationships, ProjectRuntimeBinding,
-    ProjectWorkflowProfilePin, Projects, ProviderSessionRef, ProvisionCoordinationNode,
-    ProvisionYardOrchestrator, RecordCompletionReceipt, RecordedCompletionReceipt,
-    ReplaceProjectOrchestrator, ReplacedProjectOrchestrator, RequestCoordinationSnapshot,
-    ResetOrchestratorWorkflowProfile, RunAutomationNow, RuntimeInventory, RuntimeObservationState,
-    RuntimeProcessState, RuntimeReconciliation, RuntimeTopology, SendAssignmentPrompt,
-    SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
-    SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SetAutomationPaused, TokenSpendSettings,
-    TransferProjectOrchestrator, TransferredProjectOrchestrator, UpdateAgentProfile,
-    UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
-    UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
-    UpdateProjectWorkflowProfile, UpdateTokenSpendSettings, UpdateWorkerProfile, Worker,
-    WorkerAllocation, WorkerAvailability, WorkerCandidate, WorkerCandidates, WorkerDesiredState,
-    WorkerProfile, WorkerProfileSpec, WorkerProfiles, WorkerRuntimeBinding,
-    YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator, YardOrchestratorPromptAcknowledgement,
-    YardOrchestratorRoute, YardOrchestratorRoutes, herdr_agent_name,
+    ProjectRelationshipKind, ProjectRelationships, ProjectRepositories, ProjectRepository,
+    ProjectRuntimeBinding, ProjectWorkflowProfilePin, Projects, ProviderSessionRef,
+    ProvisionCoordinationNode, ProvisionYardOrchestrator, RecordCompletionReceipt,
+    RecordedCompletionReceipt, ReplaceProjectOrchestrator, ReplacedProjectOrchestrator,
+    RequestCoordinationSnapshot, ResetOrchestratorWorkflowProfile, RunAutomationNow,
+    RuntimeInventory, RuntimeObservationState, RuntimeProcessState, RuntimeReconciliation,
+    RuntimeTopology, SendAssignmentPrompt, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
+    SendOrchestratorPrompt, SendYardOrchestratorPrompt, SendYardOrchestratorRoute,
+    SetAutomationPaused, TokenSpendSettings, TransferProjectOrchestrator,
+    TransferredProjectOrchestrator, UpdateAgentProfile, UpdateAutomation,
+    UpdateAutomationPlacement, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
+    UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
+    UpdateTokenSpendSettings, UpdateWorkerProfile, Worker, WorkerAllocation, WorkerAvailability,
+    WorkerCandidate, WorkerCandidates, WorkerDesiredState, WorkerProfile, WorkerProfileSpec,
+    WorkerProfiles, WorkerRuntimeBinding, YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator,
+    YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute, YardOrchestratorRoutes,
+    herdr_agent_name,
 };
 
 mod automation_store;
@@ -62,7 +63,7 @@ mod coordination_node_store;
 mod orchestrator_workflow_profile_store;
 mod token_spend_store;
 
-const SCHEMA_VERSION: i64 = 28;
+const SCHEMA_VERSION: i64 = 29;
 const PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS: u64 = 120_000;
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_projects.sql");
 const PROFILE_ASSIGNMENT_MIGRATION: &str =
@@ -113,6 +114,8 @@ const PROVIDER_NEUTRAL_WORKFLOW_PROFILE_INTEGRITY_MIGRATION: &str =
 const PROJECT_ARCHIVING_MIGRATION: &str = include_str!("../migrations/0027_project_archiving.sql");
 const VISIBILITY_DELETIONS_MIGRATION: &str =
     include_str!("../migrations/0028_visibility_deletions.sql");
+const PROJECT_REPOSITORIES_MIGRATION: &str =
+    include_str!("../migrations/0029_project_repositories.sql");
 const BLANK_WORKER_PROFILE_ID: &str = "yard:managed-blank-profile";
 const BLANK_WORKER_PROFILE_NAME: &str = "Blank profile";
 const MAX_ROUTE_LIST_LIMIT: usize = 500;
@@ -360,6 +363,34 @@ pub trait YardStore: Send + Sync {
         command: DeleteProjectRelationship,
     ) -> Result<DeletedProjectRelationship, ProjectStoreError>;
     async fn get_project(&self, project_id: &str) -> Result<Project, ProjectStoreError>;
+    async fn list_project_repositories(
+        &self,
+        project_id: &str,
+    ) -> Result<ProjectRepositories, ProjectStoreError>;
+    async fn get_project_repository(
+        &self,
+        project_id: &str,
+        repository_id: &str,
+    ) -> Result<ProjectRepository, ProjectStoreError>;
+    async fn create_project_repository(
+        &self,
+        project_id: &str,
+        repository_id: &str,
+        root_path: &str,
+        git_common_dir: &str,
+    ) -> Result<ProjectRepository, ProjectStoreError>;
+    async fn update_project_repository(
+        &self,
+        project_id: &str,
+        repository_id: &str,
+        root_path: &str,
+        git_common_dir: &str,
+    ) -> Result<ProjectRepository, ProjectStoreError>;
+    async fn delete_project_repository(
+        &self,
+        project_id: &str,
+        repository_id: &str,
+    ) -> Result<ProjectRepository, ProjectStoreError>;
     async fn archive_project(
         &self,
         project_id: &str,
@@ -2469,6 +2500,146 @@ impl YardStore for SqliteProjectStore {
             .await
     }
 
+    async fn list_project_repositories(
+        &self,
+        project_id: &str,
+    ) -> Result<ProjectRepositories, ProjectStoreError> {
+        let project_id = required_id(project_id)?;
+        self.run(move |connection| {
+            require_active_project(connection, &project_id)?;
+            let mut statement = connection.prepare(
+                "SELECT id, project_id, root_path, git_common_dir,
+                        created_at_unix_ms, updated_at_unix_ms
+                   FROM project_repositories
+                  WHERE project_id = ?1
+                  ORDER BY created_at_unix_ms, id",
+            )?;
+            let repositories = statement
+                .query_map([project_id], project_repository_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ProjectRepositories { repositories })
+        })
+        .await
+    }
+
+    async fn get_project_repository(
+        &self,
+        project_id: &str,
+        repository_id: &str,
+    ) -> Result<ProjectRepository, ProjectStoreError> {
+        let project_id = required_id(project_id)?;
+        let repository_id = required_id(repository_id)?;
+        self.run(move |connection| {
+            select_project_repository(connection, &project_id, &repository_id)
+        })
+        .await
+    }
+
+    async fn create_project_repository(
+        &self,
+        project_id: &str,
+        repository_id: &str,
+        root_path: &str,
+        git_common_dir: &str,
+    ) -> Result<ProjectRepository, ProjectStoreError> {
+        let project_id = required_id(project_id)?;
+        let repository_id = required_id(repository_id)?;
+        let root_path = root_path.to_owned();
+        let git_common_dir = git_common_dir.to_owned();
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_active_project(&transaction, &project_id)?;
+            let now = unix_time_ms()?;
+            transaction
+                .execute(
+                    "INSERT INTO project_repositories (
+                        id, project_id, root_path, git_common_dir,
+                        created_at_unix_ms, updated_at_unix_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                    params![
+                        repository_id,
+                        project_id,
+                        root_path,
+                        git_common_dir,
+                        to_i64(now)?,
+                    ],
+                )
+                .map_err(|error| {
+                    if is_unique_constraint(&error) {
+                        ProjectStoreError::ProjectRepositoryAlreadyLinked
+                    } else {
+                        error.into()
+                    }
+                })?;
+            let repository = select_project_repository(&transaction, &project_id, &repository_id)?;
+            transaction.commit()?;
+            Ok(repository)
+        })
+        .await
+    }
+
+    async fn update_project_repository(
+        &self,
+        project_id: &str,
+        repository_id: &str,
+        root_path: &str,
+        git_common_dir: &str,
+    ) -> Result<ProjectRepository, ProjectStoreError> {
+        let project_id = required_id(project_id)?;
+        let repository_id = required_id(repository_id)?;
+        let root_path = root_path.to_owned();
+        let git_common_dir = git_common_dir.to_owned();
+        self.run(move |connection| {
+            require_active_project(connection, &project_id)?;
+            let now = unix_time_ms()?;
+            let rows = connection
+                .execute(
+                    "UPDATE project_repositories
+                        SET root_path = ?1, git_common_dir = ?2,
+                            updated_at_unix_ms = ?3
+                      WHERE id = ?4 AND project_id = ?5",
+                    params![
+                        root_path,
+                        git_common_dir,
+                        to_i64(now)?,
+                        repository_id,
+                        project_id,
+                    ],
+                )
+                .map_err(|error| {
+                    if is_unique_constraint(&error) {
+                        ProjectStoreError::ProjectRepositoryAlreadyLinked
+                    } else {
+                        error.into()
+                    }
+                })?;
+            if rows != 1 {
+                return Err(ProjectStoreError::ProjectRepositoryNotFound);
+            }
+            select_project_repository(connection, &project_id, &repository_id)
+        })
+        .await
+    }
+
+    async fn delete_project_repository(
+        &self,
+        project_id: &str,
+        repository_id: &str,
+    ) -> Result<ProjectRepository, ProjectStoreError> {
+        let project_id = required_id(project_id)?;
+        let repository_id = required_id(repository_id)?;
+        self.run(move |connection| {
+            let repository = select_project_repository(connection, &project_id, &repository_id)?;
+            connection.execute(
+                "DELETE FROM project_repositories WHERE id = ?1 AND project_id = ?2",
+                params![repository_id, project_id],
+            )?;
+            Ok(repository)
+        })
+        .await
+    }
+
     async fn archive_project(
         &self,
         project_id: &str,
@@ -2485,6 +2656,7 @@ impl YardStore for SqliteProjectStore {
                 if !existing.matches(&project_id, &command) {
                     return Err(ProjectStoreError::IdempotencyConflict);
                 }
+                purge_project_repositories(&transaction, &project_id)?;
                 let cleanup_pending = runtime_cleanup_pending(&transaction, &command.command_id)?;
                 transaction.commit()?;
                 return Ok(existing.archived(cleanup_pending, true));
@@ -2657,6 +2829,7 @@ impl YardStore for SqliteProjectStore {
                     current_version: project.orchestrator.version,
                 });
             }
+            purge_project_repositories(&transaction, &project_id)?;
             coordination_node_store::archive_project_attachments(
                 &transaction,
                 &project_id,
@@ -2732,6 +2905,7 @@ impl YardStore for SqliteProjectStore {
                 if existing.project_id != project_id || existing.actor != command.actor {
                     return Err(ProjectStoreError::IdempotencyConflict);
                 }
+                purge_project_repositories(&transaction, &project_id)?;
                 let cleanup_pending =
                     worker_runtime_cleanup_pending(&transaction, &existing.orchestrator_worker_id)?;
                 transaction.commit()?;
@@ -2790,6 +2964,7 @@ impl YardStore for SqliteProjectStore {
                     ],
                 )?;
             }
+            purge_project_repositories(&transaction, &project_id)?;
             let cleanup_pending =
                 worker_runtime_cleanup_pending(&transaction, &archived.orchestrator_worker_id)?;
             transaction.commit()?;
@@ -11906,6 +12081,13 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
         migration?;
         foreign_keys?;
+        current = 28;
+    }
+    if current == 28 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(PROJECT_REPOSITORIES_MIGRATION)?;
+        ensure_foreign_keys(&transaction)?;
+        transaction.commit()?;
     }
     ensure_foreign_keys(connection)?;
     Ok(())
@@ -14008,6 +14190,17 @@ fn project_exists(connection: &Connection, project_id: &str) -> Result<bool, Pro
         .map_err(Into::into)
 }
 
+fn require_active_project(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<(), ProjectStoreError> {
+    if project_exists(connection, project_id)? {
+        Ok(())
+    } else {
+        Err(ProjectStoreError::ProjectNotFound)
+    }
+}
+
 fn select_project_relationship(
     connection: &Connection,
     relationship_id: &str,
@@ -14191,6 +14384,47 @@ fn select_confirmed_workspace_project_creation(
         project,
         replayed,
     })
+}
+
+fn project_repository_from_row(row: &Row<'_>) -> rusqlite::Result<ProjectRepository> {
+    Ok(ProjectRepository {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        root_path: row.get(2)?,
+        git_common_dir: row.get(3)?,
+        created_at_unix_ms: row_u64(row, 4)?,
+        updated_at_unix_ms: row_u64(row, 5)?,
+    })
+}
+
+fn select_project_repository(
+    connection: &Connection,
+    project_id: &str,
+    repository_id: &str,
+) -> Result<ProjectRepository, ProjectStoreError> {
+    require_active_project(connection, project_id)?;
+    connection
+        .query_row(
+            "SELECT id, project_id, root_path, git_common_dir,
+                    created_at_unix_ms, updated_at_unix_ms
+               FROM project_repositories
+              WHERE project_id = ?1 AND id = ?2",
+            params![project_id, repository_id],
+            project_repository_from_row,
+        )
+        .optional()?
+        .ok_or(ProjectStoreError::ProjectRepositoryNotFound)
+}
+
+fn purge_project_repositories(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<(), ProjectStoreError> {
+    connection.execute(
+        "DELETE FROM project_repositories WHERE project_id = ?1",
+        [project_id],
+    )?;
+    Ok(())
 }
 
 fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
@@ -18570,6 +18804,10 @@ pub enum ProjectStoreError {
     SnapshotProjectNotFound,
     #[error("project was not found")]
     ProjectNotFound,
+    #[error("project repository was not found")]
+    ProjectRepositoryNotFound,
+    #[error("this repository root is already linked to the project")]
+    ProjectRepositoryAlreadyLinked,
     #[error("project is already archived")]
     ProjectAlreadyArchived,
     #[error("project must be archived before it can be deleted")]
@@ -19138,6 +19376,7 @@ mod tests {
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = OFF;
+                 DROP TABLE project_repositories;
                  DROP TABLE IF EXISTS deleted_projects;
                  DROP TABLE IF EXISTS deleted_workers;
                  DROP TABLE IF EXISTS archived_projects;
@@ -22525,6 +22764,226 @@ mod tests {
             loaded.orchestrator.runtime.as_ref().unwrap().terminal_id,
             "terminal-1"
         );
+    }
+
+    #[tokio::test]
+    async fn project_repository_links_relink_and_survive_reopen() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) = draft("workspace-repository", "terminal-repository");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+
+        let linked = store
+            .create_project_repository(
+                &project.id,
+                "repository-1",
+                "/tmp/checkout-one",
+                "/tmp/repository/.git",
+            )
+            .await
+            .unwrap();
+        assert_eq!(linked.root_path, "/tmp/checkout-one");
+        assert!(matches!(
+            store
+                .create_project_repository(
+                    &project.id,
+                    "repository-duplicate",
+                    "/tmp/checkout-one",
+                    "/tmp/repository/.git",
+                )
+                .await,
+            Err(ProjectStoreError::ProjectRepositoryAlreadyLinked),
+        ));
+
+        let (other_draft, other_runtime) =
+            draft("workspace-repository-other", "terminal-repository-other");
+        let other_project = store
+            .create_project(other_draft, other_runtime)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .get_project_repository(&other_project.id, &linked.id)
+                .await,
+            Err(ProjectStoreError::ProjectRepositoryNotFound),
+        ));
+        assert!(matches!(
+            store
+                .update_project_repository(
+                    &other_project.id,
+                    &linked.id,
+                    "/tmp/forged",
+                    "/tmp/forged/.git",
+                )
+                .await,
+            Err(ProjectStoreError::ProjectRepositoryNotFound),
+        ));
+        assert!(matches!(
+            store
+                .delete_project_repository(&other_project.id, &linked.id)
+                .await,
+            Err(ProjectStoreError::ProjectRepositoryNotFound),
+        ));
+        assert_eq!(
+            store
+                .list_project_repositories(&project.id)
+                .await
+                .unwrap()
+                .repositories,
+            std::slice::from_ref(&linked),
+        );
+
+        let relinked = store
+            .update_project_repository(
+                &project.id,
+                &linked.id,
+                "/tmp/checkout-two",
+                "/tmp/repository/.git",
+            )
+            .await
+            .unwrap();
+        assert_eq!(relinked.root_path, "/tmp/checkout-two");
+        drop(store);
+
+        let reopened = open_store(&temp).await;
+        assert_eq!(
+            reopened
+                .get_project_repository(&project.id, &linked.id)
+                .await
+                .unwrap(),
+            relinked,
+        );
+        assert_eq!(
+            reopened
+                .delete_project_repository(&project.id, &linked.id)
+                .await
+                .unwrap()
+                .id,
+            linked.id,
+        );
+        assert!(
+            reopened
+                .list_project_repositories(&project.id)
+                .await
+                .unwrap()
+                .repositories
+                .is_empty()
+        );
+    }
+
+    async fn assert_project_repositories_unavailable(
+        store: &SqliteProjectStore,
+        project_id: &str,
+        repository_id: &str,
+    ) {
+        for result in [
+            store
+                .get_project_repository(project_id, repository_id)
+                .await
+                .map(|_| ()),
+            store
+                .update_project_repository(
+                    project_id,
+                    repository_id,
+                    "/sensitive/other",
+                    "/sensitive/repository/.git",
+                )
+                .await
+                .map(|_| ()),
+            store
+                .delete_project_repository(project_id, repository_id)
+                .await
+                .map(|_| ()),
+        ] {
+            assert!(matches!(result, Err(ProjectStoreError::ProjectNotFound)));
+        }
+        assert!(matches!(
+            store.list_project_repositories(project_id).await,
+            Err(ProjectStoreError::ProjectNotFound),
+        ));
+    }
+
+    #[tokio::test]
+    async fn project_archive_and_delete_purge_repository_paths() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (draft, runtime) = draft("workspace-repo-lifecycle", "terminal-repo-lifecycle");
+        let project = store.create_project(draft, runtime).await.unwrap();
+        let repository = store
+            .create_project_repository(
+                &project.id,
+                "repository-sensitive",
+                "/sensitive/checkout",
+                "/sensitive/repository/.git",
+            )
+            .await
+            .unwrap();
+        let archive = archive_command(&project, "archive-repository-project");
+
+        store
+            .archive_project(&project.id, archive.clone())
+            .await
+            .unwrap();
+        assert_project_repositories_unavailable(&store, &project.id, &repository.id).await;
+
+        let database = temp.path().join("yard.sqlite3");
+        let repository_rows = || {
+            Connection::open(&database)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM project_repositories WHERE project_id = ?1",
+                    [&project.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(repository_rows(), 0);
+
+        let insert_stale_repository = |repository_id: &str| {
+            Connection::open(&database)
+                .unwrap()
+                .execute(
+                    "INSERT INTO project_repositories (
+                        id, project_id, root_path, git_common_dir,
+                        created_at_unix_ms, updated_at_unix_ms
+                     ) VALUES (?1, ?2, '/sensitive/stale',
+                               '/sensitive/stale/.git', 1, 1)",
+                    params![repository_id, project.id],
+                )
+                .unwrap();
+        };
+
+        insert_stale_repository("repository-archive-replay");
+        assert!(
+            store
+                .archive_project(&project.id, archive)
+                .await
+                .unwrap()
+                .replayed
+        );
+        assert_eq!(repository_rows(), 0);
+
+        insert_stale_repository("repository-before-delete");
+        let delete = DeleteProject {
+            command_id: "delete-repository-project".to_owned(),
+            actor: "local-user".to_owned(),
+        };
+        store
+            .delete_project(&project.id, delete.clone())
+            .await
+            .unwrap();
+        assert_eq!(repository_rows(), 0);
+
+        insert_stale_repository("repository-delete-replay");
+        assert!(
+            store
+                .delete_project(&project.id, delete)
+                .await
+                .unwrap()
+                .replayed
+        );
+        assert_eq!(repository_rows(), 0);
+        assert_project_repositories_unavailable(&store, &project.id, &repository.id).await;
     }
 
     #[tokio::test]
