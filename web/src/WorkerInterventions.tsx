@@ -1,8 +1,10 @@
 import { useState } from 'react'
 import {
+  CircleAlert,
   ExternalLink,
   LoaderCircle,
   MessageSquareText,
+  RefreshCw,
   SquareTerminal,
 } from 'lucide-react'
 import {
@@ -11,13 +13,19 @@ import {
   useAgentWorkspace,
   type AgentWorkspaceTarget,
 } from './AgentWorkspaceContext'
-import { openTerminalInGhostty } from './api'
+import { YardApiError, openTerminalInGhostty } from './api'
+import {
+  resolveRuntimeCapabilities,
+  runtimeCapabilityDetail,
+  runtimeCapabilityLabel,
+  runtimeCapabilityStatus,
+} from './runtimeCapabilities'
 import type {
   Assignment,
   CoordinationNode,
   CoordinationNodeRoute,
-  ObservedStatus,
   Project,
+  RuntimeInventory,
   YardOrchestrator,
   YardOrchestratorRoute,
 } from './types'
@@ -37,16 +45,20 @@ function shellQuote(value: string) {
 export function WorkerInterventions({
   onCoordinationChange,
   onCoordinationNodeChange,
+  inventory,
+  onRefresh,
   projects,
   routes,
-  status,
+  snapshotCurrent,
   target,
 }: {
   onCoordinationChange?: (route: YardOrchestratorRoute) => void
   onCoordinationNodeChange?: (route: CoordinationNodeRoute) => void
+  inventory: RuntimeInventory | null
+  onRefresh?: () => void
   projects?: Project[]
   routes?: Array<YardOrchestratorRoute | CoordinationNodeRoute>
-  status?: ObservedStatus
+  snapshotCurrent: boolean
   target: InterventionTarget
 }) {
   void onCoordinationChange
@@ -75,14 +87,7 @@ export function WorkerInterventions({
     coordinationNode?.worker?.runtime
   const terminalId = runtime?.terminal_id
   const runtimeSession = runtime?.session
-  const targetKey =
-    agentWorkspaceKey(target)
-  const interactive =
-    Boolean(terminalId) &&
-    (target.kind === 'orchestrator' ||
-      target.kind === 'yard-orchestrator' ||
-      target.kind === 'coordination-node' ||
-      assignment?.lifecycle === 'active')
+  const targetKey = agentWorkspaceKey(target)
   const label =
     target.kind === 'orchestrator'
       ? `${project?.name ?? 'Project'} orchestrator`
@@ -90,7 +95,7 @@ export function WorkerInterventions({
         ? 'Superintendent'
         : target.kind === 'coordination-node'
           ? coordinationNode?.name ?? 'Workstream orchestrator'
-        : assignment?.profile_name ?? 'Worker'
+          : assignment?.profile_name ?? 'Worker'
   const terminalTarget =
     target.kind === 'assignment' && assignmentId
       ? {
@@ -100,10 +105,10 @@ export function WorkerInterventions({
         }
       : target.kind === 'orchestrator'
         ? {
-          kind: 'orchestrator' as const,
-          projectId,
-          workerId,
-        }
+            kind: 'orchestrator' as const,
+            projectId,
+            workerId,
+          }
         : workerId
           ? target.kind === 'coordination-node' && coordinationNode
             ? {
@@ -116,16 +121,22 @@ export function WorkerInterventions({
                 workerId,
               }
           : null
+  const capabilities = resolveRuntimeCapabilities(
+    snapshotCurrent,
+    runtime,
+    inventory,
+  )
+  const observed = capabilities.observedWorker
+  const current = observed ?? capabilities.observedPane
   const { openChat, openTerminal } = useAgentWorkspace()
   const [ghosttyBusy, setGhosttyBusy] = useState(false)
   const [ghosttyFeedback, setGhosttyFeedback] = useState<{
     command?: string
     message: string
-    state: 'launched' | 'fallback'
+    state: 'error' | 'launched' | 'fallback'
   } | null>(null)
-  if (!interactive) return null
 
-  if (!terminalTarget || !terminalId || !runtimeSession || !runtime) {
+  if (!runtime || !terminalTarget || !terminalId || !runtimeSession) {
     return null
   }
 
@@ -166,40 +177,59 @@ export function WorkerInterventions({
           ? 'Orchestrator'
           : assignment?.role ?? 'Worker'
   const workspaceTarget: Omit<AgentWorkspaceTarget, 'returnFocus'> = {
+    capabilityReason: capabilities.reason,
+    chatAvailable: capabilities.chat,
     contextLabel,
     cwd:
+      current?.foreground_cwd ??
+      current?.cwd ??
       coordinationNode?.cwd ??
       coordinationNode?.folder_path ??
       null,
     harness:
+      observed?.display_provider ??
+      current?.provider ??
       runtime.provider_session?.provider ??
       runtime.adapter,
+    interactive: capabilities.terminal,
     key: targetKey,
     label,
-    observation: 'durable',
-    paneId: runtime.pane_id,
+    observation:
+      capabilities.reason === 'stale'
+        ? 'stale'
+        : current
+          ? 'observed'
+          : 'durable',
+    paneId: observed?.pane_id ?? current?.runtime_id ?? runtime.pane_id,
     role,
     roleLabel,
     runtimeAdapter: runtime.adapter,
     session: runtimeSession,
-    status: status ?? 'unknown',
-    tabId: runtime.tab_id,
+    status: runtimeCapabilityStatus(runtime, capabilities),
+    tabId: current?.tab_id ?? runtime.tab_id,
     target,
     terminalId,
     terminalLeaseKey: terminalLeaseKey(target, runtime),
     terminalTarget,
-    workspaceId: runtime.workspace_id,
+    workspaceId: current?.workspace_id ?? runtime.workspace_id,
   }
 
-  const attachCommand =
-    runtimeSession && terminalId
-      ? ['herdr', '--session', runtimeSession, 'agent', 'attach', terminalId]
-          .map(shellQuote)
-          .join(' ')
-      : ''
+  const attachCommand = ['herdr', '--session', runtimeSession, 'agent', 'attach', terminalId]
+    .map(shellQuote)
+    .join(' ')
+  const capabilityLabel = runtimeCapabilityLabel(capabilities)
+  const capabilityDetail = runtimeCapabilityDetail(capabilities)
+  const lastKnownContext = [
+    `session ${runtimeSession}`,
+    `terminal ${terminalId}`,
+    `pane ${observed?.pane_id ?? current?.runtime_id ?? runtime.pane_id}`,
+    current?.foreground_cwd ?? current?.cwd ?? null,
+  ]
+    .filter(Boolean)
+    .join(' · ')
 
   const openGhostty = async () => {
-    if (!runtimeSession || !terminalId || ghosttyBusy) return
+    if (!capabilities.terminal || ghosttyBusy) return
     setGhosttyBusy(true)
     setGhosttyFeedback(null)
     try {
@@ -209,25 +239,82 @@ export function WorkerInterventions({
         state: 'launched',
       })
     } catch (caught) {
-      let copied = false
-      try {
-        await navigator.clipboard.writeText(attachCommand)
-        copied = true
-      } catch {
-        // The command remains visible when clipboard access is unavailable.
+      if (
+        caught instanceof YardApiError &&
+        caught.code === 'ghostty_unavailable'
+      ) {
+        let copied = false
+        try {
+          await navigator.clipboard.writeText(attachCommand)
+          copied = true
+        } catch {
+          // The validated command remains visible when clipboard access fails.
+        }
+        setGhosttyFeedback({
+          command: copied ? undefined : attachCommand,
+          message: copied
+            ? 'Ghostty is not available on the Yard host. Attach command copied.'
+            : caught.message,
+          state: 'fallback',
+        })
+      } else {
+        setGhosttyFeedback({
+          message:
+            caught instanceof Error
+              ? caught.message
+              : 'Ghostty could not be opened.',
+          state: 'error',
+        })
       }
-      setGhosttyFeedback({
-        command: copied ? undefined : attachCommand,
-        message: copied
-          ? 'Ghostty is not available on the Yard host. Attach command copied.'
-          : caught instanceof Error
-            ? caught.message
-            : 'Ghostty could not be opened.',
-        state: 'fallback',
-      })
     } finally {
       setGhosttyBusy(false)
     }
+  }
+
+  if (!capabilities.terminal && !capabilities.chat) {
+    return (
+      <section
+        aria-label="Agent controls"
+        className="intervention-section agent-controls"
+      >
+        <p className="eyebrow">Intervention</p>
+        <div className="awaiting-disposition" role="status">
+          <CircleAlert aria-hidden="true" size={16} />
+          <span>
+            <strong>Live controls unavailable</strong>
+            <small>
+              {capabilityLabel}. {capabilityDetail}
+            </small>
+          </span>
+        </div>
+        <div className="agent-control-launchers">
+          <div className="agent-control-launcher">
+            <span>
+              <SquareTerminal aria-hidden="true" size={17} />
+              <span>
+                <strong>Last known runtime</strong>
+                <small>{lastKnownContext}</small>
+              </span>
+            </span>
+          </div>
+        </div>
+        <div className="inspector-actions">
+          {onRefresh ? (
+            <button
+              className="secondary-button"
+              onClick={onRefresh}
+              type="button"
+            >
+              <RefreshCw aria-hidden="true" size={15} />
+              Refresh inventory
+            </button>
+          ) : null}
+        </div>
+        <p className="project-orchestrator-transfer-status" role="status">
+          Reattach becomes available after Yard sees one current matching terminal.
+        </p>
+      </section>
+    )
   }
 
   return (
@@ -247,21 +334,19 @@ export function WorkerInterventions({
               </span>
             </span>
             <div className="agent-control-actions">
-              {terminalTarget ? (
-                <button
-                  className="secondary-button"
-                  onClick={(event) =>
-                    openTerminal({
-                      ...workspaceTarget,
-                      returnFocus: event.currentTarget,
-                    })
-                  }
-                  type="button"
-                >
-                  <SquareTerminal aria-hidden="true" size={15} />
-                  Open terminal
-                </button>
-              ) : null}
+              <button
+                className="secondary-button"
+                onClick={(event) =>
+                  openTerminal({
+                    ...workspaceTarget,
+                    returnFocus: event.currentTarget,
+                  })
+                }
+                type="button"
+              >
+                <SquareTerminal aria-hidden="true" size={15} />
+                Open terminal
+              </button>
               <button
                 className="icon-button"
                 disabled={ghosttyBusy}
@@ -298,26 +383,31 @@ export function WorkerInterventions({
               <MessageSquareText aria-hidden="true" size={17} />
               <span>
                 <strong>Agent chat</strong>
-                <small>{status ?? 'unknown'} · {label}</small>
+                <small>{runtimeCapabilityStatus(runtime, capabilities)} · {label}</small>
               </span>
             </span>
-            <button
-              className="secondary-button"
-              onClick={(event) =>
-                openChat({
-                  ...workspaceTarget,
-                  returnFocus: event.currentTarget,
-                })
-              }
-              type="button"
-            >
-              <MessageSquareText aria-hidden="true" size={15} />
-              Open chat
-            </button>
+            {capabilities.chat ? (
+              <button
+                className="secondary-button"
+                onClick={(event) =>
+                  openChat({
+                    ...workspaceTarget,
+                    returnFocus: event.currentTarget,
+                  })
+                }
+                type="button"
+              >
+                <MessageSquareText aria-hidden="true" size={15} />
+                Open chat
+              </button>
+            ) : (
+              <span className="project-orchestrator-transfer-status" role="status">
+                {capabilityDetail}
+              </span>
+            )}
           </div>
         </div>
       </section>
-
     </>
   )
 }

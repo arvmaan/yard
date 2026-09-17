@@ -126,6 +126,16 @@ import {
 import { AgentWorkspaceShell } from './AgentWorkspaceShell'
 import { ProjectPulseWorkspace } from './ProjectPulseWorkspace'
 import {
+  resolveRuntimeCapabilities,
+  runtimeCapabilityDetail,
+  runtimeCapabilityLabel,
+  runtimeCapabilityObservationState,
+  runtimeCapabilityProcessState,
+  runtimeCapabilityStatus,
+  type ResolvedRuntimeCapabilities,
+  type RuntimeCapabilities,
+} from './runtimeCapabilities'
+import {
   CoordinationNodeDialog,
   type CoordinationNodeCreationDetails,
 } from './CoordinationNodeDialog'
@@ -292,7 +302,7 @@ const AVAILABILITY_LABELS = {
   assigned: 'Assigned',
   ended: 'Ended',
   orchestrator: 'Orchestrator',
-  resumable: 'Resumable',
+  resumable: 'Replacement ready',
   unavailable: 'Unavailable',
   unassigned_live: 'Unassigned live',
   yard_orchestrator: 'Superintendent',
@@ -383,51 +393,40 @@ function canDeleteCandidate(candidate: WorkerCandidate) {
 function allocationAction(candidate: WorkerCandidate) {
   if (canHandoffCandidate(candidate)) return 'Hand off worker'
   return candidate.availability === 'resumable'
-    ? 'Resume worker'
+    ? 'Replace runtime and assign'
     : 'Assign worker'
-}
-
-function findObservedWorker(
-  inventory: RuntimeInventory | null,
-  runtime: WorkerRuntimeBinding | null,
-) {
-  if (
-    !inventory ||
-    !runtime ||
-    inventory.adapter !== runtime.adapter ||
-    inventory.session !== runtime.session
-  ) {
-    return undefined
-  }
-
-  const matches = inventory.workers.filter(
-    (worker) => worker.terminal_id === runtime.terminal_id,
-  )
-  return matches.length === 1 ? matches[0] : undefined
 }
 
 function agentTargetRuntimeMetadata(
   runtime: WorkerRuntimeBinding,
-  observed: ObservedWorker | undefined,
+  capabilities: ResolvedRuntimeCapabilities,
   fallbackCwd: string | null = null,
 ) {
+  const observed = capabilities.observedWorker
+  const current = observed ?? capabilities.observedPane
   return {
+    capabilityReason: capabilities.reason,
+    chatAvailable: capabilities.chat,
     cwd:
-      observed?.foreground_cwd ??
-      observed?.cwd ??
+      current?.foreground_cwd ??
+      current?.cwd ??
       fallbackCwd,
     harness:
       observed?.display_provider ??
-      observed?.provider ??
+      current?.provider ??
       runtime.provider_session?.provider ??
       runtime.adapter,
-    observation: observed
-      ? ('observed' as const)
-      : ('durable' as const),
-    paneId: observed?.pane_id ?? runtime.pane_id,
+    interactive: capabilities.terminal,
+    observation:
+      capabilities.reason === 'stale'
+        ? ('stale' as const)
+        : current
+          ? ('observed' as const)
+          : ('durable' as const),
+    paneId: observed?.pane_id ?? current?.runtime_id ?? runtime.pane_id,
     runtimeAdapter: runtime.adapter,
-    status: observed?.status ?? runtime.status,
-    tabId: observed?.tab_id ?? runtime.tab_id,
+    status: runtimeCapabilityStatus(runtime, capabilities),
+    tabId: current?.tab_id ?? runtime.tab_id,
   }
 }
 
@@ -478,16 +477,15 @@ function projectOrchestratorTransferStatus(
 
 function resolvedRuntimeState(
   runtime: WorkerRuntimeBinding | null,
-  observed: ObservedWorker | undefined,
+  capabilities: ResolvedRuntimeCapabilities,
 ) {
   return {
-    observationState:
-      runtime?.observation_state ??
-      (observed ? ('observed' as const) : ('missing' as const)),
-    processState:
-      runtime?.process_state ??
-      (observed ? ('running' as const) : ('unknown' as const)),
-    status: observed?.status ?? runtime?.status ?? ('unknown' as const),
+    observationState: runtimeCapabilityObservationState(
+      capabilities,
+      runtime,
+    ),
+    processState: runtimeCapabilityProcessState(runtime, capabilities),
+    status: runtimeCapabilityStatus(runtime, capabilities),
   }
 }
 
@@ -577,36 +575,61 @@ function ProcessStateBadge({ state }: { state: RuntimeProcessState }) {
   )
 }
 
-function ObservationStateBadge({ state }: { state: RuntimeObservationState }) {
+function ObservationStateBadge({
+  capabilities,
+  state,
+}: {
+  capabilities: RuntimeCapabilities
+  state: RuntimeObservationState
+}) {
   const Icon = OBSERVATION_ICONS[state]
+  const label = runtimeCapabilityLabel(capabilities)
+  const detail = runtimeCapabilityDetail(capabilities)
   return (
     <span
-      aria-label={`Observation state: ${state}`}
+      aria-label={detail ? `${label}. ${detail}` : `Observation state: ${state}`}
       className="observation-state-badge"
-      data-observation-state={state}
+      data-observation-state={
+        capabilities.reason === 'stale' ? 'stale' : state
+      }
+      title={detail}
     >
       <Icon aria-hidden="true" size={14} />
-      {state}
+      {label}
     </span>
   )
 }
 
 function RuntimeStateSummary({
-  observed,
+  inventory,
   runtime,
+  snapshotCurrent,
 }: {
-  observed: ObservedWorker | undefined
+  inventory: RuntimeInventory | null
   runtime: WorkerRuntimeBinding | null
+  snapshotCurrent: boolean
 }) {
-  const { observationState, processState, status } = resolvedRuntimeState(
+  const capabilities = resolveRuntimeCapabilities(
+    snapshotCurrent,
     runtime,
-    observed,
+    inventory,
+  )
+  const { processState, status } = resolvedRuntimeState(
+    runtime,
+    capabilities,
+  )
+  const currentObservationState = runtimeCapabilityObservationState(
+    capabilities,
+    runtime,
   )
 
   return (
     <dl
       className="runtime-state-summary"
-      data-current-observation={Boolean(observed)}
+      data-current-observation={
+        snapshotCurrent &&
+        Boolean(capabilities.observedWorker || capabilities.observedPane)
+      }
     >
       <div>
         <dt>Observed status</dt>
@@ -623,7 +646,10 @@ function RuntimeStateSummary({
       <div>
         <dt>Observation</dt>
         <dd>
-          <ObservationStateBadge state={observationState} />
+          <ObservationStateBadge
+            capabilities={capabilities}
+            state={currentObservationState}
+          />
         </dd>
       </div>
     </dl>
@@ -667,7 +693,7 @@ function ObservedWorkerInspector({ worker }: { worker: ObservedWorker }) {
         <DetailRow label="Pane" value={worker.pane_id} mono />
         <DetailRow label="Working directory" value={worker.cwd} mono />
         <DetailRow
-          label="Interactive"
+          label="Launch readiness"
           value={worker.interactive_ready ? 'Ready' : 'Not ready'}
         />
         <DetailRow
@@ -728,20 +754,24 @@ function WorkerCandidateInspector({
   activeAssignment,
   candidate,
   completedAssignment,
-  observed,
+  inventory,
   onAllocate,
   onDelete,
   onEndSession,
+  onRefresh,
   projects,
+  snapshotCurrent,
 }: {
   activeAssignment: Assignment | undefined
   candidate: WorkerCandidate
   completedAssignment: Assignment | undefined
-  observed: ObservedWorker | undefined
+  inventory: RuntimeInventory | null
   onAllocate: (project: Project) => void
   onDelete: () => void
   onEndSession: () => void
+  onRefresh: () => void
   projects: Project[]
+  snapshotCurrent: boolean
 }) {
   const [projectId, setProjectId] = useState(projects[0]?.id ?? '')
   const isHandoff = canHandoffCandidate(candidate)
@@ -759,6 +789,13 @@ function WorkerCandidateInspector({
   const project = eligibleProjects.find(
     (candidate) => candidate.id === projectId,
   )
+  const capabilities = resolveRuntimeCapabilities(
+    snapshotCurrent,
+    candidate.worker.runtime,
+    inventory,
+  )
+  const observed = capabilities.observedWorker
+  const current = observed ?? capabilities.observedPane
   const AvailabilityIcon = AVAILABILITY_ICONS[candidate.availability]
 
   return (
@@ -783,14 +820,18 @@ function WorkerCandidateInspector({
         {AVAILABILITY_LABELS[candidate.availability]}
       </span>
       <RuntimeStateSummary
-        observed={observed}
+        inventory={inventory}
         runtime={candidate.worker.runtime}
+        snapshotCurrent={snapshotCurrent}
       />
       <dl className="detail-list">
         <DetailRow label="Worker ID" value={candidate.worker.id} mono />
         <DetailRow label="Profile" value={candidate.profile_name} />
         <DetailRow label="Default role" value={candidate.default_role} />
-        <DetailRow label="Provider" value={observed?.provider} />
+        <DetailRow
+          label="Provider"
+          value={observed?.provider ?? current?.provider}
+        />
         <DetailRow label="Project ID" value={candidate.project_id} mono />
         <DetailRow
           label="Assignment"
@@ -832,11 +873,9 @@ function WorkerCandidateInspector({
             activeAssignment.worker.runtime?.pane_id,
             activeAssignment.worker.runtime?.provider_session?.value,
           ].join(':')}
-          status={
-            observed?.status ??
-            activeAssignment.worker.runtime?.status ??
-            'unknown'
-          }
+          inventory={inventory}
+          onRefresh={onRefresh}
+          snapshotCurrent={snapshotCurrent}
           target={{ kind: 'assignment', assignment: activeAssignment }}
         />
       ) : null}
@@ -920,22 +959,26 @@ function YardOrchestratorInspector({
   onCoordinationChange,
   onProvision,
   onRecover,
+  onRefresh,
   orchestrator,
   profiles,
   projects,
   routes,
   sessionRunning,
+  snapshotCurrent,
 }: {
   busy: boolean
   inventory: RuntimeInventory | null
   onCoordinationChange: (route: YardOrchestratorRoute) => void
   onProvision: (profile: WorkerProfile) => void
   onRecover: () => void
+  onRefresh: () => void
   orchestrator: YardOrchestrator
   profiles: WorkerProfile[]
   projects: Project[]
   routes: YardOrchestratorRoute[]
   sessionRunning: boolean | undefined
+  snapshotCurrent: boolean
 }) {
   const eligibleProfiles = profiles.filter(
     (profile) => profile.runtime_adapter === 'herdr',
@@ -945,8 +988,15 @@ function YardOrchestratorInspector({
     eligibleProfiles[0]
   const [profileId, setProfileId] = useState(preferredProfile?.id ?? '')
   const worker = orchestrator.worker
-  const observed = findObservedWorker(inventory, worker?.runtime ?? null)
-  const runtimeState = resolvedRuntimeState(worker?.runtime ?? null, observed)
+  const capabilities = resolveRuntimeCapabilities(
+    snapshotCurrent,
+    worker?.runtime ?? null,
+    inventory,
+  )
+  const runtimeState = resolvedRuntimeState(
+    worker?.runtime ?? null,
+    capabilities,
+  )
   const isDedicated =
     worker?.runtime?.session === 'yard-orchestrator'
   const sessionStopped = isDedicated && sessionRunning === false
@@ -1036,9 +1086,11 @@ function YardOrchestratorInspector({
                 worker.runtime?.pane_id,
               ].join(':')}
               onCoordinationChange={onCoordinationChange}
+              onRefresh={onRefresh}
+              inventory={inventory}
               projects={projects}
               routes={routes}
-              status={runtimeState.status}
+              snapshotCurrent={snapshotCurrent}
               target={{ kind: 'yard-orchestrator', orchestrator }}
             />
           )}
@@ -1266,6 +1318,7 @@ function ProjectOrchestratorInspector({
   inventoryError,
   inventoryLoading,
   onChange,
+  onRefresh,
   project,
   statusReport,
 }: {
@@ -1275,19 +1328,20 @@ function ProjectOrchestratorInspector({
   inventoryError: string | null
   inventoryLoading: boolean
   onChange: (trigger: HTMLButtonElement) => void
+  onRefresh: () => void
   project: Project
   statusReport: StatusReport | undefined
 }) {
   const runtime = project.orchestrator.runtime
-  const observed = findObservedWorker(inventory, runtime)
-  const runtimeState = resolvedRuntimeState(runtime, observed)
-  const transferStatusId = `project-orchestrator-transfer-status-${project.id}`
-  const transferStatus = projectOrchestratorTransferStatus(
-    project,
-    eligibilityReason,
-    inventoryLoading,
-    inventoryError,
+  const snapshotCurrent = Boolean(inventory && !inventoryError)
+  const capabilities = resolveRuntimeCapabilities(
+    snapshotCurrent,
+    runtime,
+    inventory,
   )
+  const observed = capabilities.observedWorker
+  const runtimeState = resolvedRuntimeState(runtime, capabilities)
+  const transferStatusId = `project-orchestrator-transfer-status-${project.id}`
 
   return (
     <>
@@ -1308,7 +1362,11 @@ function ProjectOrchestratorInspector({
         className="durable-runtime-section"
       >
         <p className="eyebrow">Orchestrator runtime</p>
-        <RuntimeStateSummary observed={observed} runtime={runtime} />
+        <RuntimeStateSummary
+          inventory={inventory}
+          runtime={runtime}
+          snapshotCurrent={snapshotCurrent}
+        />
         <dl className="detail-list">
           <DetailRow
             label="Worker"
@@ -1334,7 +1392,12 @@ function ProjectOrchestratorInspector({
           role="status"
           tabIndex={candidates.length === 0 ? 0 : undefined}
         >
-          {transferStatus}
+          {projectOrchestratorTransferStatus(
+            project,
+            eligibilityReason,
+            inventoryLoading,
+            inventoryError,
+          )}
         </p>
       </section>
       <WorkerInterventions
@@ -1344,7 +1407,9 @@ function ProjectOrchestratorInspector({
           runtime?.terminal_id,
           runtime?.pane_id,
         ].join(':')}
-        status={runtimeState.status}
+        inventory={inventory}
+        onRefresh={onRefresh}
+        snapshotCurrent={snapshotCurrent}
         target={{ kind: 'orchestrator', project }}
       />
     </>
@@ -1358,9 +1423,11 @@ function ProjectInspector({
   onArchive,
   onDelete,
   onDisconnect,
+  onRefresh,
   project,
   projects,
   relationships,
+  snapshotCurrent,
   statusReport,
 }: {
   accent: string
@@ -1369,9 +1436,11 @@ function ProjectInspector({
   onArchive: (trigger: HTMLButtonElement) => void
   onDelete: (trigger: HTMLButtonElement) => void
   onDisconnect: (relationship: ProjectRelationship) => void
+  onRefresh: () => void
   project: Project
   projects: Project[]
   relationships: ProjectRelationship[]
+  snapshotCurrent: boolean
   statusReport: StatusReport | undefined
 }) {
   const runtimeMatches =
@@ -1384,10 +1453,15 @@ function ProjectInspector({
         )
     : undefined
   const orchestratorRuntime = project.orchestrator.runtime
-  const orchestrator = findObservedWorker(inventory, orchestratorRuntime)
+  const orchestratorCapabilities = resolveRuntimeCapabilities(
+    snapshotCurrent,
+    orchestratorRuntime,
+    inventory,
+  )
+  const orchestrator = orchestratorCapabilities.observedWorker
   const orchestratorState = resolvedRuntimeState(
     orchestratorRuntime,
-    orchestrator,
+    orchestratorCapabilities,
   )
 
   return (
@@ -1495,8 +1569,9 @@ function ProjectInspector({
       >
         <p className="eyebrow">Orchestrator runtime</p>
         <RuntimeStateSummary
-          observed={orchestrator}
+          inventory={inventory}
           runtime={orchestratorRuntime}
+          snapshotCurrent={snapshotCurrent}
         />
         <dl className="detail-list">
           <DetailRow
@@ -1533,7 +1608,9 @@ function ProjectInspector({
           orchestratorRuntime?.pane_id,
           orchestratorRuntime?.provider_session?.value,
         ].join(':')}
-        status={orchestratorState.status}
+        inventory={inventory}
+        onRefresh={onRefresh}
+        snapshotCurrent={snapshotCurrent}
         target={{ kind: 'orchestrator', project }}
       />
       <div className="inspector-actions disposition-actions">
@@ -1643,18 +1720,26 @@ function AssignmentInspector({
   onDelete,
   onEndSession,
   onRecordCompletion,
+  onRefresh,
+  snapshotCurrent,
 }: {
   assignment: Assignment
   inventory: RuntimeInventory | null
   onDelete?: () => void
   onEndSession?: () => void
   onRecordCompletion: () => void
+  onRefresh: () => void
+  snapshotCurrent: boolean
 }) {
   const [selectedArtifact, setSelectedArtifact] = useState<Artifact | null>(null)
   const artifactTrigger = useRef<HTMLButtonElement | null>(null)
   const runtime = assignment.worker.runtime
-  const observed = findObservedWorker(inventory, runtime)
-  const { status } = resolvedRuntimeState(runtime, observed)
+  const capabilities = resolveRuntimeCapabilities(
+    snapshotCurrent,
+    runtime,
+    inventory,
+  )
+  const { status } = resolvedRuntimeState(runtime, capabilities)
   const receipt = assignment.completion_receipt
 
   return (
@@ -1669,7 +1754,11 @@ function AssignmentInspector({
         </div>
       </div>
       <span className="runtime-badge">{assignment.lifecycle}</span>
-      <RuntimeStateSummary observed={observed} runtime={runtime} />
+      <RuntimeStateSummary
+        inventory={inventory}
+        runtime={runtime}
+        snapshotCurrent={snapshotCurrent}
+      />
       <dl className="detail-list">
         <DetailRow label="Role" value={assignment.role} />
         <DetailRow label="Objective" value={assignment.objective} />
@@ -1700,7 +1789,9 @@ function AssignmentInspector({
           runtime?.pane_id,
           runtime?.provider_session?.value,
         ].join(':')}
-        status={status}
+        inventory={inventory}
+        onRefresh={onRefresh}
+        snapshotCurrent={snapshotCurrent}
         target={{ kind: 'assignment', assignment }}
       />
       {assignment.lifecycle === 'active' && status === 'done' ? (
@@ -2241,6 +2332,7 @@ function App() {
   const [sessions, setSessions] = useState<RuntimeSession[]>([])
   const [selectedSession, setSelectedSession] = useState('')
   const [inventory, setInventory] = useState<RuntimeInventory | null>(null)
+  const [inventoryCurrent, setInventoryCurrent] = useState(false)
   const [runtimeTopology, setRuntimeTopology] =
     useState<RuntimeTopology | null>(null)
   const [projectTransferContexts, setProjectTransferContexts] = useState<
@@ -2598,11 +2690,13 @@ function App() {
     ) => {
       if (!session) {
         setInventory(null)
+        setInventoryCurrent(false)
         setRuntimeTopology(null)
         return
       }
       if (!background) {
         setRuntimeLoading(true)
+        setInventoryCurrent(false)
         setInventory((current) =>
           current?.session === session ? current : null,
         )
@@ -2624,18 +2718,32 @@ function App() {
         )
       }
       try {
-        const [result, topology] = await Promise.all([
-          fetchInventory(session, signal),
-          fetchRuntimeTopology(session, signal),
-        ])
+        const result = await fetchInventory(session, signal)
         setInventory((current) => reconcileInventorySnapshot(current, result))
-        setRuntimeTopology(topology)
-        await Promise.all([loadWorkers(signal), loadYardOrchestrator(signal)])
+        setInventoryCurrent(true)
         setRuntimeError(null)
+        try {
+          const topology = await fetchRuntimeTopology(session, signal)
+          setRuntimeTopology(topology)
+          await Promise.all([
+            loadWorkers(signal),
+            loadYardOrchestrator(signal),
+          ])
+        } catch (caught) {
+          if (caught instanceof DOMException && caught.name === 'AbortError') {
+            return
+          }
+          setRuntimeError(
+            caught instanceof Error
+              ? caught.message
+              : 'Runtime projection refresh failed',
+          )
+        }
       } catch (caught) {
         if (caught instanceof DOMException && caught.name === 'AbortError') {
           return
         }
+        setInventoryCurrent(false)
         setRuntimeError(
           caught instanceof Error ? caught.message : 'Inventory request failed',
         )
@@ -3153,10 +3261,6 @@ function App() {
             selectedObservedWorker,
           )
         : undefined
-  const selectedCandidateObservation = findObservedWorker(
-    inventory,
-    selectedWorkerCandidate?.worker.runtime ?? null,
-  )
   const selectedWorkspace =
     selection?.kind === 'workspace'
       ? inventory?.workspaces.find(
@@ -3288,9 +3392,10 @@ function App() {
         const project = projects.find(
           (candidate) => candidate.id === assignment.project_id,
         )
-        const observed = findObservedWorker(
-          inventory,
+        const capabilities = resolveRuntimeCapabilities(
+          inventoryCurrent,
           assignment.worker.runtime,
+          inventory,
         )
         return [
           {
@@ -3298,10 +3403,10 @@ function App() {
             kind: 'assignment',
             label: assignment.profile_name,
             projectName: project?.name ?? 'Yard project',
-            status:
-              observed?.status ??
-              assignment.worker.runtime?.status ??
-              'unknown',
+            status: runtimeCapabilityStatus(
+              assignment.worker.runtime,
+              capabilities,
+            ),
           },
         ]
       }
@@ -3309,23 +3414,24 @@ function App() {
         (candidate) => candidate.id === target.projectId,
       )
       if (!project) return []
-      const observed = findObservedWorker(
-        inventory,
+      const capabilities = resolveRuntimeCapabilities(
+        inventoryCurrent,
         project.orchestrator.runtime,
+        inventory,
       )
       return [
         {
           kind: 'orchestrator',
           label: `${project.name} orchestrator`,
           project,
-          status:
-            observed?.status ??
-            project.orchestrator.runtime?.status ??
-            'unknown',
+          status: runtimeCapabilityStatus(
+            project.orchestrator.runtime,
+            capabilities,
+          ),
         },
       ]
     })
-  }, [assignments, inventory, projects, selection])
+  }, [assignments, inventory, inventoryCurrent, projects, selection])
   const selectedCandidateCompletion = selectedWorkerCandidate
     ? assignments
         .filter(
@@ -3466,18 +3572,8 @@ function App() {
     : []
   const agentWorkspaceTargets = useMemo<AgentWorkspaceTarget[]>(() => {
     const targets: AgentWorkspaceTarget[] = []
-    const observedWorkers = new Map<string, ObservedWorker | null>()
-    inventory?.workers.forEach((worker) => {
-      observedWorkers.set(
-        worker.terminal_id,
-        observedWorkers.has(worker.terminal_id) ? null : worker,
-      )
-    })
-    const observedForRuntime = (runtime: WorkerRuntimeBinding) =>
-      inventory?.adapter === runtime.adapter &&
-      inventory.session === runtime.session
-        ? observedWorkers.get(runtime.terminal_id) ?? undefined
-        : undefined
+    const capabilitiesForRuntime = (runtime: WorkerRuntimeBinding) =>
+      resolveRuntimeCapabilities(inventoryCurrent, runtime, inventory)
     const projectNames = new Map(
       projects.map((project) => [project.id, project.name]),
     )
@@ -3487,7 +3583,7 @@ function App() {
       targets.push({
         ...agentTargetRuntimeMetadata(
           yardRuntime,
-          observedForRuntime(yardRuntime),
+          capabilitiesForRuntime(yardRuntime),
         ),
         contextLabel: 'Yard portfolio',
         key: 'yard-orchestrator',
@@ -3519,7 +3615,7 @@ function App() {
       targets.push({
         ...agentTargetRuntimeMetadata(
           runtime,
-          observedForRuntime(runtime),
+          capabilitiesForRuntime(runtime),
           node.cwd ?? node.folder_path,
         ),
         contextLabel:
@@ -3550,7 +3646,7 @@ function App() {
       targets.push({
         ...agentTargetRuntimeMetadata(
           runtime,
-          observedForRuntime(runtime),
+          capabilitiesForRuntime(runtime),
         ),
         contextLabel: project.name,
         key: `orchestrator:${project.id}`,
@@ -3579,7 +3675,7 @@ function App() {
       targets.push({
         ...agentTargetRuntimeMetadata(
           runtime,
-          observedForRuntime(runtime),
+          capabilitiesForRuntime(runtime),
         ),
         contextLabel:
           projectNames.get(assignment.project_id) ?? 'Yard project',
@@ -3607,6 +3703,7 @@ function App() {
     assignments,
     coordinationNodes,
     inventory,
+    inventoryCurrent,
     projects,
     yardOrchestrator,
   ])
@@ -3620,13 +3717,15 @@ function App() {
         ...currentAgentWorkspaceTarget,
         returnFocus: agentWorkspaceTarget?.returnFocus,
       }
-    : agentWorkspaceTarget ?? agentWorkspaceTargets[0] ?? null
+    : agentWorkspaceTargets[0] ?? null
   const openAgentChat = useCallback((target: AgentWorkspaceTarget) => {
+    if (!target.chatAvailable) return
     setAgentWorkspaceTarget(target)
     setAgentWorkspaceMode('chat')
   }, [])
   const openAgentTerminal = useCallback(
     (target: AgentWorkspaceTarget) => {
+      if (!target.interactive) return
       setAgentWorkspaceTarget(target)
       setTerminalPresentation(DEFAULT_TERMINAL_PRESENTATION)
       setAgentWorkspaceMode('terminal')
@@ -5552,11 +5651,25 @@ function App() {
     <AgentWorkspaceContext.Provider value={agentWorkspaceContext}>
       <div className="app-shell" data-shelf-open={resourceShelfOpen}>
         <GlobalCommandBar
+          activeAgentWorkspaceChat={Boolean(
+            activeAgentWorkspaceTarget?.chatAvailable,
+          )}
+          activeAgentWorkspaceTerminal={Boolean(
+            activeAgentWorkspaceTarget?.interactive,
+          )}
           activeAgentWorkspaceTarget={Boolean(activeAgentWorkspaceTarget)}
           agentWorkspaceMode={agentWorkspaceMode}
           busy={runtimeLoading || projectLoading}
           health={runtimeHealth}
           onAgentWorkspaceModeChange={(mode) => {
+            if (
+              (mode === 'chat' &&
+                !activeAgentWorkspaceTarget?.chatAvailable) ||
+              (mode === 'terminal' &&
+                !activeAgentWorkspaceTarget?.interactive)
+            ) {
+              return
+            }
             if (mode === 'terminal') {
               setTerminalPresentation(DEFAULT_TERMINAL_PRESENTATION)
             }
@@ -5695,13 +5808,15 @@ function App() {
             </div>
             <div className="resource-list worker-list">
               {visibleCandidates.map((candidate) => {
-                const observed = findObservedWorker(
-                  inventory,
+                const capabilities = resolveRuntimeCapabilities(
+                  inventoryCurrent,
                   candidate.worker.runtime,
+                  inventory,
                 )
+                const observed = capabilities.observedWorker
                 const runtimeState = resolvedRuntimeState(
                   candidate.worker.runtime,
-                  observed,
+                  capabilities,
                 )
                 const StatusIcon = STATUS_ICONS[runtimeState.status]
                 const draggable =
@@ -5954,6 +6069,7 @@ function App() {
             onCoordinationChange={recordYardRoute}
             onProvision={provisionCentralOrchestrator}
             onRecover={() => void recoverCentralOrchestrator()}
+            onRefresh={() => void refresh()}
             orchestrator={selectedYardOrchestrator}
             profiles={profiles}
             projects={projects}
@@ -5963,10 +6079,12 @@ function App() {
                 (session) => session.name === 'yard-orchestrator',
               )?.running
             }
+            snapshotCurrent={inventoryCurrent}
           />
         ) : selectedCoordinationNode ? (
           <CoordinationNodeInspector
             busy={coordinationNodeBusy}
+            inventory={inventory}
             node={selectedCoordinationNode}
             onProvision={(node, profile) =>
               void provisionMapNode(node, profile)
@@ -5981,6 +6099,7 @@ function App() {
             routes={coordinationNodeRoutes.filter(
               (route) => route.node_id === selectedCoordinationNode.id,
             )}
+            snapshotCurrent={inventoryCurrent}
             snapshots={
               coordinationSnapshots[selectedCoordinationNode.id] ?? []
             }
@@ -6005,6 +6124,7 @@ function App() {
                 trigger,
               )
             }
+            onRefresh={() => void refresh()}
             project={
               selectedProjectOrchestratorContextProject ??
               selectedProjectOrchestrator
@@ -6029,6 +6149,7 @@ function App() {
             onDisconnect={(relationship) =>
               void disconnectProjects(relationship)
             }
+            onRefresh={() => void refresh()}
             project={selectedProject}
             projects={projects}
             relationships={projectRelationships.filter(
@@ -6036,6 +6157,7 @@ function App() {
                 relationship.source_project_id === selectedProject.id ||
                 relationship.target_project_id === selectedProject.id,
             )}
+            snapshotCurrent={inventoryCurrent}
             statusReport={projectStatusReports[selectedProject.id]}
           />
         ) : selectedAssignment ? (
@@ -6060,6 +6182,8 @@ function App() {
                 commandId: crypto.randomUUID(),
               })
             }
+            onRefresh={() => void refresh()}
+            snapshotCurrent={inventoryCurrent}
           />
         ) : selectedProfile ? (
           <ProfileInspector
@@ -6078,7 +6202,7 @@ function App() {
             activeAssignment={selectedCandidateActiveAssignment}
             candidate={selectedWorkerCandidate}
             completedAssignment={selectedCandidateCompletion}
-            observed={selectedCandidateObservation}
+            inventory={inventory}
             onAllocate={(project) =>
               proposeAllocation(
                 { kind: 'worker', id: selectedWorkerCandidate.worker.id },
@@ -6091,7 +6215,9 @@ function App() {
             onDelete={() =>
               proposeWorkerDelete(selectedWorkerCandidate)
             }
+            onRefresh={() => void refresh()}
             projects={projects}
+            snapshotCurrent={inventoryCurrent}
           />
         ) : selectedObservedWorker ? (
           <ObservedWorkerInspector worker={selectedObservedWorker} />
@@ -6169,18 +6295,25 @@ function App() {
           onCoordinationNodeChange={recordCoordinationNodeRoute}
           onModeChange={setAgentWorkspaceMode}
           onPresentationChange={setTerminalPresentation}
+          onRefresh={() => void refresh()}
           onTargetChange={(target) => {
+            if (!target.interactive) return
             setAgentWorkspaceTarget({
               ...target,
               returnFocus: activeAgentWorkspaceTarget.returnFocus,
             })
             setTerminalPresentation(DEFAULT_TERMINAL_PRESENTATION)
             setAgentWorkspaceMode((current) =>
-              current === 'changes' ? 'changes' : 'terminal',
+              current === 'changes'
+                ? 'changes'
+                : current === 'chat' && target.chatAvailable
+                  ? 'chat'
+                  : 'terminal',
             )
           }}
           presentation={terminalPresentation}
           inventory={inventory}
+          inventoryCurrent={inventoryCurrent}
           projects={projects}
           sessions={sessions}
           targets={agentWorkspaceTargets}

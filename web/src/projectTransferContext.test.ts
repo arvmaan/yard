@@ -77,6 +77,28 @@ describe('project transfer context refresh state', () => {
     expect(resolved.snapshot).toBeNull()
   })
 
+  it('keeps a failed snapshot non-current while a retry is in flight', () => {
+    let entry = beginProjectTransferRefresh(
+      emptyProjectTransferContext(),
+      1,
+    )
+    entry = resolveProjectTransferRefresh(
+      entry,
+      1,
+      snapshot(300),
+    ).entry
+    entry = beginProjectTransferRefresh(entry, 2)
+    entry = failProjectTransferRefresh(entry, 2, 'refresh failed')
+    entry = beginProjectTransferRefresh(entry, 3)
+
+    expect(entry).toMatchObject({
+      error: 'refresh failed',
+      generation: 3,
+      loading: true,
+    })
+    expect(entry.snapshot?.inventory.observed_at_unix_ms).toBe(300)
+  })
+
   it('accepts an equal observation after rejecting a lower timestamp', () => {
     let entry = beginProjectTransferRefresh(
       emptyProjectTransferContext(),

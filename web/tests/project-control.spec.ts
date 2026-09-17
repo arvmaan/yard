@@ -27,11 +27,14 @@ import type {
   CreateWorkspaceProjectFromProfileInput,
   EndWorkerSessionInput,
   ObservedChildAgent,
+  ObservedStatus,
+  ObservedWorker,
   OrchestratorWorkflowProfile,
   ProjectRelationship,
   ProvisionYardOrchestratorInput,
   RecoverYardOrchestratorInput,
   ResetOrchestratorWorkflowProfileInput,
+  RuntimeInventory,
   RuntimeTopology,
   ProvisionCoordinationNodeInput,
   RecordCompletionReceiptInput,
@@ -82,7 +85,11 @@ const sessions = {
 const factoryWorkflowInstructions =
   '# Yard Orchestrator Workflow\n\nCreate one Yard/Herdr worker per lane and monitor every 10 minutes.\n'
 
-function worker(index: number, workspaceId: string, status = 'idle') {
+function worker(
+  index: number,
+  workspaceId: string,
+  status: ObservedStatus = 'idle',
+): ObservedWorker {
   return {
     runtime_id: `terminal-${index}`,
     terminal_id: `terminal-${index}`,
@@ -137,7 +144,7 @@ const workers = [
   worker(9, 'workspace-4'),
 ]
 
-const inventory = {
+const inventory: RuntimeInventory = {
   adapter: 'herdr',
   session: 'alpha',
   runtime_version: '0.8.0',
@@ -435,6 +442,7 @@ interface MockState {
   profiles: ReturnType<typeof profile>[]
   workerCandidates: WorkerCandidate[]
   workerRequests: number
+  workerFailure: boolean
   assignments: Assignment[]
   runtimeInventory: typeof inventory
   runtimeTopology: RuntimeTopology
@@ -648,7 +656,12 @@ async function mockApi(
     terminalOutputText?: string | ((readCount: number) => string)
     terminalOutputTruncated?: boolean
     yardStatusReport?: unknown
-    ghosttyFails?: boolean
+    ghosttyError?:
+      | 'ghostty_launch_failed'
+      | 'ghostty_unavailable'
+      | 'terminal_ambiguous'
+      | 'terminal_not_found'
+      | 'terminal_not_ready'
   } = {},
 ) {
   const initialProjectState = initialProjects()
@@ -729,6 +742,7 @@ async function mockApi(
       initialProfileState,
     ),
     workerRequests: 0,
+    workerFailure: false,
     assignments: [],
     runtimeInventory: {
       ...inventory,
@@ -1107,6 +1121,18 @@ async function mockApi(
         version: String(Number(current.version) + 1),
         updated_at_unix_ms: Date.now(),
       }
+      observeInteractiveWorker(state, node.worker!)
+      if (
+        !state.runtimeSessions.some(
+          (session) => session.name === 'yard-coordination',
+        )
+      ) {
+        state.runtimeSessions.push({
+          name: 'yard-coordination',
+          is_default: false,
+          running: true,
+        })
+      }
       state.coordinationNodes[index] = node
       await route.fulfill({
         json: { command_id: input.command_id, node, replayed: false },
@@ -1248,6 +1274,18 @@ async function mockApi(
     if (route.request().method() === 'GET') {
       state.workerRequests += 1
       state.requestLog.push('workers')
+      if (state.workerFailure) {
+        await route.fulfill({
+          status: 502,
+          json: {
+            error: {
+              code: 'worker_refresh_failed',
+              message: 'Synthetic worker refresh failure',
+            },
+          },
+        })
+        return
+      }
       await route.fulfill({ json: { workers: state.workerCandidates } })
       return
     }
@@ -1390,6 +1428,7 @@ async function mockApi(
           running: true,
         })
       }
+      observeInteractiveWorker(state, state.yardOrchestrator.worker)
       await route.fulfill({
         json: {
           command_id: input.command_id,
@@ -1440,6 +1479,7 @@ async function mockApi(
         created_at_unix_ms: state.yardOrchestrator.created_at_unix_ms,
         updated_at_unix_ms: Date.now(),
       }
+      observeInteractiveWorker(state, claimedWorker)
       const yardSession = state.runtimeSessions.find(
         (candidate) => candidate.name === 'yard-orchestrator',
       )
@@ -3274,13 +3314,20 @@ async function mockApi(
       const session = decodeURIComponent(path.split('/').at(-4) ?? '')
       const terminalId = decodeURIComponent(path.split('/').at(-2) ?? '')
       state.ghosttyRequests.push({ session, terminalId })
-      if (options.ghosttyFails) {
+      if (options.ghosttyError) {
+        const status = {
+          ghostty_launch_failed: 502,
+          ghostty_unavailable: 503,
+          terminal_ambiguous: 409,
+          terminal_not_found: 404,
+          terminal_not_ready: 409,
+        }[options.ghosttyError]
         await route.fulfill({
-          status: 503,
+          status,
           json: {
             error: {
-              code: 'ghostty_unavailable',
-              message: 'Synthetic Ghostty unavailable',
+              code: options.ghosttyError,
+              message: `Synthetic ${options.ghosttyError}`,
             },
           },
         })
@@ -3692,7 +3739,94 @@ function seedActiveAssignment(
     'implementer',
   )
   state.assignments.push(seeded)
+  observeInteractiveWorker(state, seeded.worker)
   return seeded
+}
+
+function observeInteractiveWorker(
+  state: MockState,
+  durable: Worker,
+  overrides: Partial<ReturnType<typeof worker>> = {},
+) {
+  const runtime = durable.runtime
+  if (!runtime) throw new Error('Observed worker fixture needs a runtime')
+  const observed = {
+    ...worker(
+      100 + state.runtimeInventory.workers.length,
+      runtime.workspace_id,
+      runtime.status,
+    ),
+    runtime_id: runtime.terminal_id,
+    terminal_id: runtime.terminal_id,
+    workspace_id: runtime.workspace_id,
+    tab_id:
+      runtime.tab_id ??
+      `${runtime.workspace_id}:tab-${runtime.terminal_id}`,
+    pane_id:
+      runtime.pane_id ??
+      `${runtime.workspace_id}:pane-${runtime.terminal_id}`,
+    provider_session: runtime.provider_session
+      ? { ...runtime.provider_session }
+      : null,
+    ...overrides,
+    interactive_ready: overrides.interactive_ready ?? true,
+  }
+  state.runtimeInventory.workers =
+    state.runtimeInventory.workers.filter(
+      (candidate) => candidate.terminal_id !== runtime.terminal_id,
+    )
+  state.runtimeInventory.workers.push(observed)
+  return observed
+}
+
+function observedWorkerForRuntime(
+  state: MockState,
+  runtime: WorkerRuntimeBinding | null | undefined,
+) {
+  if (!runtime) throw new Error('Observed worker fixture is missing a runtime')
+  const observed = state.runtimeInventory.workers.find(
+    (candidate) => candidate.terminal_id === runtime.terminal_id,
+  )
+  if (!observed) throw new Error('Observed worker fixture is missing')
+  return observed
+}
+
+function retainTopologyWithoutObservedWorker(
+  state: MockState,
+  durable: Worker,
+) {
+  const runtime = durable.runtime
+  if (!runtime) throw new Error('Exited worker fixture needs a runtime')
+  const observed = observedWorkerForRuntime(state, runtime)
+  state.runtimeInventory.tabs.push({
+    runtime_id: observed.tab_id,
+    workspace_id: observed.workspace_id,
+    order: state.runtimeInventory.tabs.length,
+    label: observed.name ?? observed.terminal_id,
+    focused: observed.focused,
+    pane_count: 1,
+    status: observed.status,
+  })
+  state.runtimeInventory.panes.push({
+    runtime_id: observed.pane_id,
+    terminal_id: observed.terminal_id,
+    workspace_id: observed.workspace_id,
+    tab_id: observed.tab_id,
+    focused: observed.focused,
+    cwd: observed.cwd,
+    foreground_cwd: observed.foreground_cwd,
+    label: observed.name,
+    provider: observed.provider,
+    display_provider: observed.display_provider,
+    status: observed.status,
+    tokens: observed.tokens,
+    provider_session: observed.provider_session,
+    revision: observed.revision,
+  })
+  state.runtimeInventory.workers =
+    state.runtimeInventory.workers.filter(
+      (candidate) => candidate.terminal_id !== runtime.terminal_id,
+    )
 }
 
 function codexTranscript({
@@ -3730,7 +3864,12 @@ function seedAssignedCandidateAssignment(state: MockState) {
     candidate.worker,
   )
   state.assignments.push(seeded)
+  observeInteractiveWorker(state, seeded.worker)
   return seeded
+}
+
+function projectOrchestratorTransferStatus(inspector: Locator) {
+  return inspector.locator('#project-orchestrator-transfer-status-project-1')
 }
 
 test('uses wss for terminal URLs on secure pages', () => {
@@ -3783,6 +3922,8 @@ test('renders durable, offline, and unbound resources on desktop', async ({
   const offlineRegion = page.locator(
     '.project-region[data-runtime="offline"]',
   )
+  await expect(offlineRegion).toContainText('Connection status unknown')
+  await expect(offlineRegion).not.toContainText('offline')
   const offlineCount = offlineRegion.locator('.workspace-region__count')
   await offlineCount.evaluate((element) => {
     element.dataset.contrastProbe = ''
@@ -4626,7 +4767,7 @@ test('scopes terminal projection identity to adapter and session', async ({
   const dialog = page.getByRole('dialog', { name: 'Assign worker' })
   await expect(dialog).toBeVisible()
   await expect(
-    page.getByRole('dialog', { name: 'Resume worker' }),
+    page.getByRole('dialog', { name: 'Replace runtime and assign' }),
   ).toHaveCount(0)
   await expect(dialog.getByLabel('Worker profile')).toHaveValue('')
   await dialog
@@ -4647,9 +4788,11 @@ test('uses durable status for missing ambiguous and exited worker candidates', a
   page,
 }) => {
   const state = await mockApi(page)
-  state.runtimeInventory.workers = state.runtimeInventory.workers.filter(
-    (candidate) => candidate.terminal_id !== 'terminal-7',
+  const exited = state.workerCandidates.find(
+    (candidate) => candidate.worker.id === 'worker-resumable',
   )
+  if (!exited) throw new Error('Exited worker fixture is missing')
+  retainTopologyWithoutObservedWorker(state, exited.worker)
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
   await page.getByRole('tab', { name: 'Workers' }).click()
@@ -4660,7 +4803,7 @@ test('uses durable status for missing ambiguous and exited worker candidates', a
   )
   await expect(resumable).toHaveAttribute('data-status', 'idle')
   await expect(resumable).toHaveAttribute('data-process-state', 'exited')
-  await expect(resumable).toContainText('Resumable / idle')
+  await expect(resumable).toContainText('Replacement ready / idle')
   await resumable.click()
   await expect(
     inspector.locator('.status-badge[data-status="idle"]'),
@@ -4672,7 +4815,7 @@ test('uses durable status for missing ambiguous and exited worker candidates', a
     inspector.locator(
       '.observation-state-badge[data-observation-state="observed"]',
     ),
-  ).toBeVisible()
+  ).toHaveText('Observed · process exited')
   await expect(
     inspector.locator('.status-badge[data-status="done"]'),
   ).toHaveCount(0)
@@ -4692,7 +4835,7 @@ test('uses durable status for missing ambiguous and exited worker candidates', a
   await page.locator('.worker-row[data-worker-id="worker-ambiguous"]').click()
   await expect(
     inspector.locator(
-      '.observation-state-badge[data-observation-state="ambiguous"]',
+      '.observation-state-badge[data-observation-state="missing"]',
     ),
   ).toBeVisible()
   await expect(
@@ -4709,6 +4852,82 @@ test('uses durable status for missing ambiguous and exited worker candidates', a
   expect(overflow.right).toBeLessThanOrEqual(0)
 })
 
+test('reports a fresh missing binding despite an auxiliary refresh failure', async ({
+  page,
+}, testInfo) => {
+  const state = await mockApi(page)
+  const assignment = seedActiveAssignment(state)
+  const terminalId = assignment.worker.runtime?.terminal_id
+  if (!terminalId) throw new Error('Seeded worker runtime is missing')
+  state.runtimeInventory.workers = state.runtimeInventory.workers.filter(
+    (worker) => worker.terminal_id !== terminalId,
+  )
+
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await page
+    .locator(`.assigned-worker-marker[data-worker-id="${assignment.worker.id}"]`)
+    .click()
+
+  const inspector = page.locator('.inspector')
+  const connection = inspector.locator(
+    '.observation-state-badge[data-observation-state="missing"]',
+  )
+  await expect(connection).toHaveText('Binding missing')
+  await expect(connection).toHaveAttribute(
+    'title',
+    'Worker not found in latest Herdr snapshot.',
+  )
+  await expect(connection).toHaveAttribute(
+    'aria-label',
+    'Binding missing. Worker not found in latest Herdr snapshot.',
+  )
+  await expect(
+    inspector.getByRole('button', { name: 'Refresh inventory', exact: true }),
+  ).toBeVisible()
+  await expect(inspector.getByText('Last known runtime')).toBeVisible()
+  await expect(
+    inspector.getByRole('button', { name: 'Open terminal', exact: true }),
+  ).toHaveCount(0)
+  await expect(
+    inspector.getByRole('button', { name: 'Open in Ghostty', exact: true }),
+  ).toHaveCount(0)
+  await expect(
+    inspector.getByRole('button', { name: 'Open chat', exact: true }),
+  ).toHaveCount(0)
+
+  const inventoryRequestsBeforeAuxiliaryFailure = state.inventoryRequests
+  state.workerFailure = true
+  state.runtimeInventory.observed_at_unix_ms = Date.now()
+  await expect
+    .poll(() => state.inventoryRequests, { timeout: 3_000 })
+    .toBeGreaterThan(inventoryRequestsBeforeAuxiliaryFailure)
+  await expect(page.getByText('Synthetic worker refresh failure')).toBeVisible()
+  await expect(connection).toHaveText('Binding missing')
+  await expect(connection).toHaveAttribute(
+    'title',
+    'Worker not found in latest Herdr snapshot.',
+  )
+
+  await page.screenshot({
+    path: testInfo.outputPath('connection-status-unknown-desktop.png'),
+    fullPage: true,
+  })
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(connection).toBeVisible()
+  const overflow = await inspector.evaluate((element) => ({
+    horizontal: element.scrollWidth - element.clientWidth,
+    right: element.getBoundingClientRect().right - window.innerWidth,
+  }))
+  expect(overflow.horizontal).toBeLessThanOrEqual(0)
+  expect(overflow.right).toBeLessThanOrEqual(0)
+  await page.screenshot({
+    path: testInfo.outputPath('connection-status-unknown-mobile.png'),
+    fullPage: true,
+  })
+})
+
 test('keeps exited assignment process state separate from runtime status', async ({
   page,
 }) => {
@@ -4717,6 +4936,7 @@ test('keeps exited assignment process state separate from runtime status', async
   if (!seeded.worker.runtime) throw new Error('Seeded worker must have a runtime')
   seeded.worker.runtime.process_state = 'exited'
   seeded.worker.runtime.status = 'blocked'
+  retainTopologyWithoutObservedWorker(state, seeded.worker)
 
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
@@ -4731,7 +4951,7 @@ test('keeps exited assignment process state separate from runtime status', async
 
   const inspector = page.locator('.inspector')
   await expect(
-    inspector.locator('.status-badge[data-status="blocked"]'),
+    inspector.locator('.status-badge[data-status="idle"]'),
   ).toBeVisible()
   await expect(
     inspector.locator('.process-state-badge[data-process-state="exited"]'),
@@ -4762,6 +4982,7 @@ test('shows restrained worker activity bubbles only in the spatial view', async 
     'implementer',
   )
   working.worker.runtime!.status = 'working'
+  observeInteractiveWorker(state, working.worker, { status: 'working' })
   blocked.worker.runtime!.status = 'blocked'
   unknown.worker.runtime!.status = 'unknown'
   state.assignments.push(blocked, unknown)
@@ -4883,6 +5104,199 @@ test('keeps Herdr in a loading state until session discovery completes', async (
   await expect(
     page.locator('.project-region[data-runtime="offline"]'),
   ).toHaveCount(1)
+})
+
+test('keeps terminal and chat controls for an adopted running pane even when interactive_ready is false', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const seeded = seedAssignedCandidateAssignment(state)
+  const runtime = seeded.worker.runtime
+  if (!runtime) throw new Error('Seeded worker runtime is missing')
+  const observed = observedWorkerForRuntime(state, runtime)
+  observed.interactive_ready = false
+
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await page.getByRole('tab', { name: 'Workers' }).click()
+  await page
+    .locator('.worker-row[data-worker-id="worker-assigned"]')
+    .click()
+
+  const inspector = page.locator('.inspector')
+  const observation = inspector.locator(
+    '.observation-state-badge[data-observation-state="observed"]',
+  )
+  await expect(observation).toHaveText('observed')
+  await expect(
+    inspector.getByRole('button', { name: 'Open terminal', exact: true }),
+  ).toBeVisible()
+  await expect(
+    inspector.getByRole('button', { name: 'Open in Ghostty', exact: true }),
+  ).toBeVisible()
+  await expect(
+    inspector.getByRole('button', { name: 'Open chat', exact: true }),
+  ).toBeVisible()
+
+  await page
+    .locator('.orchestrator-marker[data-project-id="project-1"]')
+    .click()
+  await page
+    .getByRole('button', { name: 'Open chat', exact: true })
+    .click()
+  const shell = page.locator('.agent-workspace-shell')
+  const row = shell.locator(
+    `[data-target-key="assignment:${seeded.id}"]`,
+  )
+  await expect(row).toBeEnabled()
+  await expect(row).toContainText('Runtime idle')
+  await row.click()
+  await expect(row).toHaveAttribute('aria-current', 'page')
+  await expect(page.getByLabel('Agent conversation')).toBeVisible()
+  expect(state.terminalSockets).toHaveLength(0)
+})
+
+test('keeps launch-pending panes disabled and shows recovery controls', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const seeded = seedAssignedCandidateAssignment(state)
+  const runtime = seeded.worker.runtime
+  if (!runtime) throw new Error('Seeded worker runtime is missing')
+  const observed = observedWorkerForRuntime(state, runtime)
+  observed.launch_pending = true
+  observed.interactive_ready = false
+
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await page.getByRole('tab', { name: 'Workers' }).click()
+  await page
+    .locator('.worker-row[data-worker-id="worker-assigned"]')
+    .click()
+
+  const inspector = page.locator('.inspector')
+  await expect(
+    inspector.locator('.observation-state-badge[data-observation-state="observed"]'),
+  ).toHaveText('Observed · launch pending')
+  await expect(
+    inspector.getByRole('button', { name: 'Refresh inventory', exact: true }),
+  ).toBeVisible()
+  await expect(
+    inspector.getByRole('button', { name: 'Open terminal', exact: true }),
+  ).toHaveCount(0)
+  await expect(
+    inspector.getByRole('button', { name: 'Open chat', exact: true }),
+  ).toHaveCount(0)
+})
+
+test('keeps topology-only shells terminal-only', async ({ page }) => {
+  const state = await mockApi(page)
+  const seeded = seedAssignedCandidateAssignment(state)
+  const runtime = seeded.worker.runtime
+  if (!runtime) throw new Error('Seeded worker runtime is missing')
+  runtime.provider_session = null
+  retainTopologyWithoutObservedWorker(state, seeded.worker)
+  const pane = state.runtimeInventory.panes.find(
+    (candidate) => candidate.terminal_id === runtime.terminal_id,
+  )
+  if (!pane) throw new Error('Topology-only shell fixture is missing a pane')
+  pane.provider = null
+  pane.display_provider = null
+  pane.provider_session = null
+
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await page.getByRole('tab', { name: 'Workers' }).click()
+  await page
+    .locator('.worker-row[data-worker-id="worker-assigned"]')
+    .click()
+
+  const inspector = page.locator('.inspector')
+  await expect(
+    inspector.locator('.observation-state-badge[data-observation-state="observed"]'),
+  ).toHaveText('Observed · terminal only')
+  await expect(
+    inspector.getByRole('button', { name: 'Open terminal', exact: true }),
+  ).toBeVisible()
+  await expect(
+    inspector.getByRole('button', { name: 'Open chat', exact: true }),
+  ).toHaveCount(0)
+  await expect(
+    inspector.getByText(
+      'Terminal reattach is still available, but chat stays disabled until Yard reports a foreground agent.',
+      { exact: true },
+    ),
+  ).toBeVisible()
+})
+
+test('invalidates live controls after a failed refresh and restores them after recovery', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const seeded = seedAssignedCandidateAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await page.getByRole('tab', { name: 'Workers' }).click()
+  await page
+    .locator('.worker-row[data-worker-id="worker-assigned"]')
+    .click()
+  await page
+    .getByRole('button', { name: 'Open terminal', exact: true })
+    .click()
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+
+  const requestsBeforeFailure = state.inventoryRequests
+  state.inventoryFailure = true
+  await expect
+    .poll(() => state.inventoryRequests, { timeout: 3_000 })
+    .toBeGreaterThan(requestsBeforeFailure)
+  await expect(page.locator('.terminal-session')).toHaveCount(0)
+  await expect(
+    page.locator('.terminal-mode-loading[role="status"]'),
+  ).toContainText('Live controls unavailable')
+  await expect(
+    page.locator('.terminal-mode-loading[role="status"]'),
+  ).toContainText('Connection status stale.')
+  await expect(
+    page.locator(
+      `.agent-window-row[data-target-key="assignment:${seeded.id}"]`,
+    ),
+  ).toBeDisabled()
+  await expect(
+    page.locator(
+      '.inspector .observation-state-badge[data-observation-state="stale"]',
+    ),
+  ).toHaveAttribute(
+    'title',
+    'Latest Herdr snapshot refresh failed. Showing last-known details; live controls are unavailable.',
+  )
+  await expect(
+    page
+      .locator('.agent-workspace-shell')
+      .getByRole('button', { name: 'Refresh inventory', exact: true }),
+  ).toBeVisible()
+  await expect(
+    page.locator('.inspector').getByText('Last known runtime', { exact: true }),
+  ).toBeVisible()
+  await expect(page.getByRole('tab', { name: 'Chat', exact: true })).toBeDisabled()
+  await expect(page.getByRole('tab', { name: 'Terminal', exact: true })).toBeDisabled()
+
+  const requestsBeforeRecovery = state.inventoryRequests
+  state.inventoryFailure = false
+  await page
+    .locator('.agent-workspace-shell')
+    .getByRole('button', { name: 'Refresh inventory', exact: true })
+    .click()
+  await expect
+    .poll(() => state.inventoryRequests, { timeout: 3_000 })
+    .toBeGreaterThan(requestsBeforeRecovery)
+  await expect(page.getByRole('tab', { name: 'Chat', exact: true })).toBeEnabled()
+  await expect(page.getByRole('tab', { name: 'Terminal', exact: true })).toBeEnabled()
+  await expect(page.locator('.terminal-session')).toHaveAttribute(
+    'data-state',
+    'connected',
+  )
+  await expect.poll(() => state.terminalSockets.length).toBe(2)
 })
 
 test('resnapshots inventory, retains stale state, and recovers after failure', async ({
@@ -5805,7 +6219,7 @@ test('allocates a profileless live worker from the keyboard inspector action', a
   expect(state.allocationCommands[0].command_id).toBeTruthy()
 })
 
-test('resumes a profiled worker through the generalized drag payload', async ({
+test('replaces a profiled worker runtime through the generalized drag payload', async ({
   page,
 }) => {
   const state = await mockApi(page)
@@ -5818,13 +6232,13 @@ test('resumes a profiled worker through the generalized drag payload', async ({
     page,
   )
 
-  const dialog = page.getByRole('dialog', { name: 'Resume worker' })
+  const dialog = page.getByRole('dialog', { name: 'Replace runtime and assign' })
   await expect(dialog).toBeVisible()
   await expect(dialog.getByLabel('Worker profile')).toHaveCount(0)
   await expect(dialog.getByLabel('Role')).toHaveValue('implementer')
-  await dialog.getByLabel('Objective').fill('Resume the verification work.')
+  await dialog.getByLabel('Objective').fill('Replace the runtime for verification work.')
   await dialog
-    .getByRole('button', { name: 'Resume worker', exact: true })
+    .getByRole('button', { name: 'Replace runtime and assign', exact: true })
     .click()
 
   expect(state.allocationCommands).toHaveLength(1)
@@ -5832,7 +6246,7 @@ test('resumes a profiled worker through the generalized drag payload', async ({
     worker_id: 'worker-resumable',
     expected_worker_version: '1',
     expected_project_version: '1',
-    objective: 'Resume the verification work.',
+    objective: 'Replace the runtime for verification work.',
     role: 'implementer',
   })
   expect(state.allocationCommands[0]).not.toHaveProperty('profile_id')
@@ -7233,8 +7647,10 @@ test('reconnects the Superintendent terminal when its runtime identity changes',
     is_default: false,
     running: true,
   })
+  observeInteractiveWorker(state, originalWorker)
   await page.setViewportSize({ width: 1200, height: 760 })
   await page.goto('/')
+  await selectRuntimeSession(page, 'yard-orchestrator')
 
   await page.locator('.yard-orchestrator-marker').click()
   await page
@@ -7261,6 +7677,7 @@ test('reconnects the Superintendent terminal when its runtime identity changes',
     created_at_unix_ms: state.yardOrchestrator.created_at_unix_ms,
     updated_at_unix_ms: Date.now(),
   }
+  observeInteractiveWorker(state, replacementWorker)
 
   await expect
     .poll(
@@ -7345,6 +7762,7 @@ test('provisions a dedicated Superintendent and shows project updates', async ({
     expected_orchestrator_version: '1',
   })
   await expect(page.getByText('Dedicated Herdr session')).toBeVisible()
+  await selectRuntimeSession(page, 'yard-orchestrator')
   await page.getByRole('button', { name: 'Project pulse' }).click()
   await expect(page.getByLabel('Latest project updates')).toContainText(
     'Finish the API compatibility migration',
@@ -7482,6 +7900,7 @@ test('recovers a stopped dedicated Superintendent session without replacing it',
     expected_orchestrator_version: '3',
   })
   await expect(page.getByText('Dedicated Herdr session')).toBeVisible()
+  await selectRuntimeSession(page, 'yard-orchestrator')
   await expect(
     page.getByRole('button', { name: 'Open chat', exact: true }),
   ).toBeVisible()
@@ -7600,28 +8019,18 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   if (!implementerRuntime || !reviewerRuntime) {
     throw new Error('Workspace navigator runtimes are missing')
   }
-  state.runtimeInventory.workers.push(
-    {
-      ...worker(20, 'workspace-1', 'working'),
-      runtime_id: implementerRuntime.terminal_id,
-      terminal_id: implementerRuntime.terminal_id,
-      tab_id: implementerRuntime.tab_id ?? 'workspace-1:tab-implementer',
-      pane_id: implementerRuntime.pane_id,
-      name: 'implementer',
-      cwd: '/tmp/sample/yard-worktrees/api-migration/web',
-      foreground_cwd: '/tmp/sample/yard-worktrees/api-migration/web',
-    },
-    {
-      ...worker(21, 'workspace-2', 'blocked'),
-      runtime_id: reviewerRuntime.terminal_id,
-      terminal_id: reviewerRuntime.terminal_id,
-      tab_id: reviewerRuntime.tab_id ?? 'workspace-2:tab-reviewer',
-      pane_id: reviewerRuntime.pane_id,
-      name: 'reviewer',
-      cwd: '/tmp/sample/release-tools/checks',
-      foreground_cwd: '/tmp/sample/release-tools/checks',
-    },
-  )
+  observeInteractiveWorker(state, implementer.worker, {
+    status: 'working',
+    name: 'implementer',
+    cwd: '/tmp/sample/yard-worktrees/api-migration/web',
+    foreground_cwd: '/tmp/sample/yard-worktrees/api-migration/web',
+  })
+  observeInteractiveWorker(state, reviewer.worker, {
+    status: 'blocked',
+    name: 'reviewer',
+    cwd: '/tmp/sample/release-tools/checks',
+    foreground_cwd: '/tmp/sample/release-tools/checks',
+  })
 
   await page.addInitScript(() => {
     window.localStorage.setItem('yard:theme', 'light')
@@ -7644,9 +8053,10 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   const navigator = shell.locator('.agent-window-navigator')
   await expect(shell).toBeVisible()
   await expect(navigator).toContainText('Runtime working')
-  await expect(navigator).toContainText('durable-only')
+  await expect(navigator).toContainText('live controls unavailable')
   await expect(navigator).toContainText('release-tools')
-  await expect(navigator).toContainText('Topology not observed')
+  await expect(navigator).toContainText('Topology unavailable')
+  await expect(navigator).toContainText('Connection status unknown')
   const workspaceGroups = navigator.locator('.agent-window-workspace')
   await expect(workspaceGroups).toHaveCount(3)
   await expect(workspaceGroups.nth(0)).toHaveAttribute(
@@ -7720,6 +8130,12 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   const implementerRow = navigator.locator(
     '[data-target-key="assignment:assignment-1"]',
   )
+  const durableRow = navigator.locator(
+    '[data-target-key="orchestrator:project-2"]',
+  )
+  await expect(durableRow).toBeDisabled()
+  await expect(durableRow).toContainText('Connection status unknown')
+  await durableRow.click({ force: true })
   await expect(implementerRow).toHaveAttribute('aria-current', 'page')
   await expect(implementerRow).toContainText('Implementer')
   await expect(implementerRow).toContainText('implementer · API migration')
@@ -7866,8 +8282,14 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   ).toHaveAttribute('aria-current', 'page')
   await expect(shell).toContainText('API migration orchestrator')
   await expect(
-    page.getByRole('tab', { name: 'Terminal', exact: true }),
+    page.getByRole('tab', { name: 'Chat', exact: true }),
   ).toHaveAttribute('aria-selected', 'true')
+  await expect(page.getByLabel('Agent conversation')).toBeVisible()
+  await page.getByRole('tab', { name: 'Terminal', exact: true }).click()
+  await expect(page.getByRole('tab', { name: 'Terminal', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  )
   await expect(page.locator('.terminal-session')).toHaveAttribute(
     'data-state',
     'connected',
@@ -7938,10 +8360,8 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
 
   await mobileNavigatorToggle.click()
   await reviewerRow.click()
-  await expect(shell).toHaveAttribute('data-mode', 'terminal')
+  await expect(shell).toHaveAttribute('data-mode', 'chat')
   await expect(reviewerRow).toHaveAttribute('aria-current', 'page')
-  await expect(navigator).toBeVisible()
-  await page.getByRole('tab', { name: 'Chat', exact: true }).click()
   await expect(page.getByLabel('Agent conversation')).toBeVisible()
   await expect(navigator).toBeHidden()
   await expect(mobileNavigatorToggle).toBeVisible()
@@ -9256,6 +9676,7 @@ test('provisions a workstream orchestrator and routes work to an attached projec
     expected_profile_version: '1',
     expected_node_version: '1',
   })
+  await selectRuntimeSession(page, 'yard-coordination')
 
   await page
     .getByRole('button', { name: 'Open terminal', exact: true })
@@ -10330,6 +10751,7 @@ test('submits full runtimes from a timestamp-reconciled transfer snapshot', asyn
     .locator('.orchestrator-marker[data-project-id="project-1"]')
     .click()
   const inspector = page.locator('.inspector')
+  const transferStatus = projectOrchestratorTransferStatus(inspector)
   const transfer = inspector.getByRole('button', {
     name: 'Change orchestrator',
   })
@@ -10341,7 +10763,7 @@ test('submits full runtimes from a timestamp-reconciled transfer snapshot', asyn
     )
     .toBe(true)
   await expect(transfer).toBeDisabled()
-  await expect(inspector.getByRole('status')).toContainText(
+  await expect(transferStatus).toContainText(
     'Checking live workers in Herdr session beta',
   )
 
@@ -10747,6 +11169,7 @@ test('rejects a lower transfer timestamp until an equal observation completes', 
     .locator('.orchestrator-marker[data-project-id="project-1"]')
     .click()
   const inspector = page.locator('.inspector')
+  const transferStatus = projectOrchestratorTransferStatus(inspector)
   const transfer = inspector.getByRole('button', {
     name: 'Change orchestrator',
   })
@@ -10776,7 +11199,7 @@ test('rejects a lower transfer timestamp until an equal observation completes', 
     .toBe(true)
   await expect(transfer).toBeDisabled()
   lowerGate.resolve()
-  await expect(inspector.getByRole('status')).toContainText(
+  await expect(transferStatus).toContainText(
     'Runtime inventory is older than the current transfer snapshot',
   )
   await expect(transfer).toBeDisabled()
@@ -10821,10 +11244,11 @@ test('rejects a transfer candidate with the current orchestrator worker id', asy
     .locator('.orchestrator-marker[data-project-id="project-1"]')
     .click()
   const inspector = page.locator('.inspector')
+  const transferStatus = projectOrchestratorTransferStatus(inspector)
   await expect(
     inspector.getByRole('button', { name: 'Change orchestrator' }),
   ).toBeDisabled()
-  await expect(inspector.getByRole('status')).toContainText(
+  await expect(transferStatus).toContainText(
     'Start or free a live worker in this project workspace',
   )
   expect(state.projectOrchestratorCommands).toHaveLength(0)
@@ -10851,7 +11275,7 @@ test('disables transfer for stale candidate topology and exposes an associated a
   const transfer = inspector.getByRole('button', {
     name: 'Change orchestrator',
   })
-  const status = inspector.getByRole('status')
+  const status = projectOrchestratorTransferStatus(inspector)
   await expect(transfer).toBeDisabled()
   await expect(status).toContainText(
     'Start or free a live worker in this project workspace, then refresh',
@@ -10893,10 +11317,11 @@ test('disables transfer for stale current orchestrator topology', async ({
     .click()
 
   const inspector = page.locator('.inspector')
+  const transferStatus = projectOrchestratorTransferStatus(inspector)
   await expect(
     inspector.getByRole('button', { name: 'Change orchestrator' }),
   ).toBeDisabled()
-  await expect(inspector.getByRole('status')).toContainText(
+  await expect(transferStatus).toContainText(
     'current orchestrator runtime topology is stale or unavailable',
   )
 })
@@ -11121,6 +11546,56 @@ test('opens an existing worker terminal in Ghostty', async ({ page }) => {
   ).toBeVisible()
   expect(state.terminalSockets).toHaveLength(0)
 })
+
+
+const ghosttyLaunchErrors = [
+  'ghostty_unavailable',
+  'ghostty_launch_failed',
+  'terminal_not_found',
+  'terminal_ambiguous',
+  'terminal_not_ready',
+] as const
+
+for (const ghosttyError of ghosttyLaunchErrors) {
+  test(`handles ${ghosttyError} without inventing an attach path`, async ({
+    page,
+  }) => {
+    const state = await mockApi(page, { ghosttyError })
+    const seeded = seedAssignedCandidateAssignment(state)
+    const runtime = seeded.worker.runtime
+    if (!runtime) throw new Error('Seeded worker runtime is missing')
+    await page.context().grantPermissions([
+      'clipboard-read',
+      'clipboard-write',
+    ])
+    await page.setViewportSize({ width: 1280, height: 800 })
+    await page.goto('/')
+    await page.evaluate(() => navigator.clipboard.writeText('unchanged'))
+    await page.getByRole('tab', { name: 'Workers' }).click()
+    await page
+      .locator('.worker-row[data-worker-id="worker-assigned"]')
+      .click()
+    await page.getByRole('button', { name: 'Open in Ghostty' }).click()
+
+    const feedback = page.locator('.external-terminal-feedback')
+    if (ghosttyError === 'ghostty_unavailable') {
+      await expect(feedback).toContainText(
+        'Ghostty is not available on the Yard host. Attach command copied.',
+      )
+      await expect
+        .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+        .toBe(
+          `herdr --session ${runtime.session} agent attach ${runtime.terminal_id}`,
+        )
+    } else {
+      await expect(feedback).toContainText(`Synthetic ${ghosttyError}`)
+      await expect(feedback.locator('code')).toHaveCount(0)
+      await expect
+        .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+        .toBe('unchanged')
+    }
+  })
+}
 
 test('submits a direct prompt payload and reports only acknowledgement', async ({
   page,
@@ -11372,15 +11847,15 @@ test('bounds ten-plus group recipients and delivery results on desktop', async (
       `Group agent ${index}`,
     )
     state.profiles.push(workerProfile)
-    state.assignments.push(
-      assignment(
-        `group-assignment-${index}`,
-        'project-1',
-        workerProfile,
-        `Handle group task ${index}.`,
-        'implementer',
-      ),
+    const seeded = assignment(
+      `group-assignment-${index}`,
+      'project-1',
+      workerProfile,
+      `Handle group task ${index}.`,
+      'implementer',
     )
+    state.assignments.push(seeded)
+    observeInteractiveWorker(state, seeded.worker)
   }
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
@@ -11877,6 +12352,7 @@ test('records a durable manual completion receipt', async ({ page }) => {
     throw new Error('Allocated worker runtime is missing')
   }
   activeAssignment.worker.runtime.status = 'done'
+  observeInteractiveWorker(state, activeAssignment.worker)
   await page.reload()
   await page.locator('.assigned-worker-marker').click()
 
@@ -12005,7 +12481,7 @@ test('records a durable manual completion receipt', async ({ page }) => {
   await resumableWorker.press('Enter')
   await expect(page.getByText('Worker candidate')).toBeVisible()
   await expect(
-    page.getByRole('button', { name: 'Resume worker', exact: true }),
+    page.getByRole('button', { name: 'Replace runtime and assign', exact: true }),
   ).toBeVisible()
   await expect(page.getByText('Awaiting disposition')).toBeVisible()
   const endingCandidate = state.workerCandidates.find(

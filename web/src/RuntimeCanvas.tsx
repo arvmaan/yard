@@ -94,6 +94,7 @@ import {
   type WorldPoint,
 } from './mapProjection'
 import { ProjectedMap } from './ProjectedMap'
+import { resolveRuntimeCapabilities } from './runtimeCapabilities'
 import { createLatestFrameQueue } from './latestFrameQueue'
 import {
   EMPTY_SCENE,
@@ -768,7 +769,7 @@ function ProjectRegion({ data, selected }: NodeProps<ProjectNode>) {
             ? `${visibleWorkerCount} worker${visibleWorkerCount === 1 ? '' : 's'}${childAgentCount > 0 ? ` + ${childAgentCount} child${childAgentCount === 1 ? '' : 'ren'}` : ''}`
             : runtimePending
               ? 'loading'
-              : 'offline'}
+              : 'Connection status unknown'}
         </span>
       </div>
       <div className="workspace-region__meta">
@@ -778,7 +779,7 @@ function ProjectRegion({ data, selected }: NodeProps<ProjectNode>) {
             ? `${workspace.tab_count} tabs`
             : runtimePending
               ? 'checking runtime'
-              : 'not observed'}
+              : 'Connection status unknown'}
         </span>
       </div>
     </div>
@@ -1531,46 +1532,6 @@ function runtimeTerminalIdentity(
     : null
 }
 
-function observedWorker(
-  project: Project,
-  runtime: WorkerRuntimeBinding | null,
-  inventory: RuntimeInventory | null,
-): ObservedWorker | null {
-  if (
-    !runtime ||
-    !inventory ||
-    inventory.adapter !== project.runtime.adapter ||
-    inventory.session !== project.runtime.session ||
-    inventory.adapter !== runtime.adapter ||
-    inventory.session !== runtime.session
-  ) {
-    return null
-  }
-
-  const matches = inventory.workers.filter(
-    (worker) => worker.terminal_id === runtime.terminal_id,
-  )
-  return matches.length === 1 ? matches[0] : null
-}
-
-function observedRuntimeWorker(
-  runtime: WorkerRuntimeBinding | null,
-  inventory: RuntimeInventory | null,
-): ObservedWorker | null {
-  if (
-    !runtime ||
-    !inventory ||
-    inventory.adapter !== runtime.adapter ||
-    inventory.session !== runtime.session
-  ) {
-    return null
-  }
-  const matches = inventory.workers.filter(
-    (worker) => worker.terminal_id === runtime.terminal_id,
-  )
-  return matches.length === 1 ? matches[0] : null
-}
-
 /**
  * Resolve the project territory under a flow-space point.
  *
@@ -1902,6 +1863,9 @@ function buildNodes(
 ): RuntimeNode[] {
   const activeTopology =
     runtimeTopology?.session === selectedSession ? runtimeTopology : null
+  const capabilitiesForRuntime = (
+    runtime: WorkerRuntimeBinding | null | undefined,
+  ) => resolveRuntimeCapabilities(true, runtime, inventory)
   const managedWorkspaces = activeTopology?.managed_workspaces ?? []
   const managedWorkspaceIds = new Set(
     managedWorkspaces.map((workspace) => workspace.workspace_id),
@@ -1977,16 +1941,17 @@ function buildNodes(
         )
       : []
     const orchestratorNodeId = `orchestrator:${project.id}`
-    const orchestratorObserved = observedWorker(
-      project,
+    const orchestratorCapabilities = capabilitiesForRuntime(
       project.orchestrator.runtime,
-      inventory,
     )
+    const orchestratorObserved =
+      orchestratorCapabilities.observedWorker
     const childRoots: ChildAgentRoot[] = [
       {
         nodeId: orchestratorNodeId,
         session:
           orchestratorObserved?.provider_session ??
+          orchestratorCapabilities.observedPane?.provider_session ??
           project.orchestrator.runtime?.provider_session ??
           null,
       },
@@ -1995,15 +1960,15 @@ function buildNodes(
         session: worker.provider_session,
       })),
       ...activeVisibleAssignments.map((assignment) => {
-        const observed = observedWorker(
-          project,
+        const capabilities = capabilitiesForRuntime(
           assignment.worker.runtime,
-          inventory,
         )
+        const observed = capabilities.observedWorker
         return {
           nodeId: `assigned-worker:${assignment.worker.id}`,
           session:
             observed?.provider_session ??
+            capabilities.observedPane?.provider_session ??
             assignment.worker.runtime?.provider_session ??
             null,
         }
@@ -2027,11 +1992,9 @@ function buildNodes(
     // already on ObservedWorker but never surfaced anywhere in the UI before.
     const projectTokenTotal = allProjectAssignments.reduce(
       (total, assignment) => {
-        const worker = observedWorker(
-          project,
+        const worker = capabilitiesForRuntime(
           assignment.worker.runtime,
-          inventory,
-        )
+        ).observedWorker
         if (!worker) return total
         const workerTotal = Object.values(worker.tokens).reduce(
           (sum, value) => sum + (Number.parseInt(value, 10) || 0),
@@ -2084,7 +2047,11 @@ function buildNodes(
       },
       deletable: false,
       ariaLabel: `${project.name}, ${
-        workspace ? 'observed' : runtimePending ? 'loading' : 'offline'
+        workspace
+          ? 'observed'
+          : runtimePending
+            ? 'loading'
+            : 'connection status unknown'
       }, ${visibleWorkerCount} visible workers, ${childAgentCount} live child agents, ${buildingCount} city structures, ${completedBuildingCount} completed`,
       focusable: true,
     }
@@ -2150,11 +2117,9 @@ function buildNodes(
     )
     const assignedNodes: AssignedWorkerNode[] = activeVisibleAssignments.map(
       (assignment, assignmentIndex) => {
-        const observed = observedWorker(
-          project,
+        const observed = capabilitiesForRuntime(
           assignment.worker.runtime,
-          inventory,
-        )
+        ).observedWorker
         const workerIndex = workers.length + assignmentIndex + 1
         const runtimeState = resolvedRuntimeState(
           assignment.worker.runtime,
@@ -2423,9 +2388,10 @@ function buildNodes(
     const yardWorker = includeYardOrchestrator
       ? yardOrchestrator.worker
       : null
-    const yardObserved = includeYardOrchestrator
-      ? observedRuntimeWorker(yardWorker?.runtime ?? null, inventory)
+    const yardCapabilities = includeYardOrchestrator
+      ? capabilitiesForRuntime(yardWorker?.runtime ?? null)
       : null
+    const yardObserved = yardCapabilities?.observedWorker ?? null
     const roots: ChildAgentRoot[] = [
       ...(includeYardOrchestrator
         ? [
@@ -2433,6 +2399,7 @@ function buildNodes(
               nodeId: 'yard-orchestrator',
               session:
                 yardObserved?.provider_session ??
+                yardCapabilities?.observedPane?.provider_session ??
                 yardWorker?.runtime?.provider_session ??
                 null,
             },
@@ -2554,7 +2521,8 @@ function buildNodes(
   if (yardOrchestrator && !centralManagedWorkspace) {
     const nodeId = 'yard-orchestrator'
     const worker = yardOrchestrator.worker
-    const observed = observedRuntimeWorker(worker?.runtime ?? null, inventory)
+    const capabilities = capabilitiesForRuntime(worker?.runtime ?? null)
+    const observed = capabilities.observedWorker
     const minimumProjectX =
       projects.length > 0
         ? Math.min(...projects.map((project) => project.placement.geometry.x))
@@ -2572,6 +2540,7 @@ function buildNodes(
         nodeId,
         session:
           observed?.provider_session ??
+          capabilities.observedPane?.provider_session ??
           worker?.runtime?.provider_session ??
           null,
       },

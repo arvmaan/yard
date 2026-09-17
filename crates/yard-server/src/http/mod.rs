@@ -69,6 +69,8 @@ use crate::yard_orchestrator_service::{YardOrchestratorService, YardOrchestrator
 mod terminal;
 mod web;
 
+type GhosttyLauncher = fn(&OsString, &[String]) -> io::Result<()>;
+
 #[derive(Clone)]
 struct AppState {
     store: Arc<dyn YardStore>,
@@ -87,6 +89,7 @@ struct AppState {
     automations: AutomationService,
     yard_orchestrator: YardOrchestratorService,
     coordination_nodes: CoordinationNodeService,
+    ghostty_launcher: GhosttyLauncher,
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
 }
@@ -107,6 +110,7 @@ pub(crate) fn router(
         terminal,
         store,
         artifacts,
+        noop_ghostty_launcher,
         None,
         ConnectionTracker::default(),
     )
@@ -121,6 +125,7 @@ fn test_router_with_shutdown(
     terminal: Arc<dyn RuntimeTerminal>,
     store: Arc<dyn YardStore>,
     artifacts: ArtifactService,
+    ghostty_launcher: GhosttyLauncher,
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
 ) -> Router {
@@ -141,7 +146,7 @@ fn test_router_with_shutdown(
         Arc::clone(&store),
     );
     let automations = AutomationService::new(Arc::clone(&store), interventions, coordination_nodes);
-    router_with_reconciliation_and_shutdown(
+    router_with_reconciliation_and_shutdown_and_ghostty(
         source,
         runtime,
         intervention,
@@ -153,6 +158,7 @@ fn test_router_with_shutdown(
         managed_root.join("coordination"),
         managed_root.join("knowledge"),
         automations,
+        ghostty_launcher,
         shutdown,
         connections,
     )
@@ -171,6 +177,41 @@ pub(crate) fn router_with_reconciliation_and_shutdown(
     coordination_path: PathBuf,
     knowledge_path: PathBuf,
     automations: AutomationService,
+    shutdown: Option<watch::Receiver<bool>>,
+    connections: ConnectionTracker,
+) -> Router {
+    router_with_reconciliation_and_shutdown_and_ghostty(
+        source,
+        runtime,
+        intervention,
+        terminal,
+        store,
+        artifacts,
+        reconciliation,
+        orchestrator_cwd,
+        coordination_path,
+        knowledge_path,
+        automations,
+        launch_ghostty_process,
+        shutdown,
+        connections,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn router_with_reconciliation_and_shutdown_and_ghostty(
+    source: Arc<dyn InventorySource>,
+    runtime: Arc<dyn RuntimeControl>,
+    intervention: Arc<dyn RuntimeIntervention>,
+    terminal: Arc<dyn RuntimeTerminal>,
+    store: Arc<dyn YardStore>,
+    artifacts: ArtifactService,
+    reconciliation: ReconciliationService,
+    orchestrator_cwd: String,
+    coordination_path: PathBuf,
+    knowledge_path: PathBuf,
+    automations: AutomationService,
+    ghostty_launcher: GhosttyLauncher,
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
 ) -> Router {
@@ -479,6 +520,7 @@ pub(crate) fn router_with_reconciliation_and_shutdown(
             automations,
             yard_orchestrator,
             coordination_nodes,
+            ghostty_launcher,
             shutdown,
             connections,
         })
@@ -1062,29 +1104,37 @@ async fn open_terminal_in_ghostty(
     Path((session, terminal_id)): Path<(String, String)>,
 ) -> Result<NoStoreJson<ExternalTerminalLaunch>, ApiError> {
     let inventory = state.source.inventory(&session).await?;
-    let mut matches = inventory
+    let worker_matches = inventory
         .workers
         .iter()
-        .filter(|worker| worker.terminal_id == terminal_id);
-    let Some(worker) = matches.next() else {
+        .filter(|worker| worker.terminal_id == terminal_id)
+        .collect::<Vec<_>>();
+    let pane_matches = inventory
+        .panes
+        .iter()
+        .filter(|pane| pane.terminal_id == terminal_id)
+        .collect::<Vec<_>>();
+    if worker_matches.len() > 1 || pane_matches.len() > 1 {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            code: "terminal_ambiguous",
+            message: "More than one live pane or worker reported this terminal identity".to_owned(),
+        });
+    }
+    let worker = worker_matches.first().copied();
+    let pane = pane_matches.first().copied();
+    if worker.is_none() && pane.is_none() {
         return Err(ApiError {
             status: StatusCode::NOT_FOUND,
             code: "terminal_not_found",
             message: "The terminal is no longer present in this Herdr session".to_owned(),
         });
-    };
-    if matches.next().is_some() {
-        return Err(ApiError {
-            status: StatusCode::CONFLICT,
-            code: "terminal_ambiguous",
-            message: "More than one live worker reported this terminal identity".to_owned(),
-        });
     }
-    if !worker.interactive_ready {
+    if worker.is_some_and(|worker| worker.launch_pending) {
         return Err(ApiError {
             status: StatusCode::CONFLICT,
             code: "terminal_not_ready",
-            message: "The worker terminal is not ready for an interactive attachment".to_owned(),
+            message: "The worker terminal is still launch pending".to_owned(),
         });
     }
 
@@ -1098,13 +1148,7 @@ async fn open_terminal_in_ghostty(
         "attach".to_owned(),
         terminal_id.clone(),
     ];
-    tokio::process::Command::new(&ghostty)
-        .arg("-e")
-        .args(&command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    (state.ghostty_launcher)(&ghostty, &command)
         .map_err(|error| external_terminal_error(&ghostty, &error))?;
 
     Ok(NoStoreJson(ExternalTerminalLaunch {
@@ -1112,6 +1156,22 @@ async fn open_terminal_in_ghostty(
         terminal_id,
         command,
     }))
+}
+
+fn launch_ghostty_process(binary: &OsString, command: &[String]) -> io::Result<()> {
+    tokio::process::Command::new(binary)
+        .arg("-e")
+        .args(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(test)]
+fn noop_ghostty_launcher(_: &OsString, _: &[String]) -> io::Result<()> {
+    Ok(())
 }
 
 fn ghostty_binary() -> OsString {
@@ -3488,7 +3548,10 @@ mod tests {
     use yard_herdr::HerdrError;
     use yard_store::{ProjectStoreError, SqliteProjectStore, YardStore};
 
-    use super::{ApiError, router, runtime_intervention_error, test_router_with_shutdown};
+    use super::{
+        ApiError, GhosttyLauncher, noop_ghostty_launcher, router, runtime_intervention_error,
+        test_router_with_shutdown,
+    };
     use crate::allocation_service::{
         AllocationServiceError, RuntimeControl, RuntimeProvisionError, RuntimeProvisionRequest,
         RuntimeRetirementError, RuntimeRetirementRequest, RuntimeSessionRequest,
@@ -4906,7 +4969,48 @@ mod tests {
         }
     }
 
-    async fn test_router_with_source(source: Arc<dyn InventorySource>) -> (Router, TempDir) {
+    #[cfg(test)]
+    fn missing_ghostty_launcher(
+        _: &std::ffi::OsString,
+        _: &[String],
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "ghostty missing",
+        ))
+    }
+
+    #[cfg(test)]
+    fn failing_ghostty_launcher(
+        _: &std::ffi::OsString,
+        _: &[String],
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::other("ghostty failed"))
+    }
+
+    fn pane_observation(runtime_id: &str, terminal_id: &str, tab_id: &str) -> PaneObservation {
+        PaneObservation {
+            runtime_id: runtime_id.to_owned(),
+            terminal_id: terminal_id.to_owned(),
+            workspace_id: "workspace-1".to_owned(),
+            tab_id: tab_id.to_owned(),
+            focused: false,
+            cwd: Some("/tmp/runtime-api".to_owned()),
+            foreground_cwd: Some("/tmp/runtime-api".to_owned()),
+            label: Some(runtime_id.to_owned()),
+            provider: Some("shell".to_owned()),
+            display_provider: Some("Shell".to_owned()),
+            status: ObservedStatus::Idle,
+            tokens: BTreeMap::new(),
+            provider_session: None,
+            revision: 1,
+        }
+    }
+
+    async fn test_router_with_source_and_launcher(
+        source: Arc<dyn InventorySource>,
+        ghostty_launcher: GhosttyLauncher,
+    ) -> (Router, TempDir) {
         let temp = TempDir::new().unwrap();
         let store = Arc::new(
             SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
@@ -4916,16 +5020,23 @@ mod tests {
         let runtime = Arc::new(FakeRuntime);
         let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
         (
-            router(
+            test_router_with_shutdown(
                 source,
                 runtime.clone(),
                 runtime.clone(),
                 runtime,
                 store,
                 artifacts,
+                ghostty_launcher,
+                None,
+                crate::ConnectionTracker::default(),
             ),
             temp,
         )
+    }
+
+    async fn test_router_with_source(source: Arc<dyn InventorySource>) -> (Router, TempDir) {
+        test_router_with_source_and_launcher(source, noop_ghostty_launcher).await
     }
 
     async fn providerless_test_router() -> (Router, TempDir) {
@@ -4955,6 +5066,149 @@ mod tests {
         test_router_with_source(Arc::new(FakeInventory)).await
     }
 
+    struct StaticInventory {
+        inventory: RuntimeInventory,
+    }
+
+    #[async_trait]
+    impl InventorySource for StaticInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            FakeInventory.sessions().await
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            let mut inventory = self.inventory.clone();
+            inventory.session = session_name.to_owned();
+            Ok(inventory)
+        }
+    }
+
+    async fn ghostty_router_with_inventory_and_launcher(
+        inventory: RuntimeInventory,
+        ghostty_launcher: GhosttyLauncher,
+    ) -> (Router, TempDir) {
+        test_router_with_source_and_launcher(
+            Arc::new(StaticInventory { inventory }),
+            ghostty_launcher,
+        )
+        .await
+    }
+
+    async fn ghostty_router_with_inventory(inventory: RuntimeInventory) -> (Router, TempDir) {
+        ghostty_router_with_inventory_and_launcher(inventory, noop_ghostty_launcher).await
+    }
+
+    async fn open_ghostty_response(
+        router: &Router,
+        terminal_id: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/runtimes/herdr/sessions/default/terminals/{terminal_id}/open-ghostty"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&body).unwrap();
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn open_ghostty_allows_a_unique_adopted_terminal_without_interactive_ready() {
+        let mut inventory = FakeInventory.inventory("default").await.unwrap();
+        let worker = inventory
+            .workers
+            .iter_mut()
+            .find(|worker| worker.terminal_id == "terminal-1")
+            .unwrap();
+        worker.interactive_ready = false;
+        let (router, _temp) = ghostty_router_with_inventory(inventory).await;
+        let (status, json) = open_ghostty_response(&router, "terminal-1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["application"], "ghostty");
+        assert_eq!(json["terminal_id"], "terminal-1");
+    }
+
+    #[tokio::test]
+    async fn open_ghostty_allows_a_unique_topology_only_pane_without_observed_worker() {
+        let mut inventory = FakeInventory.inventory("default").await.unwrap();
+        inventory.workers.retain(|worker| worker.terminal_id != "terminal-1");
+        inventory.panes.push(pane_observation("pane-1", "terminal-1", "tab-1"));
+        let (router, _temp) = ghostty_router_with_inventory(inventory).await;
+        let (status, json) = open_ghostty_response(&router, "terminal-1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["application"], "ghostty");
+        assert_eq!(json["terminal_id"], "terminal-1");
+    }
+
+    #[tokio::test]
+    async fn open_ghostty_rejects_launch_pending_terminals() {
+        let mut inventory = FakeInventory.inventory("default").await.unwrap();
+        let worker = inventory
+            .workers
+            .iter_mut()
+            .find(|worker| worker.terminal_id == "terminal-1")
+            .unwrap();
+        worker.launch_pending = true;
+        worker.interactive_ready = false;
+        let (router, _temp) = ghostty_router_with_inventory(inventory).await;
+        let (status, json) = open_ghostty_response(&router, "terminal-1").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["error"]["code"], "terminal_not_ready");
+    }
+
+    #[tokio::test]
+    async fn open_ghostty_rejects_ambiguous_terminals() {
+        let mut inventory = FakeInventory.inventory("default").await.unwrap();
+        inventory.panes.push(pane_observation("pane-1", "terminal-1", "tab-1"));
+        inventory
+            .panes
+            .push(pane_observation("pane-duplicate", "terminal-1", "tab-duplicate"));
+        let (router, _temp) = ghostty_router_with_inventory(inventory).await;
+        let (status, json) = open_ghostty_response(&router, "terminal-1").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["error"]["code"], "terminal_ambiguous");
+    }
+
+    #[tokio::test]
+    async fn open_ghostty_rejects_missing_terminals() {
+        let (router, _temp) = test_router().await;
+        let (status, json) = open_ghostty_response(&router, "missing-terminal").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["error"]["code"], "terminal_not_found");
+    }
+
+    #[tokio::test]
+    async fn open_ghostty_reports_ghostty_unavailable() {
+        let inventory = FakeInventory.inventory("default").await.unwrap();
+        let (router, _temp) =
+            ghostty_router_with_inventory_and_launcher(inventory, missing_ghostty_launcher).await;
+        let (status, json) = open_ghostty_response(&router, "terminal-1").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["error"]["code"], "ghostty_unavailable");
+    }
+
+    #[tokio::test]
+    async fn open_ghostty_reports_ghostty_launch_failed() {
+        let inventory = FakeInventory.inventory("default").await.unwrap();
+        let (router, _temp) =
+            ghostty_router_with_inventory_and_launcher(inventory, failing_ghostty_launcher).await;
+        let (status, json) = open_ghostty_response(&router, "terminal-1").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(json["error"]["code"], "ghostty_launch_failed");
+    }
+
     async fn shutdown_test_router() -> (
         Router,
         TempDir,
@@ -4978,6 +5232,7 @@ mod tests {
             runtime,
             store,
             artifacts,
+            noop_ghostty_launcher,
             Some(receiver),
             connections.clone(),
         );

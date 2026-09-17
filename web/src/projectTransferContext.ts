@@ -32,7 +32,6 @@ export function beginProjectTransferRefresh(
 ): ProjectTransferContextEntry {
   return {
     ...current,
-    error: null,
     generation,
     loading: true,
   }

@@ -26,7 +26,7 @@ interface AllocationDialogProps {
 function actionLabel(subject: AllocationSubject) {
   if (subject.kind === 'profile') return 'Create worker'
   return subject.candidate.availability === 'resumable'
-    ? 'Resume worker'
+    ? 'Replace runtime and assign'
     : 'Assign worker'
 }
 

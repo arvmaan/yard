@@ -9,17 +9,22 @@ import {
   Save,
 } from 'lucide-react'
 import { WorkerInterventions } from './WorkerInterventions'
+import {
+  resolveRuntimeCapabilities,
+  runtimeCapabilityStatus,
+} from './runtimeCapabilities'
 import type {
   CoordinationNode,
   CoordinationNodeRoute,
   CoordinationSnapshot,
-  ObservedStatus,
   Project,
+  RuntimeInventory,
   WorkerProfile,
 } from './types'
 
 export function CoordinationNodeInspector({
   busy,
+  inventory,
   node,
   onProvision,
   onRouteChange,
@@ -28,9 +33,11 @@ export function CoordinationNodeInspector({
   profiles,
   projects,
   routes,
+  snapshotCurrent,
   snapshots,
 }: {
   busy: boolean
+  inventory: RuntimeInventory | null
   node: CoordinationNode
   onProvision: (node: CoordinationNode, profile: WorkerProfile) => void
   onRouteChange: (route: CoordinationNodeRoute) => void
@@ -43,6 +50,7 @@ export function CoordinationNodeInspector({
   profiles: WorkerProfile[]
   projects: Project[]
   routes: CoordinationNodeRoute[]
+  snapshotCurrent: boolean
   snapshots: CoordinationSnapshot[]
 }) {
   const [name, setName] = useState(node.name)
@@ -63,8 +71,13 @@ export function CoordinationNodeInspector({
   const attachedProjects = projects.filter((project) =>
     node.attached_project_ids.includes(project.id),
   )
-  const workerStatus: ObservedStatus =
-    node.worker?.runtime?.status ?? 'unknown'
+  const runtime = node.worker?.runtime ?? null
+  const capabilities = resolveRuntimeCapabilities(
+    snapshotCurrent,
+    runtime,
+    inventory,
+  )
+  const workerStatus = runtimeCapabilityStatus(runtime, capabilities)
   const dirty =
     name.trim() !== node.name ||
     attachedProjectIds.length !== node.attached_project_ids.length ||
@@ -165,9 +178,10 @@ export function CoordinationNodeInspector({
           <WorkerInterventions
             key={`${node.id}:${node.version}:${node.worker.id}`}
             onCoordinationNodeChange={onRouteChange}
+            inventory={inventory}
             projects={attachedProjects}
             routes={routes}
-            status={workerStatus}
+            snapshotCurrent={snapshotCurrent}
             target={{ kind: 'coordination-node', node }}
           />
         ) : (

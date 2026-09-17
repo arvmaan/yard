@@ -27,7 +27,8 @@ export interface AgentWindowTarget {
 export interface FilterableAgentWindowTarget extends AgentWindowTarget {
   cwd: string | null
   harness: string
-  observation: 'observed' | 'durable'
+  interactive: boolean
+  observation: 'observed' | 'stale' | 'durable'
   paneId: string
   roleLabel: string
   status: ObservedStatus
@@ -128,9 +129,7 @@ function compareGroups(
 }
 
 function targetActivityRank(target: FilterableAgentWindowTarget) {
-  return target.observation === 'observed'
-    ? activityOrder[target.status]
-    : 5
+  return target.interactive ? activityOrder[target.status] : 5
 }
 
 function groupActivityRank(
@@ -175,7 +174,7 @@ function targetSearchText(target: FilterableAgentWindowTarget) {
     target.paneId,
     target.cwd,
     target.observation,
-    target.observation === 'durable' ? 'not observed' : 'runtime observed',
+    target.interactive ? 'interactive' : 'live controls unavailable',
   ]
     .filter(Boolean)
     .join(' ')

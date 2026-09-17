@@ -1,7 +1,10 @@
+import {
+  providerSessionEquals,
+  resolveRuntimeCapabilities,
+} from './runtimeCapabilities'
 import type {
   ObservedWorker,
   Project,
-  ProviderSessionRef,
   RuntimeInventory,
   WorkerCandidate,
   WorkerRuntimeBinding,
@@ -20,19 +23,6 @@ export interface ProjectOrchestratorEligibility {
   reason: ProjectOrchestratorEligibilityReason
 }
 
-function providerSessionEquals(
-  left: ProviderSessionRef | null,
-  right: ProviderSessionRef | null,
-) {
-  if (!left || !right) return left === right
-  return (
-    left.source === right.source &&
-    left.provider === right.provider &&
-    left.kind === right.kind &&
-    left.value === right.value
-  )
-}
-
 function runtimeMatchesProject(
   project: Project,
   runtime: WorkerRuntimeBinding,
@@ -46,24 +36,15 @@ function runtimeMatchesProject(
   )
 }
 
-function uniqueObservedWorker(
+function eligibleObservedWorker(
   inventory: RuntimeInventory,
   runtime: WorkerRuntimeBinding,
 ): ObservedWorker | undefined {
-  const terminalMatches = inventory.workers.filter(
-    (worker) => worker.terminal_id === runtime.terminal_id,
-  )
-  if (terminalMatches.length !== 1) return undefined
-
-  const observed = terminalMatches[0]
+  const capabilities = resolveRuntimeCapabilities(true, runtime, inventory)
+  const observed = capabilities.observedWorker
   if (
-    observed.workspace_id !== runtime.workspace_id ||
-    observed.pane_id !== runtime.pane_id ||
-    observed.tab_id !== runtime.tab_id ||
-    !providerSessionEquals(
-      observed.provider_session,
-      runtime.provider_session,
-    ) ||
+    !observed ||
+    capabilities.reason !== 'ready' ||
     !observed.interactive_ready ||
     observed.launch_pending
   ) {
@@ -117,7 +98,7 @@ export function projectOrchestratorEligibility(
     return { candidates: [], reason: 'current_orchestrator_unavailable' }
   }
 
-  const displaced = uniqueObservedWorker(inventory, orchestratorRuntime)
+  const displaced = eligibleObservedWorker(inventory, orchestratorRuntime)
   if (!displaced) {
     return { candidates: [], reason: 'current_orchestrator_unavailable' }
   }
@@ -134,7 +115,7 @@ export function projectOrchestratorEligibility(
       return false
     }
 
-    const promoted = uniqueObservedWorker(inventory, runtime)
+    const promoted = eligibleObservedWorker(inventory, runtime)
     return Boolean(
       promoted && promoted.runtime_id !== displaced.runtime_id,
     )

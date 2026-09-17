@@ -17,6 +17,7 @@ import {
   Info,
   Network,
   PanelLeftClose,
+  RefreshCw,
   Search,
   Server,
   SquareTerminal,
@@ -34,6 +35,11 @@ import {
   groupAgentWindowTargets,
   type AgentWindowSort,
 } from './agentWindowNavigator'
+import {
+  runtimeCapabilityDetail,
+  runtimeCapabilityLabel,
+  type RuntimeCapabilities,
+} from './runtimeCapabilities'
 import { useModalDialog } from './useModalDialog'
 import type {
   CoordinationNodeRoute,
@@ -71,14 +77,23 @@ const runtimeStatusOrder = [
   'unknown',
 ] as const
 
+const UNKNOWN_CONNECTION_DETAIL =
+  'Worker not found in the latest Herdr snapshot. Yard cannot confirm that the bound terminal still exists.'
+
+function targetCapabilities(target: AgentWorkspaceTarget): RuntimeCapabilities {
+  return {
+    chat: target.chatAvailable,
+    reason: target.capabilityReason,
+    terminal: target.interactive,
+  }
+}
+
 function targetRuntimeSummary(targets: AgentWorkspaceTarget[]) {
-  const observedTargets = targets.filter(
-    (target) => target.observation === 'observed',
-  )
-  const durableCount = targets.length - observedTargets.length
+  const interactiveTargets = targets.filter((target) => target.interactive)
+  const unavailableCount = targets.length - interactiveTargets.length
   const statuses = runtimeStatusOrder
     .map((status) => ({
-      count: observedTargets.filter(
+      count: interactiveTargets.filter(
         (target) => target.status === status,
       ).length,
       status,
@@ -87,8 +102,21 @@ function targetRuntimeSummary(targets: AgentWorkspaceTarget[]) {
     .map(({ count, status }) => `${count} ${status}`)
   const parts = [`${targets.length} ${targets.length === 1 ? 'target' : 'targets'}`]
   if (statuses.length > 0) parts.push(`runtime ${statuses.join(', ')}`)
-  if (durableCount > 0) parts.push(`${durableCount} durable-only`)
+  if (unavailableCount > 0) {
+    parts.push(`${unavailableCount} live controls unavailable`)
+  }
   return parts.join(' · ')
+}
+
+function targetConnectionSummary(target: AgentWorkspaceTarget) {
+  const capabilities = targetCapabilities(target)
+  if (capabilities.reason === 'ready') {
+    return `Observed runtime: ${target.status}`
+  }
+  const label = runtimeCapabilityLabel(capabilities)
+  const detail =
+    runtimeCapabilityDetail(capabilities) ?? UNKNOWN_CONNECTION_DETAIL
+  return `${label}. ${detail}`
 }
 
 function targetTitle(target: AgentWorkspaceTarget) {
@@ -103,9 +131,7 @@ function targetTitle(target: AgentWorkspaceTarget) {
     target.label,
     `${target.roleLabel} · ${target.contextLabel}`,
     `${target.harness} · ${target.runtimeAdapter} session ${target.session}`,
-    target.observation === 'observed'
-      ? `Observed runtime: ${target.status}`
-      : 'Durable binding; runtime not currently observed',
+    targetConnectionSummary(target),
     topology,
     target.cwd,
   ]
@@ -139,9 +165,15 @@ function AgentWindowDetailsDialog({
     ['Herdr session', target.session],
     [
       'Runtime state',
-      target.observation === 'observed'
-        ? `Observed / ${target.status}`
-        : 'Durable binding / not observed',
+      targetConnectionSummary(target),
+    ],
+    [
+      'Live controls',
+      !target.interactive
+        ? 'Unavailable'
+        : target.chatAvailable
+          ? 'Chat and terminal available'
+          : 'Terminal only',
     ],
     ['Terminal', target.terminalId],
     ['Tab', target.tabId ?? 'Not recorded'],
@@ -200,11 +232,13 @@ function AgentWindowDetailsDialog({
 export function AgentWorkspaceShell({
   activeTarget,
   inventory,
+  inventoryCurrent,
   mode,
   onCoordinationChange,
   onCoordinationNodeChange,
   onModeChange,
   onPresentationChange,
+  onRefresh,
   onTargetChange,
   presentation,
   projects,
@@ -216,11 +250,13 @@ export function AgentWorkspaceShell({
   activeTarget: AgentWorkspaceTarget
   coordinationRoutes: CoordinationNodeRoute[]
   inventory: RuntimeInventory | null
+  inventoryCurrent: boolean
   mode: AgentWorkspaceView
   onCoordinationChange: (route: YardOrchestratorRoute) => void
   onCoordinationNodeChange: (route: CoordinationNodeRoute) => void
   onModeChange: (mode: AgentWorkspaceView) => void
   onPresentationChange: (presentation: TerminalPresentation) => void
+  onRefresh: () => void
   onTargetChange: (target: AgentWorkspaceTarget) => void
   presentation: TerminalPresentation
   projects: Project[]
@@ -253,7 +289,17 @@ export function AgentWorkspaceShell({
             (route) => route.node_id === coordinationNode.id,
           )
         : []
-  const terminalVisible = isTerminalWorkspaceMode(mode)
+  const terminalVisible =
+    isTerminalWorkspaceMode(mode) && activeTarget.interactive
+  const chatVisible = mode === 'chat' && activeTarget.chatAvailable
+  const lastKnownRuntime = [
+    `session ${activeTarget.session}`,
+    `terminal ${activeTarget.terminalId}`,
+    activeTarget.paneId ? `pane ${activeTarget.paneId}` : null,
+    activeTarget.cwd,
+  ]
+    .filter(Boolean)
+    .join(' · ')
   const navigatorRef = useRef<HTMLElement>(null)
   const mobileNavigatorTriggerRef = useRef<HTMLButtonElement>(null)
   const [detailsTarget, setDetailsTarget] = useState<{
@@ -277,8 +323,13 @@ export function AgentWorkspaceShell({
     returnFocus: mobileNavigatorTriggerRef.current,
   })
   const workspaceGroups = useMemo(
-    () => groupAgentWindowTargets(targets, inventory, sessions),
-    [inventory, sessions, targets],
+    () =>
+      groupAgentWindowTargets(
+        targets,
+        inventoryCurrent ? inventory : null,
+        sessions,
+      ),
+    [inventory, inventoryCurrent, sessions, targets],
   )
   const visibleWorkspaceGroups = useMemo(
     () =>
@@ -455,7 +506,7 @@ export function AgentWorkspaceShell({
                         panes
                       </span>
                     ) : (
-                      <span>Topology not observed</span>
+                      <span>Topology unavailable</span>
                     )}
                   </div>
                   {workspace?.worktree ? (
@@ -488,6 +539,7 @@ export function AgentWorkspaceShell({
                         data-observation={target.observation}
                         data-status={target.status}
                         data-target-key={target.key}
+                        disabled={!target.interactive}
                         onClick={() => {
                           onTargetChange(target)
                           setMobileNavigatorOpen(false)
@@ -509,9 +561,17 @@ export function AgentWorkspaceShell({
                           <span className="agent-window-row__identity">
                             <strong>{target.label}</strong>
                             <small>
-                              {target.observation === 'observed'
-                                ? `Runtime ${target.status}`
-                                : 'Not observed'}
+                              {target.observation === 'stale'
+                                ? 'Connection status stale'
+                                : target.observation === 'observed'
+                                  ? target.interactive
+                                    ? target.chatAvailable
+                                      ? `Runtime ${target.status}`
+                                      : 'Observed · terminal only'
+                                    : runtimeCapabilityLabel(
+                                        targetCapabilities(target),
+                                      )
+                                  : 'Connection status unknown'}
                             </small>
                           </span>
                           <small className="agent-window-row__context">
@@ -658,7 +718,7 @@ export function AgentWorkspaceShell({
           onCoordinationChange={onCoordinationChange}
           onCoordinationNodeChange={onCoordinationNodeChange}
           onClose={() => onModeChange('map')}
-          open={mode === 'chat'}
+          open={chatVisible}
           projects={chatProjects}
           returnFocus={null}
           routes={chatRoutes}
@@ -666,6 +726,43 @@ export function AgentWorkspaceShell({
           target={activeTarget.target}
           variant="workspace"
         />
+        {mode === 'chat' && !activeTarget.chatAvailable ? (
+          <div className="terminal-mode-loading" role="status">
+            <strong>Agent chat unavailable</strong>
+            <span>{targetConnectionSummary(activeTarget)}</span>
+            <small>Last known runtime: {lastKnownRuntime}</small>
+            <div className="inspector-actions">
+              <button
+                className="secondary-button"
+                onClick={onRefresh}
+                type="button"
+              >
+                <RefreshCw aria-hidden="true" size={15} />
+                Refresh inventory
+              </button>
+            </div>
+          </div>
+        ) : null}
+        {mode === 'terminal' && !activeTarget.interactive ? (
+          <div className="terminal-mode-loading" role="status">
+            <strong>Live controls unavailable</strong>
+            <span>{targetConnectionSummary(activeTarget)}</span>
+            <small>Last known runtime: {lastKnownRuntime}</small>
+            <div className="inspector-actions">
+              <button
+                className="secondary-button"
+                onClick={onRefresh}
+                type="button"
+              >
+                <RefreshCw aria-hidden="true" size={15} />
+                Refresh inventory
+              </button>
+            </div>
+            <small>
+              Reattach becomes available after Yard sees one current matching terminal.
+            </small>
+          </div>
+        ) : null}
         {mode === 'changes' ? (
           <section
             aria-label={"Files for " + activeTarget.label}

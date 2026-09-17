@@ -2,8 +2,12 @@ import { createContext, useContext } from 'react'
 import type {
   AgentChatTarget,
 } from './AgentChatWorkspace'
+import type { RuntimeCapabilityReason } from './runtimeCapabilities'
 import type { TerminalTarget } from './TerminalSession'
-import type { ObservedStatus, WorkerRuntimeBinding } from './types'
+import type {
+  ObservedStatus,
+  WorkerRuntimeBinding,
+} from './types'
 import type { AgentWindowRole } from './agentWindowNavigator'
 
 export type TerminalPresentation = 'focus' | 'terminal'
@@ -18,12 +22,15 @@ export function isTerminalWorkspaceMode(
 }
 
 export interface AgentWorkspaceTarget {
+  capabilityReason: RuntimeCapabilityReason
+  chatAvailable: boolean
   contextLabel: string
   cwd: string | null
   harness: string
+  interactive: boolean
   key: string
   label: string
-  observation: 'observed' | 'durable'
+  observation: 'observed' | 'stale' | 'durable'
   paneId: string
   returnFocus?: HTMLElement | null
   role: AgentWindowRole
@@ -38,6 +45,7 @@ export interface AgentWorkspaceTarget {
   terminalTarget: TerminalTarget
   workspaceId: string
 }
+
 
 interface AgentWorkspaceContextValue {
   openChat: (target: AgentWorkspaceTarget) => void

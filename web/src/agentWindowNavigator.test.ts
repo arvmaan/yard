@@ -15,6 +15,7 @@ function target(
     contextLabel: 'Project',
     cwd: `/work/${workspaceId}`,
     harness: 'Codex',
+    interactive: true,
     key,
     label: key,
     observation: 'observed',
@@ -228,6 +229,7 @@ describe('groupAgentWindowTargets', () => {
           tabId: 'workspace-a:tab-2',
         }),
         target('planner', 'workspace-a', {
+          interactive: false,
           label: 'Planner',
           status: 'idle',
           tabId: 'workspace-a:tab-1',
@@ -238,6 +240,7 @@ describe('groupAgentWindowTargets', () => {
           status: 'blocked',
         }),
         target('offline', 'workspace-offline', {
+          interactive: false,
           label: 'Offline worker',
           observation: 'durable',
           session: 'beta',
@@ -284,6 +287,11 @@ describe('groupAgentWindowTargets', () => {
         (group) => group.workspaceId,
       ),
     ).toEqual(['workspace-a', 'workspace-z', 'workspace-offline'])
+    expect(
+      filterAndSortAgentWindowGroups(groups, '', 'activity')[1].targets.map(
+        (candidate) => candidate.key,
+      ),
+    ).toEqual(['builder', 'planner'])
     expect(
       filterAndSortAgentWindowGroups(groups, '', 'runtime')[0].targets.map(
         (candidate) => candidate.key,

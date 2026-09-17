@@ -207,6 +207,8 @@ export function RuntimeHealthPopover({
 }
 
 interface GlobalCommandBarProps extends RuntimeHealthPopoverProps {
+  activeAgentWorkspaceChat: boolean
+  activeAgentWorkspaceTerminal: boolean
   activeAgentWorkspaceTarget: boolean
   agentWorkspaceMode: AgentWorkspaceMode | 'map'
   onAgentWorkspaceModeChange: (
@@ -228,6 +230,8 @@ const RESOURCE_ICONS = {
 }
 
 export function GlobalCommandBar({
+  activeAgentWorkspaceChat,
+  activeAgentWorkspaceTerminal,
   activeAgentWorkspaceTarget,
   agentWorkspaceMode,
   busy,
@@ -271,7 +275,7 @@ export function GlobalCommandBar({
         </button>
         <button
           aria-selected={agentWorkspaceMode === 'chat'}
-          disabled={!activeAgentWorkspaceTarget}
+          disabled={!activeAgentWorkspaceChat}
           onClick={() => onAgentWorkspaceModeChange('chat')}
           role="tab"
           title="Chat"
@@ -282,7 +286,7 @@ export function GlobalCommandBar({
         </button>
         <button
           aria-selected={agentWorkspaceMode === 'terminal'}
-          disabled={!activeAgentWorkspaceTarget}
+          disabled={!activeAgentWorkspaceTerminal}
           onClick={() => onAgentWorkspaceModeChange('terminal')}
           role="tab"
           title="Terminal"

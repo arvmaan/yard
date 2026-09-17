@@ -1,3 +1,7 @@
+import {
+  resolveRuntimeCapabilities,
+  runtimeCapabilityStatus,
+} from './runtimeCapabilities'
 import type {
   Assignment,
   ObservedStatus,
@@ -57,17 +61,8 @@ function observedStatus(
   runtime: WorkerRuntimeBinding | null,
   inventory: RuntimeInventory | null,
 ): ObservedStatus {
-  if (
-    runtime &&
-    inventory?.adapter === runtime.adapter &&
-    inventory.session === runtime.session
-  ) {
-    const observed = inventory.workers.find(
-      (worker) => worker.terminal_id === runtime.terminal_id,
-    )
-    if (observed) return observed.status
-  }
-  return runtime?.status ?? 'unknown'
+  const capabilities = resolveRuntimeCapabilities(true, runtime, inventory)
+  return runtimeCapabilityStatus(runtime, capabilities)
 }
 
 function newest<T>(
