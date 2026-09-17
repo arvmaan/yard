@@ -4254,6 +4254,89 @@ test('keeps raised worker units stable and 2D motion respects reduced motion', a
   ).toBe('none')
 })
 
+test('keeps depth-mode workers visible and clickable at minimum zoom', async ({
+  page,
+}, testInfo) => {
+  const state = await mockApi(page)
+  const seeded = seedActiveAssignment(state, 'assignment-zoomed-out')
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  const marker = page.locator(
+    `.assigned-worker-marker[data-worker-id="${seeded.worker.id}"]`,
+  )
+  const zoomOut = page.getByRole('button', { name: 'Zoom Out' })
+  await expect(marker).toBeVisible()
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    if (!(await zoomOut.isEnabled())) break
+    await zoomOut.click()
+  }
+  await expect(zoomOut).toBeDisabled()
+
+  const minimumZoomLayout = await marker.evaluate((element) => {
+    const body = element.querySelector<HTMLElement>('.worker-marker__body')
+    const canvas = element.closest<HTMLElement>('.runtime-canvas')
+    const viewport = element.closest<HTMLElement>('.react-flow__viewport')
+    const zoomMatch = viewport?.style.transform.match(/scale\(([^)]+)\)/)
+    return {
+      bodyWidth: body?.getBoundingClientRect().width ?? 0,
+      compensation: Number.parseFloat(
+        canvas
+          ? getComputedStyle(canvas).getPropertyValue(
+              '--billboard-zoom-compensation',
+            )
+          : '0',
+      ),
+      zoom: zoomMatch ? Number(zoomMatch[1]) : 0,
+    }
+  })
+  expect(minimumZoomLayout.zoom).toBeCloseTo(0.3, 2)
+  expect(minimumZoomLayout.compensation).toBeCloseTo(1.8, 2)
+  expect(minimumZoomLayout.bodyWidth).toBeGreaterThanOrEqual(28)
+  expect(minimumZoomLayout.bodyWidth).toBeLessThanOrEqual(32)
+
+  await marker.click()
+  await expect(page.locator('.inspector h2')).toHaveText(
+    seeded.profile_name,
+  )
+  await page.screenshot({
+    path: testInfo.outputPath('worker-minimum-zoom-depth.png'),
+    fullPage: true,
+  })
+
+  await setMapView(page, '2D view')
+  await expect(marker).toBeVisible()
+  expect(
+    await marker.evaluate((element) => {
+      const shell = element.closest<HTMLElement>('.worker-node-shell')
+      return shell ? getComputedStyle(shell).transform : ''
+    }),
+  ).toBe('none')
+  await page.getByRole('button', { name: 'Close details' }).click()
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await setMapView(page, '2.5D view')
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    if (!(await zoomOut.isEnabled())) break
+    await zoomOut.click()
+  }
+  await expect(zoomOut).toBeDisabled()
+  const mobileBodyWidth = await marker
+    .locator('.worker-marker__body')
+    .evaluate((element) => element.getBoundingClientRect().width)
+  expect(mobileBodyWidth).toBeGreaterThanOrEqual(28)
+  expect(mobileBodyWidth).toBeLessThanOrEqual(32)
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth - window.innerWidth,
+    ),
+  ).toBeLessThanOrEqual(0)
+  await page.screenshot({
+    path: testInfo.outputPath('worker-minimum-zoom-mobile.png'),
+    fullPage: true,
+  })
+})
+
 test('keeps exactly one durable orchestrator visible across selected sessions', async ({
   page,
 }, testInfo) => {

@@ -7766,7 +7766,9 @@ html[data-yard-allocation-dragging="true"]
    stay upright billboards standing on their projected ground anchors. They are
    drawn at a smaller scale than the flat plan cards because the ground plane is
    foreshortened; full-size cards would tower over the territories they stand
-   on. Scaling the inner root keeps ReactFlow's own node transform untouched. */
+   on. Scaling the inner root keeps ReactFlow's own node transform untouched.
+   At distant zoom levels, a capped inverse scale keeps workers legible and
+   clickable without letting their hit regions overtake the map. */
 .runtime-canvas[data-visual-mode="depth"] .worker-node-shell,
 .runtime-canvas[data-visual-mode="depth"] .yard-hub-node,
 .runtime-canvas[data-visual-mode="depth"] .child-agent-marker,
@@ -7774,7 +7776,12 @@ html[data-yard-allocation-dragging="true"]
 .runtime-canvas[data-visual-mode="depth"] .automation-map-node {
   width: var(--billboard-width, 100%);
   height: var(--billboard-height, 100%);
-  transform: scale(var(--billboard-scale, 1));
+  transform: scale(
+    calc(
+      var(--billboard-scale, 1) *
+        var(--billboard-zoom-compensation, 1)
+    )
+  );
   transform-origin: top left;
 }
 

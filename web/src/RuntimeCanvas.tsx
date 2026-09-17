@@ -331,6 +331,8 @@ const TERRITORY_BOX_PAD = 24
  * still stands clear of its parent.
  */
 const BILLBOARD_SCALE = 0.78
+const BILLBOARD_ZOOM_COMPENSATION_START = 0.72
+const BILLBOARD_ZOOM_COMPENSATION_MAX = 1.8
 /** Vertical room the tallest structures need above their ground footprint. */
 const BUILDING_HEADROOM = 140
 
@@ -377,6 +379,10 @@ type ProjectedNodeProperties = CSSProperties & {
   '--territory-box-width'?: string
   '--territory-label-x'?: string
   '--territory-label-y'?: string
+}
+
+type RuntimeCanvasProperties = CSSProperties & {
+  '--billboard-zoom-compensation': string
 }
 
 type BuildingProperties = CSSProperties & {
@@ -2730,6 +2736,7 @@ export function RuntimeCanvas({
   const [agentPositions, setAgentPositions] = useState<
     Record<string, CanvasPoint>
   >(readAgentPositions)
+  const [viewportZoom, setViewportZoom] = useState(0.88)
   const instance = useRef<ReactFlowInstance<RuntimeNode> | null>(null)
   const dragOrigins = useRef(new Map<string, CanvasPoint>())
   const nodesById = useRef(new Map<string, RuntimeNode>())
@@ -2983,12 +2990,13 @@ export function RuntimeCanvas({
         // nothing (see pointerEvents above); only the label opts back in.
         style.zIndex = 10
       } else {
-        // Billboard nodes shrink to their drawn size so the wrapper box, the
-        // pointer target, and the visible sprite stay the same rectangle. The
-        // inner layout keeps its original pixel size through --billboard-*, so
-        // nothing inside a marker reflows or overflows. Dimensions come from
-        // the declared style rather than the measured box, because the measured
-        // box is already the scaled one and would compound every render.
+        // Billboard nodes shrink to their baseline drawn size. The inner
+        // layout keeps its original pixel dimensions through --billboard-* so
+        // content does not reflow. At distant zoom levels the inner root and
+        // its pointer target may grow beyond this wrapper by the separate,
+        // capped zoom compensation. Dimensions come from the declared style
+        // rather than the measured box, because the measured box is already
+        // scaled and would compound every render.
         const width = numericDimension(node.style?.width, WORKER_NODE_WIDTH)
         const height = numericDimension(node.style?.height, WORKER_NODE_HEIGHT)
         style['--billboard-width'] = `${width}px`
@@ -3000,6 +3008,20 @@ export function RuntimeCanvas({
       return { ...node, style } as RuntimeNode
     })
   }, [nodes, visualMode])
+  const canvasStyle = useMemo<RuntimeCanvasProperties>(
+    () => ({
+      '--billboard-zoom-compensation': String(
+        Math.min(
+          BILLBOARD_ZOOM_COMPENSATION_MAX,
+          Math.max(
+            1,
+            BILLBOARD_ZOOM_COMPENSATION_START / viewportZoom,
+          ),
+        ),
+      ),
+    }),
+    [viewportZoom],
+  )
   const arrangeSpaces = useCallback(() => {
     const flowInstance = instance.current
     const yardNode = flowInstance?.getNode('yard-orchestrator')
@@ -3871,6 +3893,7 @@ export function RuntimeCanvas({
       nodeTypes={NODE_TYPES}
       nodes={projectedNodes}
       nodesConnectable
+      style={canvasStyle}
       onConnect={handleConnect}
       onPaneClick={() => setContextMenu(null)}
       onPaneContextMenu={(event) => showContextMenu(event)}
@@ -3951,6 +3974,11 @@ export function RuntimeCanvas({
       }}
       onSelectionChange={handleSelectionChange}
       onNodesChange={handleNodesChange}
+      onViewportChange={({ zoom }) => {
+        setViewportZoom((current) =>
+          Math.abs(current - zoom) < 0.001 ? current : zoom,
+        )
+      }}
       onDragLeave={() => setAllocationTargetId(null)}
       onDragOver={(event) => {
         if (!event.dataTransfer.types.includes(ALLOCATION_DRAG_TYPE)) return
