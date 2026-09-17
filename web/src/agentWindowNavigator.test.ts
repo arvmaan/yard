@@ -1,22 +1,31 @@
 import { describe, expect, it } from 'vitest'
 import {
+  filterAndSortAgentWindowGroups,
   groupAgentWindowTargets,
-  type AgentWindowTarget,
+  type FilterableAgentWindowTarget,
 } from './agentWindowNavigator'
 import type { WorkspaceObservation } from './types'
 
 function target(
   key: string,
   workspaceId: string,
-  overrides: Partial<AgentWindowTarget> = {},
-): AgentWindowTarget {
+  overrides: Partial<FilterableAgentWindowTarget> = {},
+): FilterableAgentWindowTarget {
   return {
     contextLabel: 'Project',
+    cwd: `/work/${workspaceId}`,
+    harness: 'Codex',
     key,
     label: key,
+    observation: 'observed',
+    paneId: `${workspaceId}:pane-1`,
     role: 'worker',
+    roleLabel: 'Implementer',
     runtimeAdapter: 'herdr',
     session: 'alpha',
+    status: 'idle',
+    tabId: `${workspaceId}:tab-1`,
+    terminalId: `${workspaceId}:terminal-1`,
     workspaceId,
     ...overrides,
   }
@@ -208,5 +217,84 @@ describe('groupAgentWindowTargets', () => {
       },
     ])
     expect(reversed).toEqual(forward)
+  })
+
+  it('filters window metadata and supports activity and runtime order', () => {
+    const groups = groupAgentWindowTargets(
+      [
+        target('builder', 'workspace-a', {
+          label: 'Builder',
+          status: 'working',
+          tabId: 'workspace-a:tab-2',
+        }),
+        target('planner', 'workspace-a', {
+          label: 'Planner',
+          status: 'idle',
+          tabId: 'workspace-a:tab-1',
+        }),
+        target('reviewer', 'workspace-z', {
+          cwd: '/work/release-tools/checks',
+          label: 'Reviewer',
+          status: 'blocked',
+        }),
+        target('offline', 'workspace-offline', {
+          label: 'Offline worker',
+          observation: 'durable',
+          session: 'beta',
+        }),
+      ],
+      {
+        adapter: 'herdr',
+        session: 'alpha',
+        tabs: [
+          {
+            focused: false,
+            label: 'Planner',
+            order: 1,
+            pane_count: 1,
+            runtime_id: 'workspace-a:tab-1',
+            status: 'idle',
+            workspace_id: 'workspace-a',
+          },
+          {
+            focused: false,
+            label: 'Builder',
+            order: 2,
+            pane_count: 1,
+            runtime_id: 'workspace-a:tab-2',
+            status: 'working',
+            workspace_id: 'workspace-a',
+          },
+        ],
+        workspaces: [
+          workspace('workspace-a', 1, 'API migration'),
+          workspace('workspace-z', 2, 'Release checks'),
+        ],
+      },
+      sessions,
+    )
+
+    expect(
+      filterAndSortAgentWindowGroups(groups, '', 'activity').map(
+        (group) => group.workspaceId,
+      ),
+    ).toEqual(['workspace-z', 'workspace-a', 'workspace-offline'])
+    expect(
+      filterAndSortAgentWindowGroups(groups, '', 'runtime').map(
+        (group) => group.workspaceId,
+      ),
+    ).toEqual(['workspace-a', 'workspace-z', 'workspace-offline'])
+    expect(
+      filterAndSortAgentWindowGroups(groups, '', 'runtime')[0].targets.map(
+        (candidate) => candidate.key,
+      ),
+    ).toEqual(['planner', 'builder'])
+    expect(
+      filterAndSortAgentWindowGroups(
+        groups,
+        'release-tools',
+        'name',
+      ).flatMap((group) => group.targets.map((candidate) => candidate.key)),
+    ).toEqual(['reviewer'])
   })
 })

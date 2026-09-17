@@ -146,6 +146,7 @@ function activitySegments(text: string) {
 }
 
 export function AgentChatWorkspace({
+  closeOnEscape = true,
   label,
   onCoordinationChange,
   onCoordinationNodeChange,
@@ -158,6 +159,7 @@ export function AgentChatWorkspace({
   target,
   variant = 'modal',
 }: {
+  closeOnEscape?: boolean
   label: string
   onCoordinationChange?: (route: YardOrchestratorRoute) => void
   onCoordinationNodeChange?: (route: CoordinationNodeRoute) => void
@@ -261,6 +263,7 @@ export function AgentChatWorkspace({
   const outputController = useRef<AbortController | null>(null)
   const promptInFlight = useRef(false)
   const retainedPromptCommand = useRef<RetainedPrompt | null>(null)
+  const closeOnEscapeRef = useRef(closeOnEscape)
   const onCloseRef = useRef(onClose)
   const returnFocusRef = useRef(returnFocus)
   const dialogRef = useRef<HTMLElement>(null)
@@ -291,6 +294,7 @@ export function AgentChatWorkspace({
     : targetKey
   const promptTargetKeyRef = useRef(promptTargetKey)
   const activeContextLabel = dispatchProject?.name ?? contextLabel
+  closeOnEscapeRef.current = closeOnEscape
   onCloseRef.current = onClose
   returnFocusRef.current = returnFocus
   useModalDialog({
@@ -424,7 +428,9 @@ export function AgentChatWorkspace({
     window.requestAnimationFrame(() => textareaRef.current?.focus())
 
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onCloseRef.current()
+      if (event.key === 'Escape' && closeOnEscapeRef.current) {
+        onCloseRef.current()
+      }
     }
     if (variant === 'workspace') {
       window.addEventListener('keydown', handleKeyDown)

@@ -1,7 +1,11 @@
 import type {
+  ObservedStatus,
   RuntimeSession,
+  TabObservation,
   WorkspaceObservation,
 } from './types'
+
+export type AgentWindowSort = 'activity' | 'runtime' | 'name'
 
 export type AgentWindowRole =
   | 'superintendent'
@@ -16,12 +20,24 @@ export interface AgentWindowTarget {
   role: AgentWindowRole
   runtimeAdapter: string
   session: string
+  tabId: string | null
   workspaceId: string
+}
+
+export interface FilterableAgentWindowTarget extends AgentWindowTarget {
+  cwd: string | null
+  harness: string
+  observation: 'observed' | 'durable'
+  paneId: string
+  roleLabel: string
+  status: ObservedStatus
+  terminalId: string
 }
 
 export interface AgentWindowInventory {
   adapter: string
   session: string
+  tabs?: TabObservation[]
   workspaces: WorkspaceObservation[]
 }
 
@@ -42,6 +58,14 @@ const roleOrder: Record<AgentWindowRole, number> = {
   workstream: 1,
   orchestrator: 2,
   worker: 3,
+}
+
+const activityOrder: Record<ObservedStatus, number> = {
+  blocked: 0,
+  working: 1,
+  idle: 2,
+  done: 3,
+  unknown: 4,
 }
 
 function compareText(left: string, right: string) {
@@ -69,6 +93,20 @@ function compareTargets(
   )
 }
 
+function compareRuntimeTargets(
+  left: AgentWindowTarget,
+  right: AgentWindowTarget,
+  tabOrders: Map<string, number>,
+) {
+  const leftOrder = left.tabId
+    ? tabOrders.get(left.tabId) ?? Number.POSITIVE_INFINITY
+    : Number.POSITIVE_INFINITY
+  const rightOrder = right.tabId
+    ? tabOrders.get(right.tabId) ?? Number.POSITIVE_INFINITY
+    : Number.POSITIVE_INFINITY
+  return leftOrder - rightOrder || compareTargets(left, right)
+}
+
 function compareGroups(
   left: AgentWindowWorkspaceGroup,
   right: AgentWindowWorkspaceGroup,
@@ -89,6 +127,119 @@ function compareGroups(
   )
 }
 
+function targetActivityRank(target: FilterableAgentWindowTarget) {
+  return target.observation === 'observed'
+    ? activityOrder[target.status]
+    : 5
+}
+
+function groupActivityRank(
+  group: AgentWindowWorkspaceGroup<FilterableAgentWindowTarget>,
+) {
+  if (group.sessionRunning === false) return 6
+  return Math.min(...group.targets.map(targetActivityRank))
+}
+
+function groupSearchText(
+  group: AgentWindowWorkspaceGroup<FilterableAgentWindowTarget>,
+) {
+  const workspace = group.observation
+  return [
+    group.runtimeAdapter,
+    group.session,
+    group.workspaceId,
+    workspace?.label,
+    workspace?.status,
+    workspace?.worktree?.repository_name,
+    workspace?.worktree?.checkout_path,
+    workspace?.focused ? 'focused' : null,
+    group.sessionRunning === false ? 'offline' : null,
+    workspace ? 'observed' : 'durable not observed',
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLocaleLowerCase('en-US')
+}
+
+function targetSearchText(target: FilterableAgentWindowTarget) {
+  return [
+    target.label,
+    target.contextLabel,
+    target.roleLabel,
+    target.status,
+    target.harness,
+    target.session,
+    target.workspaceId,
+    target.terminalId,
+    target.tabId,
+    target.paneId,
+    target.cwd,
+    target.observation,
+    target.observation === 'durable' ? 'not observed' : 'runtime observed',
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLocaleLowerCase('en-US')
+}
+
+export function filterAndSortAgentWindowGroups<
+  Target extends FilterableAgentWindowTarget,
+>(
+  groups: AgentWindowWorkspaceGroup<Target>[],
+  query: string,
+  sort: AgentWindowSort,
+): AgentWindowWorkspaceGroup<Target>[] {
+  const normalizedQuery = query.trim().toLocaleLowerCase('en-US')
+  const visibleGroups = groups.flatMap((group) => {
+    const groupMatches =
+      normalizedQuery.length === 0 ||
+      groupSearchText(group).includes(normalizedQuery)
+    const targets = groupMatches
+      ? group.targets
+      : group.targets.filter((target) =>
+          targetSearchText(target).includes(normalizedQuery),
+        )
+    if (targets.length === 0) return []
+
+    const sortedTargets = [...targets]
+    if (sort === 'activity') {
+      sortedTargets.sort(
+        (left, right) =>
+          targetActivityRank(left) - targetActivityRank(right) ||
+          compareTargets(left, right),
+      )
+    } else if (sort === 'name') {
+      sortedTargets.sort(
+        (left, right) =>
+          compareText(left.label, right.label) ||
+          compareText(left.contextLabel, right.contextLabel) ||
+          compareTargets(left, right),
+      )
+    }
+    return [{ ...group, targets: sortedTargets }]
+  })
+
+  if (sort === 'activity') {
+    visibleGroups.sort(
+      (left, right) =>
+        groupActivityRank(left) - groupActivityRank(right) ||
+        Number(Boolean(right.observation?.focused)) -
+          Number(Boolean(left.observation?.focused)) ||
+        compareGroups(left, right),
+    )
+  } else if (sort === 'name') {
+    visibleGroups.sort(
+      (left, right) =>
+        compareText(
+          left.observation?.label ?? left.workspaceId,
+          right.observation?.label ?? right.workspaceId,
+        ) || compareGroups(left, right),
+    )
+  }
+
+  return visibleGroups
+}
+
 export function groupAgentWindowTargets<
   Target extends AgentWindowTarget,
 >(
@@ -103,6 +254,9 @@ export function groupAgentWindowTargets<
       workspace.runtime_id,
       workspace,
     ]) ?? [],
+  )
+  const tabOrders = new Map(
+    inventory?.tabs?.map((tab) => [tab.runtime_id, tab.order]) ?? [],
   )
   const sessionStates = new Map(
     sessions.map((session) => [session.name, session.running]),
@@ -145,7 +299,9 @@ export function groupAgentWindowTargets<
   return [...groups.values()]
     .map((group) => ({
       ...group,
-      targets: [...group.targets].sort(compareTargets),
+      targets: [...group.targets].sort((left, right) =>
+        compareRuntimeTargets(left, right, tabOrders),
+      ),
     }))
     .sort(compareGroups)
 }

@@ -7325,7 +7325,7 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   if (!apiWorkspace || !releaseWorkspace) {
     throw new Error('Workspace navigator fixture is incomplete')
   }
-  apiWorkspace.order = 20
+  apiWorkspace.order = 10
   apiWorkspace.worktree = {
     repository_key: 'yard',
     repository_name: 'yard',
@@ -7333,7 +7333,7 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
     checkout_path: '/tmp/sample/yard-worktrees/api-migration',
     is_linked: true,
   }
-  releaseWorkspace.order = 10
+  releaseWorkspace.order = 20
   releaseWorkspace.worktree = {
     repository_key: 'release-tools',
     repository_name: 'release-tools',
@@ -7388,7 +7388,7 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   await openChat.click()
 
   const shell = page.locator('.agent-workspace-shell')
-  const navigator = shell.getByLabel('Herdr windows')
+  const navigator = shell.locator('.agent-window-navigator')
   await expect(shell).toBeVisible()
   await expect(navigator).toContainText('Runtime working')
   await expect(navigator).toContainText('durable-only')
@@ -7408,6 +7408,36 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
     'data-workspace-id',
     'workspace-offline',
   )
+  const windowSort = navigator.getByLabel('Sort Herdr windows')
+  const windowSearch = navigator.getByLabel('Search Herdr windows')
+  await expect(windowSort).toHaveValue('activity')
+  await windowSort.selectOption('runtime')
+  await expect(workspaceGroups.nth(0)).toHaveAttribute(
+    'data-workspace-id',
+    'workspace-1',
+  )
+  await windowSort.selectOption('name')
+  await expect(workspaceGroups.nth(0)).toHaveAttribute(
+    'data-workspace-id',
+    'workspace-1',
+  )
+  await windowSort.selectOption('activity')
+  await windowSearch.fill('release-tools')
+  await expect(workspaceGroups).toHaveCount(1)
+  await expect(workspaceGroups.nth(0)).toHaveAttribute(
+    'data-workspace-id',
+    'workspace-2',
+  )
+  await windowSearch.fill('focused')
+  await expect(workspaceGroups).toHaveCount(1)
+  await expect(workspaceGroups.nth(0)).toHaveAttribute(
+    'data-workspace-id',
+    'workspace-1',
+  )
+  await windowSearch.fill('missing-window')
+  await expect(navigator.getByText('No matching windows')).toBeVisible()
+  await windowSearch.fill('')
+  await expect(workspaceGroups).toHaveCount(3)
   await expect(workspaceGroups.nth(1)).toContainText('API migration')
   await expect(workspaceGroups.nth(1)).toContainText('workspace-1')
   await expect(workspaceGroups.nth(1)).toContainText('2 targets')
@@ -7505,6 +7535,7 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   )
   await reviewerRow.focus()
   await page.keyboard.press('Tab')
+  await page.keyboard.press('Tab')
   await expect(keyboardFocusRow).toBeFocused()
   expect(
     await keyboardFocusRow.evaluate((element) =>
@@ -7546,6 +7577,7 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   await setAppTheme(page, 'Dark')
   await reviewerRow.focus()
   await page.keyboard.press('Tab')
+  await page.keyboard.press('Tab')
   await expect(keyboardFocusRow).toBeFocused()
   const darkContrasts = await navigatorMetadataContrasts(navigator)
   expect(darkContrasts.length).toBe(lightContrasts.length)
@@ -7564,6 +7596,13 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
       ),
     )
     .toBe(true)
+  await windowSearch.focus()
+  await page.keyboard.press('Escape')
+  await expect(shell).toBeHidden()
+  await openChat.click()
+  await expect(shell).toBeVisible()
+  await expect(page.getByLabel('Agent conversation')).toBeVisible()
+  await expect(navigator).toBeVisible()
 
   await navigator
     .getByRole('button', { name: /API migration orchestrator/ })
@@ -7584,6 +7623,27 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   await expect(page.getByLabel('Agent conversation')).toBeVisible()
 
   await page.setViewportSize({ width: 390, height: 844 })
+  const mobileNavigatorToggle = shell.locator(
+    '.agent-workspace-toolbar__mobile-navigator',
+  )
+  await expect(navigator).toBeHidden()
+  await expect(mobileNavigatorToggle).toBeVisible()
+  await expect(mobileNavigatorToggle).toHaveAttribute('aria-expanded', 'false')
+  await mobileNavigatorToggle.focus()
+  await page.keyboard.press('Enter')
+  await expect(mobileNavigatorToggle).toHaveAttribute('aria-expanded', 'true')
+  await expect(navigator).toBeVisible()
+  await expect(navigator).toHaveAttribute('role', 'dialog')
+  await expect(navigator).toHaveAttribute('aria-modal', 'true')
+  const closeMobileNavigator = navigator.getByRole('button', {
+    name: 'Close worker navigation',
+    exact: true,
+  })
+  await expect(closeMobileNavigator).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(windowSearch).toBeFocused()
+  await page.keyboard.press('Shift+Tab')
+  await expect(closeMobileNavigator).toBeFocused()
   const mobileBounds = await shell.boundingBox()
   expect(mobileBounds?.x).toBe(0)
   expect(mobileBounds ? mobileBounds.x + mobileBounds.width : 0).toBe(390)
@@ -7618,7 +7678,26 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
     path: testInfo.outputPath('workspace-navigator-dark-mobile.png'),
     fullPage: true,
   })
+  await page.keyboard.press('Escape')
+  await expect(navigator).toBeHidden()
+  await expect(mobileNavigatorToggle).toBeFocused()
+  await expect(mobileNavigatorToggle).toHaveAttribute('aria-expanded', 'false')
+
+  await mobileNavigatorToggle.click()
+  await reviewerRow.click()
+  await expect(shell).toHaveAttribute('data-mode', 'terminal')
+  await expect(reviewerRow).toHaveAttribute('aria-current', 'page')
+  await expect(navigator).toBeVisible()
+  await page.getByRole('tab', { name: 'Chat', exact: true }).click()
+  await expect(page.getByLabel('Agent conversation')).toBeVisible()
+  await expect(navigator).toBeHidden()
+  await expect(mobileNavigatorToggle).toBeVisible()
+  await expect(mobileNavigatorToggle).toHaveAttribute('aria-expanded', 'false')
+
   await setAppTheme(page, 'Light')
+  await mobileNavigatorToggle.click()
+  await expect(navigator).toBeVisible()
+  await expect(closeMobileNavigator).toBeFocused()
   await page.screenshot({
     path: testInfo.outputPath('workspace-navigator-light-mobile.png'),
     fullPage: true,
@@ -7655,20 +7734,23 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   })
 
   await implementerDetails.click()
-  const implementerDetailsDialog = page.getByRole('dialog', {
-    name: 'Implementer',
-  })
+  await expect(navigator).toBeHidden()
+  const implementerDetailsDialog = page.locator(
+    '.agent-window-details-dialog',
+  )
   await expect(implementerDetailsDialog).toContainText('workspace-1')
   await expect(implementerDetailsDialog).toContainText(
     'assignment-1-terminal',
   )
   await page.getByRole('button', { name: 'Close runtime details' }).click()
-  await expect(implementerDetails).toBeFocused()
+  await expect(mobileNavigatorToggle).toBeFocused()
+  await mobileNavigatorToggle.click()
+  await expect(navigator).toBeVisible()
+  await expect(closeMobileNavigator).toBeFocused()
 
   await reviewerDetails.click()
-  const detailsDialog = page.getByRole('dialog', {
-    name: 'Implementer',
-  })
+  await expect(navigator).toBeHidden()
+  const detailsDialog = page.locator('.agent-window-details-dialog')
   await expect(detailsDialog).toBeVisible()
   await expect(detailsDialog).toContainText('workspace-2')
   await expect(detailsDialog).toContainText('terminal-reviewer')
@@ -7734,13 +7816,24 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   })
   await page.keyboard.press('Escape')
   await expect(detailsDialog).toHaveCount(0)
-  await expect(reviewerDetails).toBeFocused()
+  await expect(navigator).toBeHidden()
+  await expect(mobileNavigatorToggle).toBeFocused()
+  await expect(mobileNavigatorToggle).toHaveAttribute('aria-expanded', 'false')
   await expect(commandBar).not.toHaveAttribute('aria-hidden', 'true')
   expect(
     await commandBar.evaluate((element) =>
       Boolean(element.closest('[inert], [aria-hidden="true"]')),
     ),
   ).toBe(false)
+
+  await mobileNavigatorToggle.click()
+  await expect(navigator).toBeVisible()
+  await expect(closeMobileNavigator).toBeFocused()
+  expect(
+    await commandBar.evaluate((element) =>
+      Boolean(element.closest('[inert], [aria-hidden="true"]')),
+    ),
+  ).toBe(true)
 
   const narrowLayout = await page.evaluate(() => ({
     document:
@@ -7760,6 +7853,17 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   expect(narrowLayout.document).toBeLessThanOrEqual(0)
   expect(narrowLayout.navigator).toBeLessThanOrEqual(0)
   expect(narrowLayout.shell).toBeLessThanOrEqual(0)
+  await page.keyboard.press('Escape')
+  await expect(navigator).toBeHidden()
+  await expect(mobileNavigatorToggle).toBeFocused()
+  await expect(mobileNavigatorToggle).toHaveAttribute('aria-expanded', 'false')
+  await expect(commandBar).not.toHaveAttribute('aria-hidden', 'true')
+  expect(
+    await commandBar.evaluate((element) =>
+      Boolean(element.closest('[inert], [aria-hidden="true"]')),
+    ),
+  ).toBe(false)
+  await expect(page.getByLabel('Agent conversation')).toBeVisible()
   await shell.getByRole('button', { name: 'Close chat' }).click()
   await expect(shell).toBeHidden()
   await expect(openChat).toBeFocused()
@@ -11204,6 +11308,41 @@ test('keeps assignment intervention controls within the mobile inspector', async
   await page
     .getByRole('button', { name: 'Open chat', exact: true })
     .click()
+  const navigator = page.getByLabel('Herdr windows', { exact: true })
+  const mobileNavigatorToggle = page.locator(
+    '.agent-workspace-toolbar__mobile-navigator',
+  )
+  const closeMobileNavigator = navigator.getByRole('button', {
+    name: 'Close worker navigation',
+    exact: true,
+  })
+  await expect(navigator).toBeHidden()
+  await expect(mobileNavigatorToggle).toBeVisible()
+  await expect(mobileNavigatorToggle).toHaveAttribute('aria-expanded', 'false')
+  await mobileNavigatorToggle.click()
+  await expect(navigator).toBeVisible()
+  await expect(navigator).toHaveAttribute('role', 'dialog')
+  await expect(navigator).toHaveAttribute('aria-modal', 'true')
+  await expect(closeMobileNavigator).toBeFocused()
+  const drawerLayout = await navigator.evaluate((element) => {
+    const bounds = element.getBoundingClientRect()
+    return {
+      horizontal: element.scrollWidth - element.clientWidth,
+      left: bounds.left,
+      right: bounds.right,
+      width: bounds.width,
+      windowWidth: window.innerWidth,
+    }
+  })
+  expect(drawerLayout.horizontal).toBeLessThanOrEqual(0)
+  expect(drawerLayout.left).toBeGreaterThanOrEqual(0)
+  expect(drawerLayout.right).toBeLessThanOrEqual(drawerLayout.windowWidth)
+  expect(drawerLayout.width).toBeLessThanOrEqual(320)
+  await page.keyboard.press('Escape')
+  await expect(navigator).toBeHidden()
+  await expect(mobileNavigatorToggle).toBeFocused()
+  await expect(mobileNavigatorToggle).toHaveAttribute('aria-expanded', 'false')
+
   const prompt = page.getByLabel('Message', { exact: true })
   await prompt.fill('unbroken-prompt-token'.repeat(30))
   await page

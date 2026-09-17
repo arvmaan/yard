@@ -1,12 +1,14 @@
 import {
   lazy,
   Suspense,
+  useEffect,
   useMemo,
   useRef,
   useState,
 } from 'react'
 import { createPortal } from 'react-dom'
 import {
+  ArrowUpDown,
   Bot,
   Boxes,
   BriefcaseBusiness,
@@ -15,6 +17,7 @@ import {
   Info,
   Network,
   PanelLeftClose,
+  Search,
   Server,
   SquareTerminal,
   X,
@@ -26,7 +29,11 @@ import {
   type AgentWorkspaceView,
   type TerminalPresentation,
 } from './AgentWorkspaceContext'
-import { groupAgentWindowTargets } from './agentWindowNavigator'
+import {
+  filterAndSortAgentWindowGroups,
+  groupAgentWindowTargets,
+  type AgentWindowSort,
+} from './agentWindowNavigator'
 import { useModalDialog } from './useModalDialog'
 import type {
   CoordinationNodeRoute,
@@ -247,19 +254,53 @@ export function AgentWorkspaceShell({
           )
         : []
   const terminalVisible = isTerminalWorkspaceMode(mode)
+  const navigatorRef = useRef<HTMLElement>(null)
+  const mobileNavigatorTriggerRef = useRef<HTMLButtonElement>(null)
   const [detailsTarget, setDetailsTarget] = useState<{
     returnFocus: HTMLButtonElement
     target: AgentWorkspaceTarget
   } | null>(null)
+  const [mobileNavigatorOpen, setMobileNavigatorOpen] = useState(false)
+  const [windowQuery, setWindowQuery] = useState('')
+  const [windowSort, setWindowSort] =
+    useState<AgentWindowSort>('activity')
+  useEffect(() => {
+    if (mode !== 'chat') setMobileNavigatorOpen(false)
+  }, [mode])
+  useModalDialog({
+    active:
+      mode === 'chat' &&
+      mobileNavigatorOpen &&
+      detailsTarget === null,
+    dialogRef: navigatorRef,
+    onClose: () => setMobileNavigatorOpen(false),
+    returnFocus: mobileNavigatorTriggerRef.current,
+  })
   const workspaceGroups = useMemo(
     () => groupAgentWindowTargets(targets, inventory, sessions),
     [inventory, sessions, targets],
   )
+  const visibleWorkspaceGroups = useMemo(
+    () =>
+      filterAndSortAgentWindowGroups(
+        workspaceGroups,
+        windowQuery,
+        windowSort,
+      ),
+    [windowQuery, windowSort, workspaceGroups],
+  )
+  const visibleTargetCount = visibleWorkspaceGroups.reduce(
+    (count, group) => count + group.targets.length,
+    0,
+  )
+  const closeLabel = mode === 'chat' ? 'chat' : 'terminal'
 
   return (
     <section
       aria-label={activeTarget.label}
       className="agent-workspace-shell"
+      data-mobile-navigator-open={mobileNavigatorOpen || undefined}
+      data-mode={mode}
       data-presentation={terminalVisible ? presentation : undefined}
       hidden={mode === 'map'}
       role="dialog"
@@ -267,7 +308,17 @@ export function AgentWorkspaceShell({
       {mode !== 'map' ? (
         <aside
           aria-label="Herdr windows"
+          aria-modal={mobileNavigatorOpen || undefined}
           className="agent-window-navigator"
+          id="agent-window-navigator"
+          onKeyDown={(event) => {
+            if (event.key !== 'Escape' || !mobileNavigatorOpen) return
+            event.preventDefault()
+            event.stopPropagation()
+            setMobileNavigatorOpen(false)
+          }}
+          ref={navigatorRef}
+          role={mobileNavigatorOpen ? 'dialog' : undefined}
         >
         <header>
           <span className="agent-window-navigator__mark">
@@ -276,12 +327,56 @@ export function AgentWorkspaceShell({
           <span>
             <strong>Herdr windows</strong>
             <small>
-              {targets.length} controlled · runtime evidence
+              {visibleTargetCount === targets.length
+                ? `${targets.length} controlled`
+                : `${visibleTargetCount} of ${targets.length}`}
+              {' · runtime evidence'}
             </small>
           </span>
+          <button
+            aria-label="Close worker navigation"
+            className="icon-button agent-window-navigator__close"
+            onClick={() => setMobileNavigatorOpen(false)}
+            title="Close worker navigation"
+            type="button"
+          >
+            <X aria-hidden="true" size={16} />
+          </button>
         </header>
+        <div className="agent-window-navigator__controls">
+          <label className="agent-window-search">
+            <Search aria-hidden="true" size={12} />
+            <input
+              aria-label="Search Herdr windows"
+              onChange={(event) => setWindowQuery(event.target.value)}
+              placeholder="Find window"
+              type="search"
+              value={windowQuery}
+            />
+          </label>
+          <label className="agent-window-sort">
+            <ArrowUpDown aria-hidden="true" size={12} />
+            <select
+              aria-label="Sort Herdr windows"
+              onChange={(event) =>
+                setWindowSort(event.target.value as AgentWindowSort)
+              }
+              title="Sort Herdr windows"
+              value={windowSort}
+            >
+              <option value="activity">Active</option>
+              <option value="runtime">Herdr order</option>
+              <option value="name">Name</option>
+            </select>
+          </label>
+        </div>
         <div className="agent-window-navigator__workspaces">
-          {workspaceGroups.map((group, groupIndex) => {
+          {visibleWorkspaceGroups.length === 0 ? (
+            <p className="agent-window-navigator__empty" role="status">
+              No matching windows
+            </p>
+          ) : null}
+          {visibleWorkspaceGroups.map((group, groupIndex) => {
             const workspace = group.observation
             const label = workspace?.label ?? 'Unobserved workspace'
             const offline = group.sessionRunning === false
@@ -392,7 +487,10 @@ export function AgentWorkspaceShell({
                         data-observation={target.observation}
                         data-status={target.status}
                         data-target-key={target.key}
-                        onClick={() => onTargetChange(target)}
+                        onClick={() => {
+                          onTargetChange(target)
+                          setMobileNavigatorOpen(false)
+                        }}
                         title={targetTitle(target)}
                         type="button"
                       >
@@ -444,12 +542,25 @@ export function AgentWorkspaceShell({
                         aria-haspopup="dialog"
                         aria-label={detailsControlLabel}
                         className="icon-button agent-window-row__details"
-                        onClick={(event) =>
-                          setDetailsTarget({
-                            returnFocus: event.currentTarget,
+                        onClick={(event) => {
+                          const nextDetailsTarget = {
+                            returnFocus:
+                              mobileNavigatorOpen &&
+                              mobileNavigatorTriggerRef.current
+                                ? mobileNavigatorTriggerRef.current
+                                : event.currentTarget,
                             target,
-                          })
-                        }
+                          }
+                          if (mobileNavigatorOpen) {
+                            setMobileNavigatorOpen(false)
+                            window.setTimeout(
+                              () => setDetailsTarget(nextDetailsTarget),
+                              0,
+                            )
+                            return
+                          }
+                          setDetailsTarget(nextDetailsTarget)
+                        }}
                         title={detailsControlLabel}
                         type="button"
                       >
@@ -506,15 +617,29 @@ export function AgentWorkspaceShell({
               </button>
             </div>
           ) : null}
+          {mode === 'chat' ? (
+            <button
+              aria-controls="agent-window-navigator"
+              aria-expanded={mobileNavigatorOpen}
+              aria-label="Open worker navigation"
+              className="icon-button agent-workspace-toolbar__mobile-navigator"
+              onClick={() => setMobileNavigatorOpen(true)}
+              ref={mobileNavigatorTriggerRef}
+              title="Open worker navigation"
+              type="button"
+            >
+              <Server aria-hidden="true" size={15} />
+            </button>
+          ) : null}
           <div className="agent-workspace-toolbar__target">
             <span data-status={activeTarget.status} />
             <strong>{activeTarget.label}</strong>
             <small>{activeTarget.terminalId}</small>
             <button
-              aria-label={mode === 'chat' ? 'Close chat' : 'Close terminal'}
+              aria-label={`Close ${closeLabel}`}
               className="icon-button"
               onClick={closeWorkspace}
-              title={mode === 'chat' ? 'Close chat' : 'Close terminal'}
+              title={`Close ${closeLabel}`}
               type="button"
             >
               <X aria-hidden="true" size={16} />
@@ -525,6 +650,9 @@ export function AgentWorkspaceShell({
 
       <main className="agent-workspace-content">
         <AgentChatWorkspace
+          closeOnEscape={
+            !mobileNavigatorOpen && detailsTarget === null
+          }
           label={activeTarget.label}
           onCoordinationChange={onCoordinationChange}
           onCoordinationNodeChange={onCoordinationNodeChange}
