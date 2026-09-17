@@ -1,6 +1,7 @@
 import {
   CheckCircle2,
   ChevronRight,
+  Copy,
   FileText,
   MessageCircleQuestion,
   Wrench,
@@ -8,6 +9,7 @@ import {
 import {
   lazy,
   Suspense,
+  useEffect,
   useState,
   type ReactNode,
 } from 'react'
@@ -86,12 +88,16 @@ function FullTranscript({ text }: { text: string }) {
     <details className="agent-output__transcript">
       <summary>
         <FileText aria-hidden="true" size={13} />
-        <span>Full terminal transcript</span>
+        <span>Terminal detail</span>
         <small>{lineLabel(text)}</small>
       </summary>
       <pre>{text}</pre>
     </details>
   )
+}
+
+function PreformattedOutput({ text }: { text: string }) {
+  return <pre className="agent-output__preformatted">{text}</pre>
 }
 
 export function CollapsibleQuestion({
@@ -130,6 +136,7 @@ function CollapsibleAnswer({
   const preview = compactPreview(turn.answer || turn.work)
   if (!totalOutput) return null
 
+  const label = turn.answer ? 'Answer' : 'Activity'
   return (
     <CollapsibleEntry
       kind="answer"
@@ -141,32 +148,139 @@ function CollapsibleAnswer({
           ) : (
             <Wrench aria-hidden="true" size={13} />
           )}
-          <strong>Answer</strong>
+          <strong>{label}</strong>
           <span>{preview}</span>
           <small>{lineLabel(totalOutput)}</small>
         </summary>
       }
     >
       <div className="agent-output__entry-body">
-        {turn.answer ? (
-          <section className="agent-output__final-answer">
-            <span className="agent-output__section-label">Response</span>
+        <section className="agent-output__final-answer">
+          <span className="agent-output__section-label">{label}</span>
+          {turn.answer ? (
             <MarkdownContent text={turn.answer} />
-          </section>
-        ) : null}
-        {turn.work ? (
-          <FullTranscript text={totalOutput} />
+          ) : (
+            <PreformattedOutput text={turn.work} />
+          )}
+        </section>
+        {turn.answer && turn.work ? (
+          <FullTranscript text={turn.work} />
         ) : null}
       </div>
     </CollapsibleEntry>
   )
 }
 
-function AgentTurn({
-  knownQuestions,
+function PrimaryAnswer({
+  agentLabel,
   turn,
 }: {
+  agentLabel?: string
+  turn: TerminalTranscriptTurn
+}) {
+  const text = turn.answer || turn.work
+  const label = turn.answer ? 'Answer' : 'Activity'
+  const copySubject = `${agentLabel ? `${agentLabel} ` : ''}${
+    turn.answer ? 'answer' : 'terminal output'
+  }`
+  const [copyState, setCopyState] = useState<
+    'idle' | 'copied' | 'failed'
+  >('idle')
+  useEffect(() => setCopyState('idle'), [text])
+
+  if (!text) return null
+
+  const copy = async () => {
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error('Clipboard unavailable')
+      }
+      await navigator.clipboard.writeText(text)
+      setCopyState('copied')
+    } catch {
+      setCopyState('failed')
+    }
+  }
+
+  return (
+    <section
+      aria-label={turn.answer ? 'Latest answer' : 'Latest activity'}
+      className="agent-output__primary"
+      data-kind={turn.answer ? 'answer' : 'activity'}
+    >
+      <header>
+        <span>
+          {turn.answer ? (
+            <CheckCircle2 aria-hidden="true" size={14} />
+          ) : (
+            <Wrench aria-hidden="true" size={14} />
+          )}
+          <strong>{label}</strong>
+          <small>{lineLabel(text)}</small>
+        </span>
+        <button
+          aria-label={`Copy ${copySubject}`}
+          className="agent-output__copy"
+          data-state={copyState}
+          onClick={() => void copy()}
+          type="button"
+        >
+          <Copy aria-hidden="true" size={13} />
+          <span>
+            {copyState === 'copied'
+              ? 'Copied'
+              : copyState === 'failed'
+                ? 'Copy unavailable'
+                : 'Copy'}
+          </span>
+        </button>
+      </header>
+      <span
+        aria-live="polite"
+        className="visually-hidden"
+        role="status"
+      >
+        {copyState === 'copied'
+          ? `${copySubject[0].toUpperCase()}${copySubject.slice(1)} copied to clipboard.`
+          : copyState === 'failed'
+            ? 'Copy unavailable. Select and copy manually.'
+            : ''}
+      </span>
+      <div className="agent-output__primary-body">
+        {copyState === 'failed' ? (
+          <label className="agent-output__copy-fallback">
+            <span>Clipboard unavailable. Select and copy manually.</span>
+            <textarea
+              aria-label={`Manual copy ${copySubject}`}
+              onFocus={(event) => event.currentTarget.select()}
+              readOnly
+              rows={Math.min(5, Math.max(2, text.split('\n').length))}
+              value={text}
+            />
+          </label>
+        ) : null}
+        {turn.answer ? (
+          <MarkdownContent text={turn.answer} />
+        ) : (
+          <PreformattedOutput text={turn.work} />
+        )}
+        {turn.answer && turn.work ? (
+          <FullTranscript text={turn.work} />
+        ) : null}
+      </div>
+    </section>
+  )
+}
+
+function AgentTurn({
+  agentLabel,
+  knownQuestions,
+  primary,
+  turn,
+}: {
+  agentLabel?: string
   knownQuestions: readonly string[]
+  primary: boolean
   turn: TerminalTranscriptTurn
 }) {
   const showQuestion =
@@ -177,42 +291,42 @@ function AgentTurn({
       {showQuestion ? (
         <CollapsibleQuestion text={turn.question} />
       ) : null}
-      <CollapsibleAnswer turn={turn} />
+      {primary ? (
+        <PrimaryAnswer agentLabel={agentLabel} turn={turn} />
+      ) : (
+        <CollapsibleAnswer turn={turn} />
+      )}
     </>
   )
 }
 
-function RawOutput({ text }: { text: string }) {
+function RawOutput({
+  agentLabel,
+  text,
+}: {
+  agentLabel?: string
+  text: string
+}) {
   return (
-    <CollapsibleEntry
-      kind="answer"
-      summary={
-        <summary>
-          <ChevronRight aria-hidden="true" size={13} />
-          <CheckCircle2 aria-hidden="true" size={13} />
-          <strong>Answer</strong>
-          <span>{compactPreview(text)}</span>
-          <small>{lineLabel(text)}</small>
-        </summary>
-      }
-    >
-      <div className="agent-output__entry-body">
-        <section className="agent-output__final-answer">
-          <span className="agent-output__section-label">Response</span>
-          <MarkdownContent text={text} />
-        </section>
-        <FullTranscript text={text} />
-      </div>
-    </CollapsibleEntry>
+    <PrimaryAnswer
+      agentLabel={agentLabel}
+      turn={{
+        answer: '',
+        question: '',
+        work: text,
+      }}
+    />
   )
 }
 
 export function CollapsibleAgentOutput({
+  agentLabel,
   knownQuestions = [],
   status = 'unknown',
   text,
   truncated = false,
 }: {
+  agentLabel?: string
   knownQuestions?: readonly string[]
   status?: ObservedStatus
   text: string
@@ -224,15 +338,27 @@ export function CollapsibleAgentOutput({
       Boolean(turn.question) || Boolean(turn.work) || Boolean(turn.answer),
   )
   if (!transcript.structured || !hasVisibleContent) {
-    return <RawOutput text={text} />
+    return <RawOutput agentLabel={agentLabel} text={text} />
   }
+  const primaryIndex = transcript.turns.reduce(
+    (latest, turn, index) => turn.answer ? index : latest,
+    -1,
+  )
 
   return (
     <div className="agent-output">
       {transcript.turns.map((turn, index) => (
         <AgentTurn
+          agentLabel={agentLabel}
           key={`${index}:${turn.question}`}
           knownQuestions={knownQuestions}
+          primary={
+            index === (
+              primaryIndex >= 0
+                ? primaryIndex
+                : transcript.turns.length - 1
+            )
+          }
           turn={turn}
         />
       ))}

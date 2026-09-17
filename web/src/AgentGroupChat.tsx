@@ -236,7 +236,7 @@ export function AgentGroupChat({
               output.truncated
                 ? ` · ${TRUNCATED_TERMINAL_OUTPUT_LABEL}`
                 : ''
-            }`,
+            } · rev ${output.revision}`,
             status: target.status,
             text: text || 'No recent output.',
             truncated: output.truncated,
@@ -519,23 +519,8 @@ export function AgentGroupChat({
                   <strong>{stableTargets.length} selected agents</strong>
                   <small>Broadcast order</small>
                 </div>
-                <div
-                  aria-label="Selected agents"
-                  className="group-chat-roster"
-                >
-                  {stableTargets.map((target) => (
-                    <span
-                      data-status={target.status}
-                      key={agentGroupTargetKey(target)}
-                    >
-                      <Bot aria-hidden="true" size={13} />
-                      {target.label}
-                    </span>
-                  ))}
-                </div>
-                <label className="field-label" htmlFor={templateId}>
-                  Order template
-                </label>
+                <label className="chat-context__field" htmlFor={templateId}>
+                  <span className="field-label">Order template</span>
                 <select
                   id={templateId}
                   onChange={(event) => {
@@ -553,6 +538,27 @@ export function AgentGroupChat({
                     </option>
                   ))}
                 </select>
+                </label>
+                <details className="group-chat-context__recipients">
+                  <summary>
+                    <Users aria-hidden="true" size={13} />
+                    <span>{stableTargets.length} recipients</span>
+                  </summary>
+                  <div
+                    aria-label="Selected agents"
+                    className="group-chat-roster"
+                  >
+                    {stableTargets.map((target) => (
+                      <span
+                        data-status={target.status}
+                        key={agentGroupTargetKey(target)}
+                      >
+                        <Bot aria-hidden="true" size={13} />
+                        {target.label}
+                      </span>
+                    ))}
+                  </div>
+                </details>
                 {Object.keys(deliveries).length > 0 ? (
                   <div className="group-delivery-results" role="status">
                     {stableTargets.map((target) => {
@@ -667,6 +673,7 @@ export function AgentGroupChat({
                             <small>{message.meta}</small>
                           </header>
                           <CollapsibleAgentOutput
+                            agentLabel={message.label}
                             knownQuestions={knownQuestions}
                             status={message.status}
                             text={message.text}

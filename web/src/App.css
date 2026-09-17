@@ -1739,6 +1739,12 @@ html[data-yard-allocation-dragging="true"]
   margin-bottom: 10px;
 }
 
+.group-chat-identity + .group-chat-roster {
+  max-height: 88px;
+  padding-right: 4px;
+  overflow-y: auto;
+}
+
 .group-chat-roster {
   display: flex;
   min-width: 0;
@@ -1768,6 +1774,41 @@ html[data-yard-allocation-dragging="true"]
   white-space: nowrap;
 }
 
+.group-chat-context__recipients {
+  min-width: 0;
+}
+
+.group-chat-context__recipients > summary {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 600;
+  list-style: none;
+}
+
+.group-chat-context__recipients > summary::-webkit-details-marker {
+  display: none;
+}
+
+.group-chat-context__recipients[open] {
+  grid-column: 1 / -1;
+}
+
+.group-chat-context__recipients .group-chat-roster {
+  max-height: 96px;
+  margin-top: 6px;
+  padding-right: 4px;
+  overflow-y: auto;
+}
+
 .group-chat-context .group-chat-roster {
   display: grid;
   margin: 0;
@@ -1779,6 +1820,9 @@ html[data-yard-allocation-dragging="true"]
 
 .group-chat-context .group-delivery-results {
   margin-top: 2px;
+  max-height: 104px;
+  padding-right: 4px;
+  overflow-y: auto;
 }
 
 .group-chat-thread {
@@ -3174,17 +3218,19 @@ html[data-yard-allocation-dragging="true"]
   display: grid;
   min-width: 0;
   min-height: 0;
-  grid-template-columns: 220px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .chat-context {
   display: grid;
   min-width: 0;
-  align-content: start;
-  gap: 12px;
-  padding: 16px 14px;
-  overflow-y: auto;
-  border-right: 1px solid var(--line);
+  grid-template-columns: minmax(140px, 1fr) repeat(2, minmax(120px, 220px));
+  align-items: end;
+  gap: 6px 10px;
+  padding: 8px 14px;
+  overflow: visible;
+  border-bottom: 1px solid var(--line);
   background: var(--mineral);
 }
 
@@ -3205,10 +3251,24 @@ html[data-yard-allocation-dragging="true"]
   text-transform: uppercase;
 }
 
+.chat-context__field {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.chat-context__field .field-label {
+  margin: 0;
+}
+
+.chat-context__field select {
+  width: 100%;
+}
+
 .chat-context select {
   width: 100%;
   min-width: 0;
-  height: 36px;
+  height: 32px;
   padding: 0 8px;
   border: 1px solid var(--line-strong);
   border-radius: 4px;
@@ -3217,6 +3277,12 @@ html[data-yard-allocation-dragging="true"]
   font-size: 11px;
 }
 
+
+.chat-route-statuses,
+.chat-intervention-state,
+.group-chat-context .group-delivery-results {
+  grid-column: 1 / -1;
+}
 .chat-route-statuses {
   display: grid;
   min-width: 0;
@@ -3423,6 +3489,112 @@ html[data-yard-allocation-dragging="true"]
   gap: 12px;
 }
 
+
+.agent-output__primary {
+  display: grid;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--teal);
+  background: var(--paper);
+}
+
+.agent-output__primary > header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.agent-output__primary > header > span {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+}
+
+.agent-output__primary > header svg,
+.agent-output__primary > header strong {
+  color: var(--teal);
+}
+
+.agent-output__primary > header strong {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.agent-output__primary > header small {
+  color: var(--muted);
+  font: 8px/1.2 "IBM Plex Mono", monospace;
+}
+
+.agent-output__copy {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  min-height: 28px;
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.agent-output__copy:hover {
+  border-color: var(--teal);
+}
+
+.agent-output__copy[data-state="copied"] {
+  border-color: #8fbfb5;
+  color: var(--teal);
+}
+
+.agent-output__copy[data-state="failed"] {
+  border-color: #d49b92;
+  color: var(--vermilion);
+}
+
+.agent-output__copy-fallback {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  color: var(--vermilion);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.agent-output__copy-fallback textarea {
+  width: 100%;
+  min-width: 0;
+  max-height: 112px;
+  padding: 9px 10px;
+  overflow: auto;
+  border: 1px solid #d49b92;
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--ink);
+  font: 10px/1.45 "IBM Plex Mono", monospace;
+  resize: vertical;
+  user-select: text;
+  white-space: pre;
+}
+
+.agent-output__primary-body {
+  display: grid;
+  min-width: 0;
+  gap: 16px;
+  padding: clamp(14px, 2vw, 24px);
+  background: var(--paper);
+}
+
 .agent-output__entry {
   min-width: 0;
   overflow: hidden;
@@ -3549,6 +3721,7 @@ html[data-yard-allocation-dragging="true"]
   color: var(--ink);
   font-size: 13px;
   line-height: 1.68;
+  user-select: text;
 }
 
 .agent-output__markdown-loading {
@@ -3611,6 +3784,7 @@ html[data-yard-allocation-dragging="true"]
 }
 
 .agent-output__markdown code,
+.agent-output__preformatted,
 .agent-output__transcript pre {
   font-family: "IBM Plex Mono", monospace;
 }
@@ -3678,6 +3852,20 @@ html[data-yard-allocation-dragging="true"]
   font-style: italic;
 }
 
+.agent-output__preformatted {
+  margin: 0;
+  max-width: 100%;
+  overflow: auto;
+  padding: 12px 14px 18px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--paper);
+  color: var(--ink);
+  font: 10px/1.5 "IBM Plex Mono", monospace;
+  user-select: text;
+  white-space: pre;
+}
+
 .agent-output__transcript {
   overflow: hidden;
   border: 1px solid var(--line);
@@ -3715,13 +3903,14 @@ html[data-yard-allocation-dragging="true"]
 .agent-output__transcript pre {
   margin: 0;
   max-width: 100%;
-  overflow-x: auto;
-  overflow-wrap: anywhere;
+  overflow: auto;
+  overflow-wrap: normal;
   padding: 12px 14px 18px;
   border: 0;
   background: var(--paper);
   font: 10px/1.5 "IBM Plex Mono", monospace;
-  white-space: pre-wrap;
+  user-select: text;
+  white-space: pre;
 }
 
 .chat-composer {
@@ -5610,36 +5799,20 @@ html[data-yard-allocation-dragging="true"]
     display: none;
   }
 
-  .chat-workspace__body {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto minmax(0, 1fr);
-  }
-
   .chat-context {
-    grid-template-columns: minmax(0, 1fr) minmax(150px, 0.8fr);
-    align-items: end;
-    gap: 10px;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+    max-height: 132px;
     padding: 9px 11px;
-    overflow: visible;
-    border-right: 0;
-    border-bottom: 1px solid var(--line);
+    overflow-y: auto;
   }
 
-  .chat-context .chat-intervention-state {
-    grid-column: 1 / -1;
-    grid-row: 2;
+  .chat-context__field {
+    width: 100%;
   }
 
-  .chat-context > .field-label {
-    grid-column: 2;
-    grid-row: 1;
-    align-self: start;
-  }
-
-  .chat-context select {
-    grid-column: 2;
-    grid-row: 1;
-    margin-top: 15px;
+  .group-chat-context .group-chat-roster {
+    display: flex;
   }
 
   .chat-thread__messages {
@@ -5823,6 +5996,13 @@ html[data-yard-allocation-dragging="true"]
   .agent-window-sort select {
     height: 25px;
     font-size: 8px;
+  }
+
+  .agent-workspace-shell[data-mode="chat"] {
+    grid-template:
+      "toolbar" 44px
+      "content" minmax(0, 1fr)
+      / minmax(0, 1fr);
   }
 
   .agent-workspace-shell[data-mode="chat"]:not(
@@ -6019,13 +6199,6 @@ html[data-yard-allocation-dragging="true"]
     max-width: 112px;
   }
 
-  .agent-workspace-content .chat-workspace__body {
-    grid-template-rows: minmax(0, 1fr);
-  }
-
-  .agent-workspace-content .chat-context {
-    display: none;
-  }
 }
 
 @media (max-width: 960px) {

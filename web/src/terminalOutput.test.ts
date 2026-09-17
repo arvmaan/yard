@@ -60,6 +60,30 @@ describe('parseTerminalTranscript', () => {
       ].join('\n\n'),
     })
   })
+  it('preserves classified work lines, indentation, and HTML-like text', () => {
+    const work = [
+      '• Ran tree',
+      '  ├─ src',
+      '  │  <phase-one>',
+      '  └─ complete',
+      'consecutive terminal line',
+      '',
+      'next terminal section',
+    ].join('\n')
+    const transcript = parseTerminalTranscript(
+      [
+        '› Inspect the terminal tree.',
+        work,
+      ].join('\n'),
+      'done',
+    )
+
+    expect(transcript.turns[0]).toEqual({
+      answer: '',
+      question: 'Inspect the terminal tree.',
+      work,
+    })
+  })
 
   it('keeps clear progress collapsed after durable status catches up', () => {
     const transcript = parseTerminalTranscript(

@@ -748,12 +748,31 @@ export function AgentChatWorkspace({
                   <strong>{contextLabel}</strong>
                   <small>{targetRole}</small>
                 </div>
+            <label className="chat-context__field" htmlFor={templateId}>
+              <span className="field-label">Order template</span>
+              <select
+                id={templateId}
+                onChange={(event) => {
+                  const template = ORDER_TEMPLATES.find(
+                    ({ id }) => id === event.target.value,
+                  )
+                  if (template) updatePrompt(template.text)
+                }}
+                value=""
+              >
+                <option value="">Choose an order...</option>
+                {ORDER_TEMPLATES.map((template) => (
+                  <option key={template.id} value={template.id}>
+                    {template.label}
+                  </option>
+                ))}
+              </select>
+            </label>
             {target.kind === 'yard-orchestrator' ||
             target.kind === 'coordination-node' ? (
               <>
-                <label className="field-label" htmlFor={dispatchId}>
-                  Dispatch scope
-                </label>
+                <label className="chat-context__field" htmlFor={dispatchId}>
+                  <span className="field-label">Dispatch scope</span>
                 <select
                   id={dispatchId}
                   onChange={(event) => {
@@ -774,6 +793,7 @@ export function AgentChatWorkspace({
                     </option>
                   ))}
                 </select>
+                </label>
                 {routes.length > 0 ? (
                   <div className="chat-route-statuses">
                     <p className="eyebrow">Recent routes</p>
@@ -811,26 +831,6 @@ export function AgentChatWorkspace({
                 </span>
               </div>
             ) : null}
-            <label className="field-label" htmlFor={templateId}>
-              Order template
-            </label>
-            <select
-              id={templateId}
-              onChange={(event) => {
-                const template = ORDER_TEMPLATES.find(
-                  ({ id }) => id === event.target.value,
-                )
-                if (template) updatePrompt(template.text)
-              }}
-              value=""
-            >
-              <option value="">Choose an order...</option>
-              {ORDER_TEMPLATES.map((template) => (
-                <option key={template.id} value={template.id}>
-                  {template.label}
-                </option>
-              ))}
-            </select>
           </aside>
 
           <section
@@ -881,11 +881,17 @@ export function AgentChatWorkspace({
                   key={message.id}
                 >
                   {message.kind === 'agent' ? (
-                    <CollapsibleAgentOutput
-                      status={status}
-                      text={message.text}
-                      truncated={message.truncated}
-                    />
+                    <>
+                      <header>
+                        <strong>{message.label}</strong>
+                        <small>{message.meta}</small>
+                      </header>
+                      <CollapsibleAgentOutput
+                        status={status}
+                        text={message.text}
+                        truncated={message.truncated}
+                      />
+                    </>
                   ) : message.kind === 'user' ? (
                     <CollapsibleQuestion
                       meta={message.meta}

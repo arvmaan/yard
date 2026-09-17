@@ -5873,9 +5873,9 @@ test('retains the allocation command ID while a proposal remains open', async ({
   )
 })
 
-test('loads recent assignment activity when the chat opens', async ({
+test('shows the latest answer on the full chat surface and copies it', async ({
   page,
-}) => {
+}, testInfo) => {
   const state = await mockApi(page, {
     terminalOutputDelayMs: 150,
     terminalOutputText: (readCount) =>
@@ -5891,6 +5891,9 @@ test('loads recent assignment activity when the chat opens', async ({
     terminalOutputTruncated: true,
   })
   seedActiveAssignment(state)
+  await page.context().grantPermissions([
+    'clipboard-read', 'clipboard-write',
+  ])
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
@@ -5907,10 +5910,6 @@ test('loads recent assignment activity when the chat opens', async ({
     .click()
   await expect(page.getByText('Loading recent agent activity')).toBeVisible()
   const conversation = page.getByLabel('Agent conversation')
-  await expect(conversation).toContainText('still running')
-  await expect(conversation).toContainText(
-    'build 1: check 240 still running',
-  )
   const questionDisclosure = conversation.locator(
     'details.agent-output__entry[data-kind="question"]',
   )
@@ -5921,22 +5920,48 @@ test('loads recent assignment activity when the chat opens', async ({
   await expect(
     questionDisclosure.locator('.agent-output__question-text'),
   ).toBeHidden()
-  const answerDisclosure = conversation.locator(
-    'details.agent-output__entry[data-kind="answer"]',
-  )
-  await expect(answerDisclosure).toContainText(
+  const latestAnswer = conversation.locator('.agent-output__primary[aria-label="Latest answer"]')
+  await expect(latestAnswer).toContainText(
     'Build 1 checks are ready for owner review.',
   )
-  await expect(answerDisclosure).not.toHaveAttribute('open', '')
+  await expect(latestAnswer).toBeVisible()
   await expect(
-    answerDisclosure.locator('.agent-output__entry-body'),
-  ).toBeHidden()
-  await answerDisclosure.locator(':scope > summary').click()
-  await expect(answerDisclosure).toHaveAttribute('open', '')
-  await expect(
-    answerDisclosure.locator('.agent-output__entry-body'),
+    latestAnswer.locator('.agent-output__primary-body'),
   ).toBeVisible()
-  await expect(answerDisclosure.locator('pre')).toContainText(
+  await expect(latestAnswer.locator('.agent-output__markdown')).toBeVisible()
+  const terminalDetail = latestAnswer.locator(
+    'details.agent-output__transcript',
+  )
+  await expect(terminalDetail).not.toHaveAttribute('open', '')
+  await expect(terminalDetail.locator('pre')).toBeHidden()
+  const copyButton = conversation.getByRole('button', { name: 'Copy answer' })
+  await copyButton.click()
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe('Build 1 checks are ready for owner review.')
+  await expect(copyButton).toContainText('Copied')
+  await expect(latestAnswer.getByRole('status')).toHaveText(
+    'Answer copied to clipboard.',
+  )
+
+  const readingSurface = await page.evaluate(() => {
+    const body = document.querySelector<HTMLElement>('.chat-workspace__body')
+    const thread = document.querySelector<HTMLElement>('.chat-thread')
+    return {
+      bodyWidth: body?.getBoundingClientRect().width ?? 0,
+      threadWidth: thread?.getBoundingClientRect().width ?? 0,
+    }
+  })
+  expect(
+    Math.abs(readingSurface.bodyWidth - readingSurface.threadWidth),
+  ).toBeLessThanOrEqual(1)
+  await expect(page.getByLabel('Order template')).toBeVisible()
+  await page.screenshot({
+    path: testInfo.outputPath('chat-experience-desktop.png'),
+    fullPage: true,
+  })
+  await terminalDetail.locator(':scope > summary').click()
+  await expect(terminalDetail.locator('pre')).toContainText(
     'build 1: check 1 still running',
   )
   const initialText = await conversation.textContent()
@@ -5977,18 +6002,17 @@ test('loads recent assignment activity when the chat opens', async ({
   await page
     .getByRole('button', { name: 'Open chat', exact: true })
     .click()
-  const reopenedAnswer = conversation.locator(
-    'details.agent-output__entry[data-kind="answer"]',
-  )
-  await expect(reopenedAnswer.locator(':scope > summary')).toBeVisible()
-  await expect(reopenedAnswer).not.toHaveAttribute('open', '')
+  const reopenedAnswer = conversation.locator('.agent-output__primary[aria-label="Latest answer"]')
+  await expect(reopenedAnswer).toBeVisible()
   await expect(reopenedAnswer.locator('pre')).toBeHidden()
   await expect
     .poll(() => messages.evaluate((element) => element.scrollTop))
     .toBe(0)
+  await page.setViewportSize({ width: 800, height: 800 })
 
   const overflow = await page.evaluate(() => {
     const workspace = document.querySelector<HTMLElement>('.chat-workspace')
+    const context = document.querySelector<HTMLElement>('.chat-context')
     return {
       documentHorizontal:
         document.documentElement.scrollWidth - window.innerWidth,
@@ -5997,23 +6021,88 @@ test('loads recent assignment activity when the chat opens', async ({
       workspaceHorizontal: workspace
         ? workspace.scrollWidth - workspace.clientWidth
         : Number.POSITIVE_INFINITY,
+      contextHorizontal: context
+        ? context.scrollWidth - context.clientWidth
+        : Number.POSITIVE_INFINITY,
     }
   })
   expect(overflow.documentHorizontal).toBeLessThanOrEqual(0)
   expect(overflow.documentVertical).toBeLessThanOrEqual(0)
   expect(overflow.workspaceHorizontal).toBeLessThanOrEqual(0)
+  expect(overflow.contextHorizontal).toBeLessThanOrEqual(0)
 })
 
-test('keeps one terminal output snapshot in one collapsed answer', async ({
+for (const clipboardFailure of ['denied', 'unavailable'] as const) {
+  test(
+    `shows selectable fallback when clipboard is ${clipboardFailure}`,
+    async ({ page }) => {
+      await page.addInitScript((failure) => {
+        Object.defineProperty(window.navigator, 'clipboard', {
+          configurable: true,
+          value:
+            failure === 'unavailable'
+              ? undefined
+              : {
+                  writeText: () =>
+                    Promise.reject(
+                      new DOMException('Denied', 'NotAllowedError'),
+                    ),
+                },
+        })
+      }, clipboardFailure)
+
+      const answerText = 'Clipboard fallback answer.'
+      const state = await mockApi(page, {
+        terminalOutputText: ['› Copy the result.', `• ${answerText}`].join('\n'),
+      })
+      seedActiveAssignment(state)
+      await page.setViewportSize({ width: 1280, height: 800 })
+      await page.goto('/')
+
+      await page.locator('.assigned-worker-marker').click()
+      await page
+        .getByRole('button', { name: 'Open chat', exact: true })
+        .click()
+      const answer = page
+        .getByLabel('Agent conversation')
+        .locator('.agent-output__primary[aria-label="Latest answer"]')
+      const copyButton = answer.getByRole('button', { name: 'Copy answer' })
+      await copyButton.click()
+      await expect(copyButton).toContainText('Copy unavailable')
+      await expect(answer.getByRole('status')).toHaveText(
+        'Copy unavailable. Select and copy manually.',
+      )
+      const fallback = answer.getByLabel('Manual copy answer')
+      await expect(fallback).toHaveValue(answerText)
+      await fallback.focus()
+      await expect
+        .poll(() =>
+          fallback.evaluate((element) => {
+            const textarea = element as HTMLTextAreaElement
+            return textarea.selectionEnd - textarea.selectionStart
+          }),
+        )
+        .toBe(answerText.length)
+    },
+  )
+}
+
+test('renders only classified answers as structured Markdown', async ({
   page,
 }) => {
   const state = await mockApi(page, {
     terminalOutputText: [
-      'Inspected the runtime state.',
-      'Ran the focused checks.',
-      '```text\nfirst result\n\nsecond result\n```',
-      'Ready for owner review.',
-    ].join('\n\n'),
+      '› Summarize the focused checks.',
+      '• ## Ready for review',
+      '',
+      'The focused checks passed.',
+      '',
+      '```text',
+      'first result',
+      '',
+      'second result',
+      '```',
+    ].join('\n'),
   })
   seedActiveAssignment(state)
   await page.setViewportSize({ width: 1280, height: 800 })
@@ -6028,36 +6117,17 @@ test('keeps one terminal output snapshot in one collapsed answer', async ({
     .getByLabel('Agent conversation')
     .locator('.chat-message[data-kind="agent"]')
   await expect(outputBubbles).toHaveCount(1)
-  await expect(outputBubbles).toContainText(
-    'Inspected the runtime state.',
-  )
-  await expect(outputBubbles).toContainText(
-    'Ran the focused checks.',
-  )
-  await expect(outputBubbles).toContainText(
-    'first result\n\nsecond result',
-  )
-  await expect(outputBubbles).toContainText(
-    'Ready for owner review.',
-  )
-  const answerDisclosure = outputBubbles.locator(
-    'details.agent-output__entry[data-kind="answer"]',
-  )
-  await expect(answerDisclosure).not.toHaveAttribute('open', '')
-  await expect(answerDisclosure.locator('.agent-output__markdown')).toBeHidden()
-  await answerDisclosure.locator(':scope > summary').click()
-  await expect(answerDisclosure.locator('.agent-output__markdown')).toBeVisible()
+  await expect(outputBubbles).toContainText('The focused checks passed.')
+  const answer = outputBubbles.locator('.agent-output__primary[aria-label="Latest answer"]')
+  await expect(answer).toBeVisible()
+  await expect(answer.locator('.agent-output__markdown')).toBeVisible()
   await expect(
-    answerDisclosure.locator('.agent-output__markdown pre'),
+    answer.getByRole('heading', { name: 'Ready for review' }),
+  ).toBeVisible()
+  await expect(
+    answer.locator('.agent-output__markdown pre'),
   ).toContainText('first result\n\nsecond result')
-  const fullTranscript = answerDisclosure.locator(
-    'details.agent-output__transcript',
-  )
-  await expect(fullTranscript).not.toHaveAttribute('open', '')
-  await fullTranscript.locator(':scope > summary').click()
-  await expect(fullTranscript.locator('pre')).toContainText(
-    'Ready for owner review.',
-  )
+  await expect(answer.locator('details.agent-output__transcript')).toHaveCount(0)
   const bubbleWidth = await outputBubbles.evaluate((element) => {
     const thread = element.parentElement
     if (!thread) return Number.POSITIVE_INFINITY
@@ -6069,6 +6139,64 @@ test('keeps one terminal output snapshot in one collapsed answer', async ({
     return Math.abs(element.getBoundingClientRect().width - contentWidth)
   })
   expect(bubbleWidth).toBeLessThanOrEqual(1)
+  expect(state.terminalOutputRequests).toHaveLength(1)
+})
+
+test('preserves raw terminal output as exact preformatted text', async ({ page }) => {
+  const rawOutput = [
+    'phase one',
+    'phase two',
+    '',
+    'root',
+    '  ├─ <phase-one>',
+    '  │  child',
+    '  └─ complete',
+  ].join('\n')
+  const state = await mockApi(page, { terminalOutputText: rawOutput })
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page
+    .getByRole('button', { name: 'Open chat', exact: true })
+    .click()
+  const activity = page
+    .getByLabel('Agent conversation')
+    .locator('.agent-output__primary[aria-label="Latest activity"]')
+  await expect(activity).toBeVisible()
+  const preformatted = activity.locator('.agent-output__preformatted')
+  await expect(preformatted).toBeVisible()
+  expect(await preformatted.textContent()).toBe(rawOutput)
+  await expect(activity.locator('.agent-output__markdown')).toHaveCount(0)
+  expect(state.terminalOutputRequests).toHaveLength(1)
+})
+test('preserves classified work activity as exact preformatted text', async ({ page }) => {
+  const work = [
+    '• Ran tree',
+    '  ├─ src',
+    '  │  <phase-one>',
+    '  └─ complete',
+    'consecutive terminal line',
+  ].join('\n')
+  const state = await mockApi(page, {
+    terminalOutputText: ['› Inspect the terminal tree.', work].join('\n'),
+  })
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page
+    .getByRole('button', { name: 'Open chat', exact: true })
+    .click()
+  const activity = page
+    .getByLabel('Agent conversation')
+    .locator('.agent-output__primary[aria-label="Latest activity"]')
+  const preformatted = activity.locator('.agent-output__preformatted')
+  await expect(preformatted).toBeVisible()
+  expect(await preformatted.textContent()).toBe(work)
+  await expect(activity.locator('.agent-output__markdown')).toHaveCount(0)
   expect(state.terminalOutputRequests).toHaveLength(1)
 })
 
@@ -6088,9 +6216,6 @@ test('shows agent activity error and empty states in chat', async ({
     .getByRole('button', { name: 'Open chat', exact: true })
     .click()
   const conversation = page.getByLabel('Agent conversation')
-  const initialHeight = await conversation.evaluate(
-    (element) => element.getBoundingClientRect().height,
-  )
   await expect(page.getByText('Agent output unavailable')).toBeVisible()
   await expect(page.getByText('Synthetic terminal output failure')).toBeVisible()
 
@@ -6098,18 +6223,9 @@ test('shows agent activity error and empty states in chat', async ({
   await page
     .getByRole('button', { name: 'Refresh agent activity' })
     .click()
-  const emptyOutput = conversation.locator(
-    'details.agent-output__entry[data-kind="answer"]',
-  )
-  await expect(emptyOutput.locator('summary')).toContainText(
-    'No recent agent output.',
-  )
-  await expect(emptyOutput).not.toHaveAttribute('open', '')
-  await expect
-    .poll(() =>
-      conversation.evaluate((element) => element.getBoundingClientRect().height),
-    )
-    .toBe(initialHeight)
+  const emptyOutput = conversation.locator('.agent-output__primary[aria-label="Latest activity"]')
+  await expect(emptyOutput).toBeVisible()
+  await expect(emptyOutput).toContainText('No recent agent output.')
 })
 
 test('opens the terminal socket before history and replays sequenced live frames', async ({
@@ -6718,7 +6834,7 @@ test('keeps one terminal lease and viewport across Terminal and Focus presentati
 
   await focusPresentation.click()
   await expect(shell).toHaveAttribute('data-presentation', 'focus')
-  await expect(shell.getByLabel('Herdr windows')).toBeHidden()
+  await expect(shell.getByLabel('Herdr windows', { exact: true })).toBeHidden()
   await expect(terminal).toHaveAttribute(
     'data-lifecycle-marker',
     'same-terminal',
@@ -6749,7 +6865,7 @@ test('keeps one terminal lease and viewport across Terminal and Focus presentati
 
   await terminalPresentation.click()
   await expect(shell).toHaveAttribute('data-presentation', 'terminal')
-  await expect(shell.getByLabel('Herdr windows')).toBeVisible()
+  await expect(shell.getByLabel('Herdr windows', { exact: true })).toBeVisible()
   await expect(terminal).toHaveAttribute(
     'data-lifecycle-marker',
     'same-terminal',
@@ -10976,7 +11092,7 @@ test('submits a direct prompt payload and reports only acknowledgement', async (
   })
   await expect(submit).toBeDisabled()
   await page
-    .getByLabel('Order template', { exact: true })
+    .getByRole('combobox', { name: 'Order template' })
     .selectOption({ label: 'Pick up work' })
   await expect(prompt).toHaveValue(
     /Objective: Pick up the highest-priority unfinished work/,
@@ -11083,6 +11199,12 @@ test('selects multiple agents and broadcasts one sourced group order', async ({
     .getByRole('button', { name: 'Open group chat', exact: true })
     .click()
   const groupChat = page.getByRole('dialog', { name: 'Group chat' })
+  const recipients = groupChat.locator('details.group-chat-context__recipients')
+  await expect(recipients.locator('summary')).toContainText('2 recipients')
+  await expect(recipients).not.toHaveAttribute('open', '')
+  await expect(
+    groupChat.getByRole('combobox', { name: 'Order template' }),
+  ).toBeVisible()
   const groupChatBounds = await groupChat.boundingBox()
   const closeChatBounds = await groupChat
     .getByRole('button', { name: 'Close chat' })
@@ -11116,24 +11238,34 @@ test('selects multiple agents and broadcasts one sourced group order', async ({
   ).toBeVisible()
   const snapshots = thread.locator('.chat-message[data-kind="agent"]')
   await expect(snapshots).toHaveCount(2)
-  const answerDisclosures = snapshots.locator(
-    'details.agent-output__entry[data-kind="answer"]',
-  )
-  await expect(answerDisclosures).toHaveCount(2)
+  const answers = snapshots.locator('.agent-output__primary[aria-label="Latest answer"]')
+  await expect(answers).toHaveCount(2)
   await expect(
-    answerDisclosures.first(),
+    snapshots.filter({ hasText: 'Implementer' })
+      .getByRole('button', { name: 'Copy Implementer answer' }),
+  ).toBeVisible()
+  await expect(
+    snapshots.filter({ hasText: 'API migration orchestrator' })
+      .getByRole('button', { name: 'Copy API migration orchestrator answer' }),
+  ).toBeVisible()
+  await expect(
+    answers.first(),
   ).toContainText('Agent 1 is ready for the next task.')
-  await expect(answerDisclosures.nth(0).locator('pre')).toBeHidden()
-  await expect(answerDisclosures.nth(1).locator('pre')).toBeHidden()
-  await answerDisclosures.nth(0).locator('summary').click()
-  await answerDisclosures.nth(1).locator('summary').click()
-  await expect(answerDisclosures.nth(0).locator('pre')).toBeVisible()
-  await expect(answerDisclosures.nth(1).locator('pre')).toBeVisible()
+  const prompt = page.getByLabel('Message', { exact: true })
+  await groupChat.getByRole('combobox', { name: 'Order template' })
+    .selectOption({ label: 'Status check' })
+  await expect(prompt).toHaveValue(/Give a concise operational status/)
+  const terminalDetails = answers.locator('details.agent-output__transcript')
+  await expect(terminalDetails).toHaveCount(2)
+  await expect(terminalDetails.nth(0).locator('pre')).toBeHidden()
+  await expect(terminalDetails.nth(1).locator('pre')).toBeHidden()
+  await terminalDetails.nth(0).locator('summary').click()
+  await terminalDetails.nth(1).locator('summary').click()
   await expect(
-    answerDisclosures.nth(0).locator('pre'),
+    terminalDetails.nth(0).locator('pre'),
   ).toContainText('group output 1.1')
   await expect(
-    answerDisclosures.nth(1).locator('pre'),
+    terminalDetails.nth(1).locator('pre'),
   ).toContainText('group output 1.60')
   expect(state.terminalOutputRequests).toHaveLength(1)
   expect(state.terminalOutputRequests[0]?.lines).toBe('1000')
@@ -11143,11 +11275,6 @@ test('selects multiple agents and broadcasts one sourced group order', async ({
     ),
   ).toBe(true)
 
-  const prompt = page.getByLabel('Message', { exact: true })
-  await page
-    .getByLabel('Order template', { exact: true })
-    .selectOption({ label: 'Status check' })
-  await expect(prompt).toHaveValue(/Give a concise operational status/)
   await prompt.fill('Report current status and continue the next task.')
   await page
     .getByRole('button', { name: 'Send to 2', exact: true })
@@ -11176,6 +11303,125 @@ test('selects multiple agents and broadcasts one sourced group order', async ({
   ).toContainText('2 recipients')
   await page.screenshot({
     path: testInfo.outputPath('group-chat-desktop.png'),
+    fullPage: true,
+  })
+})
+
+test('bounds ten-plus group recipients and delivery results on desktop', async ({
+  page,
+}, testInfo) => {
+  const state = await mockApi(page, {
+    terminalOutputText: (readCount) =>
+      [
+        `› What is group agent ${readCount} doing?`,
+        `• Group agent ${readCount} is ready.`,
+      ].join('\n'),
+  })
+  for (let index = 1; index <= 11; index += 1) {
+    const workerProfile = profile(
+      `group-profile-${index}`,
+      `Group agent ${index}`,
+    )
+    state.profiles.push(workerProfile)
+    state.assignments.push(
+      assignment(
+        `group-assignment-${index}`,
+        'project-1',
+        workerProfile,
+        `Handle group task ${index}.`,
+        'implementer',
+      ),
+    )
+  }
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await setMapView(page, '2D view')
+
+  const markers = page.locator('.assigned-worker-marker')
+  await expect(markers).toHaveCount(11)
+  await page.getByRole('button', { name: 'Fit View', exact: true }).click()
+  await page.waitForTimeout(300)
+  await markers.first().click()
+  for (let index = 1; index < 11; index += 1) {
+    await markers.nth(index).click({
+      force: true,
+      modifiers: ['Shift'],
+    })
+  }
+
+  await expect(
+    page.getByRole('heading', { name: 'Group chat' }),
+  ).toBeVisible()
+  const openGroupChat = page.getByRole('button', {
+    name: 'Open group chat',
+    exact: true,
+  })
+  await openGroupChat.scrollIntoViewIfNeeded()
+  await openGroupChat.click()
+
+  const groupChat = page.getByRole('dialog', { name: 'Group chat' })
+  const recipients = groupChat.locator('details.group-chat-context__recipients')
+  const recipientSummary = recipients.locator('summary')
+  const recipientCount = Number.parseInt(
+    (await recipientSummary.textContent()) ?? '',
+    10,
+  )
+  expect(recipientCount).toBeGreaterThanOrEqual(10)
+  await expect(recipients).not.toHaveAttribute('open', '')
+  await expect(
+    groupChat.getByRole('combobox', { name: 'Order template' }),
+  ).toBeVisible()
+  const initialLayout = await groupChat.evaluate((element) => {
+    const context = element.querySelector<HTMLElement>('.chat-context')
+    const thread = element.querySelector<HTMLElement>('.chat-thread')
+    return {
+      contextHeight: context?.getBoundingClientRect().height ?? Infinity,
+      threadHeight: thread?.getBoundingClientRect().height ?? 0,
+    }
+  })
+  expect(initialLayout.contextHeight).toBeLessThanOrEqual(70)
+  expect(initialLayout.threadHeight).toBeGreaterThan(400)
+
+  await recipients.locator('summary').click()
+  const roster = recipients.locator('.group-chat-roster')
+  await expect(roster.locator(':scope > span')).toHaveCount(recipientCount)
+  const rosterOverflow = await roster.evaluate(
+    (element) => element.scrollHeight - element.clientHeight,
+  )
+  expect(rosterOverflow).toBeGreaterThan(0)
+  await recipients.locator('summary').click()
+
+  const prompt = groupChat.getByLabel('Message', { exact: true })
+  await prompt.fill('Report the bounded group status.')
+  await groupChat
+    .getByRole('button', {
+      name: `Send to ${recipientCount}`,
+      exact: true,
+    })
+    .click()
+  const deliveries = groupChat.locator('.group-delivery-results')
+  await expect(deliveries.locator('[data-state="delivered"]')).toHaveCount(
+    recipientCount,
+  )
+  const boundedLayout = await groupChat.evaluate((element) => {
+    const context = element.querySelector<HTMLElement>('.chat-context')
+    const thread = element.querySelector<HTMLElement>('.chat-thread')
+    const deliveries = element.querySelector<HTMLElement>(
+      '.group-delivery-results',
+    )
+    return {
+      contextHeight: context?.getBoundingClientRect().height ?? Infinity,
+      deliveryOverflow: deliveries
+        ? deliveries.scrollHeight - deliveries.clientHeight
+        : 0,
+      threadHeight: thread?.getBoundingClientRect().height ?? 0,
+    }
+  })
+  expect(boundedLayout.contextHeight).toBeLessThanOrEqual(180)
+  expect(boundedLayout.deliveryOverflow).toBeGreaterThan(0)
+  expect(boundedLayout.threadHeight).toBeGreaterThan(280)
+  await page.screenshot({
+    path: testInfo.outputPath('chat-experience-followup-desktop.png'),
     fullPage: true,
   })
 })
@@ -11317,8 +11563,17 @@ test('keeps assignment intervention controls within the mobile inspector', async
 }, testInfo) => {
   const state = await mockApi(page, {
     promptDurableFailureOnce: 'runtime_intervention_ambiguous',
+    terminalOutputText: codexTranscript({
+      answer: 'The mobile answer remains visible.',
+      question: 'What should happen next?',
+      work: ['Review the intervention state.'],
+    }),
   })
-  seedActiveAssignment(state)
+  const seeded = seedActiveAssignment(state)
+  if (!seeded.worker.runtime) {
+    throw new Error('Seeded mobile worker runtime is missing')
+  }
+  seeded.worker.runtime.status = 'blocked'
   await page.setViewportSize({ width: 390, height: 844 })
   await page.goto('/')
 
@@ -11391,6 +11646,7 @@ test('keeps assignment intervention controls within the mobile inspector', async
     .getByRole('button', { name: 'Open chat', exact: true })
     .click()
   const navigator = page.getByLabel('Herdr windows', { exact: true })
+  await expect(navigator).toBeHidden()
   const mobileNavigatorToggle = page.locator(
     '.agent-workspace-toolbar__mobile-navigator',
   )
@@ -11398,33 +11654,13 @@ test('keeps assignment intervention controls within the mobile inspector', async
     name: 'Close worker navigation',
     exact: true,
   })
-  await expect(navigator).toBeHidden()
-  await expect(mobileNavigatorToggle).toBeVisible()
-  await expect(mobileNavigatorToggle).toHaveAttribute('aria-expanded', 'false')
-  await mobileNavigatorToggle.click()
-  await expect(navigator).toBeVisible()
-  await expect(navigator).toHaveAttribute('role', 'dialog')
-  await expect(navigator).toHaveAttribute('aria-modal', 'true')
-  await expect(closeMobileNavigator).toBeFocused()
-  const drawerLayout = await navigator.evaluate((element) => {
-    const bounds = element.getBoundingClientRect()
-    return {
-      horizontal: element.scrollWidth - element.clientWidth,
-      left: bounds.left,
-      right: bounds.right,
-      width: bounds.width,
-      windowWidth: window.innerWidth,
-    }
-  })
-  expect(drawerLayout.horizontal).toBeLessThanOrEqual(0)
-  expect(drawerLayout.left).toBeGreaterThanOrEqual(0)
-  expect(drawerLayout.right).toBeLessThanOrEqual(drawerLayout.windowWidth)
-  expect(drawerLayout.width).toBeLessThanOrEqual(320)
-  await page.keyboard.press('Escape')
-  await expect(navigator).toBeHidden()
-  await expect(mobileNavigatorToggle).toBeFocused()
-  await expect(mobileNavigatorToggle).toHaveAttribute('aria-expanded', 'false')
 
+  const mobileAnswer = page.locator('.agent-output__primary[aria-label="Latest answer"]')
+  await expect(mobileAnswer).toBeVisible()
+  const activityRequestCount = state.terminalOutputRequests.length
+  await expect(mobileAnswer.getByRole('button', { name: 'Copy answer' })).toBeVisible()
+  const mobileTemplate = page.getByLabel('Order template')
+  await expect(mobileTemplate).toBeVisible()
   const prompt = page.getByLabel('Message', { exact: true })
   await prompt.fill('unbroken-prompt-token'.repeat(30))
   await page
@@ -11436,39 +11672,143 @@ test('keeps assignment intervention controls within the mobile inspector', async
   })
   await expect(sendAsNew).toBeVisible()
 
-  const overflow = await page.evaluate(() => {
-    const workspace = document.querySelector<HTMLElement>('.chat-workspace')
-    const prompt = document.querySelector<HTMLTextAreaElement>(
-      '.chat-composer textarea',
-    )
-    const sendAsNew = document.querySelector<HTMLButtonElement>(
-      '.chat-delivery-feedback .secondary-button',
-    )
-    return {
-      documentHorizontal:
-        document.documentElement.scrollWidth - window.innerWidth,
-      documentVertical:
-        document.documentElement.scrollHeight - window.innerHeight,
-      workspaceHorizontal: workspace
-        ? workspace.scrollWidth - workspace.clientWidth
-        : Number.POSITIVE_INFINITY,
-      promptRight: prompt?.getBoundingClientRect().right ?? Infinity,
-      sendAsNewRight:
-        sendAsNew?.getBoundingClientRect().right ?? Infinity,
-      windowWidth: window.innerWidth,
-    }
-  })
-  expect(overflow.documentHorizontal).toBeLessThanOrEqual(0)
-  expect(overflow.documentVertical).toBeLessThanOrEqual(0)
-  expect(overflow.workspaceHorizontal).toBeLessThanOrEqual(0)
-  expect(overflow.promptRight).toBeLessThanOrEqual(overflow.windowWidth)
-  expect(overflow.sendAsNewRight).toBeLessThanOrEqual(overflow.windowWidth)
+  const verifyMobileChat = async (
+    width: number,
+    height: number,
+    screenshotName: string,
+  ) => {
+    await page.setViewportSize({ width, height })
+    await expect(navigator).toBeHidden()
+    await expect(mobileNavigatorToggle).toBeVisible()
+    await expect(mobileNavigatorToggle).toHaveAttribute('aria-expanded', 'false')
+    await mobileNavigatorToggle.click()
+    await expect(navigator).toBeVisible()
+    await expect(mobileNavigatorToggle).toHaveAttribute('aria-expanded', 'true')
+    await expect(closeMobileNavigator).toBeFocused()
+    const drawerLayout = await navigator.evaluate((element) => {
+      const bounds = element.getBoundingClientRect()
+      return {
+        horizontal: element.scrollWidth - element.clientWidth,
+        left: bounds.left,
+        right: bounds.right,
+        width: bounds.width,
+        windowWidth: window.innerWidth,
+      }
+    })
+    expect(drawerLayout.horizontal).toBeLessThanOrEqual(0)
+    expect(drawerLayout.left).toBeGreaterThanOrEqual(0)
+    expect(drawerLayout.right).toBeLessThanOrEqual(drawerLayout.windowWidth)
+    expect(drawerLayout.width).toBeLessThanOrEqual(320)
+    await page.keyboard.press('Escape')
+    await expect(navigator).toBeHidden()
+    await expect(mobileNavigatorToggle).toBeFocused()
+    await expect(mobileNavigatorToggle).toHaveAttribute('aria-expanded', 'false')
+    await expect(mobileAnswer).toBeVisible()
+    expect(
+      await mobileAnswer.evaluate((element) => {
+        const bounds = element.getBoundingClientRect()
+        const hit = document.elementFromPoint(
+          bounds.left + bounds.width / 2,
+          bounds.top + Math.min(24, bounds.height / 2),
+        )
+        return Boolean(hit && element.contains(hit))
+      }),
+    ).toBe(true)
+    await expect(mobileTemplate).toBeVisible()
+    const layout = await page.evaluate(() => {
+      const shell = document.querySelector<HTMLElement>(
+        '.agent-workspace-shell',
+      )
+      const content = document.querySelector<HTMLElement>(
+        '.agent-workspace-content',
+      )
+      const workspace = document.querySelector<HTMLElement>('.chat-workspace')
+      const prompt = document.querySelector<HTMLTextAreaElement>(
+        '.chat-composer textarea',
+      )
+      const sendAsNew = document.querySelector<HTMLButtonElement>(
+        '.chat-delivery-feedback .secondary-button',
+      )
+      const context = document.querySelector<HTMLElement>('.chat-context')
+      const template = document.querySelector<HTMLElement>(
+        '.chat-context__field',
+      )
+      const secondary = document.querySelector<HTMLElement>(
+        '.chat-intervention-state',
+      )
+      const thread = document.querySelector<HTMLElement>('.chat-thread')
+      const composer = document.querySelector<HTMLElement>('.chat-composer')
+      const copy = document.querySelector<HTMLElement>('.agent-output__copy')
+      const shellBounds = shell?.getBoundingClientRect()
+      const contentBounds = content?.getBoundingClientRect()
+      return {
+        contentHorizontal: content
+          ? content.scrollWidth - content.clientWidth
+          : Number.POSITIVE_INFINITY,
+        contentLeft: contentBounds?.left ?? Infinity,
+        contentRight: contentBounds?.right ?? Infinity,
+        contentWidth: contentBounds?.width ?? 0,
+        contextBottom: context?.getBoundingClientRect().bottom ?? Infinity,
+        copyRight: copy?.getBoundingClientRect().right ?? Infinity,
+        documentHorizontal:
+          document.documentElement.scrollWidth - window.innerWidth,
+        documentVertical:
+          document.documentElement.scrollHeight - window.innerHeight,
+        promptRight: prompt?.getBoundingClientRect().right ?? Infinity,
+        secondaryTop: secondary?.getBoundingClientRect().top ?? Infinity,
+        sendAsNewRight:
+          sendAsNew?.getBoundingClientRect().right ?? Infinity,
+        shellHorizontal: shell
+          ? shell.scrollWidth - shell.clientWidth
+          : Number.POSITIVE_INFINITY,
+        shellLeft: shellBounds?.left ?? 0,
+        shellRight: shellBounds?.right ?? 0,
+        shellWidth: shellBounds?.width ?? Infinity,
+        templateRight: template?.getBoundingClientRect().right ?? Infinity,
+        templateTop: template?.getBoundingClientRect().top ?? Infinity,
+        threadBottom: thread?.getBoundingClientRect().bottom ?? Infinity,
+        threadTop: thread?.getBoundingClientRect().top ?? 0,
+        composerTop: composer?.getBoundingClientRect().top ?? 0,
+        windowWidth: window.innerWidth,
+        workspaceHorizontal: workspace
+          ? workspace.scrollWidth - workspace.clientWidth
+          : Number.POSITIVE_INFINITY,
+      }
+    })
+    expect(layout.documentHorizontal).toBeLessThanOrEqual(0)
+    expect(layout.documentVertical).toBeLessThanOrEqual(0)
+    expect(layout.shellHorizontal).toBeLessThanOrEqual(0)
+    expect(layout.contentHorizontal).toBeLessThanOrEqual(0)
+    expect(layout.workspaceHorizontal).toBeLessThanOrEqual(0)
+    expect(Math.abs(layout.contentWidth - layout.shellWidth)).toBeLessThanOrEqual(1)
+    expect(Math.abs(layout.contentLeft - layout.shellLeft)).toBeLessThanOrEqual(1)
+    expect(Math.abs(layout.contentRight - layout.shellRight)).toBeLessThanOrEqual(1)
+    expect(layout.promptRight).toBeLessThanOrEqual(layout.windowWidth)
+    expect(layout.sendAsNewRight).toBeLessThanOrEqual(layout.windowWidth)
+    expect(layout.contextBottom).toBeLessThanOrEqual(layout.threadTop + 1)
+    expect(layout.threadBottom).toBeLessThanOrEqual(layout.composerTop + 1)
+    expect(layout.copyRight).toBeLessThanOrEqual(layout.windowWidth)
+    expect(layout.templateRight).toBeLessThanOrEqual(layout.windowWidth)
+    expect(layout.templateTop).toBeLessThanOrEqual(layout.secondaryTop)
 
-  await sendAsNew.scrollIntoViewIfNeeded()
-  await page.screenshot({
-    path: testInfo.outputPath('assignment-intervention-mobile.png'),
-    fullPage: true,
-  })
+    await sendAsNew.scrollIntoViewIfNeeded()
+    await page.screenshot({
+      path: testInfo.outputPath(screenshotName),
+      fullPage: true,
+    })
+  }
+
+  await verifyMobileChat(
+    390,
+    844,
+    'chat-experience-followup-mobile-390.png',
+  )
+  await verifyMobileChat(
+    320,
+    720,
+    'chat-experience-followup-mobile-320.png',
+  )
+  expect(state.terminalOutputRequests).toHaveLength(activityRequestCount)
 })
 
 test('records a durable manual completion receipt', async ({ page }) => {
