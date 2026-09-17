@@ -107,7 +107,7 @@ import {
   type ProjectedScene,
   type ProjectedTerritory,
 } from './mapScene'
-import type { YardTheme } from './theme'
+import type { ThemeDefinition } from './theme'
 import type { MapVisualMode } from './mapVisualMode'
 
 export type CanvasSelection =
@@ -146,7 +146,7 @@ interface RuntimeCanvasProps {
   runtimeLoading: boolean
   runtimeTopology: RuntimeTopology | null
   selectedSession: string
-  theme: YardTheme
+  theme: ThemeDefinition
   visualMode: MapVisualMode
   visibleWorkers: ObservedWorker[]
   yardOrchestrator: YardOrchestrator | null
@@ -1883,6 +1883,7 @@ function buildNodes(
   automations: Automation[],
   coordinationNodes: CoordinationNode[],
   inventory: RuntimeInventory | null,
+  theme: ThemeDefinition,
   projectAccents: Record<string, string>,
   projectStatusReports: ProjectStatusReports,
   projects: Project[],
@@ -2056,7 +2057,7 @@ function buildNodes(
     const geometry = project.placement.geometry
     const statusReport = projectStatusReports[project.id] ?? null
     const projectNodeId = `project:${project.id}`
-    const accent = projectAccents[project.id] ?? '#19766b'
+    const accent = projectAccents[project.id] ?? theme.tokens.accentPrimary
     const projectNode: ProjectNode = {
       id: projectNodeId,
       type: 'project',
@@ -2383,7 +2384,7 @@ function buildNodes(
           height: CHILD_NODE_HEIGHT,
         },
         deletable: false,
-        data: { agent, parentNodeId, accent: '#3178a8' },
+        data: { agent, parentNodeId, accent: theme.tokens.statusInfo },
         ariaLabel: `${childAgentLabel(agent)}, ${agent.provider} child agent, ${agent.status}`,
         focusable: true,
       })
@@ -2539,7 +2540,7 @@ function buildNodes(
         deletable: false,
         data: {
           accent:
-            managed.kind === 'yard_central' ? '#c64b3c' : '#3178a8',
+            managed.kind === 'yard_central' ? theme.tokens.statusDanger : theme.tokens.statusInfo,
           agent,
           parentNodeId,
         },
@@ -2621,7 +2622,7 @@ function buildNodes(
         },
         deletable: false,
         data: {
-          accent: '#c64b3c',
+          accent: theme.tokens.statusDanger,
           agent,
           parentNodeId,
         },
@@ -3309,7 +3310,7 @@ export function RuntimeCanvas({
           zIndex: 1,
           markerEnd: {
             type: MarkerType.ArrowClosed,
-            color: 'var(--muted)',
+            color: 'var(--text-muted)',
             height: 14,
             width: 14,
           },
@@ -3536,12 +3537,12 @@ export function RuntimeCanvas({
         const data = node.data as WorkspaceNodeData
         const accent =
           data.managedKind === 'yard_central'
-            ? '#c64b3c'
+            ? theme.tokens.statusDanger
             : data.managedKind === 'quarantined'
-              ? '#9a5a9e'
+              ? theme.tokens.accentSecondary
             : data.managedKind === 'cleanup_pending'
-              ? '#d99832'
-              : '#3178a8'
+              ? theme.tokens.statusWarning
+              : theme.tokens.statusInfo
         const { width, height } = nodeDimensions(node, 350, projectHeight(1))
         const rect = { x: world.x, y: world.y, width, height }
         centreByNodeId.set(node.id, {
@@ -3607,9 +3608,9 @@ export function RuntimeCanvas({
             : node.type === 'coordination-node'
               ? (node.data as CoordinationNodeData).node.kind ===
                 'knowledge_store'
-                ? '#347f78'
-                : '#d99832'
-              : '#c64b3c',
+                ? theme.tokens.accentPrimary
+                : theme.tokens.statusWarning
+              : theme.tokens.statusDanger,
         kind,
         nodeId: node.id,
         point: centre,
@@ -3637,7 +3638,7 @@ export function RuntimeCanvas({
     })
 
     return { anchors, routes, territories }
-  }, [edges, nodes, visualMode])
+  }, [edges, nodes, theme, visualMode])
 
   /**
    * Projected dragging for territories.
@@ -3825,6 +3826,7 @@ export function RuntimeCanvas({
         automations,
         coordinationNodes,
         inventory,
+        theme,
         projectAccents,
         projectStatusReports,
         projects,
@@ -3862,6 +3864,7 @@ export function RuntimeCanvas({
     coordinationNodes,
     inventory,
     onProjectPlacementChange,
+    theme,
     projectAccents,
     projects,
     projectStatusReports,
@@ -3879,7 +3882,7 @@ export function RuntimeCanvas({
     <ReactFlow
       aria-label="Yard project canvas"
       className="runtime-canvas"
-      colorMode={theme}
+      colorMode={theme.colorScheme}
       data-visual-mode={visualMode}
       defaultViewport={{ x: 44, y: 42, zoom: 0.88 }}
       deleteKeyCode={null}
@@ -4137,21 +4140,17 @@ export function RuntimeCanvas({
       ) : null}
       <MiniMap
         ariaLabel="Project canvas map"
-        maskColor={
-          theme === 'dark'
-            ? 'rgba(17, 23, 21, 0.76)'
-            : 'rgba(229, 233, 231, 0.76)'
-        }
+        maskColor={theme.tokens.mapMask}
         nodeColor={(node) => {
-          if (node.type === 'automation') return '#3978b8'
-          if (node.type === 'yard-orchestrator') return '#c64b3c'
+          if (node.type === 'automation') return theme.tokens.statusInfo
+          if (node.type === 'yard-orchestrator') return theme.tokens.statusDanger
           if (node.type === 'coordination-node') {
             return (node.data as CoordinationNodeData).node.kind ===
               'knowledge_store'
-              ? '#347f78'
-              : '#d99832'
+              ? theme.tokens.accentPrimary
+              : theme.tokens.statusWarning
           }
-          if (node.type !== 'project') return '#d94a37'
+          if (node.type !== 'project') return theme.tokens.statusDanger
           return (node.data as ProjectNodeData).accent
         }}
         pannable

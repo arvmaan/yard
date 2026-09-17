@@ -21,12 +21,12 @@ body {
 }
 
 ::selection {
-  background: #e7b32b;
-  color: #17201e;
+  background: var(--status-warning);
+  color: var(--text-on-accent);
 }
 
 .terminal-session__viewport:focus-within {
-  outline: 2px solid #3978b8;
+  outline: 2px solid var(--status-info);
   outline-offset: 2px;
 }
 
@@ -35,9 +35,9 @@ body {
   width: 100%;
   min-width: 0;
   overflow: hidden;
-  border: 1px solid var(--terminal-line, #34403c);
+  border: 1px solid var(--terminal-line, var(--border-strong, CanvasText));
   border-radius: 4px;
-  background: var(--terminal-bg, #111715);
+  background: var(--terminal-bg, var(--surface-muted, Canvas));
 }
 
 .terminal-session__viewport {
@@ -45,15 +45,15 @@ body {
   height: 196px;
   min-width: 0;
   overflow: hidden;
-  background: var(--terminal-bg, #111715);
+  background: var(--terminal-bg, var(--surface-muted, Canvas));
 }
 
 .terminal-session__viewport .xterm {
   width: 100%;
   height: 100%;
   padding: 8px 7px;
-  background: var(--terminal-bg, #111715);
-  color: var(--terminal-ink, #dce7e3);
+  background: var(--terminal-bg, var(--surface-muted, Canvas));
+  color: var(--terminal-ink, var(--text-primary, CanvasText));
 }
 
 .terminal-session__viewport .xterm-screen,
@@ -64,19 +64,19 @@ body {
 
 .terminal-session__viewport .xterm-viewport,
 .terminal-session__viewport .xterm-scrollable-element {
-  background-color: var(--terminal-bg, #111715) !important;
+  background-color: var(--terminal-bg, var(--surface-muted, Canvas)) !important;
 }
 
 .terminal-session__viewport .xterm-scrollable-element {
   overscroll-behavior: contain;
   scrollbar-color:
-    var(--terminal-line, #34403c)
-    var(--terminal-bg, #111715);
+    var(--terminal-line, var(--border-strong, CanvasText))
+    var(--terminal-bg, var(--surface-muted, Canvas));
 }
 
 .terminal-session__viewport .xterm .composition-view {
-  background: var(--terminal-bg, #111715);
-  color: var(--terminal-ink, #dce7e3);
+  background: var(--terminal-bg, var(--surface-muted, Canvas));
+  color: var(--terminal-ink, var(--text-primary, CanvasText));
 }
 
 .terminal-session__status {
@@ -88,8 +88,8 @@ body {
   gap: 8px;
   padding: 0 6px 0 8px;
   overflow: hidden;
-  border-top: 1px solid var(--terminal-line, #34403c);
-  color: var(--terminal-muted, #9fb0aa);
+  border-top: 1px solid var(--terminal-line, var(--border-strong, CanvasText));
+  color: var(--terminal-muted, var(--text-muted, CanvasText));
   font-family: "IBM Plex Mono", monospace;
   font-size: 9px;
 }
@@ -110,16 +110,16 @@ body {
   height: 6px;
   flex: 0 0 6px;
   border-radius: 50%;
-  background: #e7b32b;
+  background: var(--status-warning);
 }
 
 .terminal-session[data-state="connected"] .terminal-session__status-text > span {
-  background: #72b783;
+  background: var(--status-success);
 }
 
 .terminal-session[data-state="closed"] .terminal-session__status-text > span,
 .terminal-session[data-state="error"] .terminal-session__status-text > span {
-  background: #f07869;
+  background: var(--status-danger);
 }
 
 .terminal-session__reopen {
@@ -129,49 +129,19 @@ body {
   flex: 0 0 22px;
   padding: 0;
   place-items: center;
-  border: 1px solid var(--terminal-line, #34403c);
+  border: 1px solid var(--terminal-line, var(--border-strong, CanvasText));
   border-radius: 2px;
-  background: var(--terminal-bg, #111715);
-  color: var(--terminal-ink, #dce7e3);
+  background: var(--terminal-bg, var(--surface-muted, Canvas));
+  color: var(--terminal-ink, var(--text-primary, CanvasText));
   cursor: pointer;
 }
 
 .terminal-session__reopen:hover {
-  border-color: var(--terminal-ink, #dce7e3);
+  border-color: var(--terminal-ink, var(--text-primary, CanvasText));
 }
 
 .terminal-session__reopen:focus-visible {
-  outline: 2px solid #3978b8;
-  outline-offset: 1px;
-}
-
-.terminal-session__palette {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 4px;
-  color: var(--terminal-muted, #9fb0aa);
-}
-
-.terminal-session__palette-label {
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.terminal-session__palette-select {
-  height: 24px;
-  padding: 0 4px;
-  border: 1px solid var(--terminal-line, #34403c);
-  border-radius: 2px;
-  background: var(--terminal-bg, #111715);
-  color: var(--terminal-muted, #9fb0aa);
-  font-family: inherit;
-  font-size: 9px;
-  line-height: 1;
-}
-
-.terminal-session__palette-select:focus-visible {
-  outline: 2px solid #3978b8;
+  outline: 2px solid var(--status-info);
   outline-offset: 1px;
 }
 

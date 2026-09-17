@@ -165,7 +165,8 @@ import {
 import {
   applyTheme,
   readTheme,
-  type YardTheme,
+  themeDefinition,
+  type ThemeId,
 } from './theme'
 import {
   reconcileInventorySnapshot,
@@ -2233,7 +2234,7 @@ function WorkspaceInspector({
 }
 
 function App() {
-  const [theme, setTheme] = useState<YardTheme>(readTheme)
+  const [theme, setTheme] = useState<ThemeId>(readTheme)
   const [mapVisualMode, setMapVisualMode] =
     useState<MapVisualMode>(readMapVisualMode)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -5573,7 +5574,7 @@ function App() {
           resourceShelfOpen={resourceShelfOpen}
           selectedSession={selectedSession}
           sessions={sessions}
-          settingsLabel={`Settings, ${theme} theme, ${
+          settingsLabel={`Settings, ${themeDefinition(theme).label} theme, ${
             mapVisualMode === 'depth' ? '2.5D' : '2D'
           } map`}
           settingsTriggerRef={settingsTrigger}
@@ -5861,7 +5862,7 @@ function App() {
           runtimeLoading={runtimeLoading}
           runtimeTopology={runtimeTopology}
           selectedSession={selectedSession}
-          theme={theme}
+          theme={themeDefinition(theme)}
           visualMode={mapVisualMode}
           visibleWorkers={visibleWorkers}
           yardOrchestrator={yardOrchestrator}

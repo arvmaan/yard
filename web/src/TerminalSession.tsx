@@ -1,12 +1,7 @@
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import { RefreshCw } from 'lucide-react'
-import {
-  type CSSProperties,
-  useEffect,
-  useRef,
-  useState,
-} from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   assignmentTerminalWebSocketUrl,
   coordinationNodeTerminalWebSocketUrl,
@@ -23,16 +18,10 @@ import {
   TERMINAL_HISTORY_LINES,
 } from './terminalOutput'
 import {
-  applyTerminalPalette,
-  readTerminalPalette,
   readTheme,
-  resolveTerminalTheme,
-  TERMINAL_PALETTE_CHANGE_EVENT,
-  TERMINAL_PALETTE_OPTIONS,
-  terminalChromeVariables,
+  terminalTheme,
   THEME_CHANGE_EVENT,
-  type TerminalPaletteId,
-  type YardTheme,
+  type ThemeId,
 } from './theme'
 import type {
   TerminalClientMessage,
@@ -194,12 +183,11 @@ function sendMessage(
 
 function applyResolvedTerminalTheme(
   terminal: Terminal,
-  theme: YardTheme,
-  palette: TerminalPaletteId,
+  theme: ThemeId,
 ) {
   // xterm permits OSC color changes from the byte stream. Use a fresh object
-  // so its option service reapplies Yard's selected palette after each frame.
-  terminal.options.theme = { ...resolveTerminalTheme(theme, palette) }
+  // so its option service reapplies Yard's selected theme after each frame.
+  terminal.options.theme = terminalTheme(theme)
 }
 
 function protectResolvedTerminalTheme(terminal: Terminal) {
@@ -237,10 +225,7 @@ function wheelLineDelta(event: WheelEvent, viewportRows: number) {
 export function TerminalSession({ target }: { target: TerminalTarget }) {
   const hostRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<Terminal | null>(null)
-  const [theme, setTheme] = useState<YardTheme>(readTheme)
-  const [palette, setPalette] = useState<TerminalPaletteId>(
-    readTerminalPalette,
-  )
+  const [theme, setTheme] = useState<ThemeId>(readTheme)
   const [connection, setConnection] = useState<ConnectionState>({
     kind: 'connecting',
     detail: 'Connecting',
@@ -310,7 +295,7 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       screenReaderMode: true,
       scrollback: TERMINAL_SCROLLBACK_LINES,
       smoothScrollDuration: 0,
-      theme: resolveTerminalTheme(readTheme(), readTerminalPalette()),
+      theme: terminalTheme(readTheme()),
     })
     terminalRef.current = terminal
     const terminalThemeHandlers = protectResolvedTerminalTheme(terminal)
@@ -319,16 +304,9 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
     terminal.open(host)
     terminal.focus()
     const handleThemeChange = (event: Event) => {
-      setTheme((event as CustomEvent<YardTheme>).detail)
-    }
-    const handlePaletteChange = (event: Event) => {
-      setPalette((event as CustomEvent<TerminalPaletteId>).detail)
+      setTheme((event as CustomEvent<ThemeId>).detail)
     }
     window.addEventListener(THEME_CHANGE_EVENT, handleThemeChange)
-    window.addEventListener(
-      TERMINAL_PALETTE_CHANGE_EVENT,
-      handlePaletteChange,
-    )
 
     const sendResize = (force = false) => {
       if (!socket) return
@@ -664,10 +642,6 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       inputSubscription.dispose()
       terminalThemeHandlers.forEach((handler) => handler.dispose())
       window.removeEventListener(THEME_CHANGE_EVENT, handleThemeChange)
-      window.removeEventListener(
-        TERMINAL_PALETTE_CHANGE_EVENT,
-        handlePaletteChange,
-      )
       host.removeEventListener('wheel', handleWheel, true)
       if (fitAnimationFrame) {
         window.cancelAnimationFrame(fitAnimationFrame)
@@ -711,22 +685,16 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
     workerId,
   ])
 
-  // Applies the resolved xterm.js palette live whenever the app theme or
-  // the terminal palette preference changes, without tearing down the
-  // terminal (which would drop scrollback / connection state).
+  // Apply the selected app theme live without reconnecting or losing scrollback.
   useEffect(() => {
     const terminal = terminalRef.current
     if (!terminal) return
-    applyResolvedTerminalTheme(terminal, theme, palette)
+    applyResolvedTerminalTheme(terminal, theme)
     const refreshFrame = window.requestAnimationFrame(() => {
       if (terminal.rows > 0) terminal.refresh(0, terminal.rows - 1)
     })
     return () => window.cancelAnimationFrame(refreshFrame)
-  }, [theme, palette])
-
-  useEffect(() => {
-    applyTerminalPalette(palette)
-  }, [palette])
+  }, [theme])
 
   return (
     <div
@@ -737,9 +705,7 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       data-frame-width={frame?.width}
       data-history-state={history.kind}
       data-state={connection.kind}
-      data-terminal-palette={palette}
       data-terminal-theme={theme}
-      style={terminalChromeVariables(palette) as CSSProperties}
     >
       <div
         aria-label={
@@ -782,23 +748,6 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
             <RefreshCw aria-hidden="true" size={13} />
           </button>
         ) : null}
-        <label className="terminal-session__palette">
-          <span className="terminal-session__palette-label">Theme</span>
-          <select
-            aria-label="Terminal color theme"
-            className="terminal-session__palette-select"
-            onChange={(event) =>
-              setPalette(event.target.value as TerminalPaletteId)
-            }
-            value={palette}
-          >
-            {TERMINAL_PALETTE_OPTIONS.map((option) => (
-              <option key={option.id} value={option.id}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </label>
       </div>
     </div>
   )

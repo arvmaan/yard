@@ -69,6 +69,7 @@ import {
   parseStatusReport,
   statusReportMatchesLatestRoute,
 } from '../src/projectUpdates'
+import { THEME_OPTIONS } from '../src/theme'
 
 const sessions = {
   adapter: 'herdr',
@@ -3413,9 +3414,10 @@ async function setMapView(page: Page, label: '2D view' | '2.5D view') {
   await dialog.getByRole('button', { name: 'Close settings' }).click()
 }
 
-async function setAppTheme(page: Page, theme: 'Dark' | 'Light') {
+async function setAppTheme(page: Page, theme: string) {
   const dialog = await openSettings(page)
-  await dialog.getByRole('button', { name: theme, exact: true }).click()
+  const label = theme === 'Dark' || theme === 'Light' ? "Yard " + theme : theme
+  await dialog.getByLabel('Theme').selectOption({ label })
   await dialog.getByRole('button', { name: 'Close settings' }).click()
 }
 
@@ -3761,6 +3763,9 @@ test('uses wss for terminal URLs on secure pages', () => {
 test('renders durable, offline, and unbound resources on desktop', async ({
   page,
 }, testInfo) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem('yard:theme', 'light')
+  })
   const state = await mockApi(page)
   await page.setViewportSize({ width: 1440, height: 900 })
   await page.goto('/')
@@ -3775,6 +3780,16 @@ test('renders durable, offline, and unbound resources on desktop', async ({
   await expect(
     page.locator('.project-region[data-runtime="offline"]'),
   ).toHaveCount(1)
+  const offlineRegion = page.locator(
+    '.project-region[data-runtime="offline"]',
+  )
+  const offlineCount = offlineRegion.locator('.workspace-region__count')
+  await offlineCount.evaluate((element) => {
+    element.dataset.contrastProbe = ''
+  })
+  const offlineCountContrasts = await navigatorMetadataContrasts(offlineRegion)
+  expect(offlineCountContrasts).toHaveLength(1)
+  expect(offlineCountContrasts[0].contrast).toBeGreaterThanOrEqual(4.5)
   await expect(page.locator('.worker-marker')).toHaveCount(
     state.runtimeInventory.workers.length + 1,
   )
@@ -3874,7 +3889,7 @@ test('provides one-click runtime health and persistent appearance settings', asy
     'Runtime health: alpha, Herdr observed',
   )
   await expect(settingsTrigger).toHaveAccessibleName(
-    'Settings, light theme, 2.5D map',
+    'Settings, Yard Light theme, 2.5D map',
   )
   await expect(page.locator('.command-bar__metrics')).toHaveCount(0)
   await expect(page.locator('.canvas-stage__label')).toHaveCount(0)
@@ -3908,9 +3923,7 @@ test('provides one-click runtime health and persistent appearance settings', asy
   await settingsTrigger.focus()
   await settingsTrigger.press('Enter')
   const settings = page.getByRole('dialog', { name: 'Settings' })
-  await expect(
-    settings.getByRole('button', { name: 'Light', exact: true }),
-  ).toBeFocused()
+  await expect(settings.getByLabel('Theme')).toBeFocused()
   await expect(page.locator('.app-shell')).toHaveAttribute('inert', '')
   for (let index = 0; index < 12; index += 1) {
     await page.keyboard.press('Tab')
@@ -3920,9 +3933,7 @@ test('provides one-click runtime health and persistent appearance settings', asy
       ),
     ).toBe(true)
   }
-  await settings
-    .getByRole('button', { name: 'Dark', exact: true })
-    .click()
+  await settings.getByLabel('Theme').selectOption('dark')
   await settings.getByRole('button', { name: '2D view' }).click()
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
   await expect(page.getByLabel('Yard project canvas')).toHaveAttribute(
@@ -6553,7 +6564,7 @@ test('keeps a worker terminal theme and scrollback authoritative under TUI mouse
 
   await setAppTheme(page, 'Dark')
   await expect.poll(xtermBackground).toBe('rgb(23, 32, 29)')
-  await page.getByLabel('Terminal color theme').selectOption('nord')
+  await setAppTheme(page, 'Nord')
   await expect.poll(xtermBackground).toBe('rgb(46, 52, 64)')
 
   const terminalUrl = new URL(state.terminalConnectionUrls[0])
@@ -6841,134 +6852,211 @@ test('keeps the full-screen terminal surfaces synchronized with the app theme', 
   })
 })
 
-test('lets the terminal use its own named color palette, independent of the app theme, and persists the choice', async ({
+test('applies all built-in themes to populated status and terminal surfaces', async ({
   page,
-}) => {
-  const state = await mockApi(page)
+}, testInfo) => {
+  await page.addInitScript(() => {
+    if (window.localStorage.getItem('yard:theme') === null) {
+      window.localStorage.setItem('yard:theme', 'light')
+    }
+  })
+  const state = await mockApi(page, {
+    terminalOutputText: codexTranscript({
+      question: 'Is the theme follow-up ready for integration?',
+      work: [
+        'Added WCAG warning foreground tokens across seven built-ins',
+        'Guarded localStorage and matchMedia access before React mounts',
+        'Verified status badges at desktop and mobile widths',
+        'Reviewed Solarized surfaces and terminal background consistency',
+      ],
+      answer: 'Theme checks are green; preparing the focused follow-up commit.',
+    }),
+  })
   seedActiveAssignment(state)
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
+  await page.getByRole('tab', { name: 'Workers' }).click()
+  await page
+    .locator('.worker-row[data-worker-id="worker-unavailable"]')
+    .click()
 
+  const inspector = page.locator('.inspector')
+  const verifyStatusTokens = async () => {
+    const badges = [
+      inspector.locator('.status-badge[data-status="unknown"]'),
+      inspector.locator(
+        '.process-state-badge[data-process-state="unknown"]',
+      ),
+      inspector.locator(
+        '.observation-state-badge[data-observation-state="missing"]',
+      ),
+      inspector.locator(
+        '.availability-badge[data-availability="unavailable"]',
+      ),
+    ]
+    for (const badge of badges) await expect(badge).toBeVisible()
+
+    const styles = await inspector.evaluate((element) => {
+      const pair = (selector: string) => {
+        const node = element.querySelector<HTMLElement>(selector)
+        if (!node) throw new Error(`Missing status badge: ${selector}`)
+        const style = getComputedStyle(node)
+        return [style.color, style.backgroundColor]
+      }
+      const expectedPair = (foreground: string, background: string) => {
+        const probe = document.createElement('span')
+        probe.style.color = `var(${foreground})`
+        probe.style.backgroundColor = `var(${background})`
+        probe.style.position = 'absolute'
+        probe.style.visibility = 'hidden'
+        element.append(probe)
+        const style = getComputedStyle(probe)
+        const result = [style.color, style.backgroundColor]
+        probe.remove()
+        return result
+      }
+      return {
+        warning: [
+          pair('.status-badge[data-status="unknown"]'),
+          pair('.process-state-badge[data-process-state="unknown"]'),
+        ],
+        neutral: [
+          pair(
+            '.observation-state-badge[data-observation-state="missing"]',
+          ),
+          pair('.availability-badge[data-availability="unavailable"]'),
+        ],
+        expectedWarning: expectedPair(
+          '--status-warning-foreground',
+          '--status-warning-soft',
+        ),
+        expectedNeutral: expectedPair('--text-muted', '--surface-muted'),
+      }
+    })
+    expect(styles.warning).toEqual([
+      styles.expectedWarning,
+      styles.expectedWarning,
+    ])
+    expect(styles.neutral).toEqual([
+      styles.expectedNeutral,
+      styles.expectedNeutral,
+    ])
+    const overflow = await inspector.evaluate((element) => ({
+      horizontal: element.scrollWidth - element.clientWidth,
+      right: element.getBoundingClientRect().right - window.innerWidth,
+    }))
+    expect(overflow.horizontal).toBeLessThanOrEqual(0)
+    expect(overflow.right).toBeLessThanOrEqual(0)
+  }
+
+  const verifyThemesAt = async (width: number, height: number) => {
+    await page.setViewportSize({ width, height })
+    for (const option of THEME_OPTIONS) {
+      await setAppTheme(page, option.label)
+      await expect(page.locator('html')).toHaveAttribute(
+        'data-theme',
+        option.id,
+      )
+      expect(
+        await page.evaluate(() => window.localStorage.getItem('yard:theme')),
+      ).toBe(option.id)
+      await verifyStatusTokens()
+    }
+  }
+
+  await verifyThemesAt(1280, 800)
+  await verifyThemesAt(390, 844)
+
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await inspector.getByRole('button', { name: 'Close details' }).click()
   await page.locator('.assigned-worker-marker').click()
   await page
     .getByRole('button', { name: 'Open terminal', exact: true })
     .click()
 
   const terminal = page.locator('.terminal-session')
-  const viewport = terminal.locator('.xterm-viewport')
-  const paletteSelect = page.getByLabel('Terminal color theme')
+  const terminalRows = terminal.locator('.xterm-accessibility-tree')
+  await expect(terminalRows).toContainText('Theme checks are green')
+  await expect(page.getByLabel('Terminal color theme')).toHaveCount(0)
 
-  await expect(paletteSelect).toHaveValue('auto')
-  await expect(terminal).toHaveAttribute('data-terminal-palette', 'auto')
-
-  await paletteSelect.selectOption('nord')
-  await expect(terminal).toHaveAttribute('data-terminal-palette', 'nord')
-  await expect(viewport).toHaveCSS('background-color', 'rgb(46, 52, 64)')
-
-  for (const palette of [
-    'nord',
-    'dracula',
-    'solarized-dark',
-    'solarized-light',
-    'gruvbox-dark',
-  ]) {
-    await paletteSelect.selectOption(palette)
-    await expect(terminal).toHaveAttribute('data-terminal-palette', palette)
-    const chrome = await terminal.evaluate((element) => {
-      const terminalStyle = getComputedStyle(element)
-      const status = element.querySelector<HTMLElement>(
-        '.terminal-session__status',
+  for (const option of THEME_OPTIONS) {
+    await setAppTheme(page, option.label)
+    await expect(terminal).toHaveAttribute('data-terminal-theme', option.id)
+    const colors = await terminal.evaluate((element) => {
+      const root = getComputedStyle(document.documentElement)
+      const probe = document.createElement('span')
+      probe.style.position = 'absolute'
+      probe.style.visibility = 'hidden'
+      document.body.append(probe)
+      const resolve = (
+        property: 'backgroundColor' | 'color',
+        variable: string,
+      ) => {
+        probe.style[property] = root.getPropertyValue(variable).trim()
+        return getComputedStyle(probe)[property]
+      }
+      const accent = document.querySelector<HTMLElement>(
+        '.terminal-presentation-control button[aria-pressed="true"]',
       )
-      const paletteControl = element.querySelector<HTMLElement>(
-        '.terminal-session__palette-select',
+      const shell = document.querySelector<HTMLElement>(
+        '.agent-workspace-shell',
       )
-      const channels = (color: string) =>
-        [...color.matchAll(/\d+(?:\.\d+)?/g)]
-          .slice(0, 3)
-          .map((match) => Number(match[0]) / 255)
-          .map((channel) =>
-            channel <= 0.04045
-              ? channel / 12.92
-              : ((channel + 0.055) / 1.055) ** 2.4,
-          )
-      const luminance = (color: string) => {
-        const [red, green, blue] = channels(color)
-        return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+      const viewport = element.querySelector<HTMLElement>('.xterm-viewport')
+      if (!accent || !shell || !viewport) {
+        throw new Error('Terminal theme surfaces are missing')
       }
-      const contrast = (foreground: string, background: string) => {
-        const foregroundLuminance = luminance(foreground)
-        const backgroundLuminance = luminance(background)
-        return (
-          (Math.max(foregroundLuminance, backgroundLuminance) + 0.05) /
-          (Math.min(foregroundLuminance, backgroundLuminance) + 0.05)
-        )
+      const accentStyle = getComputedStyle(accent)
+      const result = {
+        accentBackground: accentStyle.backgroundColor,
+        accentText: accentStyle.color,
+        expectedAccent: resolve('backgroundColor', '--accent-primary'),
+        expectedAccentText: resolve('color', '--text-on-accent'),
+        expectedShell: resolve('backgroundColor', '--surface-muted'),
+        expectedBackground: resolve(
+          'backgroundColor',
+          '--terminal-background',
+        ),
+        shell: getComputedStyle(shell).backgroundColor,
+        terminal: getComputedStyle(element).backgroundColor,
+        viewport: getComputedStyle(viewport).backgroundColor,
       }
-      const background = terminalStyle.backgroundColor
-      const border = paletteControl
-        ? getComputedStyle(paletteControl).borderTopColor
-        : ''
-      const statusColor = status ? getComputedStyle(status).color : ''
-      return {
-        background,
-        border,
-        borderContrast: contrast(border, background),
-        status: statusColor,
-        statusContrast: contrast(statusColor, background),
-      }
+      probe.remove()
+      return result
     })
-    expect(chrome.border).not.toBe(chrome.background)
-    expect(chrome.status).not.toBe(chrome.background)
-    expect(chrome.borderContrast).toBeGreaterThanOrEqual(3)
-    expect(chrome.statusContrast).toBeGreaterThanOrEqual(4.5)
+    expect(colors.accentBackground).toBe(colors.expectedAccent)
+    expect(colors.accentText).toBe(colors.expectedAccentText)
+    expect(colors.shell).toBe(colors.expectedShell)
+    expect(colors.terminal).toBe(colors.expectedBackground)
+    expect(colors.viewport).toBe(colors.expectedBackground)
   }
-  await paletteSelect.selectOption('nord')
-  await expect(terminal).toHaveAttribute('data-terminal-palette', 'nord')
 
-  // Toggling the app-wide light/dark theme must not change the terminal's
-  // colors while a named palette is selected.
-  await setAppTheme(page, 'Dark')
-  await expect(viewport).toHaveCSS('background-color', 'rgb(46, 52, 64)')
-  await expect(terminal).toHaveAttribute('data-terminal-palette', 'nord')
-
-  // The choice survives a reload.
-  await page.reload()
-  await page.locator('.assigned-worker-marker').click()
-  await page
-    .getByRole('button', { name: 'Open terminal', exact: true })
-    .click()
-
-  const reloadedTerminal = page.locator('.terminal-session')
-  const reloadedViewport = reloadedTerminal.locator('.xterm-viewport')
-  await expect(page.getByLabel('Terminal color theme')).toHaveValue('nord')
-  await expect(reloadedTerminal).toHaveAttribute(
-    'data-terminal-palette',
-    'nord',
-  )
-  await expect(reloadedViewport).toHaveCSS(
-    'background-color',
-    'rgb(46, 52, 64)',
-  )
-
-  // Switching back to Auto restores the app-theme-derived palette.
-  await page.getByLabel('Terminal color theme').selectOption('auto')
-  await expect(reloadedTerminal).toHaveAttribute(
-    'data-terminal-palette',
-    'auto',
-  )
-  await expect(reloadedViewport).toHaveCSS(
-    'background-color',
-    'rgb(23, 32, 29)',
-  )
-
-  await page.evaluate(() => {
-    window.localStorage.setItem('yard:terminal-palette', 'not-a-palette')
+  await setAppTheme(page, 'Solarized Light')
+  await page.screenshot({
+    path: testInfo.outputPath('theme-followup-terminal-desktop.png'),
+    fullPage: true,
   })
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(terminalRows).toContainText('Theme checks are green')
+  const mobileLayout = await page.evaluate(() => ({
+    horizontal: document.documentElement.scrollWidth - window.innerWidth,
+    shellRight:
+      document
+        .querySelector<HTMLElement>('.agent-workspace-shell')
+        ?.getBoundingClientRect().right ?? Number.POSITIVE_INFINITY,
+  }))
+  expect(mobileLayout.horizontal).toBeLessThanOrEqual(0)
+  expect(mobileLayout.shellRight).toBeLessThanOrEqual(390)
+  await page.screenshot({
+    path: testInfo.outputPath('theme-followup-terminal-mobile.png'),
+    fullPage: true,
+  })
+
   await page.reload()
-  await page.locator('.assigned-worker-marker').click()
-  await page
-    .getByRole('button', { name: 'Open terminal', exact: true })
-    .click()
-  await expect(page.getByLabel('Terminal color theme')).toHaveValue('auto')
+  await expect(page.locator('html')).toHaveAttribute(
+    'data-theme',
+    'solarized-light',
+  )
 })
 
 test('shows terminal closure and reopens only when requested', async ({ page }) => {
@@ -9196,7 +9284,7 @@ test('renders communication paths by durable activity state', async ({
   await expect(idleRoute).toHaveCSS('opacity', '0.8')
   await expect(idleRoute.locator('.react-flow__edge-path')).toHaveCSS(
     'stroke',
-    'rgb(104, 115, 111)',
+    'rgb(100, 111, 107)',
   )
   await expect(relationship).toHaveCSS('opacity', '0.8')
 
@@ -9220,7 +9308,7 @@ test('renders communication paths by durable activity state', async ({
   const idleSignal = projectedIdle.locator('.projected-route__signal-light')
   await expect(activeSignal).toHaveCSS('fill', 'rgb(25, 118, 107)')
   await expect(failedSignal).toHaveCSS('fill', 'rgb(217, 74, 55)')
-  await expect(idleSignal).toHaveCSS('fill', 'rgb(104, 115, 111)')
+  await expect(idleSignal).toHaveCSS('fill', 'rgb(100, 111, 107)')
   await expect(projectedIdle).toHaveCSS('opacity', '0.8')
   const activePacket = projectedActive.locator('.projected-route__activity')
   await expect(activePacket).toHaveCount(1)
@@ -9254,13 +9342,7 @@ test('renders communication paths by durable activity state', async ({
     path: testInfo.outputPath('railroad-light.png'),
     fullPage: true,
   })
-  const railroadSettings = await openSettings(page)
-  await railroadSettings
-    .getByRole('button', { name: 'Dark', exact: true })
-    .click()
-  await railroadSettings
-    .getByRole('button', { name: 'Close settings' })
-    .click()
+  await setAppTheme(page, 'Dark')
   await page.screenshot({
     path: testInfo.outputPath('railroad-dark.png'),
     fullPage: true,

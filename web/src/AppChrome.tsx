@@ -20,8 +20,6 @@ import {
   Settings,
   Settings2,
   SquareTerminal,
-  Sun,
-  Moon,
   Wifi,
   WifiOff,
   Workflow,
@@ -30,7 +28,7 @@ import {
 import type { AgentWorkspaceMode } from './AgentWorkspaceContext'
 import type { MapVisualMode } from './mapVisualMode'
 import type { RuntimeSession } from './types'
-import type { YardTheme } from './theme'
+import { THEME_OPTIONS, type ThemeId } from './theme'
 import { useModalDialog } from './useModalDialog'
 
 export type ResourceView = 'profiles' | 'workspaces' | 'workers'
@@ -365,9 +363,9 @@ interface SettingsDialogProps {
   onOpenAutomaticCoordination: () => void
   onOpenOrchestratorWorkflow: () => void
   onMapVisualModeChange: (mode: MapVisualMode) => void
-  onThemeChange: (theme: YardTheme) => void
+  onThemeChange: (theme: ThemeId) => void
   returnFocus: HTMLElement | null
-  theme: YardTheme
+  theme: ThemeId
   workflowProfileSummary: string | null
 }
 
@@ -385,7 +383,7 @@ export function SettingsDialog({
 }: SettingsDialogProps) {
   const titleId = useId()
   const dialogRef = useRef<HTMLElement>(null)
-  const initialFocusRef = useRef<HTMLButtonElement>(null)
+  const initialFocusRef = useRef<HTMLSelectElement>(null)
   const requestClose = useModalDialog({
     dialogRef,
     initialFocusRef,
@@ -425,29 +423,19 @@ export function SettingsDialog({
                 <strong>Theme</strong>
                 <small>Stored in this browser</small>
               </div>
-              <div
+              <select
                 aria-label="Theme"
-                className="segmented-control settings-segmented-control"
-                role="group"
+                className="settings-theme-select"
+                onChange={(event) => onThemeChange(event.target.value)}
+                ref={initialFocusRef}
+                value={theme}
               >
-                <button
-                  aria-pressed={theme === 'light'}
-                  onClick={() => onThemeChange('light')}
-                  ref={initialFocusRef}
-                  type="button"
-                >
-                  <Sun aria-hidden="true" size={14} />
-                  Light
-                </button>
-                <button
-                  aria-pressed={theme === 'dark'}
-                  onClick={() => onThemeChange('dark')}
-                  type="button"
-                >
-                  <Moon aria-hidden="true" size={14} />
-                  Dark
-                </button>
-              </div>
+                {THEME_OPTIONS.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
             </div>
             <div className="settings-row">
               <div>
