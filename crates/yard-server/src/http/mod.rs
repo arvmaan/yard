@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::Serialize;
 use tokio::sync::watch;
+use yard_domain::CompletedRuntimeCleanupPreview;
 use yard_domain::{
     AgentProfile, AgentProfiles, ArchiveProject, ArchivedProject, Artifact, ArtifactContent,
     Assignments, Automation, AutomationCommandResult, AutomationRun, AutomationRunCommandResult,
@@ -39,7 +40,7 @@ use yard_domain::{
     YardOrchestratorRoutes, YardOrchestratorTerminalOutput,
 };
 use yard_herdr::HerdrError;
-use yard_store::{ProjectStoreError, YardStore};
+use yard_store::{MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT, ProjectStoreError, YardStore};
 
 use crate::ConnectionTracker;
 use crate::allocation_service::{AllocationService, AllocationServiceError, RuntimeControl};
@@ -410,6 +411,10 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             axum::routing::post(create_project_with_workspace),
         )
         .route("/api/v1/workers", get(list_workers))
+        .route(
+            "/api/v1/workers/completed-runtime-cleanup-preview",
+            get(preview_completed_runtime_cleanup),
+        )
         .route(
             "/api/v1/workers/{worker_id}/end-session",
             axum::routing::post(end_worker_session),
@@ -1337,6 +1342,63 @@ async fn list_workers(
         .await
         .map(NoStoreJson)
         .map_err(ApiError::from)
+}
+
+const DEFAULT_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT: usize = 50;
+
+#[derive(Debug, serde::Deserialize)]
+struct CompletedRuntimeCleanupPreviewQuery {
+    #[serde(default = "default_completed_runtime_cleanup_preview_limit")]
+    limit: usize,
+}
+
+const fn default_completed_runtime_cleanup_preview_limit() -> usize {
+    DEFAULT_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT
+}
+
+impl CompletedRuntimeCleanupPreviewQuery {
+    fn validated_limit(&self) -> Result<usize, ApiError> {
+        if (1..=MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT).contains(&self.limit) {
+            Ok(self.limit)
+        } else {
+            Err(ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid_completed_runtime_cleanup_preview_limit",
+                message: format!(
+                    "Completed runtime cleanup preview limit must be between 1 and {MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT}"
+                ),
+            })
+        }
+    }
+}
+
+async fn preview_completed_runtime_cleanup(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<CompletedRuntimeCleanupPreviewQuery>,
+) -> Result<NoStoreJson<CompletedRuntimeCleanupPreview>, ApiError> {
+    let limit = query.validated_limit()?;
+    state
+        .store
+        .preview_completed_runtime_cleanup(limit)
+        .await
+        .map(NoStoreJson)
+        .map_err(|error| match error {
+            ProjectStoreError::CompletedRuntimeCleanupPreviewLimitInvalid { .. } => ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid_completed_runtime_cleanup_preview_limit",
+                message: error.to_string(),
+            },
+            ProjectStoreError::DatabaseBusy => ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "database_busy",
+                message: "Yard storage is busy; retry the request".to_owned(),
+            },
+            _ => ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "completed_runtime_cleanup_preview_failed",
+                message: "Yard could not build the completed runtime cleanup preview".to_owned(),
+            },
+        })
 }
 
 async fn end_worker_session(
@@ -3552,11 +3614,15 @@ mod tests {
         WorktreeObservation,
     };
     use yard_herdr::HerdrError;
-    use yard_store::{ProjectStoreError, SqliteProjectStore, YardStore};
+    use yard_store::{
+        MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT, ProjectStoreError, SqliteProjectStore,
+        YardStore,
+    };
 
     use super::{
-        ApiError, GhosttyLauncher, noop_ghostty_launcher, router, runtime_intervention_error,
-        test_router_with_shutdown,
+        ApiError, CompletedRuntimeCleanupPreviewQuery,
+        DEFAULT_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT, GhosttyLauncher, noop_ghostty_launcher,
+        router, runtime_intervention_error, test_router_with_shutdown,
     };
     use crate::allocation_service::{
         AllocationServiceError, RuntimeControl, RuntimeProvisionError, RuntimeProvisionRequest,
@@ -3651,6 +3717,33 @@ mod tests {
                 });
             }
             Ok(prepared)
+        }
+    }
+
+    #[test]
+    fn completed_runtime_cleanup_preview_query_defaults_and_validates_bounds() {
+        let default: CompletedRuntimeCleanupPreviewQuery =
+            serde_json::from_value(serde_json::Value::Object(serde_json::Map::default())).unwrap();
+        assert_eq!(
+            default.validated_limit().ok(),
+            Some(DEFAULT_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT)
+        );
+        let maximum = CompletedRuntimeCleanupPreviewQuery {
+            limit: MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT,
+        };
+        assert_eq!(
+            maximum.validated_limit().ok(),
+            Some(MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT)
+        );
+        for limit in [0, MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT + 1] {
+            let error = CompletedRuntimeCleanupPreviewQuery { limit }
+                .validated_limit()
+                .unwrap_err();
+            assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                error.code,
+                "invalid_completed_runtime_cleanup_preview_limit"
+            );
         }
     }
 

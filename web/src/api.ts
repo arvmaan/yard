@@ -10,6 +10,7 @@ import type {
   Assignments,
   ChangedProjectOrchestrator,
   ChangeProjectOrchestratorInput,
+  CompletedRuntimeCleanupPreview,
   ConfirmedAllocation,
   ConfirmedProjectCreation,
   ConfirmedWorkerHandoff,
@@ -672,6 +673,16 @@ export function fetchWorkerProfiles(
 
 export function fetchWorkers(signal?: AbortSignal): Promise<WorkerCandidates> {
   return requestJson('/api/v1/workers', { signal })
+}
+
+export function fetchCompletedRuntimeCleanupPreview(
+  signal?: AbortSignal,
+  limit = 50,
+): Promise<CompletedRuntimeCleanupPreview> {
+  return requestJson(
+    `/api/v1/workers/completed-runtime-cleanup-preview?limit=${limit}`,
+    { signal },
+  )
 }
 
 export function endWorkerSession(

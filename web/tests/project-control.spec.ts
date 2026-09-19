@@ -1277,6 +1277,42 @@ async function mockApi(
     await route.fulfill({ status: 404 })
   })
 
+  await page.route(
+    '**/api/v1/workers/completed-runtime-cleanup-preview?*',
+    async (route) => {
+      expect(route.request().method()).toBe('GET')
+      expect(new URL(route.request().url()).searchParams.get('limit')).toBe('50')
+      await route.fulfill({
+        json: {
+          candidate_count: 50,
+          close_ready_count: 0,
+          limit: 50,
+          truncated: true,
+          candidates: Array.from({ length: 50 }, (_, index) => ({
+            worker_id: `worker-completed-${index}`,
+            profile_name: index === 0 ? 'Implementer' : `Worker ${index + 1}`,
+            project_id: 'project-alpha',
+            project_name: 'Alpha',
+            assignment_id: `assignment-completed-${index}`,
+            role: 'implementer',
+            completion_receipt_id: `receipt-completed-${index}`,
+            completed_at_unix_ms: 1_789_689_600_000 + index,
+            linked_artifact_count: 1,
+            close_eligible: false,
+            retained_reasons: [
+              'cleanup_policy_unavailable',
+              'approval_authority_unavailable',
+              'terminal_lease_fence_unavailable',
+              'observation_generation_fence_unavailable',
+              'atomic_close_unavailable',
+              'grace_policy_unavailable',
+            ],
+          })),
+        },
+      })
+    },
+  )
+
   await page.route('**/api/v1/workers', async (route) => {
     if (route.request().method() === 'GET') {
       state.workerRequests += 1
@@ -12653,6 +12689,34 @@ test('uploads and safely inspects a typed HTML artifact', async ({
     path: testInfo.outputPath('artifact-inspector-mobile.png'),
     fullPage: true,
   })
+})
+
+test('reviews bounded completed runtimes without mutation', async ({ page }) => {
+  const state = await mockApi(page)
+  await page.goto('/')
+
+  await page.getByRole('tab', { name: 'Workers' }).click()
+  const trigger = page.getByRole('button', {
+    name: 'Review completed runtimes, read-only; nothing will be closed',
+  })
+  await expect(trigger).toHaveAttribute('title', /read-only; nothing will be closed/)
+  await trigger.click()
+
+  const dialog = page.getByRole('dialog', { name: 'Cleanup safety preview' })
+  await expect(dialog).toContainText(
+    '50 completed Yard-created runtimes reviewed; all retained.',
+  )
+  await expect(dialog).toContainText(
+    'Showing the first 50; additional matching runtimes are retained outside this preview.',
+  )
+  await expect(dialog.locator('li')).toHaveCount(50)
+  await expect(dialog).toContainText('Implementer — Alpha / implementer')
+  await expect(dialog).toContainText('Terminal lease fence unavailable')
+  await expect(dialog).toContainText('Nothing will be closed.')
+  expect(state.endSessionCommands).toHaveLength(0)
+  await expect(
+    dialog.getByRole('button', { name: /confirm|close runtime/i }),
+  ).toHaveCount(0)
 })
 
 test('reports queued runtime cleanup after ending a session', async ({

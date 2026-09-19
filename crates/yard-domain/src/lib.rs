@@ -112,8 +112,10 @@ pub use token_spend::{
     UpdateTokenSpendSettings,
 };
 pub use worker::{
-    DeleteWorker, DeletedWorker, EndWorkerSession, EndedWorkerSession, WorkerAvailability,
-    WorkerCandidate, WorkerCandidates, WorkerSessionValidationError,
+    CompletedRuntimeCleanupCandidate, CompletedRuntimeCleanupPreview,
+    CompletedRuntimeRetentionReason, DeleteWorker, DeletedWorker, EndWorkerSession,
+    EndedWorkerSession, WorkerAvailability, WorkerCandidate, WorkerCandidates,
+    WorkerSessionValidationError,
 };
 pub use yard_orchestrator::{
     ConfigureYardOrchestrator, ConfiguredYardOrchestrator, ProvisionYardOrchestrator,

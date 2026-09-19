@@ -606,6 +606,41 @@ export interface WorkerCandidates {
   workers: WorkerCandidate[]
 }
 
+export type CompletedRuntimeRetentionReason =
+  | 'cleanup_policy_unavailable'
+  | 'approval_authority_unavailable'
+  | 'terminal_lease_fence_unavailable'
+  | 'observation_generation_fence_unavailable'
+  | 'atomic_close_unavailable'
+  | 'grace_policy_unavailable'
+  | 'no_linked_artifacts'
+  | 'unresolved_completion_blockers'
+  | 'pending_assignment_intervention'
+  | 'new_active_assignment'
+  | 'protected_orchestrator'
+
+export interface CompletedRuntimeCleanupCandidate {
+  worker_id: string
+  profile_name: string
+  project_id: string
+  project_name: string
+  assignment_id: string
+  role: string
+  completion_receipt_id: string
+  completed_at_unix_ms: number
+  linked_artifact_count: number
+  close_eligible: false
+  retained_reasons: CompletedRuntimeRetentionReason[]
+}
+
+export interface CompletedRuntimeCleanupPreview {
+  candidate_count: number
+  close_ready_count: 0
+  limit: number
+  truncated: boolean
+  candidates: CompletedRuntimeCleanupCandidate[]
+}
+
 export interface EndWorkerSessionInput {
   command_id: string
   actor: string

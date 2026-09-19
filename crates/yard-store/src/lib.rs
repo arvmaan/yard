@@ -57,6 +57,10 @@ use yard_domain::{
     YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute, YardOrchestratorRoutes,
     herdr_agent_name,
 };
+use yard_domain::{
+    CompletedRuntimeCleanupCandidate, CompletedRuntimeCleanupPreview,
+    CompletedRuntimeRetentionReason,
+};
 
 mod automation_store;
 mod coordination_node_store;
@@ -119,6 +123,7 @@ const PROJECT_REPOSITORIES_MIGRATION: &str =
 const BLANK_WORKER_PROFILE_ID: &str = "yard:managed-blank-profile";
 const BLANK_WORKER_PROFILE_NAME: &str = "Blank profile";
 const MAX_ROUTE_LIST_LIMIT: usize = 500;
+pub const MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT: usize = 100;
 const CLEANUP_OWNERSHIP_RETRY_BASE_MS: u64 = 60_000;
 const CLEANUP_OWNERSHIP_RETRY_CAP_MS: u64 = 60 * 60_000;
 
@@ -498,6 +503,10 @@ pub trait YardStore: Send + Sync {
         update: UpdateAgentProfile,
     ) -> Result<AgentProfile, ProjectStoreError>;
     async fn list_worker_candidates(&self) -> Result<WorkerCandidates, ProjectStoreError>;
+    async fn preview_completed_runtime_cleanup(
+        &self,
+        limit: usize,
+    ) -> Result<CompletedRuntimeCleanupPreview, ProjectStoreError>;
     async fn begin_profile_allocation(
         &self,
         project_id: &str,
@@ -4757,6 +4766,21 @@ impl YardStore for SqliteProjectStore {
             Ok(WorkerCandidates { workers })
         })
         .await
+    }
+
+    async fn preview_completed_runtime_cleanup(
+        &self,
+        limit: usize,
+    ) -> Result<CompletedRuntimeCleanupPreview, ProjectStoreError> {
+        if !(1..=MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT).contains(&limit) {
+            return Err(
+                ProjectStoreError::CompletedRuntimeCleanupPreviewLimitInvalid {
+                    max: MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT,
+                },
+            );
+        }
+        self.run(move |connection| completed_runtime_cleanup_preview(connection, limit))
+            .await
     }
 
     async fn begin_worker_allocation(
@@ -11023,6 +11047,149 @@ fn reconciliation_event_type(
         ) => "runtime_binding_restored",
         _ => "runtime_binding_reconciled",
     }
+}
+
+fn completed_runtime_cleanup_preview(
+    connection: &mut Connection,
+    limit: usize,
+) -> Result<CompletedRuntimeCleanupPreview, ProjectStoreError> {
+    let query_limit = limit.checked_add(1).ok_or(
+        ProjectStoreError::CompletedRuntimeCleanupPreviewLimitInvalid {
+            max: MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT,
+        },
+    )?;
+    let mut statement = connection.prepare(
+        "WITH ranked_allocations AS (
+            SELECT wa.id AS allocation_id, wa.worker_id, wa.mode,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY wa.worker_id
+                       ORDER BY wa.started_at_unix_ms DESC, wa.id DESC
+                   ) AS allocation_rank
+              FROM worker_allocations wa
+         ),
+         bounded AS MATERIALIZED (
+            SELECT a.worker_id, pr.name AS profile_name,
+                   a.project_id, p.name AS project_name,
+                   a.id AS assignment_id, a.role,
+                   cr.id AS receipt_id,
+                   cr.created_at_unix_ms AS completed_at_unix_ms
+              FROM ranked_allocations latest
+              JOIN assignments a ON a.allocation_id = latest.allocation_id
+              JOIN completion_receipts cr ON cr.assignment_id = a.id
+              JOIN assignment_attempts aa ON aa.id = cr.attempt_id
+              JOIN projects p ON p.id = a.project_id
+              JOIN worker_profile_revisions pr
+                ON pr.profile_id = a.profile_id
+               AND pr.version = a.profile_version
+              JOIN workers w ON w.id = a.worker_id
+             WHERE latest.allocation_rank = 1
+               AND latest.mode = 'create_new'
+               AND a.lifecycle = 'completed'
+               AND aa.lifecycle = 'completed'
+               AND w.ended_at_unix_ms IS NULL
+             ORDER BY cr.created_at_unix_ms, a.id
+             LIMIT ?1
+         )
+         SELECT bounded.worker_id, bounded.profile_name,
+                bounded.project_id, bounded.project_name,
+                bounded.assignment_id, bounded.role,
+                bounded.receipt_id, bounded.completed_at_unix_ms,
+                EXISTS (
+                    SELECT 1 FROM assignments open_assignment
+                     WHERE open_assignment.worker_id = bounded.worker_id
+                       AND open_assignment.lifecycle IN (
+                           'allocating', 'active', 'handing_off'
+                       )
+                ),
+                EXISTS (
+                    SELECT 1
+                      FROM assignment_prompt_commands prompt
+                      JOIN command_acknowledgements command
+                        ON command.id = prompt.command_id
+                     WHERE prompt.assignment_id = bounded.assignment_id
+                       AND command.status = 'pending'
+                ),
+                EXISTS (
+                    SELECT 1 FROM projects protected_project
+                     WHERE protected_project.orchestrator_worker_id = bounded.worker_id
+                ) OR EXISTS (
+                    SELECT 1 FROM yard_orchestrator
+                     WHERE worker_id = bounded.worker_id
+                ) OR EXISTS (
+                    SELECT 1 FROM coordination_nodes
+                     WHERE worker_id = bounded.worker_id
+                ),
+                (
+                    SELECT COUNT(*)
+                      FROM completion_receipt_artifact_links artifact
+                     WHERE artifact.receipt_id = bounded.receipt_id
+                ),
+                EXISTS (
+                    SELECT 1 FROM completion_receipt_blockers blocker
+                     WHERE blocker.receipt_id = bounded.receipt_id
+                )
+           FROM bounded
+          ORDER BY bounded.completed_at_unix_ms, bounded.assignment_id",
+    )?;
+    let mut candidates = statement
+        .query_map(
+            [i64::try_from(query_limit)?],
+            completed_runtime_cleanup_candidate_from_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    let truncated = candidates.len() > limit;
+    candidates.truncate(limit);
+    Ok(CompletedRuntimeCleanupPreview {
+        candidate_count: candidates.len(),
+        close_ready_count: 0,
+        limit,
+        truncated,
+        candidates,
+    })
+}
+
+fn completed_runtime_cleanup_candidate_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<CompletedRuntimeCleanupCandidate> {
+    let linked_artifact_count_value = row.get::<_, i64>(11)?;
+    let linked_artifact_count = usize::try_from(linked_artifact_count_value)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(11, linked_artifact_count_value))?;
+    let mut retained_reasons = vec![
+        CompletedRuntimeRetentionReason::CleanupPolicyUnavailable,
+        CompletedRuntimeRetentionReason::ApprovalAuthorityUnavailable,
+        CompletedRuntimeRetentionReason::TerminalLeaseFenceUnavailable,
+        CompletedRuntimeRetentionReason::ObservationGenerationFenceUnavailable,
+        CompletedRuntimeRetentionReason::AtomicCloseUnavailable,
+        CompletedRuntimeRetentionReason::GracePolicyUnavailable,
+    ];
+    if linked_artifact_count == 0 {
+        retained_reasons.push(CompletedRuntimeRetentionReason::NoLinkedArtifacts);
+    }
+    if row.get::<_, bool>(12)? {
+        retained_reasons.push(CompletedRuntimeRetentionReason::UnresolvedCompletionBlockers);
+    }
+    if row.get::<_, bool>(9)? {
+        retained_reasons.push(CompletedRuntimeRetentionReason::PendingAssignmentIntervention);
+    }
+    if row.get::<_, bool>(8)? {
+        retained_reasons.push(CompletedRuntimeRetentionReason::NewActiveAssignment);
+    }
+    if row.get::<_, bool>(10)? {
+        retained_reasons.push(CompletedRuntimeRetentionReason::ProtectedOrchestrator);
+    }
+    Ok(CompletedRuntimeCleanupCandidate {
+        worker_id: row.get(0)?,
+        profile_name: row.get(1)?,
+        project_id: row.get(2)?,
+        project_name: row.get(3)?,
+        assignment_id: row.get(4)?,
+        role: row.get(5)?,
+        completion_receipt_id: row.get(6)?,
+        completed_at_unix_ms: row_u64(row, 7)?,
+        linked_artifact_count,
+        close_eligible: false,
+        retained_reasons,
+    })
 }
 
 const PROJECT_SELECT: &str = "
@@ -18486,6 +18653,8 @@ pub enum ProjectStoreError {
     AutomationRunInProgress,
     #[error("automation list limit must contain between 1 and {max} records")]
     AutomationListLimitInvalid { max: usize },
+    #[error("completed runtime cleanup preview limit must contain between 1 and {max} records")]
+    CompletedRuntimeCleanupPreviewLimitInvalid { max: usize },
     #[error("automation run submission time precedes the run claim")]
     AutomationSubmittedAtInvalid,
     #[error("coordination node was not found")]
@@ -18754,26 +18923,26 @@ mod tests {
     use uuid::Uuid;
     use yard_domain::{
         AllocationMode, ArchiveProject, ArtifactKind, ArtifactRegistration, AssignmentLifecycle,
-        AttemptLifecycle, AutomationScope, CanvasPlacement, CompletionOutcome,
-        ConfigureYardOrchestrator, ConfirmProfileAllocation, ConfirmWorkerAllocation,
-        ConfirmWorkerHandoff, CoordinationCommandStatus, CoordinationNodeKind, CreateAgentProfile,
-        CreateAutomation, CreateCoordinationNode, CreateProject, CreateProjectFromProfile,
-        CreateProjectRelationship, CreateWorkerProfile, CreateWorkspaceProjectFromProfile,
-        DailySchedule, DeleteProject, DeleteProjectRelationship, DeleteWorker, EndWorkerSession,
-        FocusObservation, HandoffTargetRole, IsolationPolicy, ManagedRuntimeOccupantKind,
-        ManagedRuntimeWorkspaceKind, ObservedStatus, ObservedWorker, OldSessionDisposition,
-        PaneObservation, Project, ProjectRelationshipKind, ProjectRuntimeBinding,
-        ProviderSessionRef, ProvisionCoordinationNode, ProvisionYardOrchestrator,
-        RecordCompletionReceipt, ReplaceProjectOrchestrator, RequestCoordinationSnapshot,
-        RunAutomationNow, RuntimeInventory, RuntimeObservationState, RuntimeProcessState,
-        SendAssignmentPrompt, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
-        SendOrchestratorPrompt, SendYardOrchestratorPrompt, SendYardOrchestratorRoute,
-        SnapshotCollectionStatus, TransferProjectOrchestrator, UpdateAgentProfile,
-        UpdateAutomation, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
-        UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
-        UpdateTokenSpendSettings, UpdateWorkerProfile, WorkerAvailability, WorkerProfile,
-        WorkerProfileSpec, WorkerRuntimeBinding, YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
-        YardOrchestrator,
+        AttemptLifecycle, AutomationScope, CanvasPlacement, CompletedRuntimeRetentionReason,
+        CompletionOutcome, ConfigureYardOrchestrator, ConfirmProfileAllocation,
+        ConfirmWorkerAllocation, ConfirmWorkerHandoff, CoordinationCommandStatus,
+        CoordinationNodeKind, CreateAgentProfile, CreateAutomation, CreateCoordinationNode,
+        CreateProject, CreateProjectFromProfile, CreateProjectRelationship, CreateWorkerProfile,
+        CreateWorkspaceProjectFromProfile, DailySchedule, DeleteProject, DeleteProjectRelationship,
+        DeleteWorker, EndWorkerSession, FocusObservation, HandoffTargetRole, IsolationPolicy,
+        ManagedRuntimeOccupantKind, ManagedRuntimeWorkspaceKind, ObservedStatus, ObservedWorker,
+        OldSessionDisposition, PaneObservation, Project, ProjectRelationshipKind,
+        ProjectRuntimeBinding, ProviderSessionRef, ProvisionCoordinationNode,
+        ProvisionYardOrchestrator, RecordCompletionReceipt, ReplaceProjectOrchestrator,
+        RequestCoordinationSnapshot, RunAutomationNow, RuntimeInventory, RuntimeObservationState,
+        RuntimeProcessState, SendAssignmentPrompt, SendCoordinationNodePrompt,
+        SendCoordinationNodeRoute, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
+        SendYardOrchestratorRoute, SnapshotCollectionStatus, TransferProjectOrchestrator,
+        UpdateAgentProfile, UpdateAutomation, UpdateCoordinationNode,
+        UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
+        UpdateProjectWorkflowProfile, UpdateTokenSpendSettings, UpdateWorkerProfile,
+        WorkerAvailability, WorkerProfile, WorkerProfileSpec, WorkerRuntimeBinding,
+        YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator,
     };
 
     use super::{
@@ -19866,19 +20035,32 @@ mod tests {
     async fn create_active_assignment(
         store: &SqliteProjectStore,
     ) -> (String, yard_domain::Assignment) {
-        let (project_draft, orchestrator) = draft("workspace-1", "terminal-1");
+        create_active_assignment_with_suffix(store, "").await
+    }
+
+    async fn create_active_assignment_with_suffix(
+        store: &SqliteProjectStore,
+        suffix: &str,
+    ) -> (String, yard_domain::Assignment) {
+        let suffix = if suffix.is_empty() {
+            String::new()
+        } else {
+            format!("-{suffix}")
+        };
+        let workspace_id = format!("workspace-1{suffix}");
+        let (project_draft, orchestrator) = draft(&workspace_id, &format!("terminal-1{suffix}"));
         let project = store
             .create_project(project_draft, orchestrator)
             .await
             .unwrap();
         let profile = store
             .create_worker_profile(CreateWorkerProfile {
-                spec: profile_spec("Implementer"),
+                spec: profile_spec(&format!("Implementer{suffix}")),
             })
             .await
             .unwrap();
         let allocation = ConfirmProfileAllocation {
-            command_id: "prompt-test-allocation".to_owned(),
+            command_id: format!("prompt-test-allocation{suffix}"),
             actor: "local-user".to_owned(),
             profile_id: profile.id,
             expected_profile_version: profile.version,
@@ -19891,9 +20073,9 @@ mod tests {
             .begin_profile_allocation(&project.id, allocation.clone())
             .await
             .unwrap();
-        let (_, mut runtime) = draft("workspace-1", "terminal-2");
-        runtime.tab_id = Some("tab-2".to_owned());
-        runtime.pane_id = "pane-2".to_owned();
+        let (_, mut runtime) = draft(&workspace_id, &format!("terminal-2{suffix}"));
+        runtime.tab_id = Some(format!("tab-2{suffix}"));
+        runtime.pane_id = format!("pane-2{suffix}");
         runtime.owns_tab = true;
         store
             .claim_provisioning_runtime(&allocation.command_id, runtime.clone())
@@ -19909,6 +20091,81 @@ mod tests {
             .unwrap()
             .assignment;
         (project.id, active)
+    }
+
+    async fn record_completed_assignment(
+        store: &SqliteProjectStore,
+        project_id: &str,
+        assignment: &yard_domain::Assignment,
+        command_id: &str,
+    ) -> String {
+        record_completed_assignment_with_blockers(
+            store,
+            project_id,
+            assignment,
+            command_id,
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn record_completed_assignment_with_blockers(
+        store: &SqliteProjectStore,
+        project_id: &str,
+        assignment: &yard_domain::Assignment,
+        command_id: &str,
+        unresolved_blockers: Vec<String>,
+    ) -> String {
+        store
+            .record_completion_receipt(
+                project_id,
+                &assignment.id,
+                RecordCompletionReceipt {
+                    command_id: command_id.to_owned(),
+                    actor: "local-user".to_owned(),
+                    attempt_id: assignment.attempt.id.clone(),
+                    expected_assignment_version: assignment.version,
+                    expected_attempt_version: assignment.attempt.version,
+                    outcome: CompletionOutcome::Completed,
+                    summary: "Persisted result.".to_owned(),
+                    artifact_refs: Vec::new(),
+                    artifact_ids: Vec::new(),
+                    evidence_refs: vec![format!("test://{command_id}")],
+                    unresolved_blockers,
+                },
+            )
+            .await
+            .unwrap()
+            .receipt
+            .id
+    }
+
+    async fn create_completed_preview_candidate(
+        store: &SqliteProjectStore,
+        suffix: &str,
+    ) -> (String, yard_domain::Assignment) {
+        let (project_id, assignment) = create_active_assignment_with_suffix(store, suffix).await;
+        record_completed_assignment(
+            store,
+            &project_id,
+            &assignment,
+            &format!("preview-completion-{suffix}"),
+        )
+        .await;
+        (project_id, assignment)
+    }
+
+    async fn preview_retained_reasons(
+        store: &SqliteProjectStore,
+    ) -> Vec<CompletedRuntimeRetentionReason> {
+        let preview = store.preview_completed_runtime_cleanup(50).await.unwrap();
+        assert_eq!(preview.candidate_count, 1);
+        preview
+            .candidates
+            .into_iter()
+            .next()
+            .unwrap()
+            .retained_reasons
     }
 
     async fn create_handoff_fixture(
@@ -28206,6 +28463,500 @@ mod tests {
         assert_eq!(replayed, acknowledged);
         assert_eq!(schema_version, SCHEMA_VERSION);
         assert_eq!(foreign_key_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_cleanup_preview_is_read_only_and_fail_closed() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, active) = create_active_assignment(&store).await;
+        assert_eq!(
+            store
+                .preview_completed_runtime_cleanup(50)
+                .await
+                .unwrap()
+                .candidate_count,
+            0
+        );
+
+        let receipt_id =
+            record_completed_assignment(&store, &project_id, &active, "preview-completion").await;
+
+        let preview = store.preview_completed_runtime_cleanup(50).await.unwrap();
+        assert_eq!(preview.candidate_count, 1);
+        assert_eq!(preview.close_ready_count, 0);
+        assert_eq!(preview.limit, 50);
+        assert!(!preview.truncated);
+        let candidate = &preview.candidates[0];
+        assert_eq!(candidate.worker_id, active.worker.id);
+        assert_eq!(candidate.assignment_id, active.id);
+        assert_eq!(candidate.completion_receipt_id, receipt_id);
+        assert!(!candidate.close_eligible);
+        assert!(
+            candidate
+                .retained_reasons
+                .contains(&CompletedRuntimeRetentionReason::NoLinkedArtifacts)
+        );
+        assert!(
+            candidate
+                .retained_reasons
+                .contains(&CompletedRuntimeRetentionReason::TerminalLeaseFenceUnavailable)
+        );
+        assert!(
+            candidate
+                .retained_reasons
+                .contains(&CompletedRuntimeRetentionReason::AtomicCloseUnavailable)
+        );
+
+        let worker_id = active.worker.id.clone();
+        store
+            .run(move |connection| {
+                connection.execute(
+                    "UPDATE workers SET ended_at_unix_ms = updated_at_unix_ms WHERE id = ?1",
+                    [worker_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .preview_completed_runtime_cleanup(50)
+                .await
+                .unwrap()
+                .candidate_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_cleanup_preview_excludes_later_adoption() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, active) = create_active_assignment(&store).await;
+        record_completed_assignment(&store, &project_id, &active, "preview-before-adoption").await;
+        assert_eq!(
+            store
+                .preview_completed_runtime_cleanup(50)
+                .await
+                .unwrap()
+                .candidate_count,
+            1
+        );
+
+        let project = store.get_project(&project_id).await.unwrap();
+        let worker = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.worker.id == active.worker.id)
+            .unwrap()
+            .worker;
+        let adopted = store
+            .begin_worker_allocation(
+                &project_id,
+                ConfirmWorkerAllocation {
+                    command_id: "preview-adopt-existing".to_owned(),
+                    actor: "local-user".to_owned(),
+                    worker_id: worker.id,
+                    expected_worker_version: worker.version,
+                    profile_id: None,
+                    expected_profile_version: None,
+                    expected_project_version: project.version,
+                    objective: "Reuse the completed worker.".to_owned(),
+                    role: "implementer".to_owned(),
+                    isolation_policy: IsolationPolicy::ProjectWorkspace,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(adopted, BeginWorkerAllocation::Started(_)));
+        assert_eq!(
+            store
+                .preview_completed_runtime_cleanup(50)
+                .await
+                .unwrap()
+                .candidate_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_cleanup_preview_excludes_latest_handoff_allocation() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (source_project, source_assignment, target_project) =
+            create_handoff_fixture(&store).await;
+        let command = handoff_command(
+            "preview-handoff",
+            &source_project,
+            &source_assignment,
+            &target_project,
+            HandoffTargetRole::Member,
+        );
+        store
+            .begin_worker_handoff(&source_project.id, &source_assignment.id, command.clone())
+            .await
+            .unwrap();
+        let runtime = handoff_runtime("workspace-2", "terminal-preview-handoff");
+        store
+            .claim_worker_handoff_runtime(&command.command_id, runtime.clone())
+            .await
+            .unwrap();
+        let confirmed = store
+            .finalize_worker_handoff(&command.command_id, runtime)
+            .await
+            .unwrap();
+        assert_eq!(confirmed.allocation.mode, AllocationMode::Handoff);
+        record_completed_assignment(
+            &store,
+            &target_project.id,
+            &confirmed.assignment,
+            "preview-handoff-completion",
+        )
+        .await;
+
+        assert_eq!(
+            store
+                .preview_completed_runtime_cleanup(50)
+                .await
+                .unwrap()
+                .candidate_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_cleanup_preview_excludes_assignmentless_orchestrator_transfer() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, assignment) =
+            create_completed_preview_candidate(&store, "orchestrator-transfer").await;
+        assert_eq!(
+            store
+                .preview_completed_runtime_cleanup(50)
+                .await
+                .unwrap()
+                .candidate_count,
+            1
+        );
+        let project = store.get_project(&project_id).await.unwrap();
+        let worker = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.worker.id == assignment.worker.id)
+            .unwrap()
+            .worker;
+        store
+            .transfer_project_orchestrator(
+                &project_id,
+                TransferProjectOrchestrator {
+                    command_id: "preview-orchestrator-transfer".to_owned(),
+                    actor: "local-user".to_owned(),
+                    worker_id: worker.id.clone(),
+                    expected_worker_version: worker.version,
+                    expected_worker_runtime: worker.runtime.clone().unwrap(),
+                    expected_project_version: project.version,
+                    expected_orchestrator_worker_id: project.orchestrator.id.clone(),
+                    expected_orchestrator_worker_version: project.orchestrator.version,
+                    expected_orchestrator_runtime: project.orchestrator.runtime.clone().unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let worker_id = worker.id;
+        let (mode, assignment_count) = store
+            .run(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT wa.mode,
+                            (SELECT COUNT(*) FROM assignments a WHERE a.allocation_id = wa.id)
+                       FROM worker_allocations wa
+                      WHERE wa.worker_id = ?1
+                      ORDER BY wa.started_at_unix_ms DESC, wa.id DESC
+                      LIMIT 1",
+                        [worker_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .map_err(ProjectStoreError::from)
+            })
+            .await
+            .unwrap();
+        assert_eq!(mode, "adopt_existing");
+        assert_eq!(assignment_count, 0);
+        assert_eq!(
+            store
+                .preview_completed_runtime_cleanup(50)
+                .await
+                .unwrap()
+                .candidate_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_cleanup_preview_is_bounded() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        for suffix in ["one", "two"] {
+            let (project_id, active) = create_active_assignment_with_suffix(&store, suffix).await;
+            record_completed_assignment(
+                &store,
+                &project_id,
+                &active,
+                &format!("preview-completion-{suffix}"),
+            )
+            .await;
+        }
+
+        let first = store.preview_completed_runtime_cleanup(1).await.unwrap();
+        assert_eq!(first.candidate_count, 1);
+        assert_eq!(first.candidates.len(), 1);
+        assert_eq!(first.limit, 1);
+        assert!(first.truncated);
+
+        let all = store.preview_completed_runtime_cleanup(2).await.unwrap();
+        assert_eq!(all.candidate_count, 2);
+        assert_eq!(all.candidates.len(), 2);
+        assert_eq!(all.limit, 2);
+        assert!(!all.truncated);
+
+        for limit in [0, crate::MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT + 1] {
+            assert!(matches!(
+                store
+                    .preview_completed_runtime_cleanup(limit)
+                    .await
+                    .unwrap_err(),
+                ProjectStoreError::CompletedRuntimeCleanupPreviewLimitInvalid { max: 100 }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_cleanup_preview_reports_unresolved_blockers() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, assignment) =
+            create_active_assignment_with_suffix(&store, "blocked").await;
+        record_completed_assignment_with_blockers(
+            &store,
+            &project_id,
+            &assignment,
+            "preview-completion-blocked",
+            vec!["operator review remains".to_owned()],
+        )
+        .await;
+
+        assert!(
+            preview_retained_reasons(&store)
+                .await
+                .contains(&CompletedRuntimeRetentionReason::UnresolvedCompletionBlockers)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_cleanup_preview_reports_pending_intervention_in_legacy_state() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, assignment) =
+            create_completed_preview_candidate(&store, "pending-intervention").await;
+        let command_id = "preview-pending-intervention";
+        let runtime = assignment.worker.runtime.as_ref().unwrap();
+        let assignment_id = assignment.id.clone();
+        let attempt_id = assignment.attempt.id.clone();
+        let runtime_session = runtime.session.clone();
+        let runtime_pane_id = runtime.pane_id.clone();
+        let assignment_version = i64::try_from(assignment.version).unwrap();
+        let attempt_version = i64::try_from(assignment.attempt.version).unwrap();
+        store
+            .run(move |connection| {
+                connection.execute(
+                    "INSERT INTO command_acknowledgements (
+                        id, command_type, actor, status, error_message,
+                        created_at_unix_ms, updated_at_unix_ms
+                     ) VALUES (?1, 'assignment_prompt', 'local-user', 'pending', NULL, 0, 0)",
+                    [command_id],
+                )?;
+                connection.execute(
+                    "INSERT INTO assignment_prompt_commands (
+                        command_id, project_id, assignment_id, attempt_id,
+                        expected_assignment_version, expected_attempt_version,
+                        prompt_text, runtime_session, runtime_pane_id,
+                        result_runtime_status, submitted_at_unix_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)",
+                    params![
+                        command_id,
+                        project_id,
+                        assignment_id,
+                        attempt_id,
+                        assignment_version,
+                        attempt_version,
+                        "Legacy pending intervention.",
+                        runtime_session,
+                        runtime_pane_id,
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            preview_retained_reasons(&store)
+                .await
+                .contains(&CompletedRuntimeRetentionReason::PendingAssignmentIntervention)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_cleanup_preview_reports_new_active_assignment_in_inconsistent_state()
+    {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (_, assignment) = create_completed_preview_candidate(&store, "active-overlap").await;
+        let source_assignment_id = assignment.id.clone();
+        let allocation_id = Uuid::now_v7().to_string();
+        let active_assignment_id = Uuid::now_v7().to_string();
+        store
+            .run(move |connection| {
+                connection.execute(
+                    "INSERT INTO worker_allocations (
+                        id, project_id, worker_id, mode, started_by_command_id,
+                        started_at_unix_ms, ended_at_unix_ms
+                     )
+                     SELECT ?1, project_id, worker_id, 'adopt_existing', NULL, 0, 0
+                       FROM assignments WHERE id = ?2",
+                    params![allocation_id, source_assignment_id],
+                )?;
+                connection.execute(
+                    "INSERT INTO assignments (
+                        id, project_id, allocation_id, worker_id,
+                        profile_id, profile_version, objective, role,
+                        isolation_policy, lifecycle, version,
+                        created_at_unix_ms, updated_at_unix_ms
+                     )
+                     SELECT ?1, project_id, ?2, worker_id,
+                            profile_id, profile_version, 'Legacy overlap.', role,
+                            isolation_policy, 'active', 1, 0, 0
+                       FROM assignments WHERE id = ?3",
+                    params![active_assignment_id, allocation_id, source_assignment_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            preview_retained_reasons(&store)
+                .await
+                .contains(&CompletedRuntimeRetentionReason::NewActiveAssignment)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_cleanup_preview_protects_project_orchestrator() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, assignment) =
+            create_completed_preview_candidate(&store, "project-orchestrator").await;
+        let worker_id = assignment.worker.id.clone();
+        store
+            .run(move |connection| {
+                connection.execute(
+                    "UPDATE projects SET orchestrator_worker_id = ?1 WHERE id = ?2",
+                    params![worker_id, project_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            preview_retained_reasons(&store)
+                .await
+                .contains(&CompletedRuntimeRetentionReason::ProtectedOrchestrator)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_cleanup_preview_protects_superintendent() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (_, assignment) = create_completed_preview_candidate(&store, "superintendent").await;
+        let worker_id = assignment.worker.id.clone();
+        store
+            .run(move |connection| {
+                connection.execute(
+                    "UPDATE yard_orchestrator
+                        SET worker_id = ?1, version = version + 1
+                      WHERE singleton_id = 1",
+                    [worker_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            preview_retained_reasons(&store)
+                .await
+                .contains(&CompletedRuntimeRetentionReason::ProtectedOrchestrator)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_cleanup_preview_protects_coordination_node() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (_, assignment) = create_completed_preview_candidate(&store, "coordination-node").await;
+        let worker_id = assignment.worker.id.clone();
+        store
+            .run(move |connection| {
+                connection.execute(
+                    "INSERT INTO coordination_nodes (
+                        id, name, kind, worker_id, workstream_cwd, knowledge_path,
+                        version, created_by, created_at_unix_ms, updated_at_unix_ms
+                     ) VALUES (
+                        '019ff1a2-0000-7000-8000-000000000099',
+                        'Preview protection', 'workstream', ?1, '/tmp/preview',
+                        NULL, 1, 'local-user', 0, 0
+                     )",
+                    [worker_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            preview_retained_reasons(&store)
+                .await
+                .contains(&CompletedRuntimeRetentionReason::ProtectedOrchestrator)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_runtime_cleanup_preview_reports_every_missing_fence() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        create_completed_preview_candidate(&store, "missing-fences").await;
+        let reasons = preview_retained_reasons(&store).await;
+
+        for reason in [
+            CompletedRuntimeRetentionReason::CleanupPolicyUnavailable,
+            CompletedRuntimeRetentionReason::ApprovalAuthorityUnavailable,
+            CompletedRuntimeRetentionReason::TerminalLeaseFenceUnavailable,
+            CompletedRuntimeRetentionReason::ObservationGenerationFenceUnavailable,
+            CompletedRuntimeRetentionReason::AtomicCloseUnavailable,
+            CompletedRuntimeRetentionReason::GracePolicyUnavailable,
+        ] {
+            assert!(reasons.contains(&reason), "missing {reason:?}");
+        }
     }
 
     #[tokio::test]

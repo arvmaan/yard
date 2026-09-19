@@ -55,6 +55,7 @@ import {
   deleteProjectRelationship,
   deleteWorker,
   endWorkerSession,
+  fetchCompletedRuntimeCleanupPreview,
   fetchAutomation,
   fetchAutomationRuns,
   fetchAutomations,
@@ -153,6 +154,7 @@ import {
   type ProjectStatusReports,
 } from './projectUpdates'
 import { EndWorkerSessionDialog } from './EndWorkerSessionDialog'
+import { CompletedRuntimeCleanupPreviewDialog } from './CompletedRuntimeCleanupPreviewDialog'
 import { ArchiveProjectDialog } from './ArchiveProjectDialog'
 import { DeleteProjectDialog } from './DeleteProjectDialog'
 import { DeleteWorkerDialog } from './DeleteWorkerDialog'
@@ -207,6 +209,7 @@ import type {
   AutomationRun,
   AutomationScope,
   CanvasPlacement,
+  CompletedRuntimeCleanupPreview,
   CoordinationNode,
   CoordinationNodeKind,
   CoordinationNodeRoute,
@@ -2464,6 +2467,21 @@ function App() {
   } | null>(null)
   const [endSessionBusy, setEndSessionBusy] = useState(false)
   const [endSessionError, setEndSessionError] = useState<string | null>(null)
+  const [completedRuntimeCleanupPreview, setCompletedRuntimeCleanupPreview] =
+    useState<CompletedRuntimeCleanupPreview | null>(null)
+  const [
+    completedRuntimeCleanupPreviewOpen,
+    setCompletedRuntimeCleanupPreviewOpen,
+  ] = useState(false)
+  const [
+    completedRuntimeCleanupPreviewLoading,
+    setCompletedRuntimeCleanupPreviewLoading,
+  ] = useState(false)
+  const [
+    completedRuntimeCleanupPreviewError,
+    setCompletedRuntimeCleanupPreviewError,
+  ] = useState<string | null>(null)
+  const completedRuntimeCleanupPreviewTrigger = useRef<HTMLButtonElement>(null)
   const [workerDeleteProposal, setWorkerDeleteProposal] = useState<{
     candidate: WorkerCandidate
     deleteCommandId: string
@@ -4045,6 +4063,25 @@ function App() {
       selectedSession,
     ],
   )
+
+  const openCompletedRuntimeCleanupPreview = useCallback(async () => {
+    setCompletedRuntimeCleanupPreviewOpen(true)
+    setCompletedRuntimeCleanupPreviewLoading(true)
+    setCompletedRuntimeCleanupPreviewError(null)
+    try {
+      setCompletedRuntimeCleanupPreview(
+        await fetchCompletedRuntimeCleanupPreview(),
+      )
+    } catch (caught) {
+      setCompletedRuntimeCleanupPreviewError(
+        caught instanceof Error
+          ? caught.message
+          : 'Unable to load cleanup preview',
+      )
+    } finally {
+      setCompletedRuntimeCleanupPreviewLoading(false)
+    }
+  }, [])
 
   const proposeEndSession = useCallback((candidate: WorkerCandidate) => {
     if (!canEndCandidate(candidate)) return
@@ -5799,6 +5836,16 @@ function App() {
                 <h2>Workers</h2>
               </div>
               <span>{visibleCandidates.length}</span>
+              <button
+                aria-label="Review completed runtimes, read-only; nothing will be closed"
+                className="icon-button section-heading__action"
+                onClick={() => void openCompletedRuntimeCleanupPreview()}
+                ref={completedRuntimeCleanupPreviewTrigger}
+                title="Review completed runtimes, read-only; nothing will be closed"
+                type="button"
+              >
+                <CircleHelp aria-hidden="true" size={16} />
+              </button>
             </div>
             <div className="segmented-control" aria-label="Filter workers">
               {FILTERS.map((option) => (
@@ -6507,6 +6554,15 @@ function App() {
           onConfirm={deleteSelectedProject}
           project={projectDeleteProposal.project}
           returnFocus={projectDeleteProposal.returnFocus}
+        />
+      ) : null}
+      {completedRuntimeCleanupPreviewOpen ? (
+        <CompletedRuntimeCleanupPreviewDialog
+          error={completedRuntimeCleanupPreviewError}
+          loading={completedRuntimeCleanupPreviewLoading}
+          onClose={() => setCompletedRuntimeCleanupPreviewOpen(false)}
+          preview={completedRuntimeCleanupPreview}
+          returnFocus={completedRuntimeCleanupPreviewTrigger.current}
         />
       ) : null}
       {endSessionProposal ? (

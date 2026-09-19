@@ -36,6 +36,46 @@ pub struct WorkerCandidates {
     pub workers: Vec<WorkerCandidate>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletedRuntimeRetentionReason {
+    CleanupPolicyUnavailable,
+    ApprovalAuthorityUnavailable,
+    TerminalLeaseFenceUnavailable,
+    ObservationGenerationFenceUnavailable,
+    AtomicCloseUnavailable,
+    GracePolicyUnavailable,
+    NoLinkedArtifacts,
+    UnresolvedCompletionBlockers,
+    PendingAssignmentIntervention,
+    NewActiveAssignment,
+    ProtectedOrchestrator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletedRuntimeCleanupCandidate {
+    pub worker_id: String,
+    pub profile_name: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub assignment_id: String,
+    pub role: String,
+    pub completion_receipt_id: String,
+    pub completed_at_unix_ms: u64,
+    pub linked_artifact_count: usize,
+    pub close_eligible: bool,
+    pub retained_reasons: Vec<CompletedRuntimeRetentionReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletedRuntimeCleanupPreview {
+    pub candidate_count: usize,
+    pub close_ready_count: usize,
+    pub limit: usize,
+    pub truncated: bool,
+    pub candidates: Vec<CompletedRuntimeCleanupCandidate>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndWorkerSession {
     pub command_id: String,
