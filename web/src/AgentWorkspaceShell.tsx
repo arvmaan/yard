@@ -33,6 +33,7 @@ import {
 import {
   filterAndSortAgentWindowGroups,
   groupAgentWindowTargets,
+  selectAgentWindowSessionTargets,
   type AgentWindowSort,
 } from './agentWindowNavigator'
 import {
@@ -40,11 +41,13 @@ import {
   runtimeCapabilityLabel,
   type RuntimeCapabilities,
 } from './runtimeCapabilities'
+import { groupRuntimeLensEntries, runtimeLensEntryKey, runtimeLensEntryLabel } from './runtimeLensTargets'
 import { useModalDialog } from './useModalDialog'
 import type {
   CoordinationNodeRoute,
   Project,
   RuntimeInventory,
+  RuntimeLensEntry,
   RuntimeSession,
   YardOrchestratorRoute,
 } from './types'
@@ -233,6 +236,7 @@ export function AgentWorkspaceShell({
   activeTarget,
   inventory,
   inventoryCurrent,
+  lensEntries,
   mode,
   onCoordinationChange,
   onCoordinationNodeChange,
@@ -242,6 +246,7 @@ export function AgentWorkspaceShell({
   onTargetChange,
   presentation,
   projects,
+  selectedSession,
   sessions,
   targets,
   yardRoutes,
@@ -251,6 +256,7 @@ export function AgentWorkspaceShell({
   coordinationRoutes: CoordinationNodeRoute[]
   inventory: RuntimeInventory | null
   inventoryCurrent: boolean
+  lensEntries: RuntimeLensEntry[]
   mode: AgentWorkspaceView
   onCoordinationChange: (route: YardOrchestratorRoute) => void
   onCoordinationNodeChange: (route: CoordinationNodeRoute) => void
@@ -260,6 +266,7 @@ export function AgentWorkspaceShell({
   onTargetChange: (target: AgentWorkspaceTarget) => void
   presentation: TerminalPresentation
   projects: Project[]
+  selectedSession: string
   sessions: RuntimeSession[]
   targets: AgentWorkspaceTarget[]
   yardRoutes: YardOrchestratorRoute[]
@@ -308,6 +315,7 @@ export function AgentWorkspaceShell({
   } | null>(null)
   const [mobileNavigatorOpen, setMobileNavigatorOpen] = useState(false)
   const [windowQuery, setWindowQuery] = useState('')
+  const [unassignedOpen, setUnassignedOpen] = useState(false)
   const [windowSort, setWindowSort] =
     useState<AgentWindowSort>('activity')
   useEffect(() => {
@@ -322,28 +330,74 @@ export function AgentWorkspaceShell({
     onClose: () => setMobileNavigatorOpen(false),
     returnFocus: mobileNavigatorTriggerRef.current,
   })
-  const workspaceGroups = useMemo(
-    () =>
+  const sessionTargets = useMemo(
+    () => selectAgentWindowSessionTargets(targets, selectedSession),
+    [selectedSession, targets],
+  )
+  const groupedTargets = useMemo(() => {
+    const selected = sessionTargets.selected
+    const group = (candidates: AgentWorkspaceTarget[]) =>
       groupAgentWindowTargets(
-        targets,
+        candidates,
         inventoryCurrent ? inventory : null,
         sessions,
+      )
+    return {
+      pinned: group(
+        selected.filter((target) => target.role === 'superintendent'),
       ),
-    [inventory, inventoryCurrent, sessions, targets],
-  )
-  const visibleWorkspaceGroups = useMemo(
+      linked: group(
+        selected.filter((target) => target.role !== 'superintendent'),
+      ),
+    }
+  }, [inventory, inventoryCurrent, sessionTargets.selected, sessions])
+  const visibleLinkedGroups = useMemo(
     () =>
       filterAndSortAgentWindowGroups(
-        workspaceGroups,
+        groupedTargets.linked,
         windowQuery,
         windowSort,
       ),
-    [windowQuery, windowSort, workspaceGroups],
+    [groupedTargets.linked, windowQuery, windowSort],
   )
+  const unassignedGroups = useMemo(
+    () =>
+      groupRuntimeLensEntries(
+        lensEntries,
+        inventoryCurrent ? inventory : null,
+        windowQuery,
+        sessionTargets.selected,
+      ),
+    [
+      inventory,
+      inventoryCurrent,
+      lensEntries,
+      sessionTargets.selected,
+      windowQuery,
+    ],
+  )
+  const unassignedTargetCount = groupRuntimeLensEntries(
+    lensEntries,
+    inventoryCurrent ? inventory : null,
+    '',
+    sessionTargets.selected,
+  ).reduce((count, group) => count + group.entries.length, 0)
+  const unassignedExpanded =
+    unassignedOpen ||
+    (windowQuery.trim().length > 0 && unassignedGroups.length > 0)
+  const controlledTargetCount = [
+    ...groupedTargets.pinned,
+    ...groupedTargets.linked,
+  ].reduce((count, group) => count + group.targets.length, 0)
+  const visibleWorkspaceGroups = [
+    ...groupedTargets.pinned,
+    ...visibleLinkedGroups,
+  ]
   const visibleTargetCount = visibleWorkspaceGroups.reduce(
     (count, group) => count + group.targets.length,
     0,
   )
+  const otherSessionCount = sessionTargets.elsewhereCount
   const closeLabel =
     mode === 'chat' ? 'chat' : mode === 'changes' ? 'files' : 'terminal'
 
@@ -379,10 +433,13 @@ export function AgentWorkspaceShell({
           <span>
             <strong>Herdr windows</strong>
             <small>
-              {visibleTargetCount === targets.length
-                ? `${targets.length} controlled`
-                : `${visibleTargetCount} of ${targets.length}`}
-              {' · runtime evidence'}
+              {visibleTargetCount === controlledTargetCount
+                ? `${controlledTargetCount} controlled`
+                : `${visibleTargetCount} of ${controlledTargetCount}`}
+              {` · ${selectedSession || 'no session'} selected`}
+              {otherSessionCount > 0
+                ? ` · ${otherSessionCount} linked elsewhere`
+                : ''}
             </small>
           </span>
           <button
@@ -423,7 +480,55 @@ export function AgentWorkspaceShell({
           </label>
         </div>
         <div className="agent-window-navigator__workspaces">
-          {visibleWorkspaceGroups.length === 0 ? (
+          {unassignedTargetCount > 0 ? (
+            <button
+              aria-expanded={unassignedExpanded}
+              className="agent-window-unassigned-toggle"
+              onClick={() => setUnassignedOpen((current) => !current)}
+              type="button"
+            >
+              <span>Other Herdr</span>
+              <small>{unassignedTargetCount}</small>
+            </button>
+          ) : null}
+          {unassignedExpanded
+            ? unassignedGroups.map((group) => (
+                <section
+                  aria-label={`${group.label} other Herdr workspace`}
+                  className="agent-window-workspace agent-window-workspace--unassigned"
+                  data-workspace-id={group.workspaceId}
+                  key={group.workspaceId}
+                >
+                  <header className="agent-window-lens-heading">
+                    <strong>{group.label}</strong>
+                    <small>
+                      {group.workspaceId} · {group.entries.length}
+                    </small>
+                  </header>
+                  {group.entries.map((entry) => (
+                    <div
+                      aria-label={`${runtimeLensEntryLabel(entry)}, ${entry.reason}`}
+                      className="agent-window-lens-row"
+                      data-classification={entry.classification}
+                      key={runtimeLensEntryKey(entry)}
+                    >
+                      <strong>{runtimeLensEntryLabel(entry)}</strong>
+                      <small>
+                        {entry.snapshot_current ? 'Fresh' : 'Stale'} ·{' '}
+                        {entry.classification.replaceAll('_', ' ')}
+                      </small>
+                      <code>
+                        {entry.session} · {entry.terminal_id} ·{' '}
+                        {entry.tab_id ? `tab ${entry.tab_id} · ` : ''}
+                        pane {entry.pane_id}
+                      </code>
+                      <small>{entry.reason}</small>
+                    </div>
+                  ))}
+                </section>
+              ))
+            : null}
+          {visibleLinkedGroups.length === 0 && unassignedGroups.length === 0 ? (
             <p className="agent-window-navigator__empty" role="status">
               No matching windows
             </p>
@@ -459,8 +564,11 @@ export function AgentWorkspaceShell({
                 data-observed={Boolean(workspace)}
                 data-offline={offline || undefined}
                 data-session={group.session}
+                data-superintendent={group.targets.some(
+                  (target) => target.role === 'superintendent',
+                ) || undefined}
                 data-workspace-id={group.workspaceId}
-                key={group.key}
+                key={`${group.targets.some((target) => target.role === 'superintendent') ? 'superintendent' : 'linked'}:${group.key}`}
               >
                 <header
                   className="agent-window-workspace__heading"

@@ -4056,7 +4056,7 @@ html[data-yard-allocation-dragging="true"]
   color: var(--teal);
 }
 
-.agent-window-navigator > header > span:last-child {
+.agent-window-navigator > header > span:nth-child(2) {
   display: grid;
   min-width: 0;
   gap: 1px;
@@ -4146,11 +4146,50 @@ html[data-yard-allocation-dragging="true"]
 }
 
 .agent-window-navigator__workspaces {
+  display: flex;
   min-width: 0;
   min-height: 0;
+  flex-direction: column;
   overflow-y: auto;
   scrollbar-color: var(--line-strong) transparent;
   scrollbar-width: thin;
+}
+
+.agent-window-workspace[data-superintendent="true"] {
+  order: -3;
+}
+
+.agent-window-unassigned-toggle {
+  display: flex;
+  order: -2;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 9px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: var(--paper);
+  color: var(--ink);
+  font: 10px/1.2 "IBM Plex Mono", monospace;
+  cursor: pointer;
+}
+
+.agent-window-workspace--unassigned {
+  order: -1;
+}
+
+.agent-window-lens-heading,
+.agent-window-lens-row {
+  display: grid;
+  gap: 3px;
+  padding: 8px 9px;
+  border-bottom: 1px solid var(--line);
+}
+
+.agent-window-lens-row small,
+.agent-window-lens-row code,
+.agent-window-lens-heading small {
+  color: var(--muted);
+  font-size: 9px;
 }
 
 .agent-window-workspace {

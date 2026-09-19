@@ -218,7 +218,9 @@ mod tests {
     };
     use yard_store::{SqliteProjectStore, YardStore};
 
-    use crate::inventory_service::{InventoryServiceError, InventorySource};
+    use crate::inventory_service::{
+        InventoryServiceError, InventorySource, seed_inventory_workers,
+    };
 
     use super::{ProjectOrchestratorTransferService, ProjectOrchestratorTransferServiceError};
 
@@ -361,6 +363,11 @@ mod tests {
             )
             .await
             .unwrap();
+        seed_inventory_workers(
+            &temp.path().join("yard.sqlite3"),
+            &inventory,
+            &["terminal-candidate"],
+        );
         store
             .reconcile_runtime_inventory(inventory.clone())
             .await

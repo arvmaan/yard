@@ -15,14 +15,17 @@ use tokio::{
 use tracing_subscriber::{EnvFilter, fmt::MakeWriter};
 use yard_herdr::{HerdrAdapter, HerdrConfig};
 use yard_server::{
+    allocation_service::RuntimeControl,
     app_with_reconciliation_and_paths_and_automation_and_shutdown,
     config::{ConfigError, ServerConfig},
-    inventory_service::HerdrInventorySource,
+    intervention_service::RuntimeIntervention,
+    inventory_service::{HerdrInventorySource, InventorySource},
     orchestrator_replacement_service::OrchestratorReplacementService,
     reconciliation_service::ReconciliationService,
     runtime_cleanup_service::RuntimeCleanupService,
+    terminal_service::RuntimeTerminal,
 };
-use yard_store::{ProjectStoreError, SqliteProjectStore};
+use yard_store::{ProjectStoreError, SqliteProjectStore, YardStore};
 
 use crate::lifecycle::{self, LifecycleError};
 
@@ -103,7 +106,7 @@ async fn run(mode: RunMode<'_>) -> Result<(), ServerError> {
         RunMode::Foreground => lifecycle::InstanceMode::Foreground,
         RunMode::Managed { .. } => lifecycle::InstanceMode::Managed,
     };
-    let mut runtime_claim = lifecycle::claim_runtime(&config.database_path, lifecycle_mode).await?;
+    let runtime_claim = lifecycle::claim_runtime(&config.database_path, lifecycle_mode).await?;
     if lifecycle_mode == lifecycle::InstanceMode::Managed {
         init_managed_tracing(runtime_claim.paths().open_log()?);
     }
@@ -117,8 +120,42 @@ async fn run(mode: RunMode<'_>) -> Result<(), ServerError> {
     });
     let runtime = Arc::new(HerdrInventorySource::new(adapter));
     let store = Arc::new(SqliteProjectStore::open(&config.database_path).await?);
+    run_with_services(
+        mode,
+        lifecycle_mode,
+        config,
+        runtime_claim,
+        listener,
+        address,
+        ui_url,
+        runtime,
+        store,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_with_services<R>(
+    mode: RunMode<'_>,
+    lifecycle_mode: lifecycle::InstanceMode,
+    config: ServerConfig,
+    mut runtime_claim: lifecycle::RuntimeClaim,
+    listener: tokio::net::TcpListener,
+    address: std::net::SocketAddr,
+    ui_url: String,
+    runtime: Arc<R>,
+    store: Arc<SqliteProjectStore>,
+) -> Result<(), ServerError>
+where
+    R: InventorySource + RuntimeControl + RuntimeIntervention + RuntimeTerminal + 'static,
+{
+    let source: Arc<dyn InventorySource> = runtime.clone();
+    let control: Arc<dyn RuntimeControl> = runtime.clone();
+    let intervention: Arc<dyn RuntimeIntervention> = runtime.clone();
+    let terminal: Arc<dyn RuntimeTerminal> = runtime;
+    let store: Arc<dyn YardStore> = store;
     let replacement_recovery =
-        OrchestratorReplacementService::new(runtime.clone(), runtime.clone(), store.clone());
+        OrchestratorReplacementService::new(source.clone(), control.clone(), store.clone());
     match replacement_recovery
         .reconcile_ambiguous_replacements()
         .await
@@ -147,15 +184,15 @@ async fn run(mode: RunMode<'_>) -> Result<(), ServerError> {
             );
         }
     }
-    let reconciliation = ReconciliationService::new(runtime.clone(), store.clone());
-    let cleanup = RuntimeCleanupService::new(runtime.clone(), store.clone());
+    let reconciliation = ReconciliationService::new(source.clone(), store.clone());
+    let cleanup = RuntimeCleanupService::new(control.clone(), store.clone());
     let (shutdown, shutdown_receiver) = watch::channel(false);
     let (app, automations, connections) =
         app_with_reconciliation_and_paths_and_automation_and_shutdown(
-            runtime.clone(),
-            runtime.clone(),
-            runtime.clone(),
-            runtime,
+            source,
+            control,
+            intervention,
+            terminal,
             store,
             config.artifact_path.clone(),
             reconciliation.clone(),
@@ -393,12 +430,177 @@ async fn wait_for_os_signal() {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::pending, io::Write};
+    use std::{
+        collections::BTreeMap,
+        ffi::OsString,
+        future::pending,
+        io::Write,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
-    use tempfile::tempfile;
-    use tokio::task::JoinSet;
+    use async_trait::async_trait;
+    use tempfile::{TempDir, tempfile};
+    use tokio::{task::JoinSet, time::timeout};
+    use yard_domain::{
+        CanvasPlacement, CreateProject, FocusObservation, ObservedStatus, ObservedWorker,
+        ProjectRuntimeBinding, RuntimeInventory, RuntimeObservationState, RuntimeProcessState,
+        RuntimeSession, RuntimeSessions, WorkerRuntimeBinding,
+    };
+    use yard_server::{
+        allocation_service::{RuntimeControl, RuntimeProvisionError, RuntimeProvisionRequest},
+        config::ServerConfig,
+        intervention_service::{
+            RuntimeIntervention, RuntimeInterventionError, RuntimeOutputRequest,
+            RuntimeOutputResult, RuntimePromptRequest, RuntimePromptResult,
+        },
+        inventory_service::{InventoryServiceError, InventorySource},
+        terminal_service::{
+            OpenTerminalRequest, RuntimeTerminal, RuntimeTerminalError, RuntimeTerminalSession,
+        },
+    };
+    use yard_store::{SqliteProjectStore, YardStore};
 
-    use super::{BoundedLogWriter, abort_background_tasks};
+    use super::{BoundedLogWriter, RunMode, abort_background_tasks, run_with_services};
+    use crate::lifecycle::{self, InstanceMode};
+
+    const EXPLICIT_TERMINAL: &str = "terminal-explicit";
+    const UNKNOWN_TERMINAL: &str = "terminal-unknown";
+
+    struct LifecycleRuntime {
+        inventory_calls: AtomicUsize,
+    }
+
+    impl LifecycleRuntime {
+        fn observed_worker(terminal_id: &str, name: &str, sequence: u64) -> ObservedWorker {
+            ObservedWorker {
+                runtime_id: terminal_id.to_owned(),
+                terminal_id: terminal_id.to_owned(),
+                workspace_id: "workspace-supervised".to_owned(),
+                tab_id: format!("tab-{terminal_id}"),
+                pane_id: format!("pane-{terminal_id}"),
+                name: Some(name.to_owned()),
+                provider: Some("codex".to_owned()),
+                display_provider: Some("Codex".to_owned()),
+                status: ObservedStatus::Idle,
+                focused: false,
+                launch_pending: false,
+                interactive_ready: true,
+                state_change_sequence: sequence,
+                cwd: Some("/tmp/supervised".to_owned()),
+                foreground_cwd: Some("/tmp/supervised".to_owned()),
+                tokens: BTreeMap::new(),
+                provider_session: None,
+                revision: sequence,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl InventorySource for LifecycleRuntime {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            Ok(RuntimeSessions {
+                adapter: "herdr".to_owned(),
+                sessions: vec![RuntimeSession {
+                    name: "default".to_owned(),
+                    is_default: true,
+                    running: true,
+                }],
+            })
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            let sequence =
+                u64::try_from(self.inventory_calls.fetch_add(1, Ordering::SeqCst) + 1).unwrap();
+            Ok(RuntimeInventory {
+                adapter: "herdr".to_owned(),
+                session: session_name.to_owned(),
+                runtime_version: "test".to_owned(),
+                protocol: 19,
+                observed_at_unix_ms: 100 + sequence,
+                focus: FocusObservation::default(),
+                workspaces: Vec::new(),
+                tabs: Vec::new(),
+                panes: Vec::new(),
+                workers: vec![
+                    Self::observed_worker(EXPLICIT_TERMINAL, "Explicit worker", sequence),
+                    Self::observed_worker(UNKNOWN_TERMINAL, "Unknown agent", sequence),
+                ],
+                child_agents: Vec::new(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeControl for LifecycleRuntime {
+        async fn provision_worker(
+            &self,
+            _request: RuntimeProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            Err(RuntimeProvisionError::BeforeWorker(
+                "the supervised lifecycle test does not provision workers".to_owned(),
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeIntervention for LifecycleRuntime {
+        async fn prompt(
+            &self,
+            _request: RuntimePromptRequest,
+        ) -> Result<RuntimePromptResult, RuntimeInterventionError> {
+            Err(RuntimeInterventionError::Unavailable(
+                "the supervised lifecycle test does not send prompts".to_owned(),
+            ))
+        }
+
+        async fn read_output(
+            &self,
+            _request: RuntimeOutputRequest,
+        ) -> Result<RuntimeOutputResult, RuntimeInterventionError> {
+            Err(RuntimeInterventionError::Unavailable(
+                "the supervised lifecycle test does not read output".to_owned(),
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeTerminal for LifecycleRuntime {
+        async fn open_terminal(
+            &self,
+            _request: OpenTerminalRequest,
+        ) -> Result<Box<dyn RuntimeTerminalSession>, RuntimeTerminalError> {
+            Err(RuntimeTerminalError::Unavailable(
+                "the supervised lifecycle test does not open terminals".to_owned(),
+            ))
+        }
+    }
+
+    fn explicit_runtime_binding() -> WorkerRuntimeBinding {
+        WorkerRuntimeBinding {
+            adapter: "herdr".to_owned(),
+            session: "default".to_owned(),
+            workspace_id: "workspace-supervised".to_owned(),
+            terminal_id: EXPLICIT_TERMINAL.to_owned(),
+            tab_id: Some(format!("tab-{EXPLICIT_TERMINAL}")),
+            pane_id: format!("pane-{EXPLICIT_TERMINAL}"),
+            provider_session: None,
+            owns_tab: false,
+            observation_state: RuntimeObservationState::Observed,
+            process_state: RuntimeProcessState::Running,
+            status: ObservedStatus::Idle,
+            state_change_sequence: 1,
+            revision: 1,
+            version: 1,
+            last_observed_at_unix_ms: 1,
+        }
+    }
 
     #[tokio::test]
     async fn background_task_exit_is_observed_and_remaining_tasks_are_aborted() {
@@ -417,6 +619,131 @@ mod tests {
         assert_eq!(exited, "exited service");
         abort_background_tasks(&mut tasks).await;
         assert!(tasks.is_empty());
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "end-to-end supervised lifecycle proof"
+    )]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn supervised_server_keeps_unknown_agent_lens_only_after_reopen() {
+        let temp = TempDir::new().unwrap();
+        let database_path = temp.path().join("yard.sqlite3");
+        let config = ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            herdr_binary: OsString::from("unused"),
+            database_path: database_path.clone(),
+            artifact_path: temp.path().join("artifacts"),
+            orchestrator_cwd: temp.path().to_path_buf(),
+            coordination_path: temp.path().join("coordination"),
+            knowledge_path: temp.path().join("knowledge"),
+        };
+        let runtime_claim = lifecycle::claim_runtime(&database_path, InstanceMode::Managed)
+            .await
+            .unwrap();
+        let lifecycle_paths = runtime_claim.paths().clone();
+        let listener = tokio::net::TcpListener::bind(config.bind).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let ui_url = format!("http://{address}/");
+        let store = Arc::new(SqliteProjectStore::open(&database_path).await.unwrap());
+        let project = store
+            .create_project(
+                CreateProject {
+                    name: "Explicit worker project".to_owned(),
+                    runtime: ProjectRuntimeBinding {
+                        adapter: "herdr".to_owned(),
+                        session: "default".to_owned(),
+                        workspace_id: "workspace-supervised".to_owned(),
+                    },
+                    orchestrator_observed_worker_id: EXPLICIT_TERMINAL.to_owned(),
+                    placement: CanvasPlacement {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 322.0,
+                        height: 240.0,
+                    },
+                },
+                explicit_runtime_binding(),
+            )
+            .await
+            .unwrap();
+        let project_id = project.id.clone();
+        let worker_id = project.orchestrator.id.clone();
+        let runtime = Arc::new(LifecycleRuntime {
+            inventory_calls: AtomicUsize::new(0),
+        });
+        let server = tokio::spawn(run_with_services(
+            RunMode::Managed {
+                instance_id: "018f0000-0000-7000-8000-000000000001",
+            },
+            InstanceMode::Managed,
+            config,
+            runtime_claim,
+            listener,
+            address,
+            ui_url,
+            runtime.clone(),
+            store.clone(),
+        ));
+
+        timeout(Duration::from_secs(4), async {
+            while runtime.inventory_calls.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let candidates = store.list_worker_candidates().await.unwrap();
+        assert_eq!(candidates.workers.len(), 1);
+        assert_eq!(candidates.workers[0].worker.id, worker_id);
+        assert_eq!(
+            candidates.workers[0]
+                .worker
+                .runtime
+                .as_ref()
+                .unwrap()
+                .terminal_id,
+            EXPLICIT_TERMINAL
+        );
+
+        lifecycle::request_managed_stop(&lifecycle_paths)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(store);
+
+        let reopened = SqliteProjectStore::open(&database_path).await.unwrap();
+        let restored = reopened.get_project(&project_id).await.unwrap();
+        assert_eq!(restored.orchestrator.id, worker_id);
+        assert_eq!(
+            restored.orchestrator.runtime.as_ref().unwrap().terminal_id,
+            EXPLICIT_TERMINAL
+        );
+        drop(reopened);
+
+        let connection = rusqlite::Connection::open(database_path).unwrap();
+        let worker_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM workers", [], |row| row.get(0))
+            .unwrap();
+        let binding_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM worker_runtime_bindings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let unknown_binding_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM worker_runtime_bindings WHERE terminal_id = ?1",
+                [UNKNOWN_TERMINAL],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(worker_count, 1);
+        assert_eq!(binding_count, 1);
+        assert_eq!(unknown_binding_count, 0);
     }
 
     #[test]

@@ -56,6 +56,7 @@ import type {
   RecordedCompletionReceipt,
   RecordCompletionReceiptInput,
   RuntimeInventory,
+  RuntimeLens,
   RuntimeSessions,
   RuntimeTopology,
   RunAutomationInput,
@@ -144,6 +145,16 @@ export function fetchInventory(
 ): Promise<RuntimeInventory> {
   return requestJson(
     `/api/v1/runtimes/herdr/sessions/${encodeURIComponent(session)}/inventory`,
+    { signal },
+  )
+}
+
+export function fetchRuntimeLens(
+  session: string,
+  signal?: AbortSignal,
+): Promise<RuntimeLens> {
+  return requestJson(
+    `/api/v1/runtimes/herdr/sessions/${encodeURIComponent(session)}/lens`,
     { signal },
   )
 }

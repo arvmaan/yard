@@ -54,6 +54,21 @@ export interface AgentWindowWorkspaceGroup<
   workspaceId: string
 }
 
+export function selectAgentWindowSessionTargets<
+  Target extends AgentWindowTarget,
+>(targets: Target[], selectedSession: string) {
+  const selected: Target[] = []
+  const elsewhereKeys = new Set<string>()
+  targets.forEach((target) => {
+    if (target.session === selectedSession) {
+      selected.push(target)
+    } else {
+      elsewhereKeys.add(target.key)
+    }
+  })
+  return { elsewhereCount: elsewhereKeys.size, selected }
+}
+
 const roleOrder: Record<AgentWindowRole, number> = {
   superintendent: 0,
   workstream: 1,

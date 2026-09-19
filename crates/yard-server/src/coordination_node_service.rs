@@ -36,7 +36,9 @@ use crate::{
         MAX_TERMINAL_OUTPUT_LINES, RuntimeIntervention, RuntimeInterventionError,
         RuntimeOutputRequest, RuntimePromptRequest,
     },
-    inventory_service::{InventoryServiceError, InventorySource},
+    inventory_service::{
+        InventoryServiceError, InventorySource, runtime_binding_from_observed_worker,
+    },
     reconciliation_service::{ReconciliationService, ReconciliationServiceError},
     status_protocol::{
         validate_executable_orchestrator_workflow, with_orchestrator_status_contract,
@@ -221,6 +223,7 @@ impl CoordinationNodeService {
             .map_err(runtime_error)?;
         let (inventory, _) = self.reconciliation.refresh(COORDINATION_SESSION).await?;
         let mut observed = dedicated_worker(&inventory, &node);
+        let bootstrapped = observed.is_none();
         self.store
             .begin_coordination_node_runtime_provision(&node.id, command.clone())
             .await?;
@@ -319,19 +322,29 @@ impl CoordinationNodeService {
             );
         }
         let observed = observed.ok_or(CoordinationNodeServiceError::RuntimeBindingUnverified)?;
-        let candidate = self
-            .store
-            .list_worker_candidates()
-            .await?
+        let has_candidate = |candidate: &yard_domain::WorkerCandidate| {
+            candidate.worker.runtime.as_ref().is_some_and(|runtime| {
+                runtime.adapter == "herdr"
+                    && runtime.session == COORDINATION_SESSION
+                    && runtime.terminal_id == observed.terminal_id
+            })
+        };
+        let mut candidates = self.store.list_worker_candidates().await?;
+        if !bootstrapped && node.worker.is_none() && !candidates.workers.iter().any(has_candidate) {
+            let runtime = runtime_binding_from_observed_worker(&inventory, &observed, false);
+            self.store
+                .claim_provisioning_runtime(&command.command_id, runtime.clone())
+                .await?;
+            self.store
+                .confirm_dedicated_runtime_provision(&command.command_id, runtime)
+                .await?;
+            self.reconciliation.refresh(COORDINATION_SESSION).await?;
+            candidates = self.store.list_worker_candidates().await?;
+        }
+        let candidate = candidates
             .workers
             .into_iter()
-            .find(|candidate| {
-                candidate.worker.runtime.as_ref().is_some_and(|runtime| {
-                    runtime.adapter == "herdr"
-                        && runtime.session == COORDINATION_SESSION
-                        && runtime.terminal_id == observed.terminal_id
-                })
-            })
+            .find(has_candidate)
             .ok_or(CoordinationNodeServiceError::ReconciledWorkerMissing)?;
         if !matches!(
             candidate.availability,
@@ -1328,7 +1341,7 @@ mod tests {
             RuntimeIntervention, RuntimeInterventionError, RuntimeOutputRequest,
             RuntimeOutputResult, RuntimePromptRequest, RuntimePromptResult,
         },
-        inventory_service::{InventoryServiceError, InventorySource},
+        inventory_service::{InventoryServiceError, InventorySource, seed_inventory_workers},
         reconciliation_service::ReconciliationService,
     };
 
@@ -1847,7 +1860,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn snapshot_delivery_blocks_concurrent_orchestrator_transfer() {
-        let (service, store, runtime, _temp) = setup().await;
+        let (service, store, runtime, temp) = setup().await;
         let project = store
             .create_project(
                 CreateProject {
@@ -1871,32 +1884,35 @@ mod tests {
             )
             .await
             .unwrap();
-        store
-            .reconcile_runtime_inventory(inventory(
-                "default",
-                20,
-                vec![workspace("project-workspace", "Project")],
-                vec![
-                    observed_worker(
-                        "project-terminal",
-                        "project-workspace",
-                        "project-tab",
-                        "project-pane",
-                        "project-orchestrator",
-                        "project-provider-session",
-                    ),
-                    observed_worker(
-                        "transfer-terminal",
-                        "project-workspace",
-                        "transfer-tab",
-                        "transfer-pane",
-                        "transfer-candidate",
-                        "transfer-provider-session",
-                    ),
-                ],
-            ))
-            .await
-            .unwrap();
+        let snapshot = inventory(
+            "default",
+            20,
+            vec![workspace("project-workspace", "Project")],
+            vec![
+                observed_worker(
+                    "project-terminal",
+                    "project-workspace",
+                    "project-tab",
+                    "project-pane",
+                    "project-orchestrator",
+                    "project-provider-session",
+                ),
+                observed_worker(
+                    "transfer-terminal",
+                    "project-workspace",
+                    "transfer-tab",
+                    "transfer-pane",
+                    "transfer-candidate",
+                    "transfer-provider-session",
+                ),
+            ],
+        );
+        seed_inventory_workers(
+            &temp.path().join("yard.sqlite3"),
+            &snapshot,
+            &["transfer-terminal"],
+        );
+        store.reconcile_runtime_inventory(snapshot).await.unwrap();
         let current_project = store.get_project(&project.id).await.unwrap();
         let candidate = store
             .list_worker_candidates()

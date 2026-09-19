@@ -3,6 +3,7 @@ import {
   test,
   type Locator,
   type Page,
+  type Route,
   type WebSocketRoute,
 } from '@playwright/test'
 import type {
@@ -423,6 +424,7 @@ interface MockState {
   coordinationSnapshotCommands: RequestCoordinationSnapshotInput[]
   coordinationSnapshots: CoordinationSnapshot[]
   yardOrchestrator: YardOrchestrator
+  yardOrchestratorFailure: boolean
   yardOrchestratorConfigureCommands: ConfigureYardOrchestratorInput[]
   yardOrchestratorProvisionCommands: ProvisionYardOrchestratorInput[]
   yardOrchestratorRecoveryCommands: RecoverYardOrchestratorInput[]
@@ -442,7 +444,6 @@ interface MockState {
   profiles: ReturnType<typeof profile>[]
   workerCandidates: WorkerCandidate[]
   workerRequests: number
-  workerFailure: boolean
   assignments: Assignment[]
   runtimeInventory: typeof inventory
   runtimeTopology: RuntimeTopology
@@ -501,6 +502,12 @@ interface MockState {
   placementUpdates: number
   automationPlacementUpdates: number
   conflictNextPlacement: boolean
+}
+
+function runtimeTopologySnapshot(state: MockState, session: string) {
+  return state.runtimeTopology.session === session
+    ? state.runtimeTopology
+    : { adapter: "herdr", session, managed_workspaces: [] }
 }
 
 function reconcileTransferRuntimeTimestamps(
@@ -648,7 +655,7 @@ async function mockApi(
       | 'command_previously_failed'
     promptLosesResponseOnce?: boolean
     projectOrchestratorStaleOnce?: boolean
-    reconcileWorkerOnInventory?: boolean
+    productionLensFixture?: boolean
     sessionWait?: Promise<void>
     orchestratorStatusReports?: Record<string, unknown>
     terminalOutputDelayMs?: number
@@ -720,6 +727,7 @@ async function mockApi(
       created_at_unix_ms: 0,
       updated_at_unix_ms: 0,
     },
+    yardOrchestratorFailure: false,
     yardOrchestratorConfigureCommands: [],
     yardOrchestratorProvisionCommands: [],
     yardOrchestratorRecoveryCommands: [],
@@ -742,7 +750,6 @@ async function mockApi(
       initialProfileState,
     ),
     workerRequests: 0,
-    workerFailure: false,
     assignments: [],
     runtimeInventory: {
       ...inventory,
@@ -1274,18 +1281,6 @@ async function mockApi(
     if (route.request().method() === 'GET') {
       state.workerRequests += 1
       state.requestLog.push('workers')
-      if (state.workerFailure) {
-        await route.fulfill({
-          status: 502,
-          json: {
-            error: {
-              code: 'worker_refresh_failed',
-              message: 'Synthetic worker refresh failure',
-            },
-          },
-        })
-        return
-      }
       await route.fulfill({ json: { workers: state.workerCandidates } })
       return
     }
@@ -1441,6 +1436,18 @@ async function mockApi(
       url.pathname === '/api/v1/yard/orchestrator' &&
       request.method() === 'GET'
     ) {
+      if (state.yardOrchestratorFailure) {
+        await route.fulfill({
+          status: 502,
+          json: {
+            error: {
+              code: 'yard_orchestrator_refresh_failed',
+              message: 'Synthetic Yard orchestrator refresh failure',
+            },
+          },
+        })
+        return
+      }
       await route.fulfill({ json: state.yardOrchestrator })
       return
     }
@@ -3280,6 +3287,47 @@ async function mockApi(
     await route.fulfill({ status: 404 })
   })
 
+  const runtimeInventorySnapshot = async (
+    route: Route,
+    session: string,
+    preserveSourceSession = false,
+  ): Promise<RuntimeInventory | null> => {
+    state.inventoryRequests += 1
+    state.inventoryRequestSessions.push(session)
+    const responsePlan = state.inventoryResponsePlans.get(session)?.shift()
+    const observedAtUnixMs =
+      responsePlan?.observedAtUnixMs ??
+      state.runtimeInventory.observed_at_unix_ms
+    state.requestLog.push(`inventory:${session}:start:${observedAtUnixMs}`)
+    if (state.inventoryFailure || (session === "beta" && options.betaFails)) {
+      await route.fulfill({
+        status: 502,
+        json: {
+          error: {
+            code: "herdr_snapshot_failed",
+            message:
+              session === "beta" && options.betaFails
+                ? "Synthetic beta snapshot failure"
+                : "Synthetic inventory snapshot failure",
+          },
+        },
+      })
+      return null
+    }
+    if (responsePlan?.reconcileRuntimeTimestamps) {
+      reconcileTransferRuntimeTimestamps(state, session, observedAtUnixMs)
+    }
+    await responsePlan?.wait
+    state.requestLog.push(
+      `inventory:${session}:complete:${observedAtUnixMs}`,
+    )
+    return {
+      ...state.runtimeInventory,
+      observed_at_unix_ms: observedAtUnixMs,
+      session: preserveSourceSession ? state.runtimeInventory.session : session,
+    }
+  }
+
   await page.route('**/api/v1/runtimes/herdr/**', async (route) => {
     const path = new URL(route.request().url()).pathname
     if (path.endsWith('/sessions')) {
@@ -3292,18 +3340,36 @@ async function mockApi(
       })
       return
     }
+    const lensMatch = path.match(/\/sessions\/([^/]+)\/lens$/)
+    if (lensMatch) {
+      if (options.productionLensFixture) {
+        await route.continue()
+        return
+      }
+      const session = decodeURIComponent(lensMatch[1])
+      const snapshot = await runtimeInventorySnapshot(route, session, true)
+      if (!snapshot) return
+      await route.fulfill({
+        json: {
+          adapter: "herdr",
+          selected_session: snapshot.session,
+          snapshot_current: true,
+          observed_at_unix_ms: String(snapshot.observed_at_unix_ms),
+          inventory: snapshot,
+          topology: runtimeTopologySnapshot(state, snapshot.session),
+          workers: { workers: state.workerCandidates },
+          entries: [],
+        },
+      })
+      return
+    }
     const topologyMatch = path.match(/\/sessions\/([^/]+)\/topology$/)
     if (topologyMatch) {
-      const session = decodeURIComponent(topologyMatch[1])
       await route.fulfill({
-        json:
-          state.runtimeTopology.session === session
-            ? state.runtimeTopology
-            : {
-                adapter: 'herdr',
-                session,
-                managed_workspaces: [],
-              },
+        json: runtimeTopologySnapshot(
+          state,
+          decodeURIComponent(topologyMatch[1]),
+        ),
       })
       return
     }
@@ -3349,78 +3415,12 @@ async function mockApi(
       })
       return
     }
-    if (path.includes('/sessions/beta/inventory') && options.betaFails) {
-      await route.fulfill({
-        status: 502,
-        json: {
-          error: {
-            code: 'herdr_snapshot_failed',
-            message: 'Synthetic beta snapshot failure',
-          },
-        },
-      })
-      return
-    }
-    state.inventoryRequests += 1
-    const sessionMatch = path.match(/\/sessions\/([^/]+)\/inventory$/)
-    const session = sessionMatch
-      ? decodeURIComponent(sessionMatch[1])
+    const inventoryMatch = path.match(/\/sessions\/([^/]+)\/inventory$/)
+    const session = inventoryMatch
+      ? decodeURIComponent(inventoryMatch[1])
       : state.runtimeInventory.session
-    state.inventoryRequestSessions.push(session)
-    const responsePlan = state.inventoryResponsePlans.get(session)?.shift()
-    const observedAtUnixMs =
-      responsePlan?.observedAtUnixMs ??
-      state.runtimeInventory.observed_at_unix_ms
-    state.requestLog.push(`inventory:${session}:start:${observedAtUnixMs}`)
-    if (state.inventoryFailure) {
-      await route.fulfill({
-        status: 502,
-        json: {
-          error: {
-            code: 'herdr_snapshot_failed',
-            message: 'Synthetic inventory snapshot failure',
-          },
-        },
-      })
-      return
-    }
-    if (responsePlan?.reconcileRuntimeTimestamps) {
-      reconcileTransferRuntimeTimestamps(
-        state,
-        session,
-        observedAtUnixMs,
-      )
-    }
-    await responsePlan?.wait
-    if (
-      options.reconcileWorkerOnInventory &&
-      !state.workerCandidates.some(
-        (candidate) => candidate.worker.id === 'worker-reconciled',
-      )
-    ) {
-      state.workerCandidates.push({
-        worker: durableWorker(
-          'worker-reconciled',
-          'terminal-9',
-          state.profiles[0],
-          'workspace-4',
-        ),
-        profile_name: state.profiles[0].name,
-        default_role: state.profiles[0].default_role,
-        availability: 'unassigned_live',
-        reason: 'Discovered during runtime reconciliation.',
-      })
-    }
-    state.requestLog.push(
-      `inventory:${session}:complete:${observedAtUnixMs}`,
-    )
-    await route.fulfill({
-      json: {
-        ...state.runtimeInventory,
-        observed_at_unix_ms: observedAtUnixMs,
-        session,
-      },
-    })
+    const snapshot = await runtimeInventorySnapshot(route, session)
+    if (snapshot) await route.fulfill({ json: snapshot })
   })
 
   return state
@@ -4520,6 +4520,7 @@ test('keeps exactly one durable orchestrator visible across selected sessions', 
   ).toHaveCount(state.runtimeInventory.workers.length - 1)
   await expectRuntimeLayout(page)
 
+  state.runtimeInventory.session = "beta"
   await selectRuntimeSession(page, 'beta')
   await expect(
     page.locator('.project-region[data-runtime="offline"]'),
@@ -4897,12 +4898,12 @@ test('reports a fresh missing binding despite an auxiliary refresh failure', asy
   ).toHaveCount(0)
 
   const inventoryRequestsBeforeAuxiliaryFailure = state.inventoryRequests
-  state.workerFailure = true
+  state.yardOrchestratorFailure = true
   state.runtimeInventory.observed_at_unix_ms = Date.now()
   await expect
     .poll(() => state.inventoryRequests, { timeout: 3_000 })
     .toBeGreaterThan(inventoryRequestsBeforeAuxiliaryFailure)
-  await expect(page.getByText('Synthetic worker refresh failure')).toBeVisible()
+  await expect(page.getByText('Synthetic Yard orchestrator refresh failure')).toBeVisible()
   await expect(connection).toHaveText('Binding missing')
   await expect(connection).toHaveAttribute(
     'title',
@@ -5366,22 +5367,6 @@ test('resnapshots inventory, retains stale state, and recovers after failure', a
     'data-status',
     'blocked',
   )
-})
-
-test('reloads worker candidates after inventory reconciliation', async ({
-  page,
-}) => {
-  await mockApi(page, { reconcileWorkerOnInventory: true })
-  await page.setViewportSize({ width: 1200, height: 760 })
-  await page.goto('/')
-
-  await page.getByRole('tab', { name: 'Workers' }).click()
-  const reconciledWorker = page.locator(
-    '.worker-row[data-worker-id="worker-reconciled"]',
-  )
-  await expect(reconciledWorker).toBeVisible()
-  await expect(reconciledWorker).toHaveAttribute('draggable', 'true')
-  await expect(reconciledWorker).toContainText('Unassigned live')
 })
 
 test('shows selected worker details on mobile', async ({ page }, testInfo) => {
@@ -7648,6 +7633,7 @@ test('reconnects the Superintendent terminal when its runtime identity changes',
     running: true,
   })
   observeInteractiveWorker(state, originalWorker)
+  state.runtimeInventory.session = "yard-orchestrator"
   await page.setViewportSize({ width: 1200, height: 760 })
   await page.goto('/')
   await selectRuntimeSession(page, 'yard-orchestrator')
@@ -7762,6 +7748,7 @@ test('provisions a dedicated Superintendent and shows project updates', async ({
     expected_orchestrator_version: '1',
   })
   await expect(page.getByText('Dedicated Herdr session')).toBeVisible()
+  state.runtimeInventory.session = "yard-orchestrator"
   await selectRuntimeSession(page, 'yard-orchestrator')
   await page.getByRole('button', { name: 'Project pulse' }).click()
   await expect(page.getByLabel('Latest project updates')).toContainText(
@@ -7900,6 +7887,7 @@ test('recovers a stopped dedicated Superintendent session without replacing it',
     expected_orchestrator_version: '3',
   })
   await expect(page.getByText('Dedicated Herdr session')).toBeVisible()
+  state.runtimeInventory.session = "yard-orchestrator"
   await selectRuntimeSession(page, 'yard-orchestrator')
   await expect(
     page.getByRole('button', { name: 'Open chat', exact: true }),
@@ -8053,12 +8041,9 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   const navigator = shell.locator('.agent-window-navigator')
   await expect(shell).toBeVisible()
   await expect(navigator).toContainText('Runtime working')
-  await expect(navigator).toContainText('live controls unavailable')
   await expect(navigator).toContainText('release-tools')
-  await expect(navigator).toContainText('Topology unavailable')
-  await expect(navigator).toContainText('Connection status unknown')
   const workspaceGroups = navigator.locator('.agent-window-workspace')
-  await expect(workspaceGroups).toHaveCount(3)
+  await expect(workspaceGroups).toHaveCount(2)
   await expect(workspaceGroups.nth(0)).toHaveAttribute(
     'data-workspace-id',
     'workspace-2',
@@ -8066,10 +8051,6 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   await expect(workspaceGroups.nth(1)).toHaveAttribute(
     'data-workspace-id',
     'workspace-1',
-  )
-  await expect(workspaceGroups.nth(2)).toHaveAttribute(
-    'data-workspace-id',
-    'workspace-offline',
   )
   const windowSort = navigator.getByLabel('Sort Herdr windows')
   const windowSearch = navigator.getByLabel('Search Herdr windows')
@@ -8100,7 +8081,7 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   await windowSearch.fill('missing-window')
   await expect(navigator.getByText('No matching windows')).toBeVisible()
   await windowSearch.fill('')
-  await expect(workspaceGroups).toHaveCount(3)
+  await expect(workspaceGroups).toHaveCount(2)
   await expect(workspaceGroups.nth(1)).toContainText('API migration')
   await expect(workspaceGroups.nth(1)).toContainText('workspace-1')
   await expect(workspaceGroups.nth(1)).toContainText('2 targets')
@@ -8109,16 +8090,12 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   await expect(workspaceGroups.nth(1)).toContainText(
     '/tmp/sample/yard-worktrees/api-migration',
   )
-  await expect(workspaceGroups.nth(2)).toContainText('Session offline')
-  await expect(workspaceGroups.nth(2)).toContainText(
-    'workspace-offline',
-  )
   const targetRows = navigator.locator('.agent-window-row')
-  await expect(targetRows).toHaveCount(4)
+  await expect(targetRows).toHaveCount(3)
   const targetKeys = await targetRows.evaluateAll((rows) =>
     rows.map((row) => row.getAttribute('data-target-key')),
   )
-  expect(new Set(targetKeys).size).toBe(4)
+  expect(new Set(targetKeys).size).toBe(3)
   for (const key of targetKeys) {
     await expect(
       navigator.locator(`[data-target-key="${key}"]`),
@@ -8127,15 +8104,32 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   await expect(workspaceGroups.nth(1).locator('.agent-window-row')).toHaveCount(
     2,
   )
-  const implementerRow = navigator.locator(
-    '[data-target-key="assignment:assignment-1"]',
+  await selectRuntimeSession(page, 'gamma')
+  await expect(navigator).toContainText(
+    '1 controlled · gamma selected · 3 linked elsewhere',
   )
+  await expect(workspaceGroups).toHaveCount(1)
+  await expect(workspaceGroups.nth(0)).toHaveAttribute(
+    'data-workspace-id',
+    'workspace-offline',
+  )
+  await expect(workspaceGroups.nth(0)).toContainText('Session offline')
+  await expect(workspaceGroups.nth(0)).toContainText('Topology unavailable')
   const durableRow = navigator.locator(
     '[data-target-key="orchestrator:project-2"]',
   )
   await expect(durableRow).toBeDisabled()
   await expect(durableRow).toContainText('Connection status unknown')
   await durableRow.click({ force: true })
+
+  await selectRuntimeSession(page, 'alpha')
+  await expect(navigator).toContainText(
+    '3 controlled · alpha selected · 1 linked elsewhere',
+  )
+  await expect(workspaceGroups).toHaveCount(2)
+  const implementerRow = navigator.locator(
+    '[data-target-key="assignment:assignment-1"]',
+  )
   await expect(implementerRow).toHaveAttribute('aria-current', 'page')
   await expect(implementerRow).toContainText('Implementer')
   await expect(implementerRow).toContainText('implementer · API migration')
@@ -9676,6 +9670,7 @@ test('provisions a workstream orchestrator and routes work to an attached projec
     expected_profile_version: '1',
     expected_node_version: '1',
   })
+  state.runtimeInventory.session = "yard-coordination"
   await selectRuntimeSession(page, 'yard-coordination')
 
   await page
@@ -13248,4 +13243,84 @@ test('rolls project geometry back after a placement conflict', async ({
     .poll(() => state.placementUpdates, { timeout: 5_000 })
     .toBe(1)
   expect(state.projects[0].placement.geometry).toEqual(original)
+})
+
+
+test("projects the selected session into a read-only unassigned navigator", async ({ page }) => {
+  const browserErrors: string[] = []
+  const requests: Array<{ method: string; path: string }> = []
+  page.on("console", (message) => {
+    if (message.type() === "error") browserErrors.push(message.text())
+  })
+  page.on("request", (request) =>
+    requests.push({
+      method: request.method(),
+      path: new URL(request.url()).pathname,
+    }),
+  )
+  const state = await mockApi(page, { productionLensFixture: true })
+  state.yardOrchestrator = {
+    ...state.yardOrchestrator,
+    worker: durableWorker(
+      "worker-superintendent",
+      "terminal-superintendent",
+      state.profiles[0],
+    ),
+    version: "2",
+  }
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto("/")
+  await page.locator(".orchestrator-marker[data-project-id=\"project-1\"]").click()
+  await page.getByRole("button", { name: "Open chat", exact: true }).click()
+
+  const navigator = page.locator(".agent-window-navigator")
+  const toggle = navigator.getByRole("button", { name: /Other Herdr/ })
+  await expect(navigator).toContainText("alpha selected · 1 linked elsewhere")
+  await expect(navigator.locator('[data-session="beta"]')).toHaveCount(0)
+  await expect(navigator.locator("[data-superintendent=\"true\"]")).toBeVisible()
+  await expect(navigator).toContainText("API migration orchestrator")
+  await expect(toggle).toHaveAttribute("aria-expanded", "false")
+  await expect(navigator.getByText("Unassigned sentinel")).toBeHidden()
+  await navigator.getByLabel("Search Herdr windows").fill("Topology shell")
+  await expect(navigator.getByText("Topology shell")).toBeVisible()
+  await expect(navigator.locator("[data-superintendent=\"true\"]")).toBeVisible()
+  await navigator.getByLabel("Search Herdr windows").fill("")
+  await toggle.click()
+  await expect(
+    navigator.locator('[data-classification="stale_missing_binding"]'),
+  ).toBeVisible()
+  await expect(
+    navigator.locator('[data-classification="ambiguous_identity"]'),
+  ).toHaveCount(2)
+  await expect(navigator.getByText("Linked resumable worker")).toBeVisible()
+  await expect(navigator.getByText("Controlled linked duplicate")).toHaveCount(0)
+  await expect(navigator.locator(".agent-window-lens-row button")).toHaveCount(0)
+
+  await selectRuntimeSession(page, "beta")
+  await expect(navigator).toContainText("beta selected · 3 linked elsewhere")
+  await expect(navigator.locator('[data-session="alpha"]')).toHaveCount(0)
+  await expect(
+    navigator.locator('[data-session="yard-orchestrator"]'),
+  ).toHaveCount(0)
+  await navigator.getByLabel("Search Herdr windows").fill("Beta sentinel")
+  await expect(
+    navigator.locator('[data-classification="unassigned_herdr_agent"]', {
+      hasText: "Beta sentinel",
+    }),
+  ).toBeVisible()
+  await expect(navigator.getByText("Unassigned sentinel")).toHaveCount(0)
+  await expect(navigator.getByText("Topology shell")).toHaveCount(0)
+  await navigator.getByLabel("Search Herdr windows").fill("")
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.locator(".agent-workspace-toolbar__mobile-navigator").click()
+  await expect(navigator).toBeVisible()
+
+  expect(requests.filter(({ path }) => path.endsWith("/lens"))).toHaveLength(2)
+  expect(requests.some(({ path }) => path.endsWith("/topology"))).toBe(false)
+  expect(
+    requests.some(
+      ({ method, path }) => method === "POST" && path === "/api/v1/workers",
+    ),
+  ).toBe(false)
+  expect(browserErrors).toEqual([])
 })

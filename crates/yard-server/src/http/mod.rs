@@ -66,6 +66,7 @@ use crate::terminal_service::{RuntimeTerminal, TerminalService};
 use crate::worker_session_service::{WorkerSessionService, WorkerSessionServiceError};
 use crate::yard_orchestrator_service::{YardOrchestratorService, YardOrchestratorServiceError};
 
+mod lens;
 mod terminal;
 mod web;
 
@@ -382,6 +383,10 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         .route(
             "/api/v1/runtimes/herdr/sessions/{session}/topology",
             get(runtime_topology),
+        )
+        .route(
+            "/api/v1/runtimes/herdr/sessions/{session}/lens",
+            get(lens::runtime_lens),
         )
         .route(
             "/api/v1/runtimes/herdr/sessions/{session}/terminals/{terminal_id}/open-ghostty",
@@ -3512,6 +3517,7 @@ struct ErrorBody {
 mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
+        env,
         path::PathBuf,
         sync::{
             Arc, Mutex,
@@ -3565,7 +3571,9 @@ mod tests {
         RuntimeInterventionError, RuntimeOutputRequest, RuntimeOutputResult, RuntimePromptRequest,
         RuntimePromptResult,
     };
-    use crate::inventory_service::{InventoryServiceError, InventorySource};
+    use crate::inventory_service::{
+        InventoryServiceError, InventorySource, seed_inventory_workers,
+    };
     use crate::orchestrator_replacement_service::OrchestratorReplacementServiceError;
     use crate::project_service::ProjectServiceError;
     use crate::reconciliation_service::ReconciliationService;
@@ -4970,10 +4978,7 @@ mod tests {
     }
 
     #[cfg(test)]
-    fn missing_ghostty_launcher(
-        _: &std::ffi::OsString,
-        _: &[String],
-    ) -> std::io::Result<()> {
+    fn missing_ghostty_launcher(_: &std::ffi::OsString, _: &[String]) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "ghostty missing",
@@ -4981,10 +4986,7 @@ mod tests {
     }
 
     #[cfg(test)]
-    fn failing_ghostty_launcher(
-        _: &std::ffi::OsString,
-        _: &[String],
-    ) -> std::io::Result<()> {
+    fn failing_ghostty_launcher(_: &std::ffi::OsString, _: &[String]) -> std::io::Result<()> {
         Err(std::io::Error::other("ghostty failed"))
     }
 
@@ -5078,12 +5080,272 @@ mod tests {
 
         async fn inventory(
             &self,
+            _session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            Ok(self.inventory.clone())
+        }
+    }
+
+    struct SessionInventory {
+        inventories: HashMap<String, RuntimeInventory>,
+    }
+
+    #[async_trait]
+    impl InventorySource for SessionInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            Ok(RuntimeSessions {
+                adapter: "herdr".to_owned(),
+                sessions: self
+                    .inventories
+                    .keys()
+                    .map(|name| RuntimeSession {
+                        name: name.clone(),
+                        is_default: name == "alpha",
+                        running: true,
+                    })
+                    .collect(),
+            })
+        }
+
+        async fn inventory(
+            &self,
             session_name: &str,
         ) -> Result<RuntimeInventory, InventoryServiceError> {
-            let mut inventory = self.inventory.clone();
-            inventory.session = session_name.to_owned();
-            Ok(inventory)
+            Ok(self
+                .inventories
+                .get(session_name)
+                .unwrap_or_else(|| panic!("missing lens fixture session {session_name}"))
+                .clone())
         }
+    }
+
+    fn lens_fixture_worker(
+        workspace_id: &str,
+        tab_id: &str,
+        pane_id: &str,
+        terminal_id: &str,
+        name: &str,
+        provider_value: &str,
+    ) -> ObservedWorker {
+        ObservedWorker {
+            runtime_id: terminal_id.to_owned(),
+            terminal_id: terminal_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            tab_id: tab_id.to_owned(),
+            pane_id: pane_id.to_owned(),
+            name: Some(name.to_owned()),
+            provider: Some("codex".to_owned()),
+            display_provider: Some("Codex".to_owned()),
+            status: ObservedStatus::Idle,
+            focused: false,
+            launch_pending: false,
+            interactive_ready: true,
+            state_change_sequence: 1,
+            cwd: Some("/tmp/lens-fixture".to_owned()),
+            foreground_cwd: Some("/tmp/lens-fixture".to_owned()),
+            tokens: BTreeMap::new(),
+            provider_session: Some(provider_session(provider_value)),
+            revision: 1,
+        }
+    }
+
+    fn lens_fixture_pane(worker: &ObservedWorker, label: &str) -> PaneObservation {
+        PaneObservation {
+            runtime_id: worker.pane_id.clone(),
+            terminal_id: worker.terminal_id.clone(),
+            workspace_id: worker.workspace_id.clone(),
+            tab_id: worker.tab_id.clone(),
+            focused: worker.focused,
+            cwd: worker.cwd.clone(),
+            foreground_cwd: worker.foreground_cwd.clone(),
+            label: Some(label.to_owned()),
+            provider: worker.provider.clone(),
+            display_provider: worker.display_provider.clone(),
+            status: worker.status,
+            tokens: BTreeMap::new(),
+            provider_session: worker.provider_session.clone(),
+            revision: worker.revision,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "explicit multi-session browser fixture"
+    )]
+    fn lens_fixture_inventory(session: &str) -> RuntimeInventory {
+        let (workspace_id, label, workers, mut panes) = if session == "alpha" {
+            let controlled = lens_fixture_worker(
+                "workspace-1",
+                "workspace-1:tab-1",
+                "workspace-1:pane-1",
+                "terminal-1",
+                "Controlled linked duplicate",
+                "alpha-controlled",
+            );
+            let linked = lens_fixture_worker(
+                "workspace-1",
+                "workspace-1:tab-linked",
+                "workspace-1:pane-linked",
+                "terminal-lens-linked",
+                "Linked resumable worker",
+                "alpha-linked",
+            );
+            let unassigned = lens_fixture_worker(
+                "workspace-1",
+                "workspace-1:tab-agent",
+                "workspace-1:pane-agent",
+                "terminal-lens-agent",
+                "Unassigned sentinel",
+                "alpha-unassigned",
+            );
+            let panes = vec![
+                lens_fixture_pane(&controlled, "Controlled pane"),
+                lens_fixture_pane(&linked, "Linked pane"),
+                lens_fixture_pane(&unassigned, "Agent pane"),
+                pane_observation(
+                    "workspace-1:pane-shell",
+                    "terminal-lens-shell",
+                    "workspace-1:tab-shell",
+                ),
+                pane_observation(
+                    "workspace-1:pane-ambiguous-left",
+                    "terminal-lens-ambiguous",
+                    "workspace-1:tab-ambiguous-left",
+                ),
+                pane_observation(
+                    "workspace-1:pane-ambiguous-right",
+                    "terminal-lens-ambiguous",
+                    "workspace-1:tab-ambiguous-right",
+                ),
+            ];
+            (
+                "workspace-1",
+                "API migration",
+                vec![controlled, linked, unassigned],
+                panes,
+            )
+        } else {
+            let unassigned = lens_fixture_worker(
+                "workspace-beta",
+                "workspace-beta:tab-agent",
+                "workspace-beta:pane-agent",
+                "terminal-lens-linked",
+                "Beta sentinel",
+                "beta-unassigned",
+            );
+            let linked = lens_fixture_worker(
+                "workspace-beta",
+                "workspace-beta:tab-linked",
+                "workspace-beta:pane-linked",
+                "terminal-beta-linked",
+                "Beta linked worker",
+                "beta-linked",
+            );
+            let panes = vec![
+                lens_fixture_pane(&unassigned, "Beta agent pane"),
+                lens_fixture_pane(&linked, "Beta linked pane"),
+                pane_observation(
+                    "workspace-beta:pane-shell",
+                    "terminal-beta-shell",
+                    "workspace-beta:tab-shell",
+                ),
+            ];
+            (
+                "workspace-beta",
+                "Beta workspace",
+                vec![unassigned, linked],
+                panes,
+            )
+        };
+        if let Some(shell) = panes.iter_mut().find(|pane| {
+            pane.terminal_id
+                == if session == "alpha" {
+                    "terminal-lens-shell"
+                } else {
+                    "terminal-beta-shell"
+                }
+        }) {
+            shell.workspace_id = workspace_id.to_owned();
+            shell.label = Some(if session == "alpha" {
+                "Topology shell".to_owned()
+            } else {
+                "Beta shell".to_owned()
+            });
+        }
+        RuntimeInventory {
+            adapter: "herdr".to_owned(),
+            session: session.to_owned(),
+            runtime_version: "0.8.0".to_owned(),
+            protocol: 19,
+            observed_at_unix_ms: 1_786_400_000_000,
+            focus: FocusObservation::default(),
+            workspaces: vec![WorkspaceObservation {
+                runtime_id: workspace_id.to_owned(),
+                order: 0,
+                label: label.to_owned(),
+                focused: true,
+                active_tab_id: panes[0].tab_id.clone(),
+                pane_count: panes.len(),
+                tab_count: panes.len(),
+                status: ObservedStatus::Idle,
+                tokens: BTreeMap::new(),
+                worktree: None,
+            }],
+            tabs: Vec::new(),
+            panes,
+            workers,
+            child_agents: Vec::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "Playwright test-only production lens backend"]
+    async fn serves_playwright_runtime_lens_fixture() {
+        let address: std::net::SocketAddr = env::var("YARD_LENS_FIXTURE_ADDR")
+            .expect("YARD_LENS_FIXTURE_ADDR")
+            .parse()
+            .expect("valid fixture address");
+        let temp = TempDir::new().unwrap();
+        let database_path = temp.path().join("yard.sqlite3");
+        let store = Arc::new(SqliteProjectStore::open(&database_path).await.unwrap());
+        let alpha = lens_fixture_inventory("alpha");
+        let beta = lens_fixture_inventory("beta");
+        let mut alpha_seed = alpha.clone();
+        alpha_seed.workers.push(lens_fixture_worker(
+            "workspace-1",
+            "workspace-1:tab-stale",
+            "workspace-1:pane-stale",
+            "terminal-lens-stale",
+            "Stale worker",
+            "alpha-stale",
+        ));
+        seed_inventory_workers(
+            &database_path,
+            &alpha_seed,
+            &["terminal-1", "terminal-lens-linked", "terminal-lens-stale"],
+        );
+        seed_inventory_workers(&database_path, &beta, &["terminal-beta-linked"]);
+        let source = Arc::new(SessionInventory {
+            inventories: HashMap::from([
+                (alpha.session.clone(), alpha),
+                (beta.session.clone(), beta),
+            ]),
+        });
+        let runtime = Arc::new(FakeRuntime);
+        let app = crate::app(
+            source,
+            runtime.clone(),
+            runtime.clone(),
+            runtime,
+            store,
+            temp.path().join("artifacts"),
+        );
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        println!(
+            "Playwright lens fixture listening on {}",
+            listener.local_addr().unwrap()
+        );
+        axum::serve(listener, app).await.unwrap();
     }
 
     async fn ghostty_router_with_inventory_and_launcher(
@@ -5143,8 +5405,12 @@ mod tests {
     #[tokio::test]
     async fn open_ghostty_allows_a_unique_topology_only_pane_without_observed_worker() {
         let mut inventory = FakeInventory.inventory("default").await.unwrap();
-        inventory.workers.retain(|worker| worker.terminal_id != "terminal-1");
-        inventory.panes.push(pane_observation("pane-1", "terminal-1", "tab-1"));
+        inventory
+            .workers
+            .retain(|worker| worker.terminal_id != "terminal-1");
+        inventory
+            .panes
+            .push(pane_observation("pane-1", "terminal-1", "tab-1"));
         let (router, _temp) = ghostty_router_with_inventory(inventory).await;
         let (status, json) = open_ghostty_response(&router, "terminal-1").await;
         assert_eq!(status, StatusCode::OK);
@@ -5171,10 +5437,14 @@ mod tests {
     #[tokio::test]
     async fn open_ghostty_rejects_ambiguous_terminals() {
         let mut inventory = FakeInventory.inventory("default").await.unwrap();
-        inventory.panes.push(pane_observation("pane-1", "terminal-1", "tab-1"));
         inventory
             .panes
-            .push(pane_observation("pane-duplicate", "terminal-1", "tab-duplicate"));
+            .push(pane_observation("pane-1", "terminal-1", "tab-1"));
+        inventory.panes.push(pane_observation(
+            "pane-duplicate",
+            "terminal-1",
+            "tab-duplicate",
+        ));
         let (router, _temp) = ghostty_router_with_inventory(inventory).await;
         let (status, json) = open_ghostty_response(&router, "terminal-1").await;
         assert_eq!(status, StatusCode::CONFLICT);
@@ -5766,6 +6036,7 @@ mod tests {
 
     async fn create_orchestrator_transfer_request(
         app: &Router,
+        temp: &TempDir,
     ) -> (String, serde_json::Value, String) {
         let target_project_body = serde_json::json!({
             "name": "Transfer API",
@@ -5796,6 +6067,12 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
         let created = response_json(response).await;
+        let snapshot = HandoffInventory.inventory("default").await.unwrap();
+        seed_inventory_workers(
+            &temp.path().join("yard.sqlite3"),
+            &snapshot,
+            &["terminal-yard-handoff-5072292f455abdff"],
+        );
         let inventory = app
             .clone()
             .oneshot(
@@ -6344,8 +6621,8 @@ mod tests {
 
     #[tokio::test]
     async fn project_orchestrator_transfer_replays_keeps_displaced_live_and_revokes_lease() {
-        let (app, _temp, _runtime) = handoff_test_router().await;
-        let (uri, command, project_id) = create_orchestrator_transfer_request(&app).await;
+        let (app, temp, _runtime) = handoff_test_router().await;
+        let (uri, command, project_id) = create_orchestrator_transfer_request(&app, &temp).await;
         let replaced_worker_id = command["expected_orchestrator_worker_id"]
             .as_str()
             .unwrap()
@@ -6430,7 +6707,7 @@ mod tests {
     #[tokio::test]
     async fn project_orchestrator_transfer_http_rejects_stale_cross_workspace_and_unavailable() {
         let (app, temp, _runtime) = handoff_test_router().await;
-        let (uri, command, _project_id) = create_orchestrator_transfer_request(&app).await;
+        let (uri, command, _project_id) = create_orchestrator_transfer_request(&app, &temp).await;
 
         let mut stale = command.clone();
         stale["command_id"] = serde_json::json!("stale-transfer");
@@ -6892,7 +7169,16 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn yard_orchestrator_replacement_revokes_open_singleton_terminal() {
-        let (app, _temp) = test_router().await;
+        let (app, temp) = test_router().await;
+        let snapshot = FakeInventory.inventory("default").await.unwrap();
+        seed_inventory_workers(
+            &temp.path().join("yard.sqlite3"),
+            &snapshot,
+            &[
+                "terminal-yard-prompta-345234a24b29951c",
+                "terminal-yard-allocat-b3e512e61b8af4f5",
+            ],
+        );
         let inventory = app
             .clone()
             .oneshot(
@@ -7249,9 +7535,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inventory_get_reconciles_observed_workers_durably() {
-        let (app, temp) = test_router().await;
+    async fn runtime_lens_preserves_source_session_without_creating_workers() {
+        let inventory = FakeInventory.inventory("actual").await.unwrap();
+        let (app, temp) = test_router_with_source(Arc::new(StaticInventory { inventory })).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/sessions/requested/lens")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["selected_session"], "actual");
+        assert_eq!(json["inventory"]["session"], "actual");
+        assert_eq!(json["topology"]["session"], "actual");
+        assert!(
+            json["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["session"] == "actual")
+        );
+
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let worker_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM workers", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(worker_count, 0);
+    }
+
+    #[tokio::test]
+    async fn inventory_get_leaves_observed_workers_lens_only() {
+        let (app, temp) = test_router().await;
         let response = app
             .oneshot(
                 Request::builder()
@@ -7267,17 +7586,83 @@ mod tests {
         let worker_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM workers", [], |row| row.get(0))
             .unwrap();
-        let adoption_event_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM lifecycle_events
-                  WHERE event_type = 'runtime_worker_adopted'",
-                [],
-                |row| row.get(0),
-            )
+        let binding_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM worker_runtime_bindings", [], |row| {
+                row.get(0)
+            })
             .unwrap();
+        assert_eq!(worker_count, 0);
+        assert_eq!(binding_count, 0);
+    }
 
-        assert_eq!(worker_count, 3);
-        assert_eq!(adoption_event_count, 3);
+    #[tokio::test]
+    async fn reconciliation_ticks_keep_unassigned_agents_lens_only() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let source = Arc::new(CountingInventory {
+            inventory_calls: AtomicUsize::new(0),
+        });
+        let service = ReconciliationService::new(source.clone(), store.clone());
+        let reconciliation = tokio::spawn(service.run());
+        timeout(Duration::from_secs(3), async {
+            while source.inventory_calls.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        reconciliation.abort();
+
+        let calls_before_lens = source.inventory_calls.load(Ordering::SeqCst);
+        let runtime = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            source.clone(),
+            runtime.clone(),
+            runtime.clone(),
+            runtime,
+            store.clone(),
+            artifacts,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/sessions/default/lens")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(
+            source.inventory_calls.load(Ordering::SeqCst),
+            calls_before_lens + 1
+        );
+        assert_eq!(json["entries"].as_array().unwrap().len(), 3);
+        assert!(
+            json["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["classification"] == "unassigned_herdr_agent")
+        );
+
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let worker_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM workers", [], |row| row.get(0))
+            .unwrap();
+        let binding_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM worker_runtime_bindings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(worker_count, 0);
+        assert_eq!(binding_count, 0);
     }
 
     async fn archive_topology_test_project(store: &SqliteProjectStore) {
@@ -7402,11 +7787,10 @@ mod tests {
         }
     }
 
-    async fn configure_central_topology_worker(store: &SqliteProjectStore) {
-        store
-            .reconcile_runtime_inventory(central_topology_inventory())
-            .await
-            .unwrap();
+    async fn configure_central_topology_worker(temp: &TempDir, store: &SqliteProjectStore) {
+        let snapshot = central_topology_inventory();
+        seed_inventory_workers(&temp.path().join("yard.sqlite3"), &snapshot, &["wA:t1"]);
+        store.reconcile_runtime_inventory(snapshot).await.unwrap();
         let candidate = store
             .list_worker_candidates()
             .await
@@ -7457,7 +7841,7 @@ mod tests {
                 .unwrap(),
         );
         archive_topology_test_project(store.as_ref()).await;
-        configure_central_topology_worker(store.as_ref()).await;
+        configure_central_topology_worker(&temp, store.as_ref()).await;
         let app = topology_test_router(&temp, store);
 
         let response = app
@@ -7519,10 +7903,19 @@ mod tests {
     async fn transient_inventory_failure_preserves_durable_projection() {
         let snapshot = FakeInventory.inventory("default").await.unwrap();
         let source = Arc::new(FlakyInventory {
-            snapshot,
+            snapshot: snapshot.clone(),
             inventory_calls: AtomicUsize::new(0),
         });
         let (app, temp) = test_router_with_source(source).await;
+        seed_inventory_workers(
+            &temp.path().join("yard.sqlite3"),
+            &snapshot,
+            &[
+                "terminal-1",
+                "terminal-yard-prompta-345234a24b29951c",
+                "terminal-yard-allocat-b3e512e61b8af4f5",
+            ],
+        );
         let uri = "/api/v1/runtimes/herdr/sessions/default/inventory";
 
         let first = app
@@ -9200,7 +9593,13 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn ends_an_unallocated_worker_session_and_prevents_re_adoption() {
-        let (app, _temp) = test_router().await;
+        let (app, temp) = test_router().await;
+        let snapshot = FakeInventory.inventory("default").await.unwrap();
+        seed_inventory_workers(
+            &temp.path().join("yard.sqlite3"),
+            &snapshot,
+            &["terminal-1", "terminal-yard-prompta-345234a24b29951c"],
+        );
         let inventory_response = app
             .clone()
             .oneshot(
@@ -9379,7 +9778,14 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn lists_and_assigns_an_existing_live_worker() {
-        let (app, _temp) = test_router_with_source(Arc::new(ProviderlessWorkerInventory)).await;
+        let source = Arc::new(ProviderlessWorkerInventory);
+        let snapshot = source.inventory("default").await.unwrap();
+        let (app, temp) = test_router_with_source(source).await;
+        seed_inventory_workers(
+            &temp.path().join("yard.sqlite3"),
+            &snapshot,
+            &["terminal-1", "terminal-yard-prompta-345234a24b29951c"],
+        );
         let inventory_response = app
             .clone()
             .oneshot(
@@ -10578,7 +10984,13 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn configures_and_prompts_the_yard_orchestrator_idempotently() {
-        let (app, _temp) = test_router().await;
+        let (app, temp) = test_router().await;
+        let snapshot = FakeInventory.inventory("default").await.unwrap();
+        seed_inventory_workers(
+            &temp.path().join("yard.sqlite3"),
+            &snapshot,
+            &["terminal-1", "terminal-yard-prompta-345234a24b29951c"],
+        );
         let inventory = app
             .clone()
             .oneshot(
@@ -11079,6 +11491,12 @@ mod tests {
             "allocation failed: {allocated}"
         );
         let assignment_id = allocated["assignment"]["id"].as_str().unwrap();
+        let snapshot = FakeInventory.inventory("default").await.unwrap();
+        seed_inventory_workers(
+            &temp.path().join("yard.sqlite3"),
+            &snapshot,
+            &["terminal-yard-allocat-b3e512e61b8af4f5"],
+        );
 
         let inventory = app
             .clone()
@@ -11998,10 +12416,13 @@ mod tests {
             .unwrap()
             .node;
         let source = Arc::new(FakeInventory);
-        store
-            .reconcile_runtime_inventory(source.inventory("yard-coordination").await.unwrap())
-            .await
-            .unwrap();
+        let snapshot = source.inventory("yard-coordination").await.unwrap();
+        seed_inventory_workers(
+            &temp.path().join("yard.sqlite3"),
+            &snapshot,
+            &["terminal-1"],
+        );
+        store.reconcile_runtime_inventory(snapshot).await.unwrap();
         let candidate = store
             .list_worker_candidates()
             .await
@@ -12313,6 +12734,12 @@ mod tests {
             artifacts,
         );
         let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let snapshot = source.inventory("default").await.unwrap();
+        seed_inventory_workers(
+            &temp.path().join("yard.sqlite3"),
+            &snapshot,
+            &["terminal-yard-allocat-b3e512e61b8af4f5"],
+        );
 
         let inventory_response = app
             .clone()

@@ -9747,8 +9747,7 @@ fn reconcile_runtime_inventory(
         return Ok(result);
     }
 
-    let profile_allocation_reserved_workers =
-        reconcile_stale_profile_allocations(transaction, inventory)?;
+    reconcile_stale_profile_allocations(transaction, inventory)?;
     let bindings = select_runtime_bindings(transaction, &inventory.adapter, &inventory.session)?;
     let bound_terminals: HashMap<&str, &str> = bindings
         .iter()
@@ -9759,28 +9758,11 @@ fn reconcile_runtime_inventory(
             )
         })
         .collect();
-    let mut accounted_workers = HashSet::new();
-    let mut accounted_panes = HashSet::new();
-    let unknown_adoption_blocked =
-        pending_provisioning_adoption_fence(transaction, &inventory.adapter, &inventory.session)?;
-
     for binding in &bindings {
-        let next = resolve_running_worker(
-            binding,
-            &bindings,
-            inventory,
-            &bound_terminals,
-            &mut accounted_workers,
-        )
-        .unwrap_or_else(|| {
-            resolve_exited_or_missing(
-                binding,
-                &bindings,
-                inventory,
-                &bound_terminals,
-                &mut accounted_panes,
-            )
-        });
+        let next = resolve_running_worker(binding, &bindings, inventory, &bound_terminals)
+            .unwrap_or_else(|| {
+                resolve_exited_or_missing(binding, &bindings, inventory, &bound_terminals)
+            });
         update_reconciliation_counts(&mut result, &next);
         if persist_reconciled_binding(transaction, binding, &next, inventory.observed_at_unix_ms)? {
             result.updated_bindings += 1;
@@ -9790,19 +9772,7 @@ fn reconcile_runtime_inventory(
     for worker in &inventory.workers {
         if adopt_claimed_dedicated_runtime(transaction, inventory, worker)? {
             result.adopted_workers += 1;
-            continue;
         }
-        if accounted_workers.contains(&worker.terminal_id)
-            || accounted_panes.contains(&worker.terminal_id)
-            || bound_terminals.contains_key(worker.terminal_id.as_str())
-            || profile_allocation_reserved_workers.contains(&worker.terminal_id)
-            || unknown_adoption_blocked
-            || runtime_identity_is_reserved(transaction, inventory, worker)?
-        {
-            continue;
-        }
-        adopt_observed_worker(transaction, inventory, worker)?;
-        result.adopted_workers += 1;
     }
 
     persist_reconciliation_watermark(transaction, inventory)?;
@@ -10245,42 +10215,6 @@ fn upsert_quarantined_profile_runtime(
     Ok(())
 }
 
-fn pending_provisioning_adoption_fence(
-    connection: &Connection,
-    adapter: &str,
-    session: &str,
-) -> Result<bool, ProjectStoreError> {
-    connection
-        .query_row(
-            "SELECT EXISTS (
-                SELECT 1
-                  FROM provisioning_runtime_claims claim
-                  JOIN command_acknowledgements command
-                    ON command.id = claim.command_id
-                 WHERE claim.adapter = ?1
-                   AND claim.runtime_session = ?2
-                   AND command.status = 'pending'
-                UNION ALL
-                SELECT 1
-                  FROM dedicated_runtime_provision_intents intent
-                  JOIN command_acknowledgements command
-                    ON command.id = intent.command_id
-                 WHERE ?1 = 'herdr'
-                   AND command.status = 'pending'
-                   AND (
-                       (intent.kind = 'yard_orchestrator'
-                        AND ?2 = 'yard-orchestrator')
-                       OR
-                       (intent.kind = 'coordination_node'
-                        AND ?2 = 'yard-coordination')
-                   )
-            )",
-            params![adapter, session],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(Into::into)
-}
-
 fn adopt_claimed_dedicated_runtime(
     transaction: &Transaction<'_>,
     inventory: &RuntimeInventory,
@@ -10401,102 +10335,6 @@ fn dedicated_runtime_binding_from_observation(
     }
 }
 
-fn runtime_identity_is_reserved(
-    transaction: &Transaction<'_>,
-    inventory: &RuntimeInventory,
-    worker: &ObservedWorker,
-) -> Result<bool, ProjectStoreError> {
-    let provider = worker.provider_session.as_ref();
-    let observed_runtime = profile_allocation_runtime_from_observation(inventory, worker);
-    if runtime_identity_has_authoritative_binding(transaction, &observed_runtime)? {
-        return Ok(true);
-    }
-    if runtime_identity_is_provisioning_claimed(
-        transaction,
-        &inventory.adapter,
-        &inventory.session,
-        &worker.terminal_id,
-        provider,
-    )? || runtime_identity_is_quarantined(
-        transaction,
-        &inventory.adapter,
-        &inventory.session,
-        &worker.terminal_id,
-        provider,
-    )? {
-        return Ok(true);
-    }
-    let reserved = transaction
-        .query_row(
-            "SELECT
-                EXISTS (
-                    SELECT 1
-                      FROM retired_runtime_bindings rrb
-                     WHERE rrb.adapter = ?1
-                       AND rrb.runtime_session = ?2
-                       AND (
-                           rrb.terminal_id = ?3
-                           OR (
-                               ?4 IS NOT NULL
-                               AND rrb.provider_session_source = ?4
-                               AND rrb.provider_session_provider = ?5
-                               AND rrb.provider_session_kind = ?6
-                               AND rrb.provider_session_value = ?7
-                           )
-                       )
-                )
-                OR EXISTS (
-                    SELECT 1
-                      FROM worker_handoff_commands whc
-                     WHERE whc.finished_at_unix_ms IS NULL
-                       AND whc.target_runtime_adapter = ?1
-                       AND whc.target_runtime_session = ?2
-                       AND (
-                           whc.target_terminal_id = ?3
-                           OR (
-                               ?4 IS NOT NULL
-                               AND whc.target_provider_session_source = ?4
-                               AND whc.target_provider_session_provider = ?5
-                               AND whc.target_provider_session_kind = ?6
-                               AND whc.target_provider_session_value = ?7
-                           )
-                       )
-                )
-                OR EXISTS (
-                    SELECT 1
-                      FROM runtime_cleanup_jobs cleanup
-                     WHERE cleanup.status = 'pending'
-                       AND cleanup.adapter = ?1
-                       AND cleanup.runtime_session = ?2
-                       AND (
-                           cleanup.terminal_id = ?3
-                           OR (
-                               ?4 IS NOT NULL
-                               AND cleanup.provider_session_source = ?4
-                               AND cleanup.provider_session_provider = ?5
-                               AND cleanup.provider_session_kind = ?6
-                               AND cleanup.provider_session_value = ?7
-                           )
-                       )
-                )",
-            params![
-                inventory.adapter,
-                inventory.session,
-                worker.terminal_id,
-                provider.map(|session| session.source.as_str()),
-                provider.map(|session| session.provider.as_str()),
-                provider.map(|session| session.kind.as_str()),
-                provider.map(|session| session.value.as_str()),
-            ],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(ProjectStoreError::from)?;
-    if reserved {
-        return Ok(true);
-    }
-    orchestrator_replacement_identity_is_reserved(transaction, inventory, worker)
-}
-
 fn runtime_identity_is_provisioning_claimed(
     connection: &Connection,
     adapter: &str,
@@ -10612,63 +10450,6 @@ fn runtime_identity_has_authoritative_binding(
         .map_err(Into::into)
 }
 
-fn orchestrator_replacement_identity_is_reserved(
-    transaction: &Transaction<'_>,
-    inventory: &RuntimeInventory,
-    worker: &ObservedWorker,
-) -> Result<bool, ProjectStoreError> {
-    let provider = worker.provider_session.as_ref();
-    transaction
-        .query_row(
-            "SELECT EXISTS (
-                SELECT 1
-                  FROM orchestrator_replacement_runtime_bindings snapshot
-                  JOIN command_acknowledgements command
-                    ON command.id = snapshot.command_id
-                 WHERE (
-                       command.status = 'pending'
-                       OR (
-                           command.status = 'ambiguous'
-                           AND (
-                               snapshot.recovery_outcome IS NULL
-                               OR snapshot.recovery_outcome IN (
-                                   'conflicting_reused',
-                                   'present_not_safely_retirable'
-                               )
-                           )
-                       )
-                   )
-                   AND snapshot.binding_role IN (
-                       'replacement_prepared',
-                       'replacement_started'
-                   )
-                   AND snapshot.adapter = ?1
-                   AND snapshot.runtime_session = ?2
-                   AND (
-                       snapshot.terminal_id = ?3
-                       OR (
-                           ?4 IS NOT NULL
-                           AND snapshot.provider_session_source = ?4
-                           AND snapshot.provider_session_provider = ?5
-                           AND snapshot.provider_session_kind = ?6
-                           AND snapshot.provider_session_value = ?7
-                       )
-                   )
-            )",
-            params![
-                inventory.adapter,
-                inventory.session,
-                worker.terminal_id,
-                provider.map(|session| session.source.as_str()),
-                provider.map(|session| session.provider.as_str()),
-                provider.map(|session| session.kind.as_str()),
-                provider.map(|session| session.value.as_str()),
-            ],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(Into::into)
-}
-
 fn empty_reconciliation(inventory: &RuntimeInventory) -> RuntimeReconciliation {
     RuntimeReconciliation {
         adapter: inventory.adapter.clone(),
@@ -10724,14 +10505,12 @@ fn resolve_running_worker(
     bindings: &[StoredRuntimeBinding],
     inventory: &RuntimeInventory,
     bound_terminals: &HashMap<&str, &str>,
-    accounted_workers: &mut HashSet<String>,
 ) -> Option<WorkerRuntimeBinding> {
     if let Some(worker) = inventory
         .workers
         .iter()
         .find(|worker| worker.terminal_id == binding.runtime.terminal_id)
     {
-        accounted_workers.insert(worker.terminal_id.clone());
         return Some(if worker_conflicts(binding, worker) {
             ambiguous_runtime(binding)
         } else {
@@ -10747,9 +10526,6 @@ fn resolve_running_worker(
             .collect::<Vec<_>>();
         if topology_workers.is_empty() {
             return None;
-        }
-        for worker in &topology_workers {
-            accounted_workers.insert(worker.terminal_id.clone());
         }
         if topology_workers.len() != 1 || !topology_binding_is_unique(bindings, binding) {
             return Some(ambiguous_runtime(binding));
@@ -10774,9 +10550,6 @@ fn resolve_running_worker(
     if provider_workers.is_empty() {
         return None;
     }
-    for worker in &provider_workers {
-        accounted_workers.insert(worker.terminal_id.clone());
-    }
     if provider_workers.len() != 1 || !provider_binding_is_unique(bindings, provider_session) {
         return Some(ambiguous_runtime(binding));
     }
@@ -10799,14 +10572,12 @@ fn resolve_exited_or_missing(
     bindings: &[StoredRuntimeBinding],
     inventory: &RuntimeInventory,
     bound_terminals: &HashMap<&str, &str>,
-    accounted_panes: &mut HashSet<String>,
 ) -> WorkerRuntimeBinding {
     if let Some(pane) = inventory
         .panes
         .iter()
         .find(|pane| pane.terminal_id == binding.runtime.terminal_id)
     {
-        accounted_panes.insert(pane.terminal_id.clone());
         return if pane_conflicts(binding, pane, bound_terminals) {
             ambiguous_runtime(binding)
         } else {
@@ -10820,9 +10591,6 @@ fn resolve_exited_or_missing(
             .iter()
             .filter(|pane| pane_matches_stable_topology(binding, pane))
             .collect::<Vec<_>>();
-        for pane in &topology_panes {
-            accounted_panes.insert(pane.terminal_id.clone());
-        }
         if topology_panes.is_empty() {
             return missing_runtime(binding);
         }
@@ -10841,9 +10609,6 @@ fn resolve_exited_or_missing(
         .iter()
         .filter(|pane| pane.provider_session.as_ref() == Some(provider_session))
         .collect::<Vec<_>>();
-    for pane in &provider_panes {
-        accounted_panes.insert(pane.terminal_id.clone());
-    }
     if provider_panes.is_empty() {
         return missing_runtime(binding);
     }
@@ -11258,49 +11023,6 @@ fn reconciliation_event_type(
         ) => "runtime_binding_restored",
         _ => "runtime_binding_reconciled",
     }
-}
-
-fn adopt_observed_worker(
-    transaction: &Transaction<'_>,
-    inventory: &RuntimeInventory,
-    worker: &ObservedWorker,
-) -> Result<(), ProjectStoreError> {
-    let worker_id = Uuid::now_v7().to_string();
-    let now = inventory.observed_at_unix_ms;
-    transaction.execute(
-        "INSERT INTO workers (
-            id, profile_id, profile_version, desired_state, version,
-            created_at_unix_ms, updated_at_unix_ms
-         ) VALUES (?1, NULL, NULL, 'running', 1, ?2, ?2)",
-        params![worker_id, to_i64(now)?],
-    )?;
-    let runtime = WorkerRuntimeBinding {
-        adapter: inventory.adapter.clone(),
-        session: inventory.session.clone(),
-        workspace_id: worker.workspace_id.clone(),
-        terminal_id: worker.terminal_id.clone(),
-        tab_id: Some(worker.tab_id.clone()),
-        pane_id: worker.pane_id.clone(),
-        provider_session: worker.provider_session.clone(),
-        owns_tab: false,
-        observation_state: RuntimeObservationState::Observed,
-        process_state: RuntimeProcessState::Running,
-        status: worker.status,
-        state_change_sequence: worker.state_change_sequence,
-        revision: worker.revision,
-        version: 1,
-        last_observed_at_unix_ms: now,
-    };
-    insert_worker_runtime_binding(transaction, &worker_id, &runtime, now)?;
-    insert_lifecycle_event(
-        transaction,
-        "worker",
-        &worker_id,
-        1,
-        "runtime_worker_adopted",
-        "herdr",
-        now,
-    )
 }
 
 const PROJECT_SELECT: &str = "
@@ -20000,23 +19722,102 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::unused_async,
+        reason = "keeps asynchronous fixture call sites uniform"
+    )]
+    async fn seed_unassigned_worker(
+        store: &SqliteProjectStore,
+        observed_at_unix_ms: u64,
+        terminal_id: &str,
+        workspace_id: &str,
+        tab_id: &str,
+        pane_id: &str,
+        provider_session: Option<ProviderSessionRef>,
+    ) {
+        let observed =
+            observed_worker(terminal_id, workspace_id, tab_id, pane_id, provider_session);
+        let snapshot = inventory(observed_at_unix_ms, Vec::new(), Vec::new());
+        let runtime =
+            super::dedicated_runtime_binding_from_observation(&snapshot, &observed, false);
+        let worker_id = Uuid::now_v7().to_string();
+        {
+            let mut connection = store
+                .connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO workers (
+                        id, profile_id, profile_version, desired_state, version,
+                        created_at_unix_ms, updated_at_unix_ms
+                     ) VALUES (?1, NULL, NULL, 'running', 1, ?2, ?2)",
+                    params![worker_id, super::to_i64(observed_at_unix_ms).unwrap()],
+                )
+                .unwrap();
+            insert_worker_runtime_binding(&transaction, &worker_id, &runtime, observed_at_unix_ms)
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+    }
+
     async fn configure_yard_orchestrator_for_routes(
         store: &SqliteProjectStore,
     ) -> YardOrchestrator {
-        store
-            .reconcile_runtime_inventory(inventory(
-                30,
-                vec![observed_worker(
-                    "terminal-yard-routes",
-                    "workspace-yard-routes",
-                    "tab-yard-routes",
-                    "pane-yard-routes",
-                    Some(provider_session("session-yard-routes")),
-                )],
-                Vec::new(),
-            ))
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Route orchestrator"),
+            })
             .await
             .unwrap();
+        let current = store.get_yard_orchestrator().await.unwrap();
+        let command = ProvisionYardOrchestrator {
+            command_id: "configure-yard-for-routes".to_owned(),
+            actor: "local-user".to_owned(),
+            profile_id: profile.id,
+            expected_profile_version: profile.version,
+            expected_orchestrator_version: current.version,
+        };
+        store
+            .begin_yard_orchestrator_runtime_provision(command.clone())
+            .await
+            .unwrap();
+        let observed = observed_worker(
+            "terminal-yard-routes",
+            "workspace-yard-routes",
+            "tab-yard-routes",
+            "pane-yard-routes",
+            Some(provider_session("session-yard-routes")),
+        );
+        let runtime = WorkerRuntimeBinding {
+            adapter: "herdr".to_owned(),
+            session: "yard-orchestrator".to_owned(),
+            workspace_id: observed.workspace_id.clone(),
+            terminal_id: observed.terminal_id.clone(),
+            tab_id: Some(observed.tab_id.clone()),
+            pane_id: observed.pane_id.clone(),
+            provider_session: observed.provider_session.clone(),
+            owns_tab: false,
+            observation_state: RuntimeObservationState::Observed,
+            process_state: RuntimeProcessState::Running,
+            status: observed.status,
+            state_change_sequence: observed.state_change_sequence,
+            revision: observed.revision,
+            version: 1,
+            last_observed_at_unix_ms: 30,
+        };
+        store
+            .claim_provisioning_runtime(&command.command_id, runtime.clone())
+            .await
+            .unwrap();
+        store
+            .confirm_dedicated_runtime_provision(&command.command_id, runtime)
+            .await
+            .unwrap();
+        let mut snapshot = inventory(30, vec![observed], Vec::new());
+        snapshot.session = "yard-orchestrator".to_owned();
+        store.reconcile_runtime_inventory(snapshot).await.unwrap();
         let candidate = store
             .list_worker_candidates()
             .await
@@ -20031,14 +19832,13 @@ mod tests {
                     .is_some_and(|runtime| runtime.terminal_id == "terminal-yard-routes")
             })
             .unwrap();
-        let current = store.get_yard_orchestrator().await.unwrap();
         store
             .configure_yard_orchestrator(ConfigureYardOrchestrator {
-                command_id: "configure-yard-for-routes".to_owned(),
-                actor: "local-user".to_owned(),
+                command_id: command.command_id,
+                actor: command.actor,
                 worker_id: candidate.worker.id,
                 expected_worker_version: candidate.worker.version,
-                expected_orchestrator_version: current.version,
+                expected_orchestrator_version: command.expected_orchestrator_version,
                 workflow_profile_version: None,
             })
             .await
@@ -20935,6 +20735,16 @@ mod tests {
             .unwrap()
             .node;
         let displaced = project.orchestrator.runtime.as_ref().unwrap();
+        seed_unassigned_worker(
+            &store,
+            displaced.last_observed_at_unix_ms + 1,
+            "route-recovery-coordination-terminal",
+            "route-recovery-coordination-workspace",
+            "route-recovery-coordination-tab",
+            "route-recovery-coordination-pane",
+            Some(provider_session("route-recovery-coordination-provider")),
+        )
+        .await;
         store
             .reconcile_runtime_inventory(inventory(
                 displaced.last_observed_at_unix_ms + 1,
@@ -23109,16 +22919,20 @@ mod tests {
             })
             .await
             .unwrap();
+        let mut central_command = profile_project_command(
+            &profile,
+            "workspace-yard-routes",
+            "create-project-in-central",
+        );
+        central_command.runtime.session = "yard-orchestrator".to_owned();
         let begin_error = central_store
-            .begin_profile_project_creation(profile_project_command(
-                &profile,
-                "workspace-yard-routes",
-                "create-project-in-central",
-            ))
+            .begin_profile_project_creation(central_command)
             .await
             .unwrap_err();
-        let (central_project, central_runtime) =
+        let (mut central_project, mut central_runtime) =
             draft("workspace-yard-routes", "central-project-terminal");
+        central_project.runtime.session = "yard-orchestrator".to_owned();
+        central_runtime.session = "yard-orchestrator".to_owned();
         let adoption_error = central_store
             .create_project(central_project, central_runtime)
             .await
@@ -23132,7 +22946,7 @@ mod tests {
             ProjectStoreError::RuntimeWorkspaceReserved
         ));
         let central_topology = central_store
-            .runtime_topology("herdr", "default")
+            .runtime_topology("herdr", "yard-orchestrator")
             .await
             .unwrap();
         assert_eq!(
@@ -23169,6 +22983,16 @@ mod tests {
             .await
             .unwrap()
             .node;
+        seed_unassigned_worker(
+            &coordination_store,
+            30,
+            "coordination-terminal",
+            "coordination-workspace",
+            "coordination-tab",
+            "coordination-pane",
+            Some(provider_session("coordination-session")),
+        )
+        .await;
         coordination_store
             .reconcile_runtime_inventory(inventory(
                 30,
@@ -23372,6 +23196,16 @@ mod tests {
     async fn workspace_project_finalization_revalidates_central_reservation() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
+        seed_unassigned_worker(
+            &store,
+            30,
+            "future-central-terminal",
+            "finalize-race-workspace",
+            "future-central-tab",
+            "future-central-pane",
+            Some(provider_session("future-central-session")),
+        )
+        .await;
         store
             .reconcile_runtime_inventory(inventory(
                 30,
@@ -24290,7 +24124,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconciliation_adopts_unknown_worker_once_across_reopen() {
+    async fn reconciliation_leaves_unknown_worker_unassigned_across_reopen() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
         let snapshot = inventory(
@@ -24332,38 +24166,43 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(first.adopted_workers, 1);
+        assert_eq!(first.adopted_workers, 0);
         assert_eq!(second.adopted_workers, 0);
-        assert_eq!(worker_count, 1);
-        assert_eq!(binding_count, 1);
+        assert_eq!(worker_count, 0);
+        assert_eq!(binding_count, 0);
     }
 
     #[tokio::test]
-    async fn project_creation_reuses_unallocated_adopted_worker() {
+    async fn project_creation_explicitly_adopts_an_observed_worker() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
-        store
-            .reconcile_runtime_inventory(inventory(
-                20,
-                vec![observed_worker(
-                    "terminal-1",
-                    "workspace-1",
-                    "tab-1",
-                    "pane-1",
-                    Some(provider_session("session-1")),
-                )],
-                Vec::new(),
-            ))
-            .await
-            .unwrap();
-        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
-        let adopted_worker_id: String = connection
-            .query_row("SELECT id FROM workers", [], |row| row.get(0))
-            .unwrap();
-        drop(connection);
-        let (project_draft, mut orchestrator) = draft("workspace-1", "terminal-1");
-        orchestrator.last_observed_at_unix_ms = 21;
+        let snapshot = inventory(
+            20,
+            vec![observed_worker(
+                "terminal-1",
+                "workspace-1",
+                "tab-1",
+                "pane-1",
+                Some(provider_session("session-1")),
+            )],
+            Vec::new(),
+        );
+        let reconciliation = store.reconcile_runtime_inventory(snapshot).await.unwrap();
+        assert_eq!(reconciliation.adopted_workers, 0);
+        assert!(
+            store
+                .list_worker_candidates()
+                .await
+                .unwrap()
+                .workers
+                .is_empty()
+        );
 
+        let (project_draft, mut orchestrator) = draft("workspace-1", "terminal-1");
+        orchestrator.tab_id = Some("tab-1".to_owned());
+        orchestrator.pane_id = "pane-1".to_owned();
+        orchestrator.provider_session = Some(provider_session("session-1"));
+        orchestrator.last_observed_at_unix_ms = 20;
         let project = store
             .create_project(project_draft, orchestrator)
             .await
@@ -24378,7 +24217,10 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(project.orchestrator.id, adopted_worker_id);
+        assert_eq!(
+            project.orchestrator.runtime.unwrap().terminal_id,
+            "terminal-1"
+        );
         assert_eq!(worker_count, 1);
         assert_eq!(allocation_count, 1);
     }
@@ -25254,6 +25096,16 @@ mod tests {
             })
             .await
             .unwrap();
+        seed_unassigned_worker(
+            &store,
+            5,
+            "pinned-terminal",
+            "pinned-workspace",
+            "pinned-tab",
+            "pinned-pane",
+            Some(provider_session("pinned-session")),
+        )
+        .await;
         store
             .reconcile_runtime_inventory(inventory(
                 5,
@@ -28688,6 +28540,16 @@ mod tests {
         assert!(initial.worker.is_none());
         assert_eq!(initial.version, 1);
 
+        seed_unassigned_worker(
+            &store,
+            20,
+            "terminal-yard",
+            "workspace-yard",
+            "tab-yard",
+            "pane-yard",
+            Some(provider_session("session-yard")),
+        )
+        .await;
         store
             .reconcile_runtime_inventory(inventory(
                 20,
@@ -28819,6 +28681,16 @@ mod tests {
             .create_project(project_draft, orchestrator)
             .await
             .unwrap();
+        seed_unassigned_worker(
+            store,
+            20,
+            "terminal-candidate",
+            candidate_workspace_id,
+            "tab-candidate",
+            "pane-candidate",
+            Some(provider_session("session-candidate")),
+        )
+        .await;
         store
             .reconcile_runtime_inventory(inventory(
                 20,
@@ -29011,6 +28883,16 @@ mod tests {
             .unwrap();
         drop(connection);
         let displaced = replacement.expected_orchestrator_runtime;
+        seed_unassigned_worker(
+            &store,
+            displaced.last_observed_at_unix_ms + 1,
+            "terminal-transfer-active-candidate",
+            &displaced.workspace_id,
+            "tab-transfer-active-candidate",
+            "pane-transfer-active-candidate",
+            Some(provider_session("session-transfer-active-candidate")),
+        )
+        .await;
         store
             .reconcile_runtime_inventory(inventory(
                 displaced.last_observed_at_unix_ms + 1,
@@ -29297,6 +29179,16 @@ mod tests {
             .create_project(project_draft, orchestrator)
             .await
             .unwrap();
+        seed_unassigned_worker(
+            &store,
+            20,
+            "terminal-live",
+            "workspace-1",
+            "tab-live",
+            "pane-live",
+            Some(provider_session("session-live")),
+        )
+        .await;
         store
             .reconcile_runtime_inventory(inventory(
                 20,
@@ -29584,6 +29476,56 @@ mod tests {
             })
             .await
             .unwrap();
+        seed_unassigned_worker(
+            &store,
+            20,
+            "terminal-assigned",
+            "workspace-1",
+            "tab-assigned",
+            "pane-assigned",
+            Some(provider_session("session-assigned")),
+        )
+        .await;
+        seed_unassigned_worker(
+            &store,
+            20,
+            "terminal-live",
+            "workspace-live",
+            "tab-live",
+            "pane-live",
+            Some(provider_session("session-live")),
+        )
+        .await;
+        seed_unassigned_worker(
+            &store,
+            20,
+            "terminal-resumable",
+            "workspace-resumable",
+            "tab-resumable",
+            "pane-resumable",
+            Some(provider_session("session-resumable")),
+        )
+        .await;
+        seed_unassigned_worker(
+            &store,
+            20,
+            "terminal-live-without-provider-session",
+            "workspace-live-without-provider-session",
+            "tab-live-without-provider-session",
+            "pane-live-without-provider-session",
+            None,
+        )
+        .await;
+        seed_unassigned_worker(
+            &store,
+            20,
+            "terminal-ambiguous",
+            "workspace-ambiguous",
+            "tab-ambiguous",
+            "pane-ambiguous",
+            Some(provider_session("session-ambiguous")),
+        )
+        .await;
         store
             .reconcile_runtime_inventory(inventory(
                 20,
@@ -30281,6 +30223,16 @@ mod tests {
             })
             .await
             .unwrap();
+        seed_unassigned_worker(
+            &store,
+            20,
+            "terminal-ambiguous-delivery",
+            "workspace-1",
+            "tab-ambiguous-delivery",
+            "pane-ambiguous-delivery",
+            Some(provider_session("session-ambiguous-delivery")),
+        )
+        .await;
         store
             .reconcile_runtime_inventory(inventory(
                 20,
@@ -30365,6 +30317,16 @@ mod tests {
             })
             .await
             .unwrap();
+        seed_unassigned_worker(
+            &store,
+            20,
+            "terminal-concurrent",
+            "workspace-1",
+            "tab-concurrent",
+            "pane-concurrent",
+            Some(provider_session("session-concurrent")),
+        )
+        .await;
         store
             .reconcile_runtime_inventory(inventory(
                 20,
@@ -30663,6 +30625,16 @@ mod tests {
             ProjectStoreError::OrchestratorInterventionInProgress
         ));
 
+        seed_unassigned_worker(
+            &store,
+            30,
+            "terminal-yard-replacement",
+            "workspace-yard-replacement",
+            "tab-yard-replacement",
+            "pane-yard-replacement",
+            Some(provider_session("session-yard-replacement")),
+        )
+        .await;
         store
             .reconcile_runtime_inventory(inventory(
                 30,
@@ -31126,6 +31098,16 @@ mod tests {
             })
             .await
             .unwrap();
+        seed_unassigned_worker(
+            &store,
+            50,
+            "coordination-terminal",
+            "coordination-workspace",
+            "coordination-tab",
+            "coordination-pane",
+            Some(provider_session("coordination-session")),
+        )
+        .await;
         store
             .reconcile_runtime_inventory(inventory(
                 50,
@@ -31259,6 +31241,16 @@ mod tests {
             workflow_profile.id,
             target_project.workflow_profile.profile_id
         );
+        seed_unassigned_worker(
+            &store,
+            60,
+            "route-transfer-candidate",
+            "route-project",
+            "route-transfer-tab",
+            "route-transfer-pane",
+            Some(provider_session("route-transfer-session")),
+        )
+        .await;
         store
             .reconcile_runtime_inventory(inventory(
                 60,
@@ -31721,6 +31713,16 @@ mod tests {
         command_id: &str,
     ) -> (String, u64) {
         let observed_at_unix_ms = super::unix_time_ms().unwrap();
+        seed_unassigned_worker(
+            store,
+            observed_at_unix_ms,
+            terminal_id,
+            workspace_id,
+            &format!("{workspace_id}-tab"),
+            &format!("{workspace_id}-pane"),
+            Some(provider_session(&format!("{workspace_id}-session"))),
+        )
+        .await;
         store
             .reconcile_runtime_inventory(inventory(
                 observed_at_unix_ms,
@@ -31810,6 +31812,16 @@ mod tests {
             )
             .await
             .unwrap();
+        seed_unassigned_worker(
+            &store,
+            30,
+            "wA:t1",
+            "wA",
+            "wA:tab-1",
+            "wA:pane-1",
+            Some(provider_session("central-session")),
+        )
+        .await;
         store
             .reconcile_runtime_inventory(inventory(
                 30,
@@ -31992,6 +32004,16 @@ mod tests {
     async fn deleting_worker_requires_an_ended_session_and_hides_history() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
+        seed_unassigned_worker(
+            &store,
+            50,
+            "delete-worker-terminal",
+            "delete-worker-workspace",
+            "delete-worker-tab",
+            "delete-worker-pane",
+            Some(provider_session("delete-worker-session")),
+        )
+        .await;
         store
             .reconcile_runtime_inventory(inventory(
                 50,

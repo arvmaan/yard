@@ -59,7 +59,7 @@ import {
   fetchAutomationRuns,
   fetchAutomations,
   fetchInventory,
-  fetchRuntimeTopology,
+  fetchRuntimeLens,
   fetchCoordinationNodeRoutes,
   fetchCoordinationNodes,
   fetchCoordinationSnapshots,
@@ -219,6 +219,7 @@ import type {
   Project,
   ProjectRelationship,
   RuntimeInventory,
+  RuntimeLensEntry,
   RuntimeObservationState,
   RuntimeProcessState,
   RuntimeSession,
@@ -2333,6 +2334,7 @@ function App() {
   const [selectedSession, setSelectedSession] = useState('')
   const [inventory, setInventory] = useState<RuntimeInventory | null>(null)
   const [inventoryCurrent, setInventoryCurrent] = useState(false)
+  const [lensEntries, setLensEntries] = useState<RuntimeLensEntry[]>([])
   const [runtimeTopology, setRuntimeTopology] =
     useState<RuntimeTopology | null>(null)
   const [projectTransferContexts, setProjectTransferContexts] = useState<
@@ -2692,6 +2694,7 @@ function App() {
         setInventory(null)
         setInventoryCurrent(false)
         setRuntimeTopology(null)
+        setLensEntries([])
         return
       }
       if (!background) {
@@ -2703,6 +2706,7 @@ function App() {
         setRuntimeTopology((current) =>
           current?.session === session ? current : null,
         )
+        setLensEntries([])
         setSelection((current) =>
           current?.kind === 'project' ||
           current?.kind === 'orchestrator' ||
@@ -2718,17 +2722,19 @@ function App() {
         )
       }
       try {
-        const result = await fetchInventory(session, signal)
-        setInventory((current) => reconcileInventorySnapshot(current, result))
-        setInventoryCurrent(true)
+        const lens = await fetchRuntimeLens(session, signal)
+        setInventory((current) =>
+          reconcileInventorySnapshot(current, lens.inventory),
+        )
+        setRuntimeTopology(lens.topology)
+        setWorkerCandidates((current) =>
+          reconcileRuntimeProjectionSnapshot(current, lens.workers.workers),
+        )
+        setLensEntries(lens.entries)
+        setInventoryCurrent(lens.snapshot_current)
         setRuntimeError(null)
         try {
-          const topology = await fetchRuntimeTopology(session, signal)
-          setRuntimeTopology(topology)
-          await Promise.all([
-            loadWorkers(signal),
-            loadYardOrchestrator(signal),
-          ])
+          await loadYardOrchestrator(signal)
         } catch (caught) {
           if (caught instanceof DOMException && caught.name === 'AbortError') {
             return
@@ -2736,7 +2742,7 @@ function App() {
           setRuntimeError(
             caught instanceof Error
               ? caught.message
-              : 'Runtime projection refresh failed',
+              : 'Yard orchestrator refresh failed',
           )
         }
       } catch (caught) {
@@ -2745,13 +2751,15 @@ function App() {
         }
         setInventoryCurrent(false)
         setRuntimeError(
-          caught instanceof Error ? caught.message : 'Inventory request failed',
+          caught instanceof Error
+            ? caught.message
+            : 'Runtime lens request failed',
         )
       } finally {
         if (!background && !signal?.aborted) setRuntimeLoading(false)
       }
     },
-    [loadWorkers, loadYardOrchestrator],
+    [loadYardOrchestrator],
   )
 
   const writeProjectTransferContext = useCallback(
@@ -2920,7 +2928,6 @@ function App() {
       loadTokenSpendSettings(controller.signal),
       loadOrchestratorWorkflowProfile(controller.signal),
       loadProfiles(controller.signal),
-      loadWorkers(controller.signal),
     ])
       .catch((caught: unknown) => {
         if (caught instanceof DOMException && caught.name === 'AbortError') {
@@ -2941,7 +2948,6 @@ function App() {
     loadTokenSpendSettings,
     loadProfiles,
     loadProjects,
-    loadWorkers,
     loadYardOrchestrator,
   ])
 
@@ -6314,7 +6320,9 @@ function App() {
           presentation={terminalPresentation}
           inventory={inventory}
           inventoryCurrent={inventoryCurrent}
+          lensEntries={lensEntries}
           projects={projects}
+          selectedSession={selectedSession}
           sessions={sessions}
           targets={agentWorkspaceTargets}
           yardRoutes={yardOrchestratorRoutes}

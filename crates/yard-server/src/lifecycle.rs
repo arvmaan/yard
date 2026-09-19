@@ -663,6 +663,24 @@ pub(crate) async fn stop() -> Result<ExitCode, LifecycleError> {
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn request_managed_stop(paths: &RuntimePaths) -> Result<(), LifecycleError> {
+    let ManagedState::Active { metadata, state } = inspect(paths, false).await? else {
+        return Err(LifecycleError::ControlConflict(
+            "the test server has not published lifecycle metadata".to_owned(),
+        ));
+    };
+    if metadata.mode != InstanceMode::Managed {
+        return Err(LifecycleError::ForegroundStopRefused);
+    }
+    if state == InstanceState::Running {
+        request(paths, &metadata, ControlCommand::Stop)
+            .await
+            .map_err(control_error)?;
+    }
+    Ok(())
+}
+
 fn spawn_daemon(paths: &RuntimePaths, instance_id: &str) -> Result<Child, LifecycleError> {
     let stdout = paths.open_log()?;
     let stderr = stdout

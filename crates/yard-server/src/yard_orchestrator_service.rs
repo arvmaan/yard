@@ -25,6 +25,7 @@ use crate::{
         validate_supported_profile,
     },
     intervention_service::{RuntimeIntervention, RuntimeInterventionError, RuntimePromptRequest},
+    inventory_service::runtime_binding_from_observed_worker,
     reconciliation_service::{ReconciliationService, ReconciliationServiceError},
     status_protocol::{
         validate_executable_orchestrator_workflow, with_orchestrator_status_contract,
@@ -97,6 +98,7 @@ impl YardOrchestratorService {
     /// Returns [`YardOrchestratorServiceError`] for invalid or stale commands,
     /// unsupported profiles, Herdr failures, missing reconciled identities, or
     /// persistence failures.
+    #[allow(clippy::too_many_lines, reason = "linear guarded provisioning flow")]
     pub async fn provision(
         &self,
         command: ProvisionYardOrchestrator,
@@ -146,17 +148,52 @@ impl YardOrchestratorService {
         }
 
         let observed = observed.ok_or(YardOrchestratorServiceError::RuntimeBindingUnverified)?;
-        let candidates = self.store.list_worker_candidates().await?;
+        let mut candidates = self.store.list_worker_candidates().await?;
+        let has_candidate = |candidate: &yard_domain::WorkerCandidate| {
+            candidate.worker.runtime.as_ref().is_some_and(|runtime| {
+                runtime.adapter == "herdr"
+                    && runtime.session == YARD_ORCHESTRATOR_SESSION
+                    && runtime.terminal_id == observed.terminal_id
+            })
+        };
+        if !bootstrapped
+            && current.worker.is_none()
+            && !candidates.workers.iter().any(has_candidate)
+        {
+            let runtime = runtime_binding_from_observed_worker(&inventory, &observed, false);
+            if let Err(error) = self
+                .store
+                .claim_provisioning_runtime(&command.command_id, runtime.clone())
+                .await
+            {
+                self.store
+                    .fail_dedicated_runtime_provision(&command.command_id, &error.to_string(), true)
+                    .await?;
+                return Err(YardOrchestratorServiceError::RuntimeProvisionAmbiguous(
+                    error.to_string(),
+                ));
+            }
+            if let Err(error) = self
+                .store
+                .confirm_dedicated_runtime_provision(&command.command_id, runtime)
+                .await
+            {
+                self.store
+                    .fail_dedicated_runtime_provision(&command.command_id, &error.to_string(), true)
+                    .await?;
+                return Err(YardOrchestratorServiceError::RuntimeProvisionAmbiguous(
+                    error.to_string(),
+                ));
+            }
+            self.reconciliation
+                .refresh(YARD_ORCHESTRATOR_SESSION)
+                .await?;
+            candidates = self.store.list_worker_candidates().await?;
+        }
         let candidate = candidates
             .workers
             .into_iter()
-            .find(|candidate| {
-                candidate.worker.runtime.as_ref().is_some_and(|runtime| {
-                    runtime.adapter == "herdr"
-                        && runtime.session == YARD_ORCHESTRATOR_SESSION
-                        && runtime.terminal_id == observed.terminal_id
-                })
-            })
+            .find(has_candidate)
             .ok_or(YardOrchestratorServiceError::ReconciledWorkerMissing)?;
         if !matches!(
             candidate.availability,

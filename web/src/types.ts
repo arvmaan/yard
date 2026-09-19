@@ -170,6 +170,48 @@ export interface RuntimeTopology {
   managed_workspaces: ManagedRuntimeWorkspace[]
 }
 
+export type RuntimeLensClassification =
+  | 'linked_yard_worker'
+  | 'unassigned_herdr_agent'
+  | 'topology_only_shell_pane'
+  | 'stale_missing_binding'
+  | 'ambiguous_identity'
+
+export interface RuntimeLensEntry {
+  classification: RuntimeLensClassification
+  session: string
+  workspace_id: string
+  tab_id: string | null
+  pane_id: string
+  terminal_id: string
+  observed_at_unix_ms: string
+  binding_last_observed_at_unix_ms: string | null
+  snapshot_current: boolean
+  reason: string
+  worker_id: string | null
+  profile_name: string | null
+  availability: WorkerAvailability | null
+  provider: string | null
+  display_provider: string | null
+  name: string | null
+  label: string | null
+  status: ObservedStatus
+  focused: boolean
+  launch_pending: boolean
+  interactive_ready: boolean
+}
+
+export interface RuntimeLens {
+  adapter: string
+  selected_session: string
+  snapshot_current: boolean
+  observed_at_unix_ms: string
+  inventory: RuntimeInventory
+  topology: RuntimeTopology
+  workers: WorkerCandidates
+  entries: RuntimeLensEntry[]
+}
+
 export interface CanvasPlacement {
   x: number
   y: number

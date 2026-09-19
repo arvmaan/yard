@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use thiserror::Error;
-use yard_domain::{RuntimeInventory, RuntimeSessions};
+use yard_domain::{
+    ObservedWorker, RuntimeInventory, RuntimeObservationState, RuntimeProcessState,
+    RuntimeSessions, WorkerRuntimeBinding,
+};
 use yard_herdr::{
     BootstrapAgentRequest, HerdrAdapter, HerdrControlError, HerdrError, HerdrTerminal,
     HerdrTerminalError, OpenTerminalRequest as HerdrOpenTerminalRequest, PrepareAgentRequest,
@@ -39,6 +42,100 @@ pub trait InventorySource: Send + Sync {
         &self,
         session_name: &str,
     ) -> Result<RuntimeInventory, InventoryServiceError>;
+}
+
+pub(crate) fn runtime_binding_from_observed_worker(
+    inventory: &RuntimeInventory,
+    worker: &ObservedWorker,
+    owns_tab: bool,
+) -> WorkerRuntimeBinding {
+    WorkerRuntimeBinding {
+        adapter: inventory.adapter.clone(),
+        session: inventory.session.clone(),
+        workspace_id: worker.workspace_id.clone(),
+        terminal_id: worker.terminal_id.clone(),
+        tab_id: Some(worker.tab_id.clone()),
+        pane_id: worker.pane_id.clone(),
+        provider_session: worker.provider_session.clone(),
+        owns_tab,
+        observation_state: RuntimeObservationState::Observed,
+        process_state: RuntimeProcessState::Running,
+        status: worker.status,
+        state_change_sequence: worker.state_change_sequence,
+        revision: worker.revision,
+        version: 1,
+        last_observed_at_unix_ms: inventory.observed_at_unix_ms,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn seed_inventory_workers(
+    database_path: &std::path::Path,
+    inventory: &RuntimeInventory,
+    terminal_ids: &[&str],
+) {
+    let mut connection = rusqlite::Connection::open(database_path).unwrap();
+    let transaction = connection.transaction().unwrap();
+    let observed_at = i64::try_from(inventory.observed_at_unix_ms).unwrap();
+    let mut seeded = 0;
+    for worker in inventory
+        .workers
+        .iter()
+        .filter(|worker| terminal_ids.contains(&worker.terminal_id.as_str()))
+    {
+        let worker_id = uuid::Uuid::now_v7().to_string();
+        let provider = worker.provider_session.as_ref();
+        let state_change_sequence = i64::try_from(worker.state_change_sequence).unwrap();
+        let revision = i64::try_from(worker.revision).unwrap();
+        transaction
+            .execute(
+                "INSERT INTO workers (
+                    id, profile_id, profile_version, desired_state, version,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (?1, NULL, NULL, ?3, 1, ?2, ?2)",
+                rusqlite::params![worker_id, observed_at, "running"],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO worker_runtime_bindings (
+                    worker_id, adapter, runtime_session, runtime_workspace_id,
+                    terminal_id, tab_id, pane_id, provider_session_source,
+                    provider_session_provider, provider_session_kind,
+                    provider_session_value, owns_tab, observation_state,
+                    observed_status, process_state, state_change_sequence,
+                    runtime_revision, version, last_observed_at_unix_ms,
+                    updated_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                           0, ?12, ?13, ?14, ?15, ?16, 1, ?17, ?17)",
+                rusqlite::params![
+                    worker_id,
+                    inventory.adapter,
+                    inventory.session,
+                    worker.workspace_id,
+                    worker.terminal_id,
+                    worker.tab_id,
+                    worker.pane_id,
+                    provider.map(|value| value.source.as_str()),
+                    provider.map(|value| value.provider.as_str()),
+                    provider.map(|value| value.kind.as_str()),
+                    provider.map(|value| value.value.as_str()),
+                    "observed",
+                    serde_json::to_value(worker.status)
+                        .unwrap()
+                        .as_str()
+                        .unwrap(),
+                    "running",
+                    state_change_sequence,
+                    revision,
+                    observed_at,
+                ],
+            )
+            .unwrap();
+        seeded += 1;
+    }
+    assert_eq!(seeded, terminal_ids.len());
+    transaction.commit().unwrap();
 }
 
 #[derive(Debug)]

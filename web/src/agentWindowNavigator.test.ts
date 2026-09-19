@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   filterAndSortAgentWindowGroups,
   groupAgentWindowTargets,
+  selectAgentWindowSessionTargets,
   type FilterableAgentWindowTarget,
 } from './agentWindowNavigator'
 import type { WorkspaceObservation } from './types'
@@ -57,6 +58,30 @@ const sessions = [
 ]
 
 describe('groupAgentWindowTargets', () => {
+  it('selects only the current session and counts exact elsewhere targets', () => {
+    const targets = [
+      target('alpha-worker', 'workspace-alpha'),
+      target('beta-worker', 'workspace-beta', { session: 'beta' }),
+      target('beta-superintendent', 'workspace-beta-superintendent', {
+        role: 'superintendent',
+        session: 'beta',
+      }),
+    ]
+
+    expect(selectAgentWindowSessionTargets(targets, 'alpha')).toEqual({
+      elsewhereCount: 2,
+      selected: [targets[0]],
+    })
+    expect(selectAgentWindowSessionTargets(targets, 'beta')).toEqual({
+      elsewhereCount: 1,
+      selected: [targets[1], targets[2]],
+    })
+    expect(
+      selectAgentWindowSessionTargets([...targets, targets[1]], 'alpha')
+        .elsewhereCount,
+    ).toBe(2)
+  })
+
   it('uses observed workspace order before deterministic label and id ties', () => {
     const groups = groupAgentWindowTargets(
       [
