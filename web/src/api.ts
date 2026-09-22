@@ -43,6 +43,7 @@ import type {
   EndedWorkerSession,
   EndWorkerSessionInput,
   ExternalTerminalLaunch,
+  HerdrFleetInventory,
   OrchestratorPromptAcknowledgement,
   OrchestratorTerminalOutput,
   OrchestratorWorkflowProfile,
@@ -95,16 +96,27 @@ interface ApiErrorEnvelope {
   error?: {
     code?: string
     message?: string
+    attempted_session_count?: unknown
+    failed_session_count?: unknown
   }
 }
 
 export class YardApiError extends Error {
   code: string
+  attemptedSessions: number | null
+  failedSessions: number | null
 
-  constructor(code: string, message: string) {
+  constructor(
+    code: string,
+    message: string,
+    attemptedSessions: number | null = null,
+    failedSessions: number | null = null,
+  ) {
     super(message)
     this.name = 'YardApiError'
     this.code = code
+    this.attemptedSessions = attemptedSessions
+    this.failedSessions = failedSessions
   }
 }
 
@@ -127,9 +139,21 @@ async function requestJson<T>(
     } catch {
       // Preserve the HTTP fallback below when an intermediary returns text.
     }
+    const attemptedSessions = body.error?.attempted_session_count
+    const failedSessions = body.error?.failed_session_count
     throw new YardApiError(
       body.error?.code ?? `http_${response.status}`,
       body.error?.message ?? `Yard returned HTTP ${response.status}`,
+      typeof attemptedSessions === 'number' &&
+        Number.isSafeInteger(attemptedSessions) &&
+        attemptedSessions >= 0
+        ? attemptedSessions
+        : null,
+      typeof failedSessions === 'number' &&
+        Number.isSafeInteger(failedSessions) &&
+        failedSessions >= 0
+        ? failedSessions
+        : null,
     )
   }
 
@@ -138,6 +162,12 @@ async function requestJson<T>(
 
 export function fetchSessions(signal?: AbortSignal): Promise<RuntimeSessions> {
   return requestJson('/api/v1/runtimes/herdr/sessions', { signal })
+}
+
+export function fetchHerdrFleetInventory(
+  signal?: AbortSignal,
+): Promise<HerdrFleetInventory> {
+  return requestJson('/api/v1/runtimes/herdr/inventory', { signal })
 }
 
 export function fetchInventory(

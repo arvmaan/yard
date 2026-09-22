@@ -3,15 +3,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 use yard_domain::{
-    ObservedWorker, RuntimeInventory, RuntimeObservationState, RuntimeProcessState,
+    ObservedWorker, RuntimeInventory, RuntimeObservationState, RuntimeProcessState, RuntimeSession,
     RuntimeSessions, WorkerRuntimeBinding,
 };
 use yard_herdr::{
-    BootstrapAgentRequest, HerdrAdapter, HerdrControlError, HerdrError, HerdrTerminal,
-    HerdrTerminalError, OpenTerminalRequest as HerdrOpenTerminalRequest, PrepareAgentRequest,
-    PrepareWorkspaceAgentRequest, PromptAgentRequest, ProvisionAgentRequest, ReadPaneRequest,
-    StartPreparedAgentRequest, TerminalCommand as HerdrTerminalCommand, TerminalDimensions,
-    TerminalEncoding, TerminalEvent, TerminalInput,
+    BootstrapAgentRequest, DiscoveredHerdrSession, HerdrAdapter, HerdrControlError, HerdrError,
+    HerdrTerminal, HerdrTerminalError, OpenTerminalRequest as HerdrOpenTerminalRequest,
+    PrepareAgentRequest, PrepareWorkspaceAgentRequest, PromptAgentRequest, ProvisionAgentRequest,
+    ReadPaneRequest, StartPreparedAgentRequest, TerminalCommand as HerdrTerminalCommand,
+    TerminalDimensions, TerminalEncoding, TerminalEvent, TerminalInput,
 };
 
 use crate::allocation_service::{
@@ -35,6 +35,69 @@ pub enum InventoryServiceError {
     Herdr(#[from] HerdrError),
 }
 
+#[derive(Debug, Clone)]
+pub struct RuntimeSessionDescriptor {
+    id: String,
+    snapshot_key: String,
+    summary: RuntimeSession,
+    source: RuntimeSessionDescriptorSource,
+}
+
+#[derive(Debug, Clone)]
+enum RuntimeSessionDescriptorSource {
+    Named,
+    Herdr(DiscoveredHerdrSession),
+}
+
+impl RuntimeSessionDescriptor {
+    fn named(summary: RuntimeSession) -> Self {
+        Self {
+            id: summary.name.clone(),
+            snapshot_key: summary.name.clone(),
+            summary,
+            source: RuntimeSessionDescriptorSource::Named,
+        }
+    }
+
+    fn herdr(session: DiscoveredHerdrSession) -> Self {
+        Self {
+            id: session.id().to_owned(),
+            snapshot_key: session.snapshot_key().to_string_lossy().into_owned(),
+            summary: RuntimeSession {
+                name: session.name().to_owned(),
+                is_default: session.is_default(),
+                running: session.running(),
+            },
+            source: RuntimeSessionDescriptorSource::Herdr(session),
+        }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn snapshot_key(&self) -> &str {
+        &self.snapshot_key
+    }
+
+    #[must_use]
+    pub fn summary(&self) -> &RuntimeSession {
+        &self.summary
+    }
+
+    #[cfg(test)]
+    pub(crate) fn identified(id: &str, snapshot_key: &str, summary: RuntimeSession) -> Self {
+        Self {
+            id: id.to_owned(),
+            snapshot_key: snapshot_key.to_owned(),
+            summary,
+            source: RuntimeSessionDescriptorSource::Named,
+        }
+    }
+}
+
 #[async_trait]
 pub trait InventorySource: Send + Sync {
     async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError>;
@@ -42,6 +105,34 @@ pub trait InventorySource: Send + Sync {
         &self,
         session_name: &str,
     ) -> Result<RuntimeInventory, InventoryServiceError>;
+
+    async fn session_descriptors(
+        &self,
+    ) -> Result<(String, Vec<RuntimeSessionDescriptor>), InventoryServiceError> {
+        let sessions = self.sessions().await?;
+        Ok((
+            sessions.adapter,
+            sessions
+                .sessions
+                .into_iter()
+                .map(RuntimeSessionDescriptor::named)
+                .collect(),
+        ))
+    }
+
+    async fn inventory_for_descriptor(
+        &self,
+        session: &RuntimeSessionDescriptor,
+    ) -> Result<RuntimeInventory, InventoryServiceError> {
+        self.inventory(&session.summary.name).await
+    }
+
+    async fn fleet_inventory_for_descriptor(
+        &self,
+        session: &RuntimeSessionDescriptor,
+    ) -> Result<RuntimeInventory, InventoryServiceError> {
+        self.inventory_for_descriptor(session).await
+    }
 }
 
 pub(crate) fn runtime_binding_from_observed_worker(
@@ -157,6 +248,18 @@ impl HerdrInventorySource {
             provider_agents: Arc::new(ProviderAgentObserver::from_env()),
         }
     }
+
+    async fn observe_provider_agents(&self, mut inventory: RuntimeInventory) -> RuntimeInventory {
+        let workers = inventory.workers.clone();
+        let observer = Arc::clone(&self.provider_agents);
+        match tokio::task::spawn_blocking(move || observer.observe(&workers)).await {
+            Ok(children) => inventory.child_agents = children,
+            Err(error) => {
+                tracing::warn!(%error, "provider child-agent observation task failed");
+            }
+        }
+        inventory
+    }
 }
 
 #[async_trait]
@@ -169,20 +272,51 @@ impl InventorySource for HerdrInventorySource {
         &self,
         session_name: &str,
     ) -> Result<RuntimeInventory, InventoryServiceError> {
-        let mut inventory = self
+        let inventory = self
             .adapter
             .inventory(session_name)
             .await
             .map_err(InventoryServiceError::from)?;
-        let workers = inventory.workers.clone();
-        let observer = Arc::clone(&self.provider_agents);
-        match tokio::task::spawn_blocking(move || observer.observe(&workers)).await {
-            Ok(children) => inventory.child_agents = children,
-            Err(error) => {
-                tracing::warn!(%error, "provider child-agent observation task failed");
-            }
-        }
-        Ok(inventory)
+        Ok(self.observe_provider_agents(inventory).await)
+    }
+
+    async fn session_descriptors(
+        &self,
+    ) -> Result<(String, Vec<RuntimeSessionDescriptor>), InventoryServiceError> {
+        let sessions = self.adapter.discover_sessions().await?;
+        Ok((
+            "herdr".to_owned(),
+            sessions
+                .into_iter()
+                .map(RuntimeSessionDescriptor::herdr)
+                .collect(),
+        ))
+    }
+
+    async fn inventory_for_descriptor(
+        &self,
+        session: &RuntimeSessionDescriptor,
+    ) -> Result<RuntimeInventory, InventoryServiceError> {
+        let RuntimeSessionDescriptorSource::Herdr(session) = &session.source else {
+            return self.inventory(&session.summary.name).await;
+        };
+        self.adapter
+            .inventory_for_discovered_session(session)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn fleet_inventory_for_descriptor(
+        &self,
+        session: &RuntimeSessionDescriptor,
+    ) -> Result<RuntimeInventory, InventoryServiceError> {
+        let RuntimeSessionDescriptorSource::Herdr(session) = &session.source else {
+            return self.inventory_for_descriptor(session).await;
+        };
+        self.adapter
+            .fleet_inventory_for_discovered_session(session)
+            .await
+            .map_err(Into::into)
     }
 }
 

@@ -17,6 +17,7 @@ pub(crate) struct HerdrSession {
     pub is_default: bool,
     pub running: bool,
     pub socket_path: PathBuf,
+    pub session_dir: PathBuf,
 }
 
 impl HerdrSession {
@@ -130,6 +131,10 @@ mod tests {
         assert_eq!(sessions[0].name, "default");
         assert!(sessions[0].is_default);
         assert!(sessions[0].running);
+        assert_eq!(
+            sessions[0].session_dir.to_string_lossy(),
+            "/tmp/herdr/default"
+        );
         assert!(!sessions[1].running);
     }
 

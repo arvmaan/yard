@@ -453,6 +453,8 @@ interface MockState {
     running: boolean
   }>
   inventoryFailure: boolean
+  fleetRequests: number
+  fleetHiddenPaneIds: Set<string>
   inventoryRequests: number
   inventoryRequestSessions: string[]
   inventoryResponsePlans: Map<
@@ -644,6 +646,14 @@ async function mockApi(
     archiveDependency?: 'unfinished_handoff' | 'snapshot_collection_pending'
     handoffFailsOnce?: boolean
     betaFails?: boolean
+    fleetFailure?: 'partial' | 'total' | 'discovery'
+    fleetAmbiguousAgent?: boolean
+    fleetConflictingTab?: boolean
+    fleetMissingAgentEvidence?: boolean
+    fleetPaneCount?: number
+    fleetEdgeEvidence?: boolean
+    fleetPartialAfterFirst?: boolean
+    fleetWaits?: Promise<void>[]
     completionDelayMs?: number
     completionFailsOnce?: boolean
     conflictNextPlacement?: boolean
@@ -769,6 +779,7 @@ async function mockApi(
     },
     runtimeSessions: sessions.sessions.map((session) => ({ ...session })),
     inventoryFailure: false,
+    fleetRequests: 0,
     inventoryRequests: 0,
     inventoryRequestSessions: [],
     inventoryResponsePlans: new Map(),
@@ -794,6 +805,7 @@ async function mockApi(
     orchestratorTerminalOutputRequests: [],
     terminalOutputRequests: [],
     terminalOutputFailure: options.terminalOutputFails ?? false,
+    fleetHiddenPaneIds: new Set(),
     terminalConnectionUrls: [],
     terminalMessages: [],
     terminalSockets: [],
@@ -3366,6 +3378,234 @@ async function mockApi(
 
   await page.route('**/api/v1/runtimes/herdr/**', async (route) => {
     const path = new URL(route.request().url()).pathname
+    if (path === '/api/v1/runtimes/herdr/inventory') {
+      state.fleetRequests += 1
+      await options.fleetWaits?.shift()
+      const fleetFailure =
+        options.fleetPartialAfterFirst && state.fleetRequests > 1
+          ? 'partial'
+          : options.fleetFailure
+      if (fleetFailure === 'discovery') {
+        await route.fulfill({
+          status: 503,
+          json: {
+            error: {
+              code: 'herdr_session_discovery_unavailable',
+              message: '/private/herdr.sock synthetic discovery failure',
+            },
+          },
+        })
+        return
+      }
+      if (fleetFailure === 'total') {
+        await route.fulfill({
+          status: 503,
+          json: {
+            error: {
+              code: 'herdr_fleet_unavailable',
+              message: '/private/herdr.sock synthetic fleet failure',
+              attempted_session_count: 2,
+              failed_session_count: 2,
+            },
+          },
+        })
+        return
+      }
+      const observed = state.runtimeInventory.workers
+      const alphaId = options.fleetEdgeEvidence ? 'session-alpha' : 'alpha'
+      const betaId = options.fleetEdgeEvidence ? 'session-beta' : 'beta'
+      const livePane = (
+        worker: ObservedWorker,
+        overrides: Record<string, unknown> = {},
+      ) => {
+        const pane = {
+          kind: 'agent',
+          observation: 'observed',
+          reason: 'Live agent observed.',
+          metadata_reason: null,
+          has_live_pane: true,
+          session: alphaId,
+          workspace_id: worker.workspace_id,
+          workspace_label: 'API migration',
+          tab_id: worker.tab_id,
+          pane_id: worker.pane_id,
+          terminal_id: worker.terminal_id,
+          label: null,
+          name: worker.name,
+          provider: worker.provider,
+          display_provider: worker.display_provider,
+          status: worker.status,
+          cwd: worker.cwd,
+          foreground_cwd: worker.foreground_cwd,
+          ...overrides,
+        }
+        return {
+          identity_key: JSON.stringify([
+            pane.session,
+            pane.workspace_id,
+            pane.pane_id,
+            pane.terminal_id,
+          ]),
+          ...pane,
+        }
+      }
+      const alphaPanes = [
+        livePane(
+          observed[0],
+          options.fleetMissingAgentEvidence
+            ? {
+                name: null,
+                provider: null,
+                display_provider: null,
+                status: 'unknown',
+                observation: 'ambiguous',
+                reason: 'Partial agent evidence.',
+              }
+            : options.fleetAmbiguousAgent
+              ? {
+                  name: null,
+                  provider: null,
+                  display_provider: null,
+                  status: 'unknown',
+                  observation: 'ambiguous',
+                  reason: 'Multiple live agents report this pane identity.',
+                }
+              : options.fleetConflictingTab
+                ? {
+                    tab_id: null,
+                    name: null,
+                    provider: null,
+                    display_provider: null,
+                    status: 'unknown',
+                    observation: 'ambiguous',
+                    reason: 'Conflicting tab identity.',
+                  }
+                : { name: null },
+        ),
+        livePane(observed[1]),
+        livePane(observed[2], {
+          kind: 'runtime',
+          name: null,
+          terminal_id: 'runtime-shell',
+          pane_id: 'workspace-1:pane-shell',
+          tab_id: 'workspace-1:tab-shell',
+          label: 'Dev server',
+          provider: null,
+          display_provider: null,
+          reason: 'Live runtime pane observed.',
+        }),
+      ].filter((pane) => !state.fleetHiddenPaneIds.has(pane.pane_id))
+      for (let index = 3; index < (options.fleetPaneCount ?? 3); index += 1) {
+        alphaPanes.push(
+          livePane(observed[2], {
+            kind: 'runtime',
+            name: null,
+            terminal_id: `overflow-terminal-${index}`,
+            pane_id: `overflow-pane-${index}`,
+            tab_id: `overflow-tab-${index}`,
+            label: `Overflow pane ${index}`,
+            provider: null,
+            display_provider: null,
+            reason: 'Live runtime pane observed.',
+          }),
+        )
+      }
+      if (options.fleetPaneCount !== undefined) {
+        alphaPanes.splice(options.fleetPaneCount)
+      }
+      if (options.fleetEdgeEvidence) {
+        alphaPanes.push(
+          livePane(observed[0], {
+            identity_key: JSON.stringify([
+              alphaId,
+              'agent-evidence',
+              'missing-pane',
+            ]),
+            has_live_pane: false,
+            observation: 'ambiguous',
+            reason: 'No live pane observed.',
+            metadata_reason:
+              'Conflicting or incomplete metadata: title, process status.',
+            workspace_id: null,
+            workspace_label: null,
+            tab_id: null,
+            pane_id: 'missing-pane',
+            terminal_id: null,
+            label: null,
+            name: 'Detached Codex',
+            provider: null,
+            display_provider: null,
+            status: 'unknown',
+            cwd: null,
+            foreground_cwd: null,
+          }),
+        )
+      }
+      const fleetSessions: Array<{
+        id: string
+        name: string
+        is_default: boolean
+        metadata_ambiguous: boolean
+        metadata_reason: string | null
+        observed_at_unix_ms: string
+        pane_count: number
+        panes: Array<Record<string, unknown>>
+      }> = [{
+        id: alphaId,
+        name: options.fleetEdgeEvidence ? 'shared' : 'alpha',
+        is_default: true,
+        metadata_ambiguous: false,
+        metadata_reason: null,
+        observed_at_unix_ms: String(state.runtimeInventory.observed_at_unix_ms),
+        pane_count: alphaPanes.filter((pane) => pane.has_live_pane).length,
+        panes: alphaPanes,
+      }]
+      if (fleetFailure !== 'partial') {
+        fleetSessions.push({
+          id: betaId,
+          name: options.fleetEdgeEvidence ? 'shared' : 'beta',
+          is_default: false,
+          metadata_ambiguous: false,
+          metadata_reason: null,
+          observed_at_unix_ms: String(state.runtimeInventory.observed_at_unix_ms),
+          pane_count: 1,
+          panes: [
+            livePane(observed[2], {
+              kind: 'runtime',
+              session: betaId,
+              workspace_id: 'workspace-beta',
+              workspace_label: 'Beta logs',
+              tab_id: 'workspace-beta:tab-1',
+              pane_id: 'workspace-beta:pane-1',
+              terminal_id: 'beta-logs',
+              label: 'Release logs',
+              name: null,
+              provider: null,
+              display_provider: null,
+              reason: 'Live runtime pane observed.',
+            }),
+          ],
+        })
+      }
+      await route.fulfill({
+        json: {
+          adapter: 'herdr',
+          live_pane_count: fleetSessions.reduce(
+            (count, session) => count + session.pane_count,
+            0,
+          ),
+          sessions: fleetSessions,
+          failures: fleetFailure === 'partial'
+            ? [{
+                session: betaId,
+                code: 'herdr_snapshot_failed',
+                reason: '/private/herdr.sock beta failure',
+              }]
+            : [],
+        },
+      })
+      return
+    }
     if (path.endsWith('/sessions')) {
       await options.sessionWait
       await route.fulfill({
@@ -13387,4 +13627,701 @@ test("projects the selected session into a read-only unassigned navigator", asyn
     ),
   ).toBe(false)
   expect(browserErrors).toEqual([])
+})
+
+
+test('layers Herdr inventory above Terminal without releasing state and restores Chat and Files', async ({ page }) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open terminal', exact: true }).click()
+
+  const shell = page.locator('.agent-workspace-shell')
+  const terminal = page.locator('.terminal-session')
+  const terminalRows = terminal.locator('.xterm-accessibility-tree')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  const terminalUrl = new URL(state.terminalConnectionUrls[0])
+  state.terminalSockets[0].send(
+    JSON.stringify({
+      type: 'terminal.frame',
+      bytes: Buffer.from(
+        `${Array.from({ length: 120 }, (_, index) => `inventory history ${index + 1}`).join('\r\n')}\r\ninventory tail`,
+      ).toString('base64'),
+      seq: 40,
+      width: Number(terminalUrl.searchParams.get('cols')),
+      height: Number(terminalUrl.searchParams.get('rows')),
+      full: true,
+    }),
+  )
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '40')
+  await terminal.locator('.xterm-scrollable-element').hover()
+  await page.mouse.wheel(0, -1200)
+  await expect(terminalRows).toContainText('inventory history')
+  await expect(terminalRows).not.toContainText('inventory tail')
+  const firstVisibleRow = terminalRows.getByRole('listitem').first()
+  const scrollPosition = Number(await firstVisibleRow.getAttribute('aria-posinset'))
+  await terminal.evaluate((element) => {
+    element.dataset.lifecycleMarker = 'preserved-terminal'
+  })
+
+  const trigger = page.getByRole('button', { name: 'Herdr', exact: true })
+  await trigger.click()
+  const overlay = page.getByRole('dialog', { name: 'Herdr inventory' })
+  const inventory = overlay.getByRole('region', { name: 'Live Herdr inventory' })
+  await expect(inventory).toBeVisible()
+  await expect(inventory.getByLabel('Search live Herdr panes')).toBeFocused()
+  await expect(page.locator('#root')).toHaveAttribute('inert', '')
+  await expect(page.locator('#root')).toHaveAttribute('aria-hidden', 'true')
+  await expect(shell).toBeAttached()
+  await expect(terminal).toHaveAttribute('data-lifecycle-marker', 'preserved-terminal')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  expect(state.terminalConnectionUrls).toHaveLength(1)
+  expect(
+    state.terminalMessages.filter((message) => message.type === 'terminal.release'),
+  ).toHaveLength(0)
+  const layers = await page.evaluate(() => ({
+    overlay: Number.parseInt(
+      getComputedStyle(document.querySelector<HTMLElement>('.herdr-inventory-overlay')!).zIndex,
+      10,
+    ),
+    shell: Number.parseInt(
+      getComputedStyle(document.querySelector<HTMLElement>('.agent-workspace-shell')!).zIndex,
+      10,
+    ),
+  }))
+  expect(layers.overlay).toBeGreaterThan(layers.shell)
+
+  await page.keyboard.press('Escape')
+  await expect(overlay).toHaveCount(0)
+  await expect(trigger).toBeFocused()
+  await expect(page.locator('#root')).not.toHaveAttribute('inert', '')
+  await expect(page.locator('#root')).not.toHaveAttribute('aria-hidden', 'true')
+  await expect(terminal).toHaveAttribute('data-lifecycle-marker', 'preserved-terminal')
+  await expect(terminalRows).toContainText('inventory history')
+  await expect.poll(() => firstVisibleRow.getAttribute('aria-posinset').then(Number)).toBe(
+    scrollPosition,
+  )
+
+  await page.getByRole('tab', { name: 'Chat', exact: true }).click()
+  const conversation = page.getByLabel('Agent conversation')
+  await expect(conversation).toBeVisible()
+  await trigger.click()
+  await expect(page.getByRole('dialog', { name: 'Herdr inventory' })).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(conversation).toBeVisible()
+  await expect(page.getByRole('tab', { name: 'Chat', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  )
+
+  await page.getByRole('tab', { name: 'Files', exact: true }).click()
+  const files = page.getByLabel('Files for Implementer')
+  await expect(files).toBeVisible()
+  await trigger.click()
+  await expect(page.getByRole('dialog', { name: 'Herdr inventory' })).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(files).toBeVisible()
+  await expect(page.getByRole('tab', { name: 'Files', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  )
+})
+
+test('constrains large Herdr inventories with and without failure banners', async ({ page }) => {
+  test.setTimeout(60_000)
+  await mockApi(page, {
+    fleetPaneCount: 80,
+    fleetPartialAfterFirst: true,
+  })
+  await page.setViewportSize({ width: 1280, height: 600 })
+  await page.goto('/')
+  const trigger = page.getByRole('button', { name: 'Herdr', exact: true })
+
+  const assertLayout = async (
+    name: string,
+    rowCount: number,
+    expectFailure: boolean,
+  ) => {
+    const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
+    const failures = inventory.locator('.herdr-inventory__failures')
+    await expect(inventory.locator('[data-herdr-pane-row]')).toHaveCount(
+      rowCount,
+    )
+    await inventory.locator('[data-herdr-pane-row]').first().click()
+    const layout = await inventory.evaluate((section) => {
+      const body = section.querySelector<HTMLElement>('.herdr-inventory__body')!
+      const list = section.querySelector<HTMLElement>('.herdr-inventory__list')!
+      const details = section.querySelector<HTMLElement>('.herdr-inventory__details')!
+      const search = section.querySelector<HTMLElement>('.herdr-inventory__search')!
+      const failures = section.querySelector<HTMLElement>('.herdr-inventory__failures')
+      const bodyRect = body.getBoundingClientRect()
+      return {
+        bodyBottom: bodyRect.bottom,
+        bodyTop: bodyRect.top,
+        detailsBottom: details.getBoundingClientRect().bottom,
+        detailsClientHeight: details.clientHeight,
+        detailsScrollHeight: details.scrollHeight,
+        expectedBodyTop: (failures ?? search).getBoundingClientRect().bottom,
+        listBottom: list.getBoundingClientRect().bottom,
+        listClientHeight: list.clientHeight,
+        listScrollHeight: list.scrollHeight,
+        sectionBottom: section.getBoundingClientRect().bottom,
+      }
+    })
+    expect(layout.bodyBottom, name).toBeLessThanOrEqual(
+      layout.sectionBottom + 1,
+    )
+    expect(layout.listBottom, name).toBeLessThanOrEqual(layout.bodyBottom + 1)
+    expect(layout.detailsBottom, name).toBeLessThanOrEqual(layout.bodyBottom + 1)
+    expect(Math.abs(layout.bodyTop - layout.expectedBodyTop), name).toBeLessThanOrEqual(1)
+    expect(layout.listScrollHeight, name).toBeGreaterThan(layout.listClientHeight)
+    if (expectFailure) {
+      await expect(failures).toBeVisible()
+      expect(layout.detailsScrollHeight, name).toBeGreaterThan(
+        layout.detailsClientHeight,
+      )
+    } else {
+      await expect(failures).toHaveCount(0)
+    }
+  }
+
+  await trigger.click()
+  await assertLayout('desktop success', 81, false)
+  await page.getByRole('button', { name: 'Close Herdr inventory' }).click()
+
+  await trigger.click()
+  await page.setViewportSize({ width: 390, height: 640 })
+  await assertLayout('mobile partial failure', 80, true)
+})
+
+test('shows every live Herdr pane in a separate details-only inventory', async ({ page }) => {
+  const state = await mockApi(page)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  const trigger = page.locator(
+    'button[aria-controls="herdr-inventory-workspace"]',
+  )
+  await expect(trigger).toHaveAttribute('aria-expanded', 'false')
+  await trigger.click()
+  await expect(trigger).toHaveAttribute('aria-expanded', 'true')
+  const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
+  await expect(inventory).toBeVisible()
+  await expect(inventory.getByText('alpha · default')).toBeVisible()
+  await expect(inventory.getByText('Beta logs')).toBeVisible()
+  await expect(inventory.locator('[data-herdr-pane-row]')).toHaveCount(4)
+  await expect(inventory.getByLabel('Herdr inventory counts')).toHaveText(
+    '4 fresh · 4 shown · 2 agents · 2 runtime · 0 stale · 0 failed sessions',
+  )
+  await expect(inventory.getByLabel('Search live Herdr panes')).toBeFocused()
+
+  const firstAgent = inventory.getByRole('button', {
+    name: /Unnamed agent · terminal-1, Agent pane, alpha/,
+  })
+  await expect(firstAgent).toHaveAccessibleDescription(
+    /idle.*Live agent observed./,
+  )
+  await firstAgent.click()
+  const details = inventory.getByRole('article', { name: 'Herdr pane details' })
+  await expect(details).toContainText('Codex')
+  await expect(
+    details.locator('.herdr-inventory__detail-row').filter({ hasText: 'Tab' }),
+  ).toContainText(state.runtimeInventory.workers[0].tab_id)
+  expect(state.ghosttyRequests).toEqual([])
+})
+
+test('retains failed refreshes as stale details and restores fresh state', async ({ page }) => {
+  await mockApi(page)
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
+  const pane = inventory.getByRole('button', {
+    name: /Unnamed agent · terminal-1, Agent pane, alpha/,
+  })
+  await pane.click()
+
+  const failedRefresh = async (route: Route) => {
+    await route.fulfill({
+      status: 503,
+      json: {
+        error: {
+          code: 'herdr_fleet_unavailable',
+          message: '/private/herdr.sock should never reach the UI',
+        },
+      },
+    })
+  }
+  await page.route('**/api/v1/runtimes/herdr/inventory', failedRefresh)
+  await inventory.getByRole('button', { name: 'Refresh Herdr inventory' }).click()
+  await expect(inventory).toContainText(
+    'Live Herdr inventory is temporarily unavailable. Retry the refresh.',
+  )
+  await expect(inventory).not.toContainText('/private/herdr.sock')
+  await expect(pane).toHaveAttribute('data-stale', 'true')
+  await expect(inventory).toContainText('Live agent observed.')
+  await expect(inventory).toContainText('Last observed details')
+  await expect(inventory.getByLabel('Herdr inventory counts')).toHaveText(
+    '0 fresh · 4 shown · 2 agents · 2 runtime · 4 stale · 0 failed sessions',
+  )
+
+  await page.unroute('**/api/v1/runtimes/herdr/inventory', failedRefresh)
+  await inventory.getByRole('button', { name: 'Refresh Herdr inventory' }).click()
+  await expect(inventory).not.toContainText(
+    'Live Herdr inventory is temporarily unavailable. Retry the refresh.',
+  )
+  await expect(pane).toHaveAttribute('data-stale', 'false')
+  await expect(inventory).toContainText('Live agent observed.')
+})
+
+test('total refresh failure replaces prior per-session errors', async ({ page }) => {
+  await mockApi(page, { fleetFailure: 'partial' })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
+  await expect(inventory).toContainText(
+    'beta Herdr snapshot was unavailable for this session.',
+  )
+  await page.route('**/api/v1/runtimes/herdr/inventory', async (route) => {
+    await route.fulfill({
+      status: 503,
+      json: {
+        error: {
+          code: 'herdr_fleet_unavailable',
+          message: '/private/herdr.sock latest total failure',
+          attempted_session_count: 2,
+          failed_session_count: 2,
+        },
+      },
+    })
+  })
+
+  await inventory.getByRole('button', { name: 'Refresh Herdr inventory' }).click()
+
+  await expect(inventory).not.toContainText(
+    'beta Herdr snapshot was unavailable for this session.',
+  )
+  await expect(inventory.locator('.herdr-inventory__failures p')).toHaveCount(1)
+  await expect(inventory.getByLabel('Herdr inventory counts')).toHaveText(
+    '0 fresh · 3 shown · 2 agents · 1 runtime · 3 stale · 2 failed sessions',
+  )
+  await expect(inventory.getByRole('status')).toHaveText(
+    '2 of 2 Herdr session snapshots failed.',
+  )
+})
+
+test('shows immutable duplicate session ids and searchable unattached evidence', async ({ page }) => {
+  const state = await mockApi(page, {
+    fleetEdgeEvidence: true,
+    fleetPartialAfterFirst: true,
+  })
+  state.runtimeInventory.workers[0].status = 'working'
+  state.runtimeInventory.workers[1].status = 'idle'
+  state.runtimeInventory.workers[2].status = 'blocked'
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
+  const rows = inventory.locator('[data-herdr-pane-row]')
+  const search = inventory.getByLabel('Search live Herdr panes')
+
+  await expect(rows).toHaveCount(5)
+  await expect(inventory.getByText('shared · session-alpha · default')).toBeVisible()
+  await expect(inventory.getByText('shared · session-beta')).toBeVisible()
+  await expect(inventory.getByLabel('Herdr inventory counts')).toHaveText(
+    '4 fresh · 4 shown · 2 agents · 2 runtime · 1 unattached agent · 0 stale · 0 failed sessions',
+  )
+  await expect(inventory.getByRole('status')).toHaveText(
+    'Showing 5 results: 4 of 4 Herdr panes; 1 unattached agent; 0 session failures.',
+  )
+
+  const unattached = inventory.getByRole('button', {
+    name: /Unattached agent · Detached Codex, shared · session-alpha, Ambiguous location/,
+  })
+  await expect(unattached).toHaveAccessibleName(
+    'Unattached agent · Detached Codex, shared · session-alpha, Ambiguous location',
+  )
+  await expect(unattached).toHaveAccessibleDescription(
+    'Status not reported No live pane observed. Conflicting or incomplete metadata: title, process status.',
+  )
+  await unattached.click()
+  const details = inventory.getByRole('article', { name: 'Herdr pane details' })
+  await expect(details).toContainText('No live pane observed.')
+  await expect(details).toContainText('Conflicting or incomplete metadata: title, process status.')
+  await expect(details.getByRole('button')).toHaveCount(1)
+  await expect(details.locator('.herdr-inventory__detail-row').filter({ hasText: 'Terminal' })).toHaveCount(0)
+
+  const totalFailure = async (route: Route) => {
+    await route.fulfill({
+      status: 503,
+      json: {
+        error: {
+          code: 'herdr_fleet_unavailable',
+          message: 'synthetic total failure',
+          attempted_session_count: 2,
+          failed_session_count: 2,
+        },
+      },
+    })
+  }
+  await page.route('**/api/v1/runtimes/herdr/inventory', totalFailure)
+  await inventory.getByRole('button', { name: 'Refresh Herdr inventory' }).click()
+  await expect(details).toContainText('No live pane observed.')
+  await expect(details).toContainText(
+    'Conflicting or incomplete metadata: title, process status.',
+  )
+  await expect(details).toContainText(
+    'Last observed details. Refresh for current information.',
+  )
+  await expect(unattached).toHaveAccessibleDescription(
+    'Status not reported Stale snapshot; last observed. No live pane observed. Conflicting or incomplete metadata: title, process status.',
+  )
+  await page.unroute('**/api/v1/runtimes/herdr/inventory', totalFailure)
+
+  await inventory.getByRole('button', { name: 'Refresh Herdr inventory' }).click()
+  await expect(inventory.getByText('shared · session-beta · stale')).toBeVisible()
+  const staleRuntime = inventory.getByRole('button', {
+    name: /Release logs, Runtime pane, shared · session-beta, Beta logs/,
+  })
+  await expect(staleRuntime).toHaveAccessibleDescription(
+    'blocked Stale snapshot; last observed. Live runtime pane observed.',
+  )
+  const cases: Array<[string, number]> = [
+    ['session-alpha', 4],
+    ['session-beta', 1],
+    ['default', 4],
+    ['stale', 1],
+    ['Last observed', 1],
+    ['Unattached agent', 1],
+    ['Ambiguous location', 1],
+    ['Runtime pane', 2],
+    ['agent evidence', 3],
+    ['No live pane observed', 1],
+    ['Last observed details', 1],
+    ['working', 1],
+    ['idle', 1],
+    ['blocked', 2],
+  ]
+  for (const [term, count] of cases) {
+    await search.fill('')
+    await search.pressSequentially(term)
+    await expect(search).toBeFocused()
+    await expect(rows).toHaveCount(count)
+  }
+})
+
+test('keeps Herdr inventory as the single topmost Escape owner', async ({ page }) => {
+  await mockApi(page)
+  await page.goto('/')
+  const trigger = page.getByRole('button', { name: 'Herdr', exact: true })
+  await trigger.click()
+  const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
+  await expect(page.locator('#root')).toHaveAttribute('inert', '')
+  await page.keyboard.press('Escape')
+  await expect(inventory).toBeHidden()
+  await expect(trigger).toBeFocused()
+})
+
+test('aborts an in-flight manual fleet refresh when inventory closes', async ({ page }) => {
+  let releaseRefresh = () => {}
+  const refreshWait = new Promise<void>((resolve) => {
+    releaseRefresh = () => resolve()
+  })
+  const state = await mockApi(page, {
+    fleetWaits: [Promise.resolve(), Promise.resolve(), refreshWait],
+  })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
+  const refresh = inventory.getByRole('button', {
+    name: 'Refresh Herdr inventory',
+  })
+  await expect(refresh).toBeEnabled()
+  const initialRequests = state.fleetRequests
+  await refresh.click()
+  await expect.poll(() => state.fleetRequests).toBe(initialRequests + 1)
+  await inventory.getByRole('button', { name: 'Close Herdr inventory' }).click()
+  releaseRefresh()
+  await expect(inventory).toBeHidden()
+  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  const reopened = page.getByRole('region', { name: 'Live Herdr inventory' })
+  await expect(reopened.getByLabel('Herdr inventory counts')).toHaveText(
+    '4 fresh · 4 shown · 2 agents · 2 runtime · 0 stale · 0 failed sessions',
+  )
+  await expect.poll(() => state.fleetRequests).toBeGreaterThanOrEqual(
+    initialRequests + 2,
+  )
+})
+
+test('keeps one concise live inventory summary for counts filters and failures', async ({ page }) => {
+  await mockApi(page, { fleetFailure: 'partial', fleetPaneCount: 1 })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
+  const live = inventory.locator('[aria-live]')
+  const search = inventory.getByLabel('Search live Herdr panes')
+  await expect(live).toHaveCount(1)
+  await expect(live).toHaveText(
+    'Showing 2 results: 1 of 1 Herdr pane; 1 session failure.',
+  )
+
+  await search.fill('terminal-1')
+  await expect(live).toHaveText(
+    'Showing 1 result: 1 of 1 Herdr pane; 1 session failure.',
+  )
+
+  await search.fill('Herdr snapshot was unavailable for this session')
+  await expect(inventory).toContainText(
+    'beta Herdr snapshot was unavailable for this session.',
+  )
+  await expect(inventory.locator('[data-herdr-pane-row]')).toHaveCount(0)
+  await expect(inventory.getByLabel('Herdr inventory counts')).toContainText(
+    '1 fresh · 0 shown',
+  )
+  await expect(live).toHaveText(
+    'Showing 1 result: 0 of 1 Herdr pane; 1 session failure.',
+  )
+
+  await search.fill('/private/herdr.sock')
+  await expect(inventory.locator('.herdr-inventory__failures')).toHaveCount(0)
+  await expect(live).toHaveText(
+    'Showing 0 results: 0 of 1 Herdr pane; 1 session failure.',
+  )
+  await expect(inventory.locator('.herdr-inventory__failures [role]')).toHaveCount(0)
+})
+
+test('keeps stable pane selection across provider and display metadata refreshes', async ({ page }) => {
+  const state = await mockApi(page)
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
+  const linked = inventory.getByRole('button', {
+    name: /Unnamed agent · terminal-1, Agent pane, alpha/,
+  })
+  await linked.click()
+  state.runtimeInventory.workers[0].provider = 'claude'
+  state.runtimeInventory.workers[0].display_provider = 'Claude CLI'
+  state.runtimeInventory.workers[0].status = 'blocked'
+  await inventory.getByRole('button', { name: 'Refresh Herdr inventory' }).click()
+  await expect(inventory.locator('[data-herdr-pane-row]')).toHaveCount(4)
+  await expect(inventory.getByRole('article', { name: 'Herdr pane details' })).toContainText('Claude CLI')
+})
+
+test('keeps unbound agents and runtime panes details-only with roving keyboard focus', async ({ page }) => {
+  await mockApi(page)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  const trigger = page.getByRole('button', { name: 'Herdr', exact: true })
+  await trigger.click()
+  const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
+  const search = inventory.getByLabel('Search live Herdr panes')
+  await expect(search).toBeFocused()
+  const rows = inventory.locator('[data-herdr-pane-row]')
+  await expect(rows).toHaveCount(4)
+  await search.fill('Dev server')
+  await expect(rows).toHaveCount(1)
+  await expect(inventory.getByLabel('Herdr inventory counts')).toHaveText(
+    '4 fresh · 1 shown · 0 agents · 1 runtime · 0 stale · 0 failed sessions',
+  )
+  await search.fill('')
+  await expect(rows).toHaveCount(4)
+  const activeRow = inventory.locator('[data-herdr-pane-row][tabindex="0"]')
+  await expect(activeRow).toHaveCount(1)
+  await page.keyboard.press('Tab')
+  await expect(activeRow).toBeFocused()
+  await page.keyboard.press('End')
+  await expect(rows.nth(3)).toBeFocused()
+  await page.keyboard.press('Home')
+  await expect(rows.nth(0)).toBeFocused()
+  await page.keyboard.press('ArrowDown')
+  await page.keyboard.press('ArrowDown')
+  await expect(rows.nth(2)).toBeFocused()
+  await page.keyboard.press('Enter')
+  const details = inventory.getByRole('article', { name: 'Herdr pane details' })
+  const back = details.getByRole('button', { name: 'Back to pane list' })
+  await expect(back).toBeFocused()
+  await expect(details).toContainText('Runtime pane')
+  await expect(details).toContainText('Dev server')
+  await back.click()
+  await expect(rows.nth(2)).toBeFocused()
+  await page.keyboard.press('Enter')
+  await expect(back).toBeFocused()
+  await back.click()
+  await expect(rows.nth(2)).toBeFocused()
+  await page.keyboard.press('ArrowDown')
+  await page.keyboard.press(' ')
+  await expect(back).toBeFocused()
+  await page.evaluate(() => {
+    const outside = document.createElement('button')
+    outside.textContent = 'Accidental outside focus'
+    document.body.append(outside)
+    outside.focus()
+  })
+  await page.keyboard.press('Escape')
+  await expect(inventory).toBeHidden()
+  await expect(trigger).toBeFocused()
+})
+
+test('shows provider pane evidence without an agent record as ambiguous agent', async ({ page }) => {
+  await mockApi(page, { fleetMissingAgentEvidence: true })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
+  const pane = inventory.getByRole('button', {
+    name: /Unnamed agent · terminal-1, Agent pane, alpha/,
+  })
+  const search = inventory.getByLabel('Search live Herdr panes')
+  await search.fill('agent pane')
+  await expect(pane).toBeVisible()
+  await search.fill('Partial agent evidence')
+  await expect(pane).toBeVisible()
+  await search.fill('Status not reported')
+  await expect(pane).toBeVisible()
+  await expect(pane).toHaveAttribute('data-observation', 'ambiguous')
+  await pane.click()
+  const details = inventory.getByRole('article', { name: 'Herdr pane details' })
+  await expect(details).toContainText('Agent pane')
+  await expect(details).toContainText('Partial agent evidence.')
+  await expect(details).toContainText('Status not reported')
+  await expect(details).not.toContainText('Codex')
+})
+
+test('shows ambiguous duplicate-agent evidence without conflicting metadata', async ({ page }) => {
+  await mockApi(page, { fleetAmbiguousAgent: true })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
+  const pane = inventory.getByRole('button', {
+    name: /Unnamed agent · terminal-1, Agent pane, alpha/,
+  })
+  await expect(pane).toHaveAttribute('data-observation', 'ambiguous')
+  await pane.click()
+  const details = inventory.getByRole('article', { name: 'Herdr pane details' })
+  await expect(details).toContainText('Multiple live agents report this pane identity.')
+  await expect(details).toContainText('terminal-1')
+  await expect(details).not.toContainText('Codex')
+  await expect(details).not.toContainText('Claude')
+  await expect(details).toContainText('Status not reported')
+})
+
+test('shows conflicting tab identity without fabricated or untrusted metadata', async ({ page }) => {
+  await mockApi(page, { fleetConflictingTab: true })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
+  const pane = inventory.getByRole('button', {
+    name: /Unnamed agent · terminal-1, Agent pane, alpha/,
+  })
+  await expect(pane).toHaveAttribute('data-observation', 'ambiguous')
+  await pane.click()
+  const details = inventory.getByRole('article', { name: 'Herdr pane details' })
+  await expect(details).toContainText('Conflicting tab identity.')
+  await expect(details.locator('.herdr-inventory__detail-row').filter({ hasText: 'Tab' })).toHaveCount(0)
+  await expect(details).not.toContainText('Codex')
+  await expect(details).toContainText('Status not reported')
+})
+
+test('preserves search focus and only recovers focus for a removed roving row', async ({ page }) => {
+  const state = await mockApi(page)
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
+  const rows = inventory.locator('[data-herdr-pane-row]')
+  const search = inventory.getByLabel('Search live Herdr panes')
+
+  await rows.nth(1).click()
+  await search.focus()
+  await search.pressSequentially('Dev server')
+  await expect(search).toHaveValue('Dev server')
+  await expect(search).toBeFocused()
+  await expect(rows).toHaveCount(1)
+  await expect(inventory.getByRole('article', { name: 'Herdr pane details' })).toContainText(
+    'Select a pane',
+  )
+  await expect(inventory.getByRole('status')).toHaveText(
+    'Showing 1 result: 1 of 4 Herdr panes; 0 session failures.',
+  )
+
+  await search.fill('')
+  await rows.nth(1).focus()
+  state.fleetHiddenPaneIds.add(state.runtimeInventory.workers[1].pane_id)
+  await inventory
+    .getByRole('button', { name: 'Refresh Herdr inventory' })
+    .evaluate((button) => (button as HTMLButtonElement).click())
+  await expect(rows).toHaveCount(3)
+  await expect(rows.nth(1)).toBeFocused()
+  await expect(inventory.getByRole('status')).toContainText(
+    'Focused pane is no longer visible. Focus moved to',
+  )
+
+  await search.evaluate((element) => {
+    const input = element as HTMLInputElement
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      'value',
+    )?.set
+    setter?.call(input, 'no matching pane')
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  await expect(rows).toHaveCount(0)
+  await expect(search).toBeFocused()
+  await expect(inventory.getByRole('status')).toHaveText(
+    'Focused pane is no longer visible. Focus moved to search.',
+  )
+})
+
+test('reports a sanitized session discovery outage without snapshot counts', async ({ page }) => {
+  await mockApi(page, { fleetFailure: 'discovery' })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
+
+  await expect(inventory).toContainText(
+    'Unable to discover running Herdr sessions. Retry the refresh.',
+  )
+  await expect(inventory.getByRole('status')).toHaveText(
+    'Unable to discover running Herdr sessions. Retry the refresh.',
+  )
+  await expect(inventory).not.toContainText('0 of 0')
+  await expect(inventory).not.toContainText('/private/herdr.sock')
+})
+
+test('reports sanitized partial and total Herdr fleet failures', async ({ page }) => {
+  await mockApi(page, { fleetFailure: 'partial' })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
+  await expect(inventory).toContainText(
+    'beta Herdr snapshot was unavailable for this session.',
+  )
+  await expect(inventory.getByLabel('Herdr inventory counts')).toHaveText(
+    '3 fresh · 3 shown · 2 agents · 1 runtime · 0 stale · 1 failed session',
+  )
+  await expect(inventory).not.toContainText('/private/herdr.sock')
+  await expect(inventory.getByText('alpha · default')).toBeVisible()
+  await expect(inventory.getByText('Offline release')).toHaveCount(0)
+
+  await page.keyboard.press('Escape')
+  await page.unrouteAll({ behavior: 'wait' })
+  await mockApi(page, { fleetFailure: 'total' })
+  await page.reload()
+  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  await expect(
+    page.getByRole('region', { name: 'Live Herdr inventory' }),
+  ).toContainText(
+    'Live Herdr inventory is temporarily unavailable. Retry the refresh.',
+  )
+  const failedInventory = page.getByRole('region', {
+    name: 'Live Herdr inventory',
+  })
+  await expect(failedInventory).not.toContainText('/private/herdr.sock')
+  await expect(failedInventory.getByLabel('Herdr inventory counts')).toHaveText(
+    '0 fresh · 0 shown · 0 agents · 0 runtime · 0 stale · 2 failed sessions',
+  )
+  await expect(failedInventory.getByRole('status')).toHaveText(
+    '2 of 2 Herdr session snapshots failed.',
+  )
+  await expect(failedInventory).toContainText(
+    '2 of 2 Herdr session snapshots failed.',
+  )
 })

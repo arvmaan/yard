@@ -126,6 +126,7 @@ import {
 } from './AgentWorkspaceContext'
 import { AgentWorkspaceShell } from './AgentWorkspaceShell'
 import { ProjectPulseWorkspace } from './ProjectPulseWorkspace'
+import { HerdrInventoryWorkspace } from './HerdrInventoryWorkspace'
 import {
   resolveRuntimeCapabilities,
   runtimeCapabilityDetail,
@@ -2333,6 +2334,7 @@ function App() {
   const [mapVisualMode, setMapVisualMode] =
     useState<MapVisualMode>(readMapVisualMode)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [herdrInventoryOpen, setHerdrInventoryOpen] = useState(false)
   const [sessions, setSessions] = useState<RuntimeSession[]>([])
   const [selectedSession, setSelectedSession] = useState('')
   const [inventory, setInventory] = useState<RuntimeInventory | null>(null)
@@ -2532,7 +2534,9 @@ function App() {
     new Map<string, CanvasPlacement>(),
   )
   const projectPulseTrigger = useRef<HTMLButtonElement | null>(null)
+  const herdrInventoryTrigger = useRef<HTMLButtonElement | null>(null)
   const settingsTrigger = useRef<HTMLButtonElement | null>(null)
+
 
   useEffect(() => {
     applyTheme(theme)
@@ -2566,16 +2570,17 @@ function App() {
       ) {
         return current
       }
-      return (
+      const next =
         result.sessions.find(
           (session) => session.is_default && session.running,
         )?.name ??
         result.sessions.find((session) => session.running)?.name ??
         ''
-      )
+      return next
     })
     return result.sessions
   }, [])
+
 
   const loadAssignments = useCallback(
     async (projectIds: string[], signal?: AbortSignal) => {
@@ -3763,7 +3768,6 @@ function App() {
     }),
     [openAgentChat, openAgentTerminal],
   )
-
   const refresh = useCallback(async () => {
     setActionError(null)
     try {
@@ -5692,7 +5696,10 @@ function App() {
 
   return (
     <AgentWorkspaceContext.Provider value={agentWorkspaceContext}>
-      <div className="app-shell" data-shelf-open={resourceShelfOpen}>
+      <div
+        className="app-shell"
+        data-shelf-open={resourceShelfOpen && !herdrInventoryOpen}
+      >
         <GlobalCommandBar
           activeAgentWorkspaceChat={Boolean(
             activeAgentWorkspaceTarget?.chatAvailable,
@@ -5704,6 +5711,8 @@ function App() {
           agentWorkspaceMode={agentWorkspaceMode}
           busy={runtimeLoading || projectLoading}
           health={runtimeHealth}
+          herdrInventoryOpen={herdrInventoryOpen}
+          herdrInventoryTriggerRef={herdrInventoryTrigger}
           onAgentWorkspaceModeChange={(mode) => {
             if (
               (mode === 'chat' &&
@@ -5716,15 +5725,23 @@ function App() {
             if (mode === 'terminal') {
               setTerminalPresentation(DEFAULT_TERMINAL_PRESENTATION)
             }
+            setHerdrInventoryOpen(false)
             setAgentWorkspaceMode(mode)
           }}
           onCreateProject={() => {
+            setHerdrInventoryOpen(false)
             setSelection(null)
             setWorkspaceProjectOpen(true)
           }}
+          onOpenHerdrInventory={() =>
+            setHerdrInventoryOpen((open) => !open)
+          }
           onOpenSettings={() => setSettingsOpen(true)}
           onRefresh={() => void refresh()}
-          onResourceViewChange={toggleResourceShelf}
+          onResourceViewChange={(view) => {
+            setHerdrInventoryOpen(false)
+            toggleResourceShelf(view)
+          }}
           onSessionChange={setSelectedSession}
           railView={railView}
           resourceShelfOpen={resourceShelfOpen}
@@ -5736,7 +5753,7 @@ function App() {
           settingsTriggerRef={settingsTrigger}
         />
 
-        {resourceShelfOpen ? (
+        {resourceShelfOpen && !herdrInventoryOpen ? (
           <section
             aria-label={`${railView} shelf`}
             className="resource-shelf"
@@ -6590,6 +6607,9 @@ function App() {
           }}
           onConfirm={deleteSelectedWorker}
         />
+      ) : null}
+      {herdrInventoryOpen ? (
+        <HerdrInventoryWorkspace onClose={() => setHerdrInventoryOpen(false)} />
       ) : null}
     </AgentWorkspaceContext.Provider>
   )

@@ -16,17 +16,39 @@ pub(crate) fn normalize(
     observed_at_unix_ms: u64,
     config: &HerdrConfig,
 ) -> Result<RuntimeInventory, HerdrError> {
-    if !config.supported_protocols.contains(&snapshot.protocol) {
-        return Err(HerdrError::ProtocolMismatch {
+    validate_protocol(&snapshot, config)?;
+    validate_topology(&snapshot)?;
+    Ok(project(snapshot, session_name, observed_at_unix_ms))
+}
+
+pub(crate) fn normalize_fleet(
+    snapshot: SessionSnapshot,
+    session_name: &str,
+    observed_at_unix_ms: u64,
+    config: &HerdrConfig,
+) -> Result<RuntimeInventory, HerdrError> {
+    validate_protocol(&snapshot, config)?;
+    Ok(project(snapshot, session_name, observed_at_unix_ms))
+}
+
+fn validate_protocol(snapshot: &SessionSnapshot, config: &HerdrConfig) -> Result<(), HerdrError> {
+    if config.supported_protocols.contains(&snapshot.protocol) {
+        Ok(())
+    } else {
+        Err(HerdrError::ProtocolMismatch {
             minimum: *config.supported_protocols.start(),
             maximum: *config.supported_protocols.end(),
             actual: snapshot.protocol,
-        });
+        })
     }
+}
 
-    validate_topology(&snapshot)?;
-
-    Ok(RuntimeInventory {
+fn project(
+    snapshot: SessionSnapshot,
+    session_name: &str,
+    observed_at_unix_ms: u64,
+) -> RuntimeInventory {
+    RuntimeInventory {
         adapter: "herdr".to_owned(),
         session: session_name.to_owned(),
         runtime_version: snapshot.version,
@@ -117,7 +139,7 @@ pub(crate) fn normalize(
             })
             .collect(),
         child_agents: Vec::new(),
-    })
+    }
 }
 
 fn provider_session(session: AgentSession) -> ProviderSessionRef {
@@ -275,7 +297,7 @@ mod tests {
     };
     use yard_domain::ObservedStatus;
 
-    use super::normalize;
+    use super::{normalize, normalize_fleet};
 
     #[test]
     fn normalizes_scrubbed_snapshot() {
@@ -379,5 +401,66 @@ mod tests {
 
         assert!(matches!(error, HerdrError::InvalidTopology(_)));
         assert!(error.to_string().contains("missing pane"));
+    }
+
+    #[test]
+    fn fleet_preserves_duplicate_panes_while_strict_normalization_rejects_them() {
+        let mut fixture: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/v0.8.0/snapshot.json"))
+                .unwrap();
+        let panes = fixture["result"]["snapshot"]["panes"]
+            .as_array_mut()
+            .unwrap();
+        let mut conflicting = panes[0].clone();
+        conflicting["tab_id"] = "conflicting-tab".into();
+        panes.push(conflicting);
+        let fixture = serde_json::to_vec(&fixture).unwrap();
+
+        let inventory = normalize_fleet(
+            decode_snapshot(&fixture).unwrap(),
+            "default",
+            1,
+            &HerdrConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(inventory.panes.len(), 2);
+        assert_eq!(inventory.panes[0].runtime_id, inventory.panes[1].runtime_id);
+        assert_ne!(inventory.panes[0].tab_id, inventory.panes[1].tab_id);
+
+        let error = normalize(
+            decode_snapshot(&fixture).unwrap(),
+            "default",
+            1,
+            &HerdrConfig::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate pane ID"));
+    }
+
+    #[test]
+    fn fleet_preserves_conflicting_agent_ancestry_while_strict_normalization_rejects_it() {
+        let mut fixture: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/v0.8.0/snapshot.json"))
+                .unwrap();
+        fixture["result"]["snapshot"]["agents"][0]["tab_id"] = "conflicting-tab".into();
+        let fixture = serde_json::to_vec(&fixture).unwrap();
+
+        let inventory = normalize_fleet(
+            decode_snapshot(&fixture).unwrap(),
+            "default",
+            1,
+            &HerdrConfig::default(),
+        )
+        .unwrap();
+        assert_ne!(inventory.panes[0].tab_id, inventory.workers[0].tab_id);
+
+        let error = normalize(
+            decode_snapshot(&fixture).unwrap(),
+            "default",
+            1,
+            &HerdrConfig::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ancestry does not match"));
     }
 }

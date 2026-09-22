@@ -378,6 +378,10 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         )
         .route("/api/v1/runtimes/herdr/sessions", get(sessions))
         .route(
+            "/api/v1/runtimes/herdr/inventory",
+            get(lens::runtime_fleet_inventory),
+        )
+        .route(
             "/api/v1/runtimes/herdr/sessions/{session}/inventory",
             get(inventory),
         )
@@ -3580,6 +3584,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
         env,
+        os::unix::fs::PermissionsExt,
         path::PathBuf,
         sync::{
             Arc, Mutex,
@@ -3597,7 +3602,12 @@ mod tests {
     use futures_util::{SinkExt, StreamExt, future::join_all};
     use http_body_util::BodyExt;
     use tempfile::TempDir;
-    use tokio::{sync::Notify, time::timeout};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixListener,
+        sync::{Notify, Semaphore},
+        time::timeout,
+    };
     use tokio_tungstenite::{
         connect_async,
         tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest},
@@ -3613,7 +3623,7 @@ mod tests {
         UpdateTokenSpendSettings, WorkerProfileSpec, WorkerRuntimeBinding, WorkspaceObservation,
         WorktreeObservation,
     };
-    use yard_herdr::HerdrError;
+    use yard_herdr::{HerdrAdapter, HerdrConfig, HerdrError};
     use yard_store::{
         MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT, ProjectStoreError, SqliteProjectStore,
         YardStore,
@@ -3638,7 +3648,8 @@ mod tests {
         RuntimePromptResult,
     };
     use crate::inventory_service::{
-        InventoryServiceError, InventorySource, seed_inventory_workers,
+        HerdrInventorySource, InventoryServiceError, InventorySource, RuntimeSessionDescriptor,
+        seed_inventory_workers,
     };
     use crate::orchestrator_replacement_service::OrchestratorReplacementServiceError;
     use crate::project_service::ProjectServiceError;
@@ -5209,6 +5220,244 @@ mod tests {
                 .get(session_name)
                 .unwrap_or_else(|| panic!("missing lens fixture session {session_name}"))
                 .clone())
+        }
+    }
+
+    struct IdentifiedFleetInventory {
+        descriptors: Vec<RuntimeSessionDescriptor>,
+        inventories: HashMap<String, RuntimeInventory>,
+        snapshot_requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl InventorySource for IdentifiedFleetInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            panic!("fleet test must use session descriptors")
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            panic!("fleet test must snapshot descriptor {session_name}")
+        }
+
+        async fn session_descriptors(
+            &self,
+        ) -> Result<(String, Vec<RuntimeSessionDescriptor>), InventoryServiceError> {
+            Ok(("herdr".to_owned(), self.descriptors.clone()))
+        }
+
+        async fn fleet_inventory_for_descriptor(
+            &self,
+            session: &RuntimeSessionDescriptor,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            self.snapshot_requests
+                .lock()
+                .unwrap()
+                .push(session.snapshot_key().to_owned());
+            Ok(self.inventories[session.id()].clone())
+        }
+    }
+
+    struct PartialFleetInventory {
+        alpha: RuntimeInventory,
+    }
+
+    #[async_trait]
+    impl InventorySource for PartialFleetInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            Ok(RuntimeSessions {
+                adapter: "herdr".to_owned(),
+                sessions: vec![
+                    RuntimeSession {
+                        name: "alpha".to_owned(),
+                        is_default: true,
+                        running: true,
+                    },
+                    RuntimeSession {
+                        name: "beta".to_owned(),
+                        is_default: false,
+                        running: true,
+                    },
+                    RuntimeSession {
+                        name: "stopped".to_owned(),
+                        is_default: false,
+                        running: false,
+                    },
+                ],
+            })
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            match session_name {
+                "alpha" => Ok(self.alpha.clone()),
+                "beta" => Err(InventoryServiceError::Herdr(HerdrError::SocketTimeout)),
+                other => panic!("stopped session inventory requested: {other}"),
+            }
+        }
+    }
+
+    struct EmptyFleetInventory;
+
+    #[async_trait]
+    impl InventorySource for EmptyFleetInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            Ok(RuntimeSessions {
+                adapter: "herdr".to_owned(),
+                sessions: vec![RuntimeSession {
+                    name: "stopped".to_owned(),
+                    is_default: true,
+                    running: false,
+                }],
+            })
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            panic!("stopped session inventory requested: {session_name}")
+        }
+    }
+
+    struct AllFailedFleetInventory;
+
+    #[async_trait]
+    impl InventorySource for AllFailedFleetInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            Ok(RuntimeSessions {
+                adapter: "herdr".to_owned(),
+                sessions: ["alpha", "beta"]
+                    .into_iter()
+                    .map(|name| RuntimeSession {
+                        name: name.to_owned(),
+                        is_default: name == "alpha",
+                        running: true,
+                    })
+                    .collect(),
+            })
+        }
+
+        async fn inventory(
+            &self,
+            _session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            Err(InventoryServiceError::Herdr(HerdrError::SocketTimeout))
+        }
+    }
+
+    struct ConcurrentFleetInventory {
+        inventory: RuntimeInventory,
+        calls: Arc<AtomicUsize>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+        release: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl InventorySource for ConcurrentFleetInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            Ok(RuntimeSessions {
+                adapter: "herdr".to_owned(),
+                sessions: (0..6)
+                    .map(|index| RuntimeSession {
+                        name: format!("session-{index}"),
+                        is_default: index == 0,
+                        running: true,
+                    })
+                    .collect(),
+            })
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            let permit = self.release.acquire().await.unwrap();
+            permit.forget();
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(RuntimeInventory {
+                session: session_name.to_owned(),
+                ..self.inventory.clone()
+            })
+        }
+    }
+
+    struct CountingFleetInventory {
+        discoveries: Arc<AtomicUsize>,
+        snapshots: Arc<Mutex<HashMap<String, usize>>>,
+        inventory: RuntimeInventory,
+    }
+
+    #[async_trait]
+    impl InventorySource for CountingFleetInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            self.discoveries.fetch_add(1, Ordering::SeqCst);
+            let mut sessions = (0..64)
+                .map(|index| RuntimeSession {
+                    name: format!("session-{index}"),
+                    is_default: index == 0,
+                    running: true,
+                })
+                .collect::<Vec<_>>();
+            sessions.push(sessions[0].clone());
+            sessions.push(RuntimeSession {
+                name: "stopped".to_owned(),
+                is_default: false,
+                running: false,
+            });
+            Ok(RuntimeSessions {
+                adapter: "herdr".to_owned(),
+                sessions,
+            })
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            *self
+                .snapshots
+                .lock()
+                .unwrap()
+                .entry(session_name.to_owned())
+                .or_default() += 1;
+            let mut inventory = self.inventory.clone();
+            inventory.session = session_name.to_owned();
+            let template = inventory.panes[0].clone();
+            inventory.panes = (0..8)
+                .map(|index| {
+                    let mut pane = template.clone();
+                    pane.runtime_id = format!("{session_name}:pane-{index}");
+                    pane.terminal_id = format!("{session_name}:terminal-{index}");
+                    pane
+                })
+                .collect();
+            inventory.workers.clear();
+            Ok(inventory)
+        }
+    }
+
+    struct FailedFleetDiscovery;
+
+    #[async_trait]
+    impl InventorySource for FailedFleetDiscovery {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            Err(InventoryServiceError::Herdr(HerdrError::SocketTimeout))
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            panic!("inventory requested after failed discovery: {session_name}")
         }
     }
 
@@ -7408,6 +7657,501 @@ mod tests {
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         let json = response_json(response).await;
         assert_eq!(json["sessions"][0]["name"], "default");
+    }
+
+    #[tokio::test]
+    async fn herdr_fleet_inventory_rejects_conflicting_session_sources_without_snapshotting() {
+        let descriptor = |id: &str, snapshot: &str, name: &str, is_default: bool, running: bool| {
+            RuntimeSessionDescriptor::identified(
+                id,
+                snapshot,
+                RuntimeSession {
+                    name: name.to_owned(),
+                    is_default,
+                    running,
+                },
+            )
+        };
+        let descriptors = vec![
+            descriptor("session-alpha", "socket-alpha", "shared", true, true),
+            descriptor("session-alpha", "socket-alpha", "shared", true, true),
+            descriptor("session-beta", "socket-beta", "shared", false, true),
+            descriptor("session-conflict", "socket-conflict-a", "first", true, true),
+            descriptor(
+                "session-conflict",
+                "socket-conflict-b",
+                "second",
+                false,
+                false,
+            ),
+        ];
+        let inventories = ["session-alpha", "session-beta"]
+            .into_iter()
+            .map(|id| {
+                let mut inventory = lens_fixture_inventory(id);
+                inventory.session = id.to_owned();
+                (id.to_owned(), inventory)
+            })
+            .collect::<HashMap<_, _>>();
+
+        for (descriptors, expected_sessions, expected_snapshots) in [
+            (
+                descriptors.clone(),
+                ["session-alpha", "session-beta"],
+                ["socket-alpha", "socket-beta"],
+            ),
+            (
+                descriptors.into_iter().rev().collect(),
+                ["session-beta", "session-alpha"],
+                ["socket-beta", "socket-alpha"],
+            ),
+        ] {
+            let snapshot_requests = Arc::new(Mutex::new(Vec::new()));
+            let (app, _temp) = test_router_with_source(Arc::new(IdentifiedFleetInventory {
+                descriptors,
+                inventories: inventories.clone(),
+                snapshot_requests: snapshot_requests.clone(),
+            }))
+            .await;
+
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/runtimes/herdr/inventory")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let json = response_json(response).await;
+            assert_eq!(
+                json["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|session| session["id"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                expected_sessions,
+            );
+            assert_eq!(json["failures"].as_array().unwrap().len(), 1);
+            assert_eq!(json["failures"][0]["session"], "session-conflict");
+            assert_eq!(json["failures"][0]["code"], "session_metadata_ambiguous");
+            assert_eq!(
+                json["failures"][0]["reason"],
+                "Herdr reported conflicting session metadata."
+            );
+            assert_eq!(
+                snapshot_requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                expected_snapshots,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn herdr_fleet_inventory_retains_unattached_agent_without_counting_a_pane() {
+        let mut alpha = lens_fixture_inventory("alpha");
+        let live_pane_count = alpha.panes.len();
+        let mut orphan = alpha.workers[0].clone();
+        orphan.runtime_id = "orphan-agent".to_owned();
+        orphan.pane_id = "missing-pane".to_owned();
+        orphan.terminal_id = "orphan-terminal".to_owned();
+        alpha.workers.push(orphan);
+        let (app, _temp) = test_router_with_source(Arc::new(SessionInventory {
+            inventories: HashMap::from([("alpha".to_owned(), alpha)]),
+        }))
+        .await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/inventory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["live_pane_count"], live_pane_count);
+        let panes = json["sessions"][0]["panes"].as_array().unwrap();
+        assert_eq!(panes.len(), live_pane_count + 1);
+        let orphan = panes
+            .iter()
+            .find(|pane| pane["reason"] == "No live pane observed.")
+            .unwrap();
+        assert_eq!(orphan["has_live_pane"], false);
+        assert_eq!(orphan["observation"], "ambiguous");
+        assert!(orphan.get("yard_worker_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn herdr_fleet_adapter_preserves_conflicts_through_the_endpoint() {
+        let source_temp = TempDir::new().unwrap();
+        let socket_path = source_temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let sessions = serde_json::json!({
+            "sessions": [{
+                "default": true,
+                "name": "alpha",
+                "running": true,
+                "socket_path": socket_path,
+                "session_dir": source_temp.path().join("session-alpha"),
+            }],
+        });
+        let binary = source_temp.path().join("herdr-fixture");
+        std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s' '{sessions}'\n")).unwrap();
+        let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).unwrap();
+
+        let mut fixture: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../../yard-herdr/tests/fixtures/v0.8.0/snapshot.json"
+        ))
+        .unwrap();
+        let panes = fixture["result"]["snapshot"]["panes"]
+            .as_array_mut()
+            .unwrap();
+        let mut conflicting = panes[0].clone();
+        conflicting["tab_id"] = "conflicting-tab".into();
+        panes.push(conflicting);
+        fixture["result"]["snapshot"]["agents"][0]["tab_id"] = "different-agent-tab".into();
+        let mut fixture = serde_json::to_vec(&fixture).unwrap();
+        fixture.push(b'\n');
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut request = String::new();
+            BufReader::new(reader)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            writer.write_all(&fixture).await.unwrap();
+        });
+        let source = HerdrInventorySource::new(HerdrAdapter::new(HerdrConfig {
+            binary: binary.into_os_string(),
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        }));
+        let (app, _temp) = test_router_with_source(Arc::new(source)).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/inventory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["live_pane_count"], 1);
+        let pane = &json["sessions"][0]["panes"][0];
+        assert_eq!(pane["observation"], "ambiguous");
+        assert_eq!(pane["reason"], "Missing tab ancestry.");
+        assert!(pane["tab_id"].is_null());
+        assert!(pane["provider"].is_null());
+        assert!(pane["name"].is_null());
+        assert_eq!(pane["status"], "working");
+    }
+
+    #[tokio::test]
+    async fn herdr_fleet_inventory_keeps_successful_sessions_and_reports_failures() {
+        let alpha = lens_fixture_inventory("alpha");
+        let expected_panes = alpha.panes.len();
+        let (app, _temp) = test_router_with_source(Arc::new(PartialFleetInventory { alpha })).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/inventory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let json = response_json(response).await;
+        assert_eq!(json["live_pane_count"], expected_panes);
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(json["sessions"][0]["name"], "alpha");
+        assert_eq!(
+            json["sessions"][0]["panes"].as_array().unwrap().len(),
+            expected_panes
+        );
+        assert_eq!(json["failures"].as_array().unwrap().len(), 1);
+        assert_eq!(json["failures"][0]["session"], "beta");
+        assert_eq!(json["failures"][0]["code"], "herdr_snapshot_failed");
+        assert_eq!(
+            json["failures"][0]["reason"],
+            "Herdr snapshot was unavailable for this session."
+        );
+        assert!(json.get("warnings").is_none());
+    }
+
+    #[tokio::test]
+    async fn herdr_fleet_inventory_zero_running_sessions_is_empty_success() {
+        let (app, _temp) = test_router_with_source(Arc::new(EmptyFleetInventory)).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/inventory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["live_pane_count"], 0);
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 0);
+        assert_eq!(json["failures"].as_array().unwrap().len(), 0);
+        assert!(json.get("warnings").is_none());
+    }
+
+    #[tokio::test]
+    async fn herdr_fleet_inventory_all_running_snapshots_failed_is_typed_unavailable() {
+        let (app, _temp) = test_router_with_source(Arc::new(AllFailedFleetInventory)).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/inventory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let json = response_json(response).await;
+        assert_eq!(json["error"]["code"], "herdr_fleet_unavailable");
+        assert_eq!(
+            json["error"]["message"],
+            "Live Herdr inventory is temporarily unavailable; retry the request."
+        );
+        assert_eq!(json["error"]["attempted_session_count"], 2);
+        assert_eq!(json["error"]["failed_session_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn herdr_fleet_inventory_total_discovery_failure_is_honest() {
+        let (app, _temp) = test_router_with_source(Arc::new(FailedFleetDiscovery)).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/inventory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let json = response_json(response).await;
+        assert_eq!(json["error"]["code"], "herdr_session_discovery_unavailable");
+        assert_eq!(
+            json["error"]["message"],
+            "Unable to discover running Herdr sessions; retry the request."
+        );
+        assert!(json["error"].get("attempted_session_count").is_none());
+        assert!(json["error"].get("failed_session_count").is_none());
+    }
+
+    #[tokio::test]
+    async fn herdr_fleet_inventory_bounds_concurrent_session_snapshots() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let source = Arc::new(ConcurrentFleetInventory {
+            inventory: lens_fixture_inventory("session-0"),
+            calls: calls.clone(),
+            active: active.clone(),
+            max_active: max_active.clone(),
+            release: release.clone(),
+        });
+        let (app, _temp) = test_router_with_source(source).await;
+        let response = tokio::spawn(
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/inventory")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+
+        timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("four fleet snapshots did not start concurrently");
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(active.load(Ordering::SeqCst), 4);
+        assert_eq!(max_active.load(Ordering::SeqCst), 4);
+
+        release.add_permits(6);
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+        assert_eq!(max_active.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn herdr_fleet_inventory_discovers_once_and_snapshots_each_running_session_once() {
+        let discoveries = Arc::new(AtomicUsize::new(0));
+        let snapshots = Arc::new(Mutex::new(HashMap::new()));
+        let source = Arc::new(CountingFleetInventory {
+            discoveries: discoveries.clone(),
+            snapshots: snapshots.clone(),
+            inventory: lens_fixture_inventory("session-0"),
+        });
+        let (app, _temp) = test_router_with_source(source).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/inventory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["live_pane_count"], 512);
+        assert_eq!(discoveries.load(Ordering::SeqCst), 1);
+        let snapshots = snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 64);
+        assert!(snapshots.values().all(|calls| *calls == 1));
+        assert!(!snapshots.contains_key("stopped"));
+    }
+
+    #[tokio::test]
+    async fn herdr_fleet_inventory_ignores_large_yard_history_and_missing_binding_table() {
+        let alpha = lens_fixture_inventory("alpha");
+        let (app, temp) = test_router_with_source(Arc::new(SessionInventory {
+            inventories: HashMap::from([("alpha".to_owned(), alpha.clone())]),
+        }))
+        .await;
+        let mut connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let transaction = connection.transaction().unwrap();
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO workers (
+                         id, profile_id, profile_version, desired_state, version,
+                         created_at_unix_ms, updated_at_unix_ms
+                     ) VALUES (?1, NULL, NULL, ?2, 1, 1, 1)",
+                )
+                .unwrap();
+            for index in 0..20_000 {
+                insert
+                    .execute((format!("history-{index}"), "running"))
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+        connection
+            .execute("DROP TABLE worker_runtime_bindings", [])
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/inventory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(json["live_pane_count"], alpha.panes.len());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM workers", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            20_000
+        );
+        assert!(
+            json["sessions"][0]["panes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|pane| pane.get("yard_worker_id").is_none()
+                    && pane.get("authority_fingerprint").is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn herdr_fleet_inventory_get_is_strictly_read_only() {
+        let alpha = lens_fixture_inventory("alpha");
+        let (app, temp) = test_router_with_source(Arc::new(SessionInventory {
+            inventories: HashMap::from([("alpha".to_owned(), alpha.clone())]),
+        }))
+        .await;
+        seed_inventory_workers(
+            &temp.path().join("yard.sqlite3"),
+            &alpha,
+            &["terminal-1", "terminal-lens-linked"],
+        );
+        let observer = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let before_version: i64 = observer
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap();
+        let counts = |connection: &rusqlite::Connection| {
+            [
+                "workers",
+                "worker_runtime_bindings",
+                "lifecycle_events",
+                "runtime_reconciliation_watermarks",
+            ]
+            .map(|table| {
+                connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap()
+            })
+        };
+        let before_counts = counts(&observer);
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/runtimes/herdr/inventory")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert_eq!(
+            observer
+                .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            before_version
+        );
+        assert_eq!(counts(&observer), before_counts);
     }
 
     #[tokio::test]

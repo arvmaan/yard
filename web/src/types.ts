@@ -30,6 +30,55 @@ export interface RuntimeSessions {
   sessions: RuntimeSession[]
 }
 
+export type HerdrPaneKind = 'agent' | 'runtime'
+export type HerdrPaneObservation = 'observed' | 'unobserved' | 'ambiguous'
+
+export interface HerdrLivePane {
+  identity_key: string
+  kind: HerdrPaneKind
+  observation: HerdrPaneObservation
+  reason: string
+  metadata_reason: string | null
+  has_live_pane: boolean
+  session: string
+  workspace_id: string | null
+  workspace_label: string | null
+  tab_id: string | null
+  pane_id: string | null
+  terminal_id: string | null
+  label: string | null
+  name: string | null
+  provider: string | null
+  display_provider: string | null
+  status: ObservedStatus
+  cwd: string | null
+  foreground_cwd: string | null
+}
+
+export interface HerdrLiveSession {
+  id: string
+  name: string
+  is_default: boolean
+  metadata_ambiguous: boolean
+  metadata_reason: string | null
+  observed_at_unix_ms: string
+  pane_count: number
+  panes: HerdrLivePane[]
+}
+
+export interface HerdrSessionFailure {
+  session: string
+  code: string
+  reason: string
+}
+
+export interface HerdrFleetInventory {
+  adapter: string
+  live_pane_count: number
+  sessions: HerdrLiveSession[]
+  failures: HerdrSessionFailure[]
+}
+
 export interface FocusObservation {
   workspace_id: string | null
   tab_id: string | null

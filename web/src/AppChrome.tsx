@@ -214,7 +214,10 @@ interface GlobalCommandBarProps extends RuntimeHealthPopoverProps {
   onAgentWorkspaceModeChange: (
     mode: AgentWorkspaceMode | 'map',
   ) => void
+  herdrInventoryOpen: boolean
+  herdrInventoryTriggerRef: RefObject<HTMLButtonElement | null>
   onCreateProject: () => void
+  onOpenHerdrInventory: () => void
   onOpenSettings: () => void
   onResourceViewChange: (view: ResourceView) => void
   railView: ResourceView
@@ -236,8 +239,11 @@ export function GlobalCommandBar({
   agentWorkspaceMode,
   busy,
   health,
+  herdrInventoryOpen,
+  herdrInventoryTriggerRef,
   onAgentWorkspaceModeChange,
   onCreateProject,
+  onOpenHerdrInventory,
   onOpenSettings,
   onRefresh,
   onResourceViewChange,
@@ -317,6 +323,20 @@ export function GlobalCommandBar({
       >
         <FolderPlus aria-hidden="true" size={16} />
         <span>Create project</span>
+      </button>
+
+      <button
+        aria-controls="herdr-inventory-workspace"
+        aria-expanded={herdrInventoryOpen}
+        aria-pressed={herdrInventoryOpen}
+        className="top-command top-command--secondary"
+        onClick={onOpenHerdrInventory}
+        ref={herdrInventoryTriggerRef}
+        title="Live Herdr panes"
+        type="button"
+      >
+        <Boxes aria-hidden="true" size={16} />
+        <span>Herdr</span>
       </button>
 
       <div
