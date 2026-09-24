@@ -16,6 +16,7 @@ mod serde_u64;
 mod status_report;
 mod token_spend;
 mod worker;
+mod worker_cleanup;
 mod yard_orchestrator;
 
 pub use agent_profile::{
@@ -122,6 +123,13 @@ pub use worker::{
     CompletedRuntimeRetentionReason, DeleteWorker, DeletedWorker, EndWorkerSession,
     EndedWorkerSession, WorkerAvailability, WorkerCandidate, WorkerCandidates,
     WorkerSessionValidationError,
+};
+pub use worker_cleanup::{
+    CancelWorkerCleanupRun, CleanupAdvisorArtifact, CleanupAdvisorRecommendation,
+    CleanupAdvisorRequest, CleanupAdvisorResult, CleanupAdvisorState, StartWorkerCleanupRun,
+    UpdateWorkerCleanupPolicy, WorkerCleanupDashboard, WorkerCleanupItemStatus,
+    WorkerCleanupPolicy, WorkerCleanupRun, WorkerCleanupRunItem, WorkerCleanupRunStatus,
+    WorkerCleanupRunTrigger, WorkerCleanupRuns, WorkerCleanupValidationError,
 };
 pub use yard_orchestrator::{
     ConfigureYardOrchestrator, ConfiguredYardOrchestrator, ProvisionYardOrchestrator,

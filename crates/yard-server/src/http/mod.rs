@@ -9,36 +9,38 @@ use axum::{
 };
 use serde::Serialize;
 use tokio::sync::watch;
-use yard_domain::CompletedRuntimeCleanupPreview;
 use yard_domain::{
     AgentProfile, AgentProfiles, ArchiveProject, ArchivedProject, Artifact, ArtifactContent,
     Assignments, Automation, AutomationCommandResult, AutomationRun, AutomationRunCommandResult,
-    AutomationRuns, Automations, ConfigureYardOrchestrator, ConfiguredYardOrchestrator,
-    ConfirmProfileAllocation, ConfirmWorkerAllocation, ConfirmWorkerHandoff, ConfirmedAllocation,
-    ConfirmedProjectCreation, ConfirmedWorkerHandoff, CoordinationNode,
-    CoordinationNodeCommandResult, CoordinationNodePromptAcknowledgement, CoordinationNodeRoute,
-    CoordinationNodeRoutes, CoordinationNodeTerminalOutput, CoordinationNodes,
-    CoordinationSnapshot, CoordinationSnapshots, CreateAgentProfile, CreateAutomation,
-    CreateCoordinationNode, CreateProject, CreateProjectFromProfile, CreateProjectRelationship,
-    CreateWorkerProfile, CreateWorkspaceProjectFromProfile, CreatedProjectRelationship,
-    DeleteProject, DeleteProjectRelationship, DeleteWorker, DeletedProject,
-    DeletedProjectRelationship, DeletedWorker, EndWorkerSession, EndedWorkerSession,
-    ManageAllAgents, OrchestratorPromptAcknowledgement, OrchestratorTerminalOutput,
-    OrchestratorWorkflowProfile, OrchestratorWorkflowProfiles, PaneManagementBatchResult,
-    PaneManagementPreview, Project, ProjectRelationships, Projects, PromptAcknowledgement,
-    ProvisionCoordinationNode, ProvisionYardOrchestrator, RecordCompletionReceipt,
-    RecordedCompletionReceipt, RecoverYardOrchestrator, RecoveredYardOrchestrator,
-    ReplaceProjectOrchestrator, ReplacedProjectOrchestrator, RequestCoordinationSnapshot,
-    ResetOrchestratorWorkflowProfile, RunAutomationNow, RuntimeInventory, RuntimeSessions,
-    RuntimeTopology, SendAssignmentPrompt, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
-    SendOrchestratorPrompt, SendYardOrchestratorPrompt, SendYardOrchestratorRoute,
-    SetAutomationPaused, TerminalOutput, TokenSpendSettings, TransferProjectOrchestrator,
+    AutomationRuns, Automations, CancelWorkerCleanupRun, CompletedRuntimeCleanupPreview,
+    ConfigureYardOrchestrator, ConfiguredYardOrchestrator, ConfirmProfileAllocation,
+    ConfirmWorkerAllocation, ConfirmWorkerHandoff, ConfirmedAllocation, ConfirmedProjectCreation,
+    ConfirmedWorkerHandoff, CoordinationNode, CoordinationNodeCommandResult,
+    CoordinationNodePromptAcknowledgement, CoordinationNodeRoute, CoordinationNodeRoutes,
+    CoordinationNodeTerminalOutput, CoordinationNodes, CoordinationSnapshot, CoordinationSnapshots,
+    CreateAgentProfile, CreateAutomation, CreateCoordinationNode, CreateProject,
+    CreateProjectFromProfile, CreateProjectRelationship, CreateWorkerProfile,
+    CreateWorkspaceProjectFromProfile, CreatedProjectRelationship, DeleteProject,
+    DeleteProjectRelationship, DeleteWorker, DeletedProject, DeletedProjectRelationship,
+    DeletedWorker, EndWorkerSession, EndedWorkerSession, ManageAllAgents,
+    OrchestratorPromptAcknowledgement, OrchestratorTerminalOutput, OrchestratorWorkflowProfile,
+    OrchestratorWorkflowProfiles, PaneManagementBatchResult, PaneManagementPreview, Project,
+    ProjectRelationships, Projects, PromptAcknowledgement, ProvisionCoordinationNode,
+    ProvisionYardOrchestrator, RecordCompletionReceipt, RecordedCompletionReceipt,
+    RecoverYardOrchestrator, RecoveredYardOrchestrator, ReplaceProjectOrchestrator,
+    ReplacedProjectOrchestrator, RequestCoordinationSnapshot, ResetOrchestratorWorkflowProfile,
+    RunAutomationNow, RuntimeInventory, RuntimeSessions, RuntimeTopology, SendAssignmentPrompt,
+    SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
+    SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SetAutomationPaused,
+    StartWorkerCleanupRun, TerminalOutput, TokenSpendSettings, TransferProjectOrchestrator,
     TransferredProjectOrchestrator, UpdateAgentProfile, UpdateAutomation,
     UpdateAutomationPlacement, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
     UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
-    UpdateTokenSpendSettings, UpdateWorkerProfile, UploadArtifact, WorkerCandidates, WorkerProfile,
-    WorkerProfiles, YardOrchestrator, YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute,
-    YardOrchestratorRoutes, YardOrchestratorTerminalOutput,
+    UpdateTokenSpendSettings, UpdateWorkerCleanupPolicy, UpdateWorkerProfile, UploadArtifact,
+    WorkerCandidates, WorkerCleanupDashboard, WorkerCleanupPolicy, WorkerCleanupRun,
+    WorkerCleanupRunTrigger, WorkerProfile, WorkerProfiles, YardOrchestrator,
+    YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute, YardOrchestratorRoutes,
+    YardOrchestratorTerminalOutput,
 };
 use yard_herdr::HerdrError;
 use yard_store::{MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT, ProjectStoreError, YardStore};
@@ -66,6 +68,7 @@ use crate::project_orchestrator_transfer_service::{
 use crate::project_service::{ProjectService, ProjectServiceError};
 use crate::reconciliation_service::{ReconciliationService, ReconciliationServiceError};
 use crate::terminal_service::{RuntimeTerminal, TerminalService};
+use crate::worker_cleanup_service::WorkerCleanupService;
 use crate::worker_session_service::{WorkerSessionService, WorkerSessionServiceError};
 use crate::yard_orchestrator_service::{YardOrchestratorService, YardOrchestratorServiceError};
 
@@ -87,6 +90,7 @@ struct AppState {
     orchestrator_replacements: OrchestratorReplacementService,
     orchestrator_transfers: ProjectOrchestratorTransferService,
     worker_sessions: WorkerSessionService,
+    worker_cleanup: WorkerCleanupService,
     interventions: InterventionService,
     terminals: TerminalService,
     artifacts: ArtifactService,
@@ -229,6 +233,7 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
     let orchestrator_workflow_profiles =
         OrchestratorWorkflowProfileService::new(Arc::clone(&store));
     let worker_sessions = WorkerSessionService::new(Arc::clone(&runtime), Arc::clone(&store));
+    let worker_cleanup = WorkerCleanupService::new(Arc::clone(&source), Arc::clone(&store));
     let allocations = AllocationService::new(
         Arc::clone(&source),
         Arc::clone(&runtime),
@@ -431,6 +436,23 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             "/api/v1/workers/completed-runtime-cleanup-preview",
             get(preview_completed_runtime_cleanup),
         )
+        .route("/api/v1/workers/cleanup", get(get_worker_cleanup_dashboard))
+        .route(
+            "/api/v1/workers/cleanup/policy",
+            put(update_worker_cleanup_policy),
+        )
+        .route(
+            "/api/v1/workers/cleanup/runs",
+            axum::routing::post(start_worker_cleanup_run),
+        )
+        .route(
+            "/api/v1/workers/cleanup/runs/{run_id}",
+            get(get_worker_cleanup_run),
+        )
+        .route(
+            "/api/v1/workers/cleanup/runs/{run_id}/cancel",
+            axum::routing::post(cancel_worker_cleanup_run),
+        )
         .route(
             "/api/v1/workers/{worker_id}/end-session",
             axum::routing::post(end_worker_session),
@@ -540,6 +562,7 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             orchestrator_replacements,
             orchestrator_transfers,
             worker_sessions,
+            worker_cleanup,
             interventions,
             terminals,
             artifacts,
@@ -1474,6 +1497,85 @@ async fn preview_completed_runtime_cleanup(
                 message: "Yard could not build the completed runtime cleanup preview".to_owned(),
             },
         })
+}
+
+async fn get_worker_cleanup_dashboard(
+    State(state): State<AppState>,
+) -> Result<NoStoreJson<WorkerCleanupDashboard>, ApiError> {
+    state
+        .store
+        .get_worker_cleanup_dashboard(50, 20)
+        .await
+        .map(NoStoreJson)
+        .map_err(worker_cleanup_store_error)
+}
+
+async fn update_worker_cleanup_policy(
+    State(state): State<AppState>,
+    Json(command): Json<UpdateWorkerCleanupPolicy>,
+) -> Result<NoStoreJson<WorkerCleanupPolicy>, ApiError> {
+    state
+        .store
+        .update_worker_cleanup_policy(command)
+        .await
+        .map(NoStoreJson)
+        .map_err(worker_cleanup_store_error)
+}
+
+async fn start_worker_cleanup_run(
+    State(state): State<AppState>,
+    Json(command): Json<StartWorkerCleanupRun>,
+) -> Result<NoStoreJson<WorkerCleanupRun>, ApiError> {
+    let trigger = if command.preview {
+        WorkerCleanupRunTrigger::Preview
+    } else {
+        WorkerCleanupRunTrigger::Manual
+    };
+    let run = state
+        .store
+        .start_worker_cleanup_run(trigger, command)
+        .await
+        .map_err(worker_cleanup_store_error)?;
+    if !run.preview {
+        if let Err(error) = state.worker_cleanup.process_pending().await {
+            tracing::warn!(
+                error = %error,
+                run_id = %run.id,
+                "Immediate worker cleanup pass failed; durable items remain pending"
+            );
+        }
+    }
+    state
+        .store
+        .get_worker_cleanup_run(&run.id)
+        .await
+        .map(NoStoreJson)
+        .map_err(worker_cleanup_store_error)
+}
+
+async fn get_worker_cleanup_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<NoStoreJson<WorkerCleanupRun>, ApiError> {
+    state
+        .store
+        .get_worker_cleanup_run(&run_id)
+        .await
+        .map(NoStoreJson)
+        .map_err(worker_cleanup_store_error)
+}
+
+async fn cancel_worker_cleanup_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(command): Json<CancelWorkerCleanupRun>,
+) -> Result<NoStoreJson<WorkerCleanupRun>, ApiError> {
+    state
+        .store
+        .cancel_worker_cleanup_run(&run_id, command)
+        .await
+        .map(NoStoreJson)
+        .map_err(worker_cleanup_store_error)
 }
 
 async fn end_worker_session(
@@ -3497,6 +3599,40 @@ fn allocation_store_error(error: ProjectStoreError) -> ApiError {
             ),
         },
         error => allocation_store_command_error(error),
+    }
+}
+
+fn worker_cleanup_store_error(error: ProjectStoreError) -> ApiError {
+    match error {
+        ProjectStoreError::InvalidWorkerCleanup(error) => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "invalid_worker_cleanup",
+            message: error.to_string(),
+        },
+        ProjectStoreError::WorkerCleanupRunNotFound => ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "worker_cleanup_run_not_found",
+            message: error.to_string(),
+        },
+        ProjectStoreError::WorkerCleanupPolicyVersionConflict { .. }
+        | ProjectStoreError::WorkerCleanupRunIdConflict
+        | ProjectStoreError::WorkerCleanupRunTerminal
+        | ProjectStoreError::WorkerCleanupClaimConflict
+        | ProjectStoreError::WorkerCleanupRevalidationFailed => ApiError {
+            status: StatusCode::CONFLICT,
+            code: "worker_cleanup_conflict",
+            message: error.to_string(),
+        },
+        ProjectStoreError::DatabaseBusy => ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "database_busy",
+            message: "Yard storage is busy; retry the request".to_owned(),
+        },
+        _ => ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "storage_error",
+            message: "Yard storage is unavailable".to_owned(),
+        },
     }
 }
 

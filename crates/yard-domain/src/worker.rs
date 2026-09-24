@@ -50,6 +50,17 @@ pub enum CompletedRuntimeRetentionReason {
     PendingAssignmentIntervention,
     NewActiveAssignment,
     ProtectedOrchestrator,
+    NotYardOwned,
+    ProjectOwnershipMismatch,
+    ParentOwnershipMismatch,
+    GraceNotElapsed,
+    HandoffInProgress,
+    CoordinationNode,
+    Pinned,
+    RuntimeConflict,
+    ObservationFailure,
+    CleanupAdvisorArtifactMissing,
+    CleanupAdvisorRecursionPrevented,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

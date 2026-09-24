@@ -58,8 +58,10 @@ use yard_domain::{
     YardOrchestratorRoute, YardOrchestratorRoutes, herdr_agent_name,
 };
 use yard_domain::{
-    CompletedRuntimeCleanupCandidate, CompletedRuntimeCleanupPreview,
-    CompletedRuntimeRetentionReason,
+    CancelWorkerCleanupRun, CleanupAdvisorArtifact, CompletedRuntimeCleanupCandidate,
+    CompletedRuntimeCleanupPreview, CompletedRuntimeRetentionReason, StartWorkerCleanupRun,
+    UpdateWorkerCleanupPolicy, WorkerCleanupDashboard, WorkerCleanupPolicy, WorkerCleanupRun,
+    WorkerCleanupRunTrigger, WorkerCleanupRuns,
 };
 
 mod automation_store;
@@ -67,12 +69,13 @@ mod coordination_node_store;
 mod orchestrator_workflow_profile_store;
 mod pane_management_store;
 mod token_spend_store;
+mod worker_cleanup_store;
 
 pub use pane_management_store::{
     BeginPaneManagementBatch, ManagedPaneAdoption, StoredLeaseToken, StoredPaneManagementLease,
 };
 
-const SCHEMA_VERSION: i64 = 30;
+const SCHEMA_VERSION: i64 = 31;
 const PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS: u64 = 120_000;
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_projects.sql");
 const PROFILE_ASSIGNMENT_MIGRATION: &str =
@@ -128,6 +131,7 @@ const PROJECT_REPOSITORIES_MIGRATION: &str =
 const PANE_MANAGEMENT_MIGRATION: &str =
     include_str!("../migrations/0030_pane_management_leases.sql");
 const BLANK_WORKER_PROFILE_ID: &str = "yard:managed-blank-profile";
+const WORKER_CLEANUP_MIGRATION: &str = include_str!("../migrations/0031_worker_cleanup.sql");
 const BLANK_WORKER_PROFILE_NAME: &str = "Blank profile";
 const MAX_ROUTE_LIST_LIMIT: usize = 500;
 pub const MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT: usize = 100;
@@ -547,6 +551,79 @@ pub trait YardStore: Send + Sync {
         &self,
         limit: usize,
     ) -> Result<CompletedRuntimeCleanupPreview, ProjectStoreError>;
+    async fn get_worker_cleanup_dashboard(
+        &self,
+        preview_limit: usize,
+        run_limit: usize,
+    ) -> Result<WorkerCleanupDashboard, ProjectStoreError>;
+    async fn get_worker_cleanup_policy(&self) -> Result<WorkerCleanupPolicy, ProjectStoreError>;
+    async fn update_worker_cleanup_policy(
+        &self,
+        command: UpdateWorkerCleanupPolicy,
+    ) -> Result<WorkerCleanupPolicy, ProjectStoreError>;
+    async fn start_worker_cleanup_run(
+        &self,
+        trigger: WorkerCleanupRunTrigger,
+        command: StartWorkerCleanupRun,
+    ) -> Result<WorkerCleanupRun, ProjectStoreError>;
+    async fn list_worker_cleanup_runs(
+        &self,
+        limit: usize,
+    ) -> Result<WorkerCleanupRuns, ProjectStoreError>;
+    async fn get_worker_cleanup_run(
+        &self,
+        run_id: &str,
+    ) -> Result<WorkerCleanupRun, ProjectStoreError>;
+    async fn cancel_worker_cleanup_run(
+        &self,
+        run_id: &str,
+        command: CancelWorkerCleanupRun,
+    ) -> Result<WorkerCleanupRun, ProjectStoreError>;
+    async fn claim_worker_cleanup_items(
+        &self,
+        run_id: Option<&str>,
+        limit: usize,
+        claim_ttl_ms: u64,
+    ) -> Result<Vec<ClaimedWorkerCleanupItem>, ProjectStoreError>;
+    async fn finish_worker_cleanup_item(
+        &self,
+        run_id: &str,
+        worker_id: &str,
+        claim_token: &str,
+        status: yard_domain::WorkerCleanupItemStatus,
+        reason: &str,
+    ) -> Result<(), ProjectStoreError>;
+    async fn retry_worker_cleanup_item(
+        &self,
+        run_id: &str,
+        worker_id: &str,
+        claim_token: &str,
+        reason: &str,
+        retry_after_ms: u64,
+    ) -> Result<(), ProjectStoreError>;
+    async fn reconcile_missing_worker_cleanup_item(
+        &self,
+        item: &ClaimedWorkerCleanupItem,
+        observed_at_unix_ms: u64,
+    ) -> Result<(), ProjectStoreError>;
+    async fn authorize_worker_cleanup_close(
+        &self,
+        item: &ClaimedWorkerCleanupItem,
+    ) -> Result<(), ProjectStoreError>;
+    async fn record_cleanup_advisor_assignment(
+        &self,
+        item: &ClaimedWorkerCleanupItem,
+        parent_worker_id: &str,
+        advisor_worker_id: &str,
+        advisor_assignment_id: &str,
+    ) -> Result<(), ProjectStoreError>;
+    async fn record_cleanup_advisor_artifact(
+        &self,
+        item: &ClaimedWorkerCleanupItem,
+        completion_receipt_id: &str,
+        artifact_id: &str,
+        artifact: CleanupAdvisorArtifact,
+    ) -> Result<(), ProjectStoreError>;
     async fn begin_profile_allocation(
         &self,
         project_id: &str,
@@ -1006,6 +1083,24 @@ pub enum TokenSpendCommandSource {
 pub struct ClaimedRuntimeCleanupBatch {
     pub jobs: Vec<PendingRuntimeCleanup>,
     pub rejected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedWorkerCleanupItem {
+    pub run_id: String,
+    pub worker_id: String,
+    pub project_id: String,
+    pub assignment_id: String,
+    pub completion_receipt_id: String,
+    pub expected_worker_version: u64,
+    pub expected_runtime_version: u64,
+    pub runtime: WorkerRuntimeBinding,
+    pub preview: bool,
+    pub advisor_profile_id: Option<String>,
+    pub advisor_assignment_id: Option<String>,
+    pub is_cleanup_advisor: bool,
+    pub claim_token: String,
+    pub attempts: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4685,8 +4780,8 @@ impl YardStore for SqliteProjectStore {
             transaction.execute(
                 "INSERT INTO workers (
                     id, profile_id, profile_version, desired_state, version,
-                    created_at_unix_ms, updated_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, 'running', 1, ?4, ?4)",
+                    created_at_unix_ms, updated_at_unix_ms, ownership_kind
+                 ) VALUES (?1, ?2, ?3, 'running', 1, ?4, ?4, 'yard_owned')",
                 params![
                     worker_id,
                     command.profile_id,
@@ -4878,6 +4973,144 @@ impl YardStore for SqliteProjectStore {
         }
         self.run(move |connection| completed_runtime_cleanup_preview(connection, limit))
             .await
+    }
+
+    async fn get_worker_cleanup_dashboard(
+        &self,
+        preview_limit: usize,
+        run_limit: usize,
+    ) -> Result<WorkerCleanupDashboard, ProjectStoreError> {
+        worker_cleanup_store::dashboard(self, preview_limit, run_limit).await
+    }
+
+    async fn get_worker_cleanup_policy(&self) -> Result<WorkerCleanupPolicy, ProjectStoreError> {
+        worker_cleanup_store::get_policy(self).await
+    }
+
+    async fn update_worker_cleanup_policy(
+        &self,
+        command: UpdateWorkerCleanupPolicy,
+    ) -> Result<WorkerCleanupPolicy, ProjectStoreError> {
+        worker_cleanup_store::update_policy(self, command).await
+    }
+
+    async fn start_worker_cleanup_run(
+        &self,
+        trigger: WorkerCleanupRunTrigger,
+        command: StartWorkerCleanupRun,
+    ) -> Result<WorkerCleanupRun, ProjectStoreError> {
+        worker_cleanup_store::start_run(self, trigger, command).await
+    }
+
+    async fn list_worker_cleanup_runs(
+        &self,
+        limit: usize,
+    ) -> Result<WorkerCleanupRuns, ProjectStoreError> {
+        worker_cleanup_store::list_runs(self, limit).await
+    }
+
+    async fn get_worker_cleanup_run(
+        &self,
+        run_id: &str,
+    ) -> Result<WorkerCleanupRun, ProjectStoreError> {
+        worker_cleanup_store::get_run(self, run_id).await
+    }
+
+    async fn cancel_worker_cleanup_run(
+        &self,
+        run_id: &str,
+        command: CancelWorkerCleanupRun,
+    ) -> Result<WorkerCleanupRun, ProjectStoreError> {
+        worker_cleanup_store::cancel_run(self, run_id, command).await
+    }
+
+    async fn claim_worker_cleanup_items(
+        &self,
+        run_id: Option<&str>,
+        limit: usize,
+        claim_ttl_ms: u64,
+    ) -> Result<Vec<ClaimedWorkerCleanupItem>, ProjectStoreError> {
+        worker_cleanup_store::claim_items(self, run_id, limit, claim_ttl_ms).await
+    }
+
+    async fn finish_worker_cleanup_item(
+        &self,
+        run_id: &str,
+        worker_id: &str,
+        claim_token: &str,
+        status: yard_domain::WorkerCleanupItemStatus,
+        reason: &str,
+    ) -> Result<(), ProjectStoreError> {
+        worker_cleanup_store::finish_item(self, run_id, worker_id, claim_token, status, reason)
+            .await
+    }
+
+    async fn retry_worker_cleanup_item(
+        &self,
+        run_id: &str,
+        worker_id: &str,
+        claim_token: &str,
+        reason: &str,
+        retry_after_ms: u64,
+    ) -> Result<(), ProjectStoreError> {
+        worker_cleanup_store::retry_item(
+            self,
+            run_id,
+            worker_id,
+            claim_token,
+            reason,
+            retry_after_ms,
+        )
+        .await
+    }
+
+    async fn reconcile_missing_worker_cleanup_item(
+        &self,
+        item: &ClaimedWorkerCleanupItem,
+        observed_at_unix_ms: u64,
+    ) -> Result<(), ProjectStoreError> {
+        worker_cleanup_store::reconcile_missing(self, item, observed_at_unix_ms).await
+    }
+
+    async fn authorize_worker_cleanup_close(
+        &self,
+        item: &ClaimedWorkerCleanupItem,
+    ) -> Result<(), ProjectStoreError> {
+        worker_cleanup_store::authorize_close(self, item).await
+    }
+
+    async fn record_cleanup_advisor_assignment(
+        &self,
+        item: &ClaimedWorkerCleanupItem,
+        parent_worker_id: &str,
+        advisor_worker_id: &str,
+        advisor_assignment_id: &str,
+    ) -> Result<(), ProjectStoreError> {
+        worker_cleanup_store::record_advisor_assignment(
+            self,
+            item,
+            parent_worker_id,
+            advisor_worker_id,
+            advisor_assignment_id,
+        )
+        .await
+    }
+
+    async fn record_cleanup_advisor_artifact(
+        &self,
+        item: &ClaimedWorkerCleanupItem,
+        completion_receipt_id: &str,
+        artifact_id: &str,
+        artifact: CleanupAdvisorArtifact,
+    ) -> Result<(), ProjectStoreError> {
+        worker_cleanup_store::record_advisor_artifact(
+            self,
+            item,
+            completion_receipt_id,
+            artifact_id,
+            artifact,
+        )
+        .await
     }
 
     async fn begin_worker_allocation(
@@ -7089,8 +7322,8 @@ impl YardStore for SqliteProjectStore {
             transaction.execute(
                 "INSERT INTO workers (
                     id, profile_id, profile_version, desired_state, version,
-                    created_at_unix_ms, updated_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, 'running', 1, ?4, ?4)",
+                    created_at_unix_ms, updated_at_unix_ms, ownership_kind
+                 ) VALUES (?1, ?2, ?3, 'running', 1, ?4, ?4, 'yard_owned')",
                 params![
                     worker_id,
                     profile.id,
@@ -10401,8 +10634,8 @@ fn adopt_claimed_dedicated_runtime(
     transaction.execute(
         "INSERT INTO workers (
             id, profile_id, profile_version, desired_state, version,
-            created_at_unix_ms, updated_at_unix_ms
-         ) VALUES (?1, ?2, ?3, 'running', 1, ?4, ?4)",
+            created_at_unix_ms, updated_at_unix_ms, ownership_kind
+         ) VALUES (?1, ?2, ?3, 'running', 1, ?4, ?4, 'yard_owned')",
         params![
             worker_id,
             profile_id,
@@ -11416,6 +11649,11 @@ const WORKER_CANDIDATE_SELECT: &str = "
                  FROM runtime_cleanup_jobs cleanup
                 WHERE cleanup.worker_id = w.id
                   AND cleanup.status = 'pending'
+           ) OR EXISTS (
+               SELECT 1
+                 FROM worker_cleanup_run_items cleanup
+                WHERE cleanup.worker_id = w.id
+                  AND cleanup.status = 'pending'
            )
       FROM workers w
       LEFT JOIN worker_profile_revisions pr
@@ -12079,6 +12317,13 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
     if current == 29 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(PANE_MANAGEMENT_MIGRATION)?;
+        ensure_foreign_keys(&transaction)?;
+        transaction.commit()?;
+        current = 30;
+    }
+    if current == 30 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(WORKER_CLEANUP_MIGRATION)?;
         ensure_foreign_keys(&transaction)?;
         transaction.commit()?;
     }
@@ -13670,8 +13915,8 @@ fn insert_project_aggregate(
         transaction.execute(
             "INSERT INTO workers (
                 id, profile_id, profile_version, desired_state, version,
-                created_at_unix_ms, updated_at_unix_ms
-             ) VALUES (?1, ?2, ?3, 'running', 1, ?4, ?4)",
+                created_at_unix_ms, updated_at_unix_ms, ownership_kind
+             ) VALUES (?1, ?2, ?3, 'running', 1, ?4, ?4, 'yard_owned')",
             params![worker_id, profile_id, profile_version, now_i64],
         )?;
         insert_worker_runtime_binding(transaction, worker_id, orchestrator_runtime, now)?;
@@ -18759,6 +19004,22 @@ pub enum ProjectStoreError {
     AutomationListLimitInvalid { max: usize },
     #[error("completed runtime cleanup preview limit must contain between 1 and {max} records")]
     CompletedRuntimeCleanupPreviewLimitInvalid { max: usize },
+    #[error(transparent)]
+    InvalidWorkerCleanup(#[from] yard_domain::WorkerCleanupValidationError),
+    #[error("worker cleanup policy version conflict; current version is {current_version}")]
+    WorkerCleanupPolicyVersionConflict { current_version: u64 },
+    #[error("worker cleanup run was not found")]
+    WorkerCleanupRunNotFound,
+    #[error("worker cleanup run command ID conflicts with existing input")]
+    WorkerCleanupRunIdConflict,
+    #[error("worker cleanup run is already terminal")]
+    WorkerCleanupRunTerminal,
+    #[error("worker cleanup item claim changed or expired")]
+    WorkerCleanupClaimConflict,
+    #[error("worker cleanup authority changed during processing")]
+    WorkerCleanupRevalidationFailed,
+    #[error("worker cleanup run list limit must contain between 1 and {max} records")]
+    WorkerCleanupRunListLimitInvalid { max: usize },
     #[error("automation run submission time precedes the run claim")]
     AutomationSubmittedAtInvalid,
     #[error("coordination node was not found")]
@@ -19029,25 +19290,27 @@ mod tests {
     use uuid::Uuid;
     use yard_domain::{
         AllocationMode, ArchiveProject, ArtifactKind, ArtifactRegistration, AssignmentLifecycle,
-        AttemptLifecycle, AutomationScope, CanvasPlacement, CompletedRuntimeRetentionReason,
-        CompletionOutcome, ConfigureYardOrchestrator, ConfirmProfileAllocation,
-        ConfirmWorkerAllocation, ConfirmWorkerHandoff, CoordinationCommandStatus,
-        CoordinationNodeKind, CreateAgentProfile, CreateAutomation, CreateCoordinationNode,
-        CreateProject, CreateProjectFromProfile, CreateProjectRelationship, CreateWorkerProfile,
-        CreateWorkspaceProjectFromProfile, DailySchedule, DeleteProject, DeleteProjectRelationship,
-        DeleteWorker, EndWorkerSession, FocusObservation, HandoffTargetRole, IsolationPolicy,
-        ManagedRuntimeOccupantKind, ManagedRuntimeWorkspaceKind, ObservedStatus, ObservedWorker,
-        OldSessionDisposition, PaneObservation, Project, ProjectRelationshipKind,
-        ProjectRuntimeBinding, ProviderSessionRef, ProvisionCoordinationNode,
-        ProvisionYardOrchestrator, RecordCompletionReceipt, ReplaceProjectOrchestrator,
-        RequestCoordinationSnapshot, RunAutomationNow, RuntimeInventory, RuntimeObservationState,
-        RuntimeProcessState, SendAssignmentPrompt, SendCoordinationNodePrompt,
-        SendCoordinationNodeRoute, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
-        SendYardOrchestratorRoute, SnapshotCollectionStatus, TransferProjectOrchestrator,
+        AttemptLifecycle, AutomationScope, CancelWorkerCleanupRun, CanvasPlacement,
+        CompletedRuntimeRetentionReason, CompletionOutcome, ConfigureYardOrchestrator,
+        ConfirmProfileAllocation, ConfirmWorkerAllocation, ConfirmWorkerHandoff,
+        CoordinationCommandStatus, CoordinationNodeKind, CreateAgentProfile, CreateAutomation,
+        CreateCoordinationNode, CreateProject, CreateProjectFromProfile, CreateProjectRelationship,
+        CreateWorkerProfile, CreateWorkspaceProjectFromProfile, DailySchedule, DeleteProject,
+        DeleteProjectRelationship, DeleteWorker, EndWorkerSession, FocusObservation,
+        HandoffTargetRole, IsolationPolicy, ManagedRuntimeOccupantKind,
+        ManagedRuntimeWorkspaceKind, ObservedStatus, ObservedWorker, OldSessionDisposition,
+        PaneObservation, Project, ProjectRelationshipKind, ProjectRuntimeBinding,
+        ProviderSessionRef, ProvisionCoordinationNode, ProvisionYardOrchestrator,
+        RecordCompletionReceipt, ReplaceProjectOrchestrator, RequestCoordinationSnapshot,
+        RunAutomationNow, RuntimeInventory, RuntimeObservationState, RuntimeProcessState,
+        SendAssignmentPrompt, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
+        SendOrchestratorPrompt, SendYardOrchestratorPrompt, SendYardOrchestratorRoute,
+        SnapshotCollectionStatus, StartWorkerCleanupRun, TransferProjectOrchestrator,
         UpdateAgentProfile, UpdateAutomation, UpdateCoordinationNode,
         UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
         UpdateProjectWorkflowProfile, UpdateTokenSpendSettings, UpdateWorkerProfile,
-        WorkerAvailability, WorkerProfile, WorkerProfileSpec, WorkerRuntimeBinding,
+        WorkerAvailability, WorkerCleanupItemStatus, WorkerCleanupRunStatus,
+        WorkerCleanupRunTrigger, WorkerProfile, WorkerProfileSpec, WorkerRuntimeBinding,
         YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator,
     };
 
@@ -20261,6 +20524,70 @@ mod tests {
         )
         .await;
         (project_id, assignment)
+    }
+
+    async fn create_eligible_cleanup_candidate(
+        store: &SqliteProjectStore,
+        suffix: &str,
+    ) -> (String, yard_domain::Assignment, String) {
+        let (project_id, assignment) = create_active_assignment_with_suffix(store, suffix).await;
+        let artifact_id = Uuid::now_v7().to_string();
+        store
+            .register_artifact(
+                &project_id,
+                &assignment.id,
+                &artifact_id,
+                ArtifactRegistration {
+                    actor: "cleanup-test".to_owned(),
+                    attempt_id: assignment.attempt.id.clone(),
+                    expected_assignment_version: assignment.version,
+                    expected_attempt_version: assignment.attempt.version,
+                    kind: ArtifactKind::Markdown,
+                    display_name: format!("cleanup-{suffix}.md"),
+                    byte_size: 1,
+                    sha256: "a".repeat(64),
+                },
+            )
+            .await
+            .unwrap();
+        let receipt = store
+            .record_completion_receipt(
+                &project_id,
+                &assignment.id,
+                RecordCompletionReceipt {
+                    command_id: format!("cleanup-completion-{suffix}"),
+                    actor: "cleanup-test".to_owned(),
+                    attempt_id: assignment.attempt.id.clone(),
+                    expected_assignment_version: assignment.version,
+                    expected_attempt_version: assignment.attempt.version,
+                    outcome: CompletionOutcome::Completed,
+                    summary: "Cleanup evidence is durable.".to_owned(),
+                    artifact_refs: Vec::new(),
+                    artifact_ids: vec![artifact_id],
+                    evidence_refs: Vec::new(),
+                    unresolved_blockers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap()
+            .receipt;
+        let receipt_id = receipt.id.clone();
+        store
+            .run({
+                let receipt_id = receipt_id.clone();
+                move |connection| {
+                    connection.execute(
+                        "UPDATE completion_receipts
+                            SET created_at_unix_ms = 0
+                          WHERE id = ?1",
+                        [receipt_id],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+        (project_id, assignment, receipt_id)
     }
 
     async fn preview_retained_reasons(
@@ -29065,6 +29392,143 @@ mod tests {
         ] {
             assert!(reasons.contains(&reason), "missing {reason:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn worker_cleanup_runs_are_durable_idempotent_and_reconcile_missing_without_advisor() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let policy = store.get_worker_cleanup_policy().await.unwrap();
+        assert!(!policy.automatic_enabled);
+        assert_eq!(policy.updated_by, "yard:migration");
+        assert_eq!(
+            Connection::open(temp.path().join("yard.sqlite3"))
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+
+        let (_, assignment, _) = create_eligible_cleanup_candidate(&store, "durable-run").await;
+        let command = StartWorkerCleanupRun {
+            command_id: "worker-cleanup-run-1".to_owned(),
+            actor: "cleanup-test".to_owned(),
+            preview: false,
+        };
+        let run = store
+            .start_worker_cleanup_run(WorkerCleanupRunTrigger::Manual, command.clone())
+            .await
+            .unwrap();
+        assert_eq!(run.candidate_count, 1);
+        assert_eq!(
+            store
+                .start_worker_cleanup_run(WorkerCleanupRunTrigger::Manual, command)
+                .await
+                .unwrap()
+                .id,
+            run.id
+        );
+        assert_eq!(
+            store
+                .start_worker_cleanup_run(
+                    WorkerCleanupRunTrigger::Manual,
+                    StartWorkerCleanupRun {
+                        command_id: "worker-cleanup-run-2".to_owned(),
+                        actor: "cleanup-test".to_owned(),
+                        preview: false,
+                    },
+                )
+                .await
+                .unwrap()
+                .candidate_count,
+            0
+        );
+
+        let item = store
+            .claim_worker_cleanup_items(Some(&run.id), 1, 30_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(item.worker_id, assignment.worker.id);
+        assert!(matches!(
+            store.authorize_worker_cleanup_close(&item).await,
+            Err(ProjectStoreError::WorkerCleanupRevalidationFailed)
+        ));
+        let cancel = CancelWorkerCleanupRun {
+            command_id: "worker-cleanup-cancel-1".to_owned(),
+            actor: "cleanup-test".to_owned(),
+        };
+        let cancelling = store
+            .cancel_worker_cleanup_run(&run.id, cancel.clone())
+            .await
+            .unwrap();
+        assert_eq!(cancelling.status, WorkerCleanupRunStatus::Running);
+        assert!(cancelling.cancellation_requested);
+        assert_eq!(cancelling.items[0].status, WorkerCleanupItemStatus::Pending);
+        assert_eq!(
+            store
+                .cancel_worker_cleanup_run(&run.id, cancel)
+                .await
+                .unwrap()
+                .status,
+            WorkerCleanupRunStatus::Running
+        );
+        store
+            .reconcile_missing_worker_cleanup_item(&item, 42)
+            .await
+            .unwrap();
+        let completed = store.get_worker_cleanup_run(&run.id).await.unwrap();
+        assert_eq!(completed.status, WorkerCleanupRunStatus::Cancelled);
+        assert_eq!(completed.reconciled_count, 1);
+        assert_eq!(
+            completed.items[0].status,
+            WorkerCleanupItemStatus::Reconciled
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_cleanup_eligibility_fails_closed_on_ownership_and_advisor_lineage() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (_, assignment, _) = create_eligible_cleanup_candidate(&store, "ownership").await;
+        let worker_id = assignment.worker.id.clone();
+        store
+            .run({
+                let worker_id = worker_id.clone();
+                move |connection| {
+                    connection.execute(
+                        "UPDATE workers SET ownership_kind = 'external' WHERE id = ?1",
+                        [worker_id],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+        let external = store.get_worker_cleanup_dashboard(50, 20).await.unwrap();
+        assert!(
+            external.preview.candidates[0]
+                .retained_reasons
+                .contains(&CompletedRuntimeRetentionReason::NotYardOwned)
+        );
+
+        store
+            .run(move |connection| {
+                connection.execute(
+                    "UPDATE workers
+                        SET ownership_kind = 'system_ephemeral', parent_worker_id = NULL
+                      WHERE id = ?1",
+                    [worker_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let advisor = store.get_worker_cleanup_dashboard(50, 20).await.unwrap();
+        let reasons = &advisor.preview.candidates[0].retained_reasons;
+        assert!(reasons.contains(&CompletedRuntimeRetentionReason::ParentOwnershipMismatch));
+        assert!(reasons.contains(&CompletedRuntimeRetentionReason::CleanupAdvisorArtifactMissing));
     }
 
     #[tokio::test]

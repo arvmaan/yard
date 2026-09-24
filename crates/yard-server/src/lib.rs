@@ -1,6 +1,7 @@
 pub mod allocation_service;
 pub mod artifact_service;
 pub mod automation_service;
+pub mod cleanup_retirement;
 pub mod config;
 pub mod coordination_node_service;
 mod http;
@@ -17,6 +18,7 @@ pub mod reconciliation_service;
 pub mod runtime_cleanup_service;
 mod status_protocol;
 pub mod terminal_service;
+pub mod worker_cleanup_service;
 pub mod worker_session_service;
 pub mod yard_orchestrator_service;
 
