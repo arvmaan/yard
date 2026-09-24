@@ -8,6 +8,7 @@ pub mod intervention_service;
 pub mod inventory_service;
 pub mod orchestrator_replacement_service;
 pub mod orchestrator_workflow_profile_service;
+pub mod pane_management_service;
 pub mod profile_service;
 pub mod project_orchestrator_transfer_service;
 pub mod project_service;

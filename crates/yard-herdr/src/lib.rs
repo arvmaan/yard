@@ -2,6 +2,7 @@ mod config;
 mod control;
 mod discovery;
 mod error;
+mod management;
 mod normalize;
 mod session;
 mod socket;
@@ -17,6 +18,11 @@ pub use control::{
     ProvisionAgentRequest, ProvisionedAgent, ReadPaneRequest, StartPreparedAgentRequest,
 };
 pub use error::HerdrError;
+pub use management::{
+    AcquirePaneLeaseRequest, CloseLeasedPaneRequest, LeaseToken, PaneLease,
+    PaneLeaseOperationResult, PaneLeaseStatus, PaneLeaseStatusRequest, PaneManagementCapability,
+    PaneManagementRpcError, ReleasePaneLeaseRequest, RenewPaneLeaseRequest,
+};
 pub use terminal::{
     HerdrTerminal, HerdrTerminalError, MAX_TERMINAL_COLS, MAX_TERMINAL_COMMAND_LINE_BYTES,
     MAX_TERMINAL_EVENT_LINE_BYTES, MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_ROWS, MIN_TERMINAL_COLS,
@@ -293,6 +299,48 @@ impl HerdrAdapter {
     /// response does not match the pinned protocol.
     pub async fn read_pane(&self, request: ReadPaneRequest) -> Result<PaneOutput, HerdrError> {
         control::read_pane(&self.config, request).await
+    }
+
+    pub async fn pane_management_capability(
+        &self,
+        session_name: &str,
+    ) -> Result<PaneManagementCapability, PaneManagementRpcError> {
+        management::capability(&self.config, session_name).await
+    }
+
+    pub async fn acquire_pane_lease(
+        &self,
+        request: AcquirePaneLeaseRequest,
+    ) -> Result<PaneLease, PaneManagementRpcError> {
+        management::acquire(&self.config, request).await
+    }
+
+    pub async fn renew_pane_lease(
+        &self,
+        request: RenewPaneLeaseRequest,
+    ) -> Result<PaneLeaseOperationResult, PaneManagementRpcError> {
+        management::renew(&self.config, request).await
+    }
+
+    pub async fn release_pane_lease(
+        &self,
+        request: ReleasePaneLeaseRequest,
+    ) -> Result<PaneLeaseOperationResult, PaneManagementRpcError> {
+        management::release(&self.config, request).await
+    }
+
+    pub async fn pane_lease_status(
+        &self,
+        request: PaneLeaseStatusRequest,
+    ) -> Result<PaneLeaseStatus, PaneManagementRpcError> {
+        management::status(&self.config, request).await
+    }
+
+    pub async fn close_if_pane_leased(
+        &self,
+        request: CloseLeasedPaneRequest,
+    ) -> Result<PaneLeaseOperationResult, PaneManagementRpcError> {
+        management::close_if_leased(&self.config, request).await
     }
 
     /// Open one interactive Herdr terminal controller process.

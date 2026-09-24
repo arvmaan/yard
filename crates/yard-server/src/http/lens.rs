@@ -118,6 +118,7 @@ struct HerdrLivePane {
     workspace_label: Option<String>,
     tab_id: Option<String>,
     pane_id: Option<String>,
+    pane_instance_id: Option<String>,
     terminal_id: Option<String>,
     label: Option<String>,
     name: Option<String>,
@@ -669,6 +670,12 @@ fn project_live_pane(
         |pane| pane.runtime_id.as_str(),
         |worker| worker.pane_id.as_str(),
     );
+    let pane_instance_id = common_optional_evidence_field(
+        evidence,
+        |pane| pane.pane_instance_id.as_deref(),
+        |worker| worker.pane_instance_id.as_deref(),
+    )
+    .0;
     let terminal_id = common_evidence_field(
         evidence,
         |pane| pane.terminal_id.as_str(),
@@ -817,6 +824,7 @@ fn project_live_pane(
         workspace_label: workspace_label.map(str::to_owned),
         tab_id,
         pane_id,
+        pane_instance_id,
         terminal_id,
         label: if ambiguous {
             common_title
@@ -1259,6 +1267,7 @@ mod tests {
     fn pane(index: usize, terminal_id: &str) -> PaneObservation {
         PaneObservation {
             runtime_id: format!("pane-{index}"),
+            pane_instance_id: None,
             terminal_id: terminal_id.to_owned(),
             workspace_id: format!("workspace-{}", index / 20),
             tab_id: format!("tab-{index}"),
@@ -1279,6 +1288,7 @@ mod tests {
         let pane = pane(index, terminal_id);
         ObservedWorker {
             runtime_id: terminal_id.to_owned(),
+            pane_instance_id: None,
             terminal_id: terminal_id.to_owned(),
             workspace_id: pane.workspace_id,
             tab_id: pane.tab_id,

@@ -608,6 +608,7 @@ mod tests {
     fn worker(provider: &str, session_id: &str) -> ObservedWorker {
         ObservedWorker {
             runtime_id: format!("terminal-{provider}"),
+            pane_instance_id: None,
             terminal_id: format!("terminal-{provider}"),
             workspace_id: "workspace".to_owned(),
             tab_id: "tab".to_owned(),

@@ -81,6 +81,8 @@ pub(crate) struct Tab {
 #[derive(Debug, Deserialize)]
 pub(crate) struct Pane {
     pub pane_id: String,
+    #[serde(default)]
+    pub pane_instance_id: Option<String>,
     pub terminal_id: String,
     pub workspace_id: String,
     pub tab_id: String,
@@ -128,6 +130,8 @@ pub(crate) struct Agent {
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,
+    #[serde(default)]
+    pub pane_instance_id: Option<String>,
     pub focused: bool,
     #[serde(default)]
     pub launch_pending: bool,

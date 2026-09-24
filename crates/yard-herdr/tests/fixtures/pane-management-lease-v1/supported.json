@@ -1,0 +1,15 @@
+{
+  "ping_result": {
+    "type": "pong",
+    "version": "0.10.0-preview",
+    "protocol": 23,
+    "capabilities": {
+      "pane_management_lease": true,
+      "pane_management_lease_v1": true
+    },
+    "endpoints": {
+      "pane_management_lease": "pane_management_lease_v1",
+      "pane_management_lease_v1": "pane_management_lease_v1"
+    }
+  }
+}

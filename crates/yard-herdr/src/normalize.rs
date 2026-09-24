@@ -99,6 +99,7 @@ fn project(
             .into_iter()
             .map(|pane| PaneObservation {
                 runtime_id: pane.pane_id,
+                pane_instance_id: pane.pane_instance_id,
                 terminal_id: pane.terminal_id,
                 workspace_id: pane.workspace_id,
                 tab_id: pane.tab_id,
@@ -119,6 +120,7 @@ fn project(
             .into_iter()
             .map(|agent| ObservedWorker {
                 runtime_id: agent.terminal_id.clone(),
+                pane_instance_id: agent.pane_instance_id,
                 terminal_id: agent.terminal_id,
                 workspace_id: agent.workspace_id,
                 tab_id: agent.tab_id,

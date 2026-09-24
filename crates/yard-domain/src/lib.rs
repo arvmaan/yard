@@ -9,6 +9,7 @@ mod inventory;
 mod orchestrator_replacement;
 mod orchestrator_transfer;
 mod orchestrator_workflow_profile;
+mod pane_management;
 mod profile;
 mod project;
 mod serde_u64;
@@ -89,6 +90,11 @@ pub use orchestrator_workflow_profile::{
     YARD_STANDARD_ORCHESTRATOR_PROFILE_DESCRIPTION, YARD_STANDARD_ORCHESTRATOR_PROFILE_ID,
     YARD_STANDARD_ORCHESTRATOR_PROFILE_NAME, validate_orchestrator_workflow_commands,
     validate_stored_orchestrator_workflow_commands, yard_standard_orchestrator_commands,
+};
+pub use pane_management::{
+    MAX_PANE_MANAGEMENT_CANDIDATES, ManageAllAgents, PaneManagementBatchResult,
+    PaneManagementCandidate, PaneManagementCategory, PaneManagementItemResult,
+    PaneManagementOutcome, PaneManagementPreview, PaneManagementValidationError,
 };
 pub use profile::{
     CreateWorkerProfile, ProfileValidationError, UpdateWorkerProfile, WorkerProfile,

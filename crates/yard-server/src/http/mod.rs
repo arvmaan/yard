@@ -23,8 +23,9 @@ use yard_domain::{
     CreateWorkerProfile, CreateWorkspaceProjectFromProfile, CreatedProjectRelationship,
     DeleteProject, DeleteProjectRelationship, DeleteWorker, DeletedProject,
     DeletedProjectRelationship, DeletedWorker, EndWorkerSession, EndedWorkerSession,
-    OrchestratorPromptAcknowledgement, OrchestratorTerminalOutput, OrchestratorWorkflowProfile,
-    OrchestratorWorkflowProfiles, Project, ProjectRelationships, Projects, PromptAcknowledgement,
+    ManageAllAgents, OrchestratorPromptAcknowledgement, OrchestratorTerminalOutput,
+    OrchestratorWorkflowProfile, OrchestratorWorkflowProfiles, PaneManagementBatchResult,
+    PaneManagementPreview, Project, ProjectRelationships, Projects, PromptAcknowledgement,
     ProvisionCoordinationNode, ProvisionYardOrchestrator, RecordCompletionReceipt,
     RecordedCompletionReceipt, RecoverYardOrchestrator, RecoveredYardOrchestrator,
     ReplaceProjectOrchestrator, ReplacedProjectOrchestrator, RequestCoordinationSnapshot,
@@ -57,6 +58,7 @@ use crate::orchestrator_replacement_service::{
 use crate::orchestrator_workflow_profile_service::{
     OrchestratorWorkflowProfileService, OrchestratorWorkflowProfileServiceError,
 };
+use crate::pane_management_service::{PaneManagementService, PaneManagementServiceError};
 use crate::profile_service::{AgentProfileServiceError, ProfileService, ProfileServiceError};
 use crate::project_orchestrator_transfer_service::{
     ProjectOrchestratorTransferService, ProjectOrchestratorTransferServiceError,
@@ -91,6 +93,7 @@ struct AppState {
     automations: AutomationService,
     yard_orchestrator: YardOrchestratorService,
     coordination_nodes: CoordinationNodeService,
+    pane_management: PaneManagementService,
     ghostty_launcher: GhosttyLauncher,
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
@@ -260,6 +263,7 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         reconciliation.clone(),
         orchestrator_cwd,
     );
+    let pane_management = PaneManagementService::new(Arc::clone(&source), Arc::clone(&store));
     Router::new()
         .route("/health", get(health))
         .route(
@@ -380,6 +384,14 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         .route(
             "/api/v1/runtimes/herdr/inventory",
             get(lens::runtime_fleet_inventory),
+        )
+        .route(
+            "/api/v1/runtimes/herdr/pane-management-preview",
+            get(preview_pane_management),
+        )
+        .route(
+            "/api/v1/runtimes/herdr/manage-all-agents",
+            axum::routing::post(manage_all_agents),
         )
         .route(
             "/api/v1/runtimes/herdr/sessions/{session}/inventory",
@@ -534,6 +546,7 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             automations,
             yard_orchestrator,
             coordination_nodes,
+            pane_management,
             ghostty_launcher,
             shutdown,
             connections,
@@ -1092,6 +1105,64 @@ async fn inventory(
         .await
         .map(|(inventory, _)| NoStoreJson(inventory))
         .map_err(ApiError::from)
+}
+
+async fn preview_pane_management(
+    State(state): State<AppState>,
+) -> Result<NoStoreJson<PaneManagementPreview>, ApiError> {
+    state
+        .pane_management
+        .preview()
+        .await
+        .map(NoStoreJson)
+        .map_err(pane_management_error)
+}
+
+async fn manage_all_agents(
+    State(state): State<AppState>,
+    Json(command): Json<ManageAllAgents>,
+) -> Result<NoStoreJson<PaneManagementBatchResult>, ApiError> {
+    state
+        .pane_management
+        .manage_all_agents(command)
+        .await
+        .map(NoStoreJson)
+        .map_err(pane_management_error)
+}
+
+fn pane_management_error(error: PaneManagementServiceError) -> ApiError {
+    match error {
+        PaneManagementServiceError::InvalidCommand(error) => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "invalid_pane_management_command",
+            message: error.to_string(),
+        },
+        PaneManagementServiceError::Store(ProjectStoreError::DatabaseBusy) => ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "database_busy",
+            message: "Yard storage is busy; retry the request".to_owned(),
+        },
+        PaneManagementServiceError::Store(ProjectStoreError::IdempotencyConflict) => ApiError {
+            status: StatusCode::CONFLICT,
+            code: "pane_management_idempotency_conflict",
+            message: "Command ID is already associated with different input".to_owned(),
+        },
+        PaneManagementServiceError::Store(ProjectStoreError::CommandInProgress) => ApiError {
+            status: StatusCode::CONFLICT,
+            code: "pane_management_command_in_progress",
+            message: "Pane management command is still in progress".to_owned(),
+        },
+        PaneManagementServiceError::Inventory(_) => ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "pane_management_inventory_unavailable",
+            message: "Live Herdr inventory is unavailable".to_owned(),
+        },
+        PaneManagementServiceError::Store(_) => ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "pane_management_failed",
+            message: "Yard could not persist pane management state".to_owned(),
+        },
+    }
 }
 
 async fn runtime_topology(
@@ -3862,6 +3933,7 @@ mod tests {
                 workers: vec![
                     ObservedWorker {
                         runtime_id: "terminal-1".to_owned(),
+                        pane_instance_id: None,
                         terminal_id: "terminal-1".to_owned(),
                         workspace_id: "workspace-1".to_owned(),
                         tab_id: "tab-1".to_owned(),
@@ -3882,6 +3954,7 @@ mod tests {
                     },
                     ObservedWorker {
                         runtime_id: "terminal-yard-prompta-345234a24b29951c".to_owned(),
+                        pane_instance_id: None,
                         terminal_id: "terminal-yard-prompta-345234a24b29951c".to_owned(),
                         workspace_id: "workspace-1".to_owned(),
                         tab_id: "tab-yard-prompta-345234a24b29951c".to_owned(),
@@ -3904,6 +3977,7 @@ mod tests {
                     },
                     ObservedWorker {
                         runtime_id: "terminal-yard-allocat-b3e512e61b8af4f5".to_owned(),
+                        pane_instance_id: None,
                         terminal_id: "terminal-yard-allocat-b3e512e61b8af4f5".to_owned(),
                         workspace_id: "workspace-1".to_owned(),
                         tab_id: "tab-yard-allocat-b3e512e61b8af4f5".to_owned(),
@@ -4030,6 +4104,7 @@ mod tests {
             let mut inventory = FakeInventory.inventory(session_name).await?;
             inventory.workers.push(ObservedWorker {
                 runtime_id: "terminal-yard-profile-0434dae47c8a42aa".to_owned(),
+                pane_instance_id: None,
                 terminal_id: "terminal-yard-profile-0434dae47c8a42aa".to_owned(),
                 workspace_id: "workspace-1".to_owned(),
                 tab_id: "tab-yard-profile-0434dae47c8a42aa".to_owned(),
@@ -4085,6 +4160,7 @@ mod tests {
             });
             inventory.workers.push(ObservedWorker {
                 runtime_id: "terminal-yard-workspa-e5f71e104d6dc952".to_owned(),
+                pane_instance_id: None,
                 terminal_id: "terminal-yard-workspa-e5f71e104d6dc952".to_owned(),
                 workspace_id: "workspace-created".to_owned(),
                 tab_id: "tab-yard-workspa-e5f71e104d6dc952".to_owned(),
@@ -4142,6 +4218,7 @@ mod tests {
                 panes: Vec::new(),
                 workers: vec![ObservedWorker {
                     runtime_id: "terminal-yard-orchestrator".to_owned(),
+                    pane_instance_id: None,
                     terminal_id: "terminal-yard-orchestrator".to_owned(),
                     workspace_id: "workspace-yard-orchestrator".to_owned(),
                     tab_id: "tab-yard-orchestrator".to_owned(),
@@ -4199,6 +4276,7 @@ mod tests {
             inventory.workers.extend([
                 ObservedWorker {
                     runtime_id: "terminal-target-orchestrator".to_owned(),
+                    pane_instance_id: None,
                     terminal_id: "terminal-target-orchestrator".to_owned(),
                     workspace_id: "workspace-2".to_owned(),
                     tab_id: "tab-target-orchestrator".to_owned(),
@@ -4219,6 +4297,7 @@ mod tests {
                 },
                 ObservedWorker {
                     runtime_id: "terminal-yard-handoff-5072292f455abdff".to_owned(),
+                    pane_instance_id: None,
                     terminal_id: "terminal-yard-handoff-5072292f455abdff".to_owned(),
                     workspace_id: "workspace-2".to_owned(),
                     tab_id: "tab-yard-handoff-5072292f455abdff".to_owned(),
@@ -4241,6 +4320,7 @@ mod tests {
                 },
                 ObservedWorker {
                     runtime_id: "terminal-yard-replace-fa0a6b32d50a8ac9".to_owned(),
+                    pane_instance_id: None,
                     terminal_id: "terminal-yard-replace-fa0a6b32d50a8ac9".to_owned(),
                     workspace_id: "workspace-2".to_owned(),
                     tab_id: "tab-yard-replace-fa0a6b32d50a8ac9".to_owned(),
@@ -4317,6 +4397,7 @@ mod tests {
                     .retain(|worker| worker.terminal_id != "terminal-target-orchestrator");
                 inventory.panes.push(PaneObservation {
                     runtime_id: "pane-target-orchestrator".to_owned(),
+                    pane_instance_id: None,
                     terminal_id: "terminal-restored-shell".to_owned(),
                     workspace_id: "workspace-2".to_owned(),
                     tab_id: "tab-target-orchestrator".to_owned(),
@@ -5097,6 +5178,7 @@ mod tests {
     fn pane_observation(runtime_id: &str, terminal_id: &str, tab_id: &str) -> PaneObservation {
         PaneObservation {
             runtime_id: runtime_id.to_owned(),
+            pane_instance_id: None,
             terminal_id: terminal_id.to_owned(),
             workspace_id: "workspace-1".to_owned(),
             tab_id: tab_id.to_owned(),
@@ -5471,6 +5553,7 @@ mod tests {
     ) -> ObservedWorker {
         ObservedWorker {
             runtime_id: terminal_id.to_owned(),
+            pane_instance_id: None,
             terminal_id: terminal_id.to_owned(),
             workspace_id: workspace_id.to_owned(),
             tab_id: tab_id.to_owned(),
@@ -5494,6 +5577,7 @@ mod tests {
     fn lens_fixture_pane(worker: &ObservedWorker, label: &str) -> PaneObservation {
         PaneObservation {
             runtime_id: worker.pane_id.clone(),
+            pane_instance_id: worker.pane_instance_id.clone(),
             terminal_id: worker.terminal_id.clone(),
             workspace_id: worker.workspace_id.clone(),
             tab_id: worker.tab_id.clone(),
@@ -8569,6 +8653,7 @@ mod tests {
     ) -> ObservedWorker {
         ObservedWorker {
             runtime_id: terminal_id.to_owned(),
+            pane_instance_id: None,
             terminal_id: terminal_id.to_owned(),
             workspace_id: "wA".to_owned(),
             tab_id: tab_id.to_owned(),

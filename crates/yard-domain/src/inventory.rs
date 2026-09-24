@@ -78,6 +78,8 @@ pub struct ProviderSessionRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneObservation {
     pub runtime_id: String,
+    #[serde(default)]
+    pub pane_instance_id: Option<String>,
     pub terminal_id: String,
     pub workspace_id: String,
     pub tab_id: String,
@@ -97,6 +99,8 @@ pub struct PaneObservation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedWorker {
     pub runtime_id: String,
+    #[serde(default)]
+    pub pane_instance_id: Option<String>,
     pub terminal_id: String,
     pub workspace_id: String,
     pub tab_id: String,
@@ -215,6 +219,7 @@ mod tests {
     fn serializes_runtime_counters_without_javascript_precision_loss() {
         let pane = PaneObservation {
             runtime_id: "pane".to_owned(),
+            pane_instance_id: None,
             terminal_id: "terminal".to_owned(),
             workspace_id: "workspace".to_owned(),
             tab_id: "tab".to_owned(),

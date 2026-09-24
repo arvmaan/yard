@@ -255,6 +255,7 @@ mod tests {
     fn observed(terminal: &str, tab: &str, pane: &str, provider_value: &str) -> ObservedWorker {
         ObservedWorker {
             runtime_id: terminal.to_owned(),
+            pane_instance_id: None,
             terminal_id: terminal.to_owned(),
             workspace_id: "workspace-1".to_owned(),
             tab_id: tab.to_owned(),

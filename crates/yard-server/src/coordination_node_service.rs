@@ -2305,6 +2305,7 @@ mod tests {
     ) -> ObservedWorker {
         ObservedWorker {
             runtime_id: terminal_id.to_owned(),
+            pane_instance_id: None,
             terminal_id: terminal_id.to_owned(),
             workspace_id: workspace_id.to_owned(),
             tab_id: tab_id.to_owned(),

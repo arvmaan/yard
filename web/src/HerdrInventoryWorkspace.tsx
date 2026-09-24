@@ -5,6 +5,7 @@ import {
   RefreshCw,
   Search,
   Server,
+  ShieldCheck,
   X,
 } from 'lucide-react'
 import {
@@ -16,7 +17,12 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react'
 import { createPortal } from 'react-dom'
-import { YardApiError, fetchHerdrFleetInventory } from './api'
+import {
+  YardApiError,
+  fetchHerdrFleetInventory,
+  fetchPaneManagementPreview,
+  manageAllAgents,
+} from './api'
 import {
   clearHerdrInventoryFailures,
   countHerdrInventory,
@@ -35,7 +41,12 @@ import {
   safeHerdrPaneReason,
   safeHerdrRequestError,
 } from './herdrInventory'
-import type { HerdrFleetInventory, HerdrLivePane } from './types'
+import type {
+  HerdrFleetInventory,
+  HerdrLivePane,
+  PaneManagementBatchResult,
+  PaneManagementPreview,
+} from './types'
 import { useModalDialog } from './useModalDialog'
 
 interface HerdrInventoryWorkspaceProps {
@@ -78,6 +89,13 @@ export function HerdrInventoryWorkspace({ onClose }: HerdrInventoryWorkspaceProp
   const [requestFailureCounts, setRequestFailureCounts] =
     useState<FleetFailureCounts | null>(null)
   const [focusNotice, setFocusNotice] = useState<string | null>(null)
+  const [managementPreview, setManagementPreview] =
+    useState<PaneManagementPreview | null>(null)
+  const [managementResult, setManagementResult] =
+    useState<PaneManagementBatchResult | null>(null)
+  const [managementOpen, setManagementOpen] = useState(false)
+  const [managementLoading, setManagementLoading] = useState(true)
+  const [managementError, setManagementError] = useState<string | null>(null)
   const dialogRef = useRef<HTMLDivElement>(null)
   const searchRef = useRef<HTMLInputElement>(null)
   const detailsRef = useRef<HTMLElement>(null)
@@ -154,10 +172,24 @@ export function HerdrInventoryWorkspace({ onClose }: HerdrInventoryWorkspaceProp
     }
   }, [])
 
+  const loadManagementPreview = useCallback(async () => {
+    setManagementLoading(true)
+    try {
+      setManagementPreview(await fetchPaneManagementPreview())
+      setManagementError(null)
+    } catch {
+      setManagementPreview(null)
+      setManagementError('Pane management capability is unavailable.')
+    } finally {
+      setManagementLoading(false)
+    }
+  }, [])
+
   useEffect(() => {
     void load()
+    void loadManagementPreview()
     return cancelRefresh
-  }, [cancelRefresh, load])
+  }, [cancelRefresh, load, loadManagementPreview])
   useModalDialog({
     dialogRef,
     initialFocusRef: searchRef,
@@ -388,6 +420,22 @@ export function HerdrInventoryWorkspace({ onClose }: HerdrInventoryWorkspaceProp
             : 'Observing Herdr'}
         </span>
         <button
+          className="secondary-button"
+          disabled={
+            managementLoading ||
+            !managementPreview?.supported ||
+            managementPreview.eligible_count === 0
+          }
+          onClick={() => {
+            setManagementResult(null)
+            setManagementOpen(true)
+          }}
+          type="button"
+        >
+          <ShieldCheck aria-hidden="true" size={14} />
+          Manage all agents
+        </button>
+        <button
           aria-label="Refresh Herdr inventory"
           className="icon-button"
           disabled={loading}
@@ -409,6 +457,92 @@ export function HerdrInventoryWorkspace({ onClose }: HerdrInventoryWorkspaceProp
           <X aria-hidden="true" size={16} />
         </button>
       </header>
+      {!managementLoading && !managementPreview?.supported ? (
+        <p className="herdr-inventory__management-message">
+          {managementError ?? 'Installed Herdr does not support safe pane claims.'}
+        </p>
+      ) : null}
+      {managementOpen && managementPreview ? (
+        <section
+          aria-label="Manage all agents preview"
+          className="herdr-inventory__management"
+        >
+          {managementResult ? (
+            <>
+              <strong>
+                Managed {managementResult.managed_count} of{' '}
+                {managementResult.results.length} selected panes
+              </strong>
+              <ul>
+                {managementResult.results.map((result) => (
+                  <li key={result.candidate_key}>
+                    <code>{result.candidate_key}</code> · {result.outcome.replaceAll('_', ' ')}
+                  </li>
+                ))}
+              </ul>
+              <button
+                className="secondary-button"
+                onClick={() => setManagementOpen(false)}
+                type="button"
+              >
+                Close result
+              </button>
+            </>
+          ) : (
+            <>
+              <strong>
+                {managementPreview.eligible_count} eligible of{' '}
+                {managementPreview.candidate_count} agent panes
+              </strong>
+              <ul>
+                {managementPreview.candidates.map((candidate) => (
+                  <li key={candidate.candidate_key}>
+                    <code>{candidate.terminal_id ?? candidate.candidate_key}</code> ·{' '}
+                    {candidate.category.replaceAll('_', ' ')} · {candidate.reason}
+                  </li>
+                ))}
+              </ul>
+              <div>
+                <button
+                  className="primary-button"
+                  disabled={managementLoading || managementPreview.eligible_count === 0}
+                  onClick={() => {
+                    setManagementLoading(true)
+                    void manageAllAgents({
+                      command_id: crypto.randomUUID(),
+                      actor: 'user',
+                      confirmed: true,
+                      candidate_keys: managementPreview.candidates
+                        .filter(({ category }) => category === 'eligible')
+                        .map(({ candidate_key }) => candidate_key),
+                    })
+                      .then((result) => {
+                        setManagementResult(result)
+                        setManagementError(null)
+                        void loadManagementPreview()
+                      })
+                      .catch(() => {
+                        setManagementError('Yard could not complete pane management.')
+                      })
+                      .finally(() => setManagementLoading(false))
+                  }}
+                  type="button"
+                >
+                  Confirm management
+                </button>
+                <button
+                  className="secondary-button"
+                  onClick={() => setManagementOpen(false)}
+                  type="button"
+                >
+                  Cancel
+                </button>
+              </div>
+              {managementError ? <p>{managementError}</p> : null}
+            </>
+          )}
+        </section>
+      ) : null}
       <span
         aria-atomic="true"
         aria-live="polite"

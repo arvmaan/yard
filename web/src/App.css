@@ -8746,13 +8746,38 @@ html[data-yard-allocation-dragging="true"]
 
 .herdr-inventory__header {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto auto auto;
   align-items: center;
   gap: 10px;
   min-height: 64px;
   padding: 10px 14px;
   border-bottom: 1px solid var(--line);
   background: var(--paper);
+}
+
+.herdr-inventory__management,
+.herdr-inventory__management-message {
+  margin: 0;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--paper);
+  font-size: 11px;
+}
+
+.herdr-inventory__management ul {
+  max-height: 160px;
+  margin: 8px 0;
+  padding-left: 20px;
+  overflow: auto;
+}
+
+.herdr-inventory__management > div {
+  display: flex;
+  gap: 8px;
+}
+
+.herdr-inventory__management-message {
+  color: var(--muted);
 }
 
 .herdr-inventory__header h1,

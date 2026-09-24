@@ -38,24 +38,24 @@ use yard_domain::{
     ManagedRuntimeOccupant, ManagedRuntimeOccupantKind, ManagedRuntimeWorkspace,
     ManagedRuntimeWorkspaceKind, ObservedStatus, ObservedWorker, OldSessionDisposition,
     OrchestratorPromptAcknowledgement, OrchestratorWorkflowProfile, OrchestratorWorkflowProfiles,
-    PaneObservation, PreparedAgentProfile, Project, ProjectPlacement, ProjectRelationship,
-    ProjectRelationshipKind, ProjectRelationships, ProjectRepositories, ProjectRepository,
-    ProjectRuntimeBinding, ProjectWorkflowProfilePin, Projects, ProviderSessionRef,
-    ProvisionCoordinationNode, ProvisionYardOrchestrator, RecordCompletionReceipt,
-    RecordedCompletionReceipt, ReplaceProjectOrchestrator, ReplacedProjectOrchestrator,
-    RequestCoordinationSnapshot, ResetOrchestratorWorkflowProfile, RunAutomationNow,
-    RuntimeInventory, RuntimeObservationState, RuntimeProcessState, RuntimeReconciliation,
-    RuntimeTopology, SendAssignmentPrompt, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
-    SendOrchestratorPrompt, SendYardOrchestratorPrompt, SendYardOrchestratorRoute,
-    SetAutomationPaused, TokenSpendSettings, TransferProjectOrchestrator,
-    TransferredProjectOrchestrator, UpdateAgentProfile, UpdateAutomation,
-    UpdateAutomationPlacement, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
-    UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
-    UpdateTokenSpendSettings, UpdateWorkerProfile, Worker, WorkerAllocation, WorkerAvailability,
-    WorkerCandidate, WorkerCandidates, WorkerDesiredState, WorkerProfile, WorkerProfileSpec,
-    WorkerProfiles, WorkerRuntimeBinding, YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator,
-    YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute, YardOrchestratorRoutes,
-    herdr_agent_name,
+    PaneManagementBatchResult, PaneObservation, PreparedAgentProfile, Project, ProjectPlacement,
+    ProjectRelationship, ProjectRelationshipKind, ProjectRelationships, ProjectRepositories,
+    ProjectRepository, ProjectRuntimeBinding, ProjectWorkflowProfilePin, Projects,
+    ProviderSessionRef, ProvisionCoordinationNode, ProvisionYardOrchestrator,
+    RecordCompletionReceipt, RecordedCompletionReceipt, ReplaceProjectOrchestrator,
+    ReplacedProjectOrchestrator, RequestCoordinationSnapshot, ResetOrchestratorWorkflowProfile,
+    RunAutomationNow, RuntimeInventory, RuntimeObservationState, RuntimeProcessState,
+    RuntimeReconciliation, RuntimeTopology, SendAssignmentPrompt, SendCoordinationNodePrompt,
+    SendCoordinationNodeRoute, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
+    SendYardOrchestratorRoute, SetAutomationPaused, TokenSpendSettings,
+    TransferProjectOrchestrator, TransferredProjectOrchestrator, UpdateAgentProfile,
+    UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
+    UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
+    UpdateProjectWorkflowProfile, UpdateTokenSpendSettings, UpdateWorkerProfile, Worker,
+    WorkerAllocation, WorkerAvailability, WorkerCandidate, WorkerCandidates, WorkerDesiredState,
+    WorkerProfile, WorkerProfileSpec, WorkerProfiles, WorkerRuntimeBinding,
+    YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator, YardOrchestratorPromptAcknowledgement,
+    YardOrchestratorRoute, YardOrchestratorRoutes, herdr_agent_name,
 };
 use yard_domain::{
     CompletedRuntimeCleanupCandidate, CompletedRuntimeCleanupPreview,
@@ -65,9 +65,14 @@ use yard_domain::{
 mod automation_store;
 mod coordination_node_store;
 mod orchestrator_workflow_profile_store;
+mod pane_management_store;
 mod token_spend_store;
 
-const SCHEMA_VERSION: i64 = 29;
+pub use pane_management_store::{
+    BeginPaneManagementBatch, ManagedPaneAdoption, StoredLeaseToken, StoredPaneManagementLease,
+};
+
+const SCHEMA_VERSION: i64 = 30;
 const PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS: u64 = 120_000;
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_projects.sql");
 const PROFILE_ASSIGNMENT_MIGRATION: &str =
@@ -120,6 +125,8 @@ const VISIBILITY_DELETIONS_MIGRATION: &str =
     include_str!("../migrations/0028_visibility_deletions.sql");
 const PROJECT_REPOSITORIES_MIGRATION: &str =
     include_str!("../migrations/0029_project_repositories.sql");
+const PANE_MANAGEMENT_MIGRATION: &str =
+    include_str!("../migrations/0030_pane_management_leases.sql");
 const BLANK_WORKER_PROFILE_ID: &str = "yard:managed-blank-profile";
 const BLANK_WORKER_PROFILE_NAME: &str = "Blank profile";
 const MAX_ROUTE_LIST_LIMIT: usize = 500;
@@ -357,6 +364,39 @@ pub trait YardStore: Send + Sync {
         command: ConfigureYardOrchestrator,
     ) -> Result<ConfiguredYardOrchestrator, ProjectStoreError>;
     async fn list_projects(&self) -> Result<Projects, ProjectStoreError>;
+    async fn pane_management_installation_uuid(&self) -> Result<String, ProjectStoreError>;
+    async fn list_pane_management_leases(
+        &self,
+    ) -> Result<Vec<StoredPaneManagementLease>, ProjectStoreError>;
+    async fn begin_pane_management_batch(
+        &self,
+        command_id: &str,
+        actor: &str,
+        input_hash: &str,
+    ) -> Result<BeginPaneManagementBatch, ProjectStoreError>;
+    async fn adopt_managed_pane(
+        &self,
+        adoption: ManagedPaneAdoption,
+    ) -> Result<String, ProjectStoreError>;
+    async fn complete_pane_management_batch(
+        &self,
+        result: PaneManagementBatchResult,
+    ) -> Result<(), ProjectStoreError>;
+    async fn list_due_pane_management_leases(
+        &self,
+        now_unix_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredPaneManagementLease>, ProjectStoreError>;
+    async fn renew_pane_management_lease(
+        &self,
+        worker_id: &str,
+        expires_at_unix_ms: u64,
+    ) -> Result<(), ProjectStoreError>;
+    async fn mark_pane_management_recovery_required(
+        &self,
+        worker_id: &str,
+        error_code: &str,
+    ) -> Result<(), ProjectStoreError>;
     async fn list_project_relationships(&self) -> Result<ProjectRelationships, ProjectStoreError>;
     async fn create_project_relationship(
         &self,
@@ -2278,6 +2318,63 @@ impl YardStore for SqliteProjectStore {
             Ok(Projects { projects })
         })
         .await
+    }
+
+    async fn pane_management_installation_uuid(&self) -> Result<String, ProjectStoreError> {
+        pane_management_store::installation_uuid(self).await
+    }
+
+    async fn list_pane_management_leases(
+        &self,
+    ) -> Result<Vec<StoredPaneManagementLease>, ProjectStoreError> {
+        pane_management_store::list(self).await
+    }
+
+    async fn begin_pane_management_batch(
+        &self,
+        command_id: &str,
+        actor: &str,
+        input_hash: &str,
+    ) -> Result<BeginPaneManagementBatch, ProjectStoreError> {
+        pane_management_store::begin_batch(self, command_id, actor, input_hash).await
+    }
+
+    async fn adopt_managed_pane(
+        &self,
+        adoption: ManagedPaneAdoption,
+    ) -> Result<String, ProjectStoreError> {
+        pane_management_store::adopt(self, adoption).await
+    }
+
+    async fn complete_pane_management_batch(
+        &self,
+        result: PaneManagementBatchResult,
+    ) -> Result<(), ProjectStoreError> {
+        pane_management_store::complete_batch(self, result).await
+    }
+
+    async fn list_due_pane_management_leases(
+        &self,
+        now_unix_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredPaneManagementLease>, ProjectStoreError> {
+        pane_management_store::list_due(self, now_unix_ms, limit).await
+    }
+
+    async fn renew_pane_management_lease(
+        &self,
+        worker_id: &str,
+        expires_at_unix_ms: u64,
+    ) -> Result<(), ProjectStoreError> {
+        pane_management_store::renewed(self, worker_id, expires_at_unix_ms).await
+    }
+
+    async fn mark_pane_management_recovery_required(
+        &self,
+        worker_id: &str,
+        error_code: &str,
+    ) -> Result<(), ProjectStoreError> {
+        pane_management_store::mark_recovery_required(self, worker_id, error_code).await
     }
 
     async fn list_project_relationships(&self) -> Result<ProjectRelationships, ProjectStoreError> {
@@ -11977,6 +12074,13 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         transaction.execute_batch(PROJECT_REPOSITORIES_MIGRATION)?;
         ensure_foreign_keys(&transaction)?;
         transaction.commit()?;
+        current = 29;
+    }
+    if current == 29 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(PANE_MANAGEMENT_MIGRATION)?;
+        ensure_foreign_keys(&transaction)?;
+        transaction.commit()?;
     }
     ensure_foreign_keys(connection)?;
     Ok(())
@@ -18871,6 +18975,8 @@ pub enum ProjectStoreError {
     CommandNotFound,
     #[error("command is not pending")]
     CommandNotPending,
+    #[error("pane management lease changed during renewal")]
+    PaneManagementLeaseChanged,
     #[error("allocation command does not have a durable runtime allocation")]
     RuntimeAllocationMissing,
     #[error("project creation command does not have a durable project result")]
@@ -19827,6 +19933,7 @@ mod tests {
     ) -> ObservedWorker {
         ObservedWorker {
             runtime_id: terminal_id.to_owned(),
+            pane_instance_id: None,
             terminal_id: terminal_id.to_owned(),
             workspace_id: workspace_id.to_owned(),
             tab_id: tab_id.to_owned(),
@@ -19856,6 +19963,7 @@ mod tests {
     ) -> PaneObservation {
         PaneObservation {
             runtime_id: pane_id.to_owned(),
+            pane_instance_id: None,
             terminal_id: terminal_id.to_owned(),
             workspace_id: workspace_id.to_owned(),
             tab_id: tab_id.to_owned(),

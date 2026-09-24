@@ -21,6 +21,7 @@ use yard_server::{
     intervention_service::RuntimeIntervention,
     inventory_service::{HerdrInventorySource, InventorySource},
     orchestrator_replacement_service::OrchestratorReplacementService,
+    pane_management_service::PaneManagementService,
     reconciliation_service::ReconciliationService,
     runtime_cleanup_service::RuntimeCleanupService,
     terminal_service::RuntimeTerminal,
@@ -186,6 +187,7 @@ where
     }
     let reconciliation = ReconciliationService::new(source.clone(), store.clone());
     let cleanup = RuntimeCleanupService::new(control.clone(), store.clone());
+    let pane_management = PaneManagementService::new(source.clone(), store.clone());
     let (shutdown, shutdown_receiver) = watch::channel(false);
     let (app, automations, connections) =
         app_with_reconciliation_and_paths_and_automation_and_shutdown(
@@ -228,6 +230,10 @@ where
     background_tasks.spawn(async move {
         cleanup.run().await;
         "runtime cleanup"
+    });
+    background_tasks.spawn(async move {
+        pane_management.run().await;
+        "pane management renewal"
     });
     background_tasks.spawn(async move {
         replacement_recovery.run().await;
@@ -478,6 +484,7 @@ mod tests {
         fn observed_worker(terminal_id: &str, name: &str, sequence: u64) -> ObservedWorker {
             ObservedWorker {
                 runtime_id: terminal_id.to_owned(),
+                pane_instance_id: None,
                 terminal_id: terminal_id.to_owned(),
                 workspace_id: "workspace-supervised".to_owned(),
                 tab_id: format!("tab-{terminal_id}"),

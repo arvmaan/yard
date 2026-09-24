@@ -45,6 +45,7 @@ export interface HerdrLivePane {
   workspace_label: string | null
   tab_id: string | null
   pane_id: string | null
+  pane_instance_id?: string | null
   terminal_id: string | null
   label: string | null
   name: string | null
@@ -125,6 +126,7 @@ export interface ProviderSessionRef {
 
 export interface PaneObservation {
   runtime_id: string
+  pane_instance_id?: string | null
   terminal_id: string
   workspace_id: string
   tab_id: string
@@ -142,6 +144,7 @@ export interface PaneObservation {
 
 export interface ObservedWorker {
   runtime_id: string
+  pane_instance_id?: string | null
   terminal_id: string
   workspace_id: string
   tab_id: string
@@ -159,6 +162,67 @@ export interface ObservedWorker {
   tokens: Record<string, string>
   provider_session: ProviderSessionRef | null
   revision: string
+}
+
+export type PaneManagementCategory =
+  | 'eligible'
+  | 'already_managed'
+  | 'conflict'
+  | 'ambiguous'
+  | 'unsupported'
+
+export interface PaneManagementCandidate {
+  candidate_key: string
+  category: PaneManagementCategory
+  reason: string
+  session: string
+  workspace_id: string | null
+  workspace_label: string | null
+  pane_id: string | null
+  pane_instance_id: string | null
+  terminal_id: string | null
+  project_id: string | null
+  project_name: string | null
+  worker_id: string | null
+  provider: string | null
+  display_provider: string | null
+  recovery_required: boolean
+  management_controls_enabled: boolean
+}
+
+export interface PaneManagementPreview {
+  supported: boolean
+  endpoint: string | null
+  limit: number
+  truncated: boolean
+  candidate_count: number
+  eligible_count: number
+  candidates: PaneManagementCandidate[]
+}
+
+export interface PaneManagementBatchResult {
+  command_id: string
+  replayed: boolean
+  managed_count: number
+  results: Array<{
+    candidate_key: string
+    outcome:
+      | 'managed'
+      | 'already_managed'
+      | 'conflict'
+      | 'skipped'
+      | 'failed'
+      | 'rollback_failed'
+    reason: string
+    worker_id: string | null
+  }>
+}
+
+export interface ManageAllAgentsInput {
+  command_id: string
+  actor: string
+  confirmed: boolean
+  candidate_keys: string[]
 }
 
 export interface ObservedChildAgent {

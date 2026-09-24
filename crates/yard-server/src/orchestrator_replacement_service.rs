@@ -1555,6 +1555,7 @@ mod tests {
     fn observed_worker(runtime: &WorkerRuntimeBinding) -> ObservedWorker {
         ObservedWorker {
             runtime_id: runtime.terminal_id.clone(),
+            pane_instance_id: None,
             terminal_id: runtime.terminal_id.clone(),
             workspace_id: runtime.workspace_id.clone(),
             tab_id: runtime.tab_id.clone().unwrap(),
@@ -1647,6 +1648,7 @@ mod tests {
             }],
             panes: vec![PaneObservation {
                 runtime_id: "pane-intent".to_owned(),
+                pane_instance_id: None,
                 terminal_id: "terminal-intent".to_owned(),
                 workspace_id: "workspace-1".to_owned(),
                 tab_id: "tab-intent".to_owned(),

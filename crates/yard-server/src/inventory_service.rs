@@ -7,11 +7,14 @@ use yard_domain::{
     RuntimeSessions, WorkerRuntimeBinding,
 };
 use yard_herdr::{
-    BootstrapAgentRequest, DiscoveredHerdrSession, HerdrAdapter, HerdrControlError, HerdrError,
-    HerdrTerminal, HerdrTerminalError, OpenTerminalRequest as HerdrOpenTerminalRequest,
+    AcquirePaneLeaseRequest, BootstrapAgentRequest, CloseLeasedPaneRequest, DiscoveredHerdrSession,
+    HerdrAdapter, HerdrControlError, HerdrError, HerdrTerminal, HerdrTerminalError,
+    OpenTerminalRequest as HerdrOpenTerminalRequest, PaneLease, PaneLeaseOperationResult,
+    PaneLeaseStatus, PaneLeaseStatusRequest, PaneManagementCapability, PaneManagementRpcError,
     PrepareAgentRequest, PrepareWorkspaceAgentRequest, PromptAgentRequest, ProvisionAgentRequest,
-    ReadPaneRequest, StartPreparedAgentRequest, TerminalCommand as HerdrTerminalCommand,
-    TerminalDimensions, TerminalEncoding, TerminalEvent, TerminalInput,
+    ReadPaneRequest, ReleasePaneLeaseRequest, RenewPaneLeaseRequest, StartPreparedAgentRequest,
+    TerminalCommand as HerdrTerminalCommand, TerminalDimensions, TerminalEncoding, TerminalEvent,
+    TerminalInput,
 };
 
 use crate::allocation_service::{
@@ -132,6 +135,48 @@ pub trait InventorySource: Send + Sync {
         session: &RuntimeSessionDescriptor,
     ) -> Result<RuntimeInventory, InventoryServiceError> {
         self.inventory_for_descriptor(session).await
+    }
+
+    async fn pane_management_capability(
+        &self,
+        _session_name: &str,
+    ) -> Result<PaneManagementCapability, PaneManagementRpcError> {
+        Ok(PaneManagementCapability::unsupported())
+    }
+
+    async fn acquire_pane_lease(
+        &self,
+        _request: AcquirePaneLeaseRequest,
+    ) -> Result<PaneLease, PaneManagementRpcError> {
+        Err(PaneManagementRpcError::Unsupported)
+    }
+
+    async fn renew_pane_lease(
+        &self,
+        _request: RenewPaneLeaseRequest,
+    ) -> Result<PaneLeaseOperationResult, PaneManagementRpcError> {
+        Err(PaneManagementRpcError::Unsupported)
+    }
+
+    async fn release_pane_lease(
+        &self,
+        _request: ReleasePaneLeaseRequest,
+    ) -> Result<PaneLeaseOperationResult, PaneManagementRpcError> {
+        Err(PaneManagementRpcError::Unsupported)
+    }
+
+    async fn pane_lease_status(
+        &self,
+        _request: PaneLeaseStatusRequest,
+    ) -> Result<PaneLeaseStatus, PaneManagementRpcError> {
+        Err(PaneManagementRpcError::Unsupported)
+    }
+
+    async fn close_if_pane_leased(
+        &self,
+        _request: CloseLeasedPaneRequest,
+    ) -> Result<PaneLeaseOperationResult, PaneManagementRpcError> {
+        Err(PaneManagementRpcError::Unsupported)
     }
 }
 
@@ -317,6 +362,48 @@ impl InventorySource for HerdrInventorySource {
             .fleet_inventory_for_discovered_session(session)
             .await
             .map_err(Into::into)
+    }
+
+    async fn pane_management_capability(
+        &self,
+        session_name: &str,
+    ) -> Result<PaneManagementCapability, PaneManagementRpcError> {
+        self.adapter.pane_management_capability(session_name).await
+    }
+
+    async fn acquire_pane_lease(
+        &self,
+        request: AcquirePaneLeaseRequest,
+    ) -> Result<PaneLease, PaneManagementRpcError> {
+        self.adapter.acquire_pane_lease(request).await
+    }
+
+    async fn renew_pane_lease(
+        &self,
+        request: RenewPaneLeaseRequest,
+    ) -> Result<PaneLeaseOperationResult, PaneManagementRpcError> {
+        self.adapter.renew_pane_lease(request).await
+    }
+
+    async fn release_pane_lease(
+        &self,
+        request: ReleasePaneLeaseRequest,
+    ) -> Result<PaneLeaseOperationResult, PaneManagementRpcError> {
+        self.adapter.release_pane_lease(request).await
+    }
+
+    async fn pane_lease_status(
+        &self,
+        request: PaneLeaseStatusRequest,
+    ) -> Result<PaneLeaseStatus, PaneManagementRpcError> {
+        self.adapter.pane_lease_status(request).await
+    }
+
+    async fn close_if_pane_leased(
+        &self,
+        request: CloseLeasedPaneRequest,
+    ) -> Result<PaneLeaseOperationResult, PaneManagementRpcError> {
+        self.adapter.close_if_pane_leased(request).await
     }
 }
 
@@ -1170,6 +1257,7 @@ mod tests {
             panes: Vec::new(),
             workers: vec![ObservedWorker {
                 runtime_id: "terminal-1".to_owned(),
+                pane_instance_id: None,
                 terminal_id: "terminal-1".to_owned(),
                 workspace_id: "workspace-1".to_owned(),
                 tab_id: "tab-current".to_owned(),
@@ -1340,6 +1428,7 @@ mod tests {
         inventory.workers.clear();
         inventory.panes.push(PaneObservation {
             runtime_id: "pane-current".to_owned(),
+            pane_instance_id: None,
             terminal_id: "terminal-restored".to_owned(),
             workspace_id: "workspace-1".to_owned(),
             tab_id: "tab-current".to_owned(),

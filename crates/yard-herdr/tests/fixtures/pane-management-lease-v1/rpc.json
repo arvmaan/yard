@@ -1,0 +1,105 @@
+{
+  "calls": [
+    {
+      "request": {
+        "id": "yard:manage:batch:pane:acquire",
+        "method": "pane_management_lease_v1",
+        "params": {
+          "operation": "acquire",
+          "acquisition_request_id": "yard:manage:batch:pane",
+          "pane_id": "pane-1",
+          "pane_instance_id": "pane-instance-1",
+          "owner_id": "yard:installation-1",
+          "ttl_ms": "60000"
+        }
+      },
+      "result": {
+        "type": "pane_management_lease_acquired",
+        "pane_id": "pane-1",
+        "pane_instance_id": "pane-instance-1",
+        "owner_id": "yard:installation-1",
+        "token": "fixture-secret-never-expose",
+        "expires_at_unix_ms": "1790000060000",
+        "replayed": true
+      }
+    },
+    {
+      "request": {
+        "id": "yard:manage:batch:pane:renew",
+        "method": "pane_management_lease_v1",
+        "params": {
+          "operation": "renew",
+          "pane_id": "pane-1",
+          "pane_instance_id": "pane-instance-1",
+          "owner_id": "yard:installation-1",
+          "token": "fixture-secret-never-expose",
+          "ttl_ms": "60000"
+        }
+      },
+      "result": {
+        "type": "pane_management_lease_renewed",
+        "expires_at_unix_ms": "1790000060000",
+        "replayed": true
+      }
+    },
+    {
+      "request": {
+        "id": "yard:manage:batch:pane:release",
+        "method": "pane_management_lease_v1",
+        "params": {
+          "operation": "release",
+          "pane_id": "pane-1",
+          "pane_instance_id": "pane-instance-1",
+          "owner_id": "yard:installation-1",
+          "token": "fixture-secret-never-expose"
+        }
+      },
+      "result": {
+        "type": "pane_management_lease_released",
+        "replayed": true
+      }
+    },
+    {
+      "request": {
+        "id": "yard:manage:batch:pane:status",
+        "method": "pane_management_lease_v1",
+        "params": {
+          "operation": "status",
+          "pane_id": "pane-1",
+          "pane_instance_id": "pane-instance-1",
+          "owner_id": "yard:installation-1"
+        }
+      },
+      "result": {
+        "type": "pane_management_lease_status",
+        "status": "conflict"
+      }
+    },
+    {
+      "request": {
+        "id": "yard:manage:batch:pane:close",
+        "method": "pane_management_lease_v1",
+        "params": {
+          "operation": "close_if_leased",
+          "pane_id": "pane-1",
+          "pane_instance_id": "pane-instance-1",
+          "owner_id": "yard:installation-1",
+          "token": "fixture-secret-never-expose"
+        }
+      },
+      "result": {
+        "type": "pane_closed_if_leased",
+        "replayed": true
+      }
+    }
+  ],
+  "errors": [
+    { "code": "pane_management_lease_conflict" },
+    { "code": "pane_management_lease_not_found" },
+    { "code": "pane_management_lease_expired" },
+    { "code": "pane_management_lease_owner_mismatch" },
+    { "code": "pane_management_lease_token_mismatch" },
+    { "code": "pane_instance_mismatch" },
+    { "code": "idempotency_conflict" }
+  ]
+}

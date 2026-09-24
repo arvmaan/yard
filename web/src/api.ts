@@ -44,9 +44,12 @@ import type {
   EndWorkerSessionInput,
   ExternalTerminalLaunch,
   HerdrFleetInventory,
+  ManageAllAgentsInput,
   OrchestratorPromptAcknowledgement,
   OrchestratorTerminalOutput,
   OrchestratorWorkflowProfile,
+  PaneManagementBatchResult,
+  PaneManagementPreview,
   Project,
   Projects,
   ProvisionYardOrchestratorInput,
@@ -168,6 +171,24 @@ export function fetchHerdrFleetInventory(
   signal?: AbortSignal,
 ): Promise<HerdrFleetInventory> {
   return requestJson('/api/v1/runtimes/herdr/inventory', { signal })
+}
+
+export function fetchPaneManagementPreview(
+  signal?: AbortSignal,
+): Promise<PaneManagementPreview> {
+  return requestJson('/api/v1/runtimes/herdr/pane-management-preview', { signal })
+}
+
+export function manageAllAgents(
+  command: ManageAllAgentsInput,
+  signal?: AbortSignal,
+): Promise<PaneManagementBatchResult> {
+  return requestJson('/api/v1/runtimes/herdr/manage-all-agents', {
+    body: JSON.stringify(command),
+    headers: { 'Content-Type': 'application/json' },
+    method: 'POST',
+    signal,
+  })
 }
 
 export function fetchInventory(

@@ -1436,6 +1436,7 @@ mod tests {
                 panes: retained_shell
                     .then(|| PaneObservation {
                         runtime_id: "pane-yard-orchestrator".to_owned(),
+                        pane_instance_id: None,
                         terminal_id: "terminal-yard-orchestrator".to_owned(),
                         workspace_id: "workspace-yard-orchestrator".to_owned(),
                         tab_id: "tab-yard-orchestrator".to_owned(),
@@ -1455,6 +1456,7 @@ mod tests {
                 workers: live
                     .then(|| ObservedWorker {
                         runtime_id: "terminal-yard-orchestrator".to_owned(),
+                        pane_instance_id: None,
                         terminal_id: "terminal-yard-orchestrator".to_owned(),
                         workspace_id: "workspace-yard-orchestrator".to_owned(),
                         tab_id: "tab-yard-orchestrator".to_owned(),
