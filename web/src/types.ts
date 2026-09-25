@@ -389,6 +389,49 @@ export interface Project {
   updated_at_unix_ms: number
 }
 
+export type ArchitectureEcosystem = 'cargo' | 'npm'
+export type ArchitectureNodeKind =
+  | 'application'
+  | 'library'
+  | 'package'
+  | 'service'
+export type ArchitectureRepositoryStatus =
+  | 'error'
+  | 'partial'
+  | 'ready'
+  | 'unsupported'
+
+export interface ArchitectureNode {
+  id: string
+  kind: ArchitectureNodeKind
+  name: string
+  manifest_path: string
+  ecosystem: ArchitectureEcosystem
+}
+
+export interface ArchitectureEdge {
+  from: string
+  to: string
+}
+
+export interface RepositoryArchitecture {
+  repository_id: string
+  name: string
+  status: ArchitectureRepositoryStatus
+  nodes: ArchitectureNode[]
+  edges: ArchitectureEdge[]
+  errors: string[]
+  truncated: boolean
+}
+
+export interface ProjectArchitecture {
+  project_id: string
+  repositories: RepositoryArchitecture[]
+  scanned_at_unix_ms: number
+  stale: boolean
+  truncated: boolean
+}
+
 export interface YardOrchestrator {
   worker: Worker | null
   version: string

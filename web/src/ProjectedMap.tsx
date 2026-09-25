@@ -19,10 +19,11 @@ import {
 import type {
   ProjectedAnchor,
   ProjectedBuilding,
+  ProjectedDistrict,
   ProjectedScene,
   ProjectedTerritory,
 } from './mapScene'
-import { formatTokenCount, groundRoutePoints } from './mapScene'
+import { groundRoutePoints } from './mapScene'
 
 interface ProjectedMapProps {
   scene: ProjectedScene
@@ -130,9 +131,6 @@ function GroundGrid({ world }: { world: WorldRect }) {
   )
 }
 
-const COMPLETED_PLATE_COUNT = 4
-const COMPLETED_PLATE_GAP = 3
-
 /**
  * One extruded slab: a flat top face plus a single visible side face.
  *
@@ -185,30 +183,6 @@ function Building({
   building: ProjectedBuilding
 }) {
   const base = projectRect(building.footprint)
-  // Completed work accumulates: an assignment with a completion receipt is
-  // drawn as a stack of thin layered plates, the way the reference marks its
-  // most accumulated component, while in-progress work stays a single block.
-  const plates = building.completed
-    ? Array.from({ length: COMPLETED_PLATE_COUNT }, (_, index) => {
-        const plateHeight = Math.max(
-          3,
-          (building.height -
-            COMPLETED_PLATE_GAP * (COMPLETED_PLATE_COUNT - 1)) /
-            COMPLETED_PLATE_COUNT,
-        )
-        return {
-          height: plateHeight,
-          lift: index * (plateHeight + COMPLETED_PLATE_GAP),
-        }
-      })
-    : [{ height: building.height, lift: 0 }]
-
-  // A small per-building tint of the project's own accent — lighter or
-  // darker by a hash-driven amount — so a skyline reads as individually
-  // colored buildings in related purples rather than one flat repeated
-  // color. Nested inside the color-mix calls each face already does for its
-  // own top/side tone, so the variance carries through everywhere the base
-  // accent would have been used.
   const lighten = building.colorSeed % 2 === 0
   const shiftAmount = 4 + (building.colorSeed % 10)
   const tintedAccent = `color-mix(in srgb, ${accent} ${100 - shiftAmount}%, ${
@@ -217,48 +191,49 @@ function Building({
 
   return (
     <g
-      className={`projected-building ${building.completed ? 'is-completed' : ''}`}
+      aria-label={`${building.name}, ${building.kind}, ${building.ecosystem}, ${building.manifestPath}`}
+      className="projected-building"
+      data-architecture-node-id={building.id}
       style={{ '--project-accent': tintedAccent } as React.CSSProperties}
     >
-      {plates.map((plate, index) => (
-        <Slab
-          base={base}
-          height={plate.height}
-          key={index}
-          lift={plate.lift}
-        />
-      ))}
+      <title>{`${building.name} — ${building.manifestPath}`}</title>
+      <Slab base={base} height={building.height} lift={0} />
     </g>
   )
 }
 
-/**
- * Compact real-usage label on the skyline's tallest building — real observed
- * token counts (see RuntimeCanvas.tsx's projectTokenTotal, summed from each
- * assigned worker's own Herdr-reported usage), not a decorative number.
- */
-function TokenLabel({
-  building,
-  formatted,
-}: {
-  building: ProjectedBuilding
-  formatted: string
-}) {
-  const base = projectRect(building.footprint)
-  const roof = base.map((point) => raise(point, building.height))
-  const centre = {
-    x: roof.reduce((sum, point) => sum + point.x, 0) / roof.length,
-    y: roof.reduce((sum, point) => sum + point.y, 0) / roof.length,
-  }
+function District({ district }: { district: ProjectedDistrict }) {
+  const outline = projectRect(district.rect)
+  const label = projectPoint({
+    x: district.rect.x + 8,
+    y: district.rect.y + 8,
+  })
+  const state =
+    district.status === 'ready'
+      ? district.truncated
+        ? 'truncated'
+        : null
+      : district.status
   return (
-    <text
-      className="projected-building__token-label"
-      textAnchor="middle"
-      x={round(centre.x)}
-      y={round(centre.y - 10)}
+    <g
+      className="projected-district"
+      data-repository-id={district.id}
+      data-status={district.status}
     >
-      {formatted}
-    </text>
+      <title>{district.error ?? `${district.label} repository`}</title>
+      <polygon
+        className="projected-district__outline"
+        points={polygonPoints(outline)}
+      />
+      <text
+        className="projected-district__label"
+        x={round(label.x)}
+        y={round(label.y)}
+      >
+        {district.label}
+        {state ? ` · ${state}` : ''}
+      </text>
+    </g>
   )
 }
 
@@ -289,6 +264,11 @@ function Territory({
         onPointerDown={(event) => onPointerDown(territory.nodeId, event)}
         points={polygonPoints(outline)}
       />
+      <g className="projected-territory__districts">
+        {territory.districts.map((district) => (
+          <District district={district} key={district.id} />
+        ))}
+      </g>
       <g className="projected-territory__buildings">
         {/* Painted back-to-front by world depth (x+y, the same combination
             the projection's v-axis uses), not grid index. Buildings are now
@@ -301,23 +281,50 @@ function Territory({
             (a, b) =>
               a.footprint.x + a.footprint.y - (b.footprint.x + b.footprint.y),
           )
-          .map((building, index) => (
+          .map((building) => (
             <Building
               accent={territory.accent}
               building={building}
-              key={index}
+              key={building.id}
             />
           ))}
       </g>
-      {(() => {
-        if (territory.buildings.length === 0) return null
-        const formatted = formatTokenCount(territory.tokenTotal ?? 0)
-        if (!formatted) return null
-        const tallest = territory.buildings.reduce((max, building) =>
-          building.height > max.height ? building : max,
-        )
-        return <TokenLabel building={tallest} formatted={formatted} />
-      })()}
+      {territory.emptyLabel ? (
+        <text
+          className="projected-territory__empty"
+          textAnchor="middle"
+          x={round(projectPoint({
+            x: territory.rect.x + territory.rect.width / 2,
+            y: territory.rect.y + territory.rect.height / 2,
+          }).x)}
+          y={round(projectPoint({
+            x: territory.rect.x + territory.rect.width / 2,
+            y: territory.rect.y + territory.rect.height / 2,
+          }).y)}
+        >
+          {territory.emptyLabel}
+        </text>
+      ) : null}
+      {territory.architectureScannedAt ? (
+        <text
+          className="projected-territory__scan-status"
+          x={round(projectPoint({
+            x: territory.rect.x + 10,
+            y: territory.rect.y + territory.rect.height - 10,
+          }).x)}
+          y={round(projectPoint({
+            x: territory.rect.x + 10,
+            y: territory.rect.y + territory.rect.height - 10,
+          }).y)}
+        >
+          {territory.architectureStale ? 'stale · ' : ''}
+          scanned{' '}
+          {new Date(territory.architectureScannedAt)
+            .toISOString()
+            .slice(11, 19)}
+          {territory.architectureTruncated ? ' · truncated' : ''}
+        </text>
+      ) : null}
       <polygon
         className="territory-polygon__outline"
         points={polygonPoints(outline)}

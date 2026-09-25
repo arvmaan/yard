@@ -67,6 +67,7 @@ import {
   fetchOrchestratorWorkflowProfile,
   fetchOrchestratorStatusOutput,
   fetchProject,
+  fetchProjectArchitecture,
   fetchProjectAssignments,
   fetchSummaryWorkers,
   fetchProjectRelationships,
@@ -224,6 +225,7 @@ import type {
   ObservedWorker,
   OrchestratorWorkflowProfile,
   Project,
+  ProjectArchitecture,
   ProjectRelationship,
   RuntimeInventory,
   RuntimeLensEntry,
@@ -247,6 +249,7 @@ import './App.css'
 
 const INVENTORY_REFRESH_INTERVAL_MS = 1_000
 const ASSIGNMENT_REFRESH_INTERVAL_MS = 5_000
+const ARCHITECTURE_REFRESH_INTERVAL_MS = 30_000
 const PROJECT_STATUS_REFRESH_INTERVAL_MS = 15_000
 
 const ArtifactInspector = lazy(() =>
@@ -2436,6 +2439,9 @@ function App() {
   const [yardOrchestrator, setYardOrchestrator] =
     useState<YardOrchestrator | null>(null)
   const [projects, setProjects] = useState<Project[]>([])
+  const [projectArchitectures, setProjectArchitectures] = useState<
+    Record<string, ProjectArchitecture | null>
+  >({})
   const [projectRelationships, setProjectRelationships] = useState<
     ProjectRelationship[]
   >([])
@@ -2642,6 +2648,10 @@ function App() {
   useEffect(() => {
     projectsRef.current = projects
   }, [projects])
+  const architectureProjectKey = projects
+    .map((project) => project.id)
+    .sort()
+    .join('\u0000')
 
   useEffect(() => {
     coordinationNodesRef.current = coordinationNodes
@@ -3227,6 +3237,61 @@ function App() {
       controller.abort()
     }
   }, [loadAssignments, loadSummaryWorkers])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    let inFlight = false
+
+    const refreshArchitectures = async () => {
+      if (inFlight) return
+      inFlight = true
+      const projectIds = projectsRef.current.map((project) => project.id)
+      try {
+        const results = await Promise.allSettled(
+          projectIds.map((projectId) =>
+            fetchProjectArchitecture(projectId, controller.signal),
+          ),
+        )
+        if (controller.signal.aborted) return
+        setProjectArchitectures((current) =>
+          Object.fromEntries(
+            projectIds.map((projectId, index) => {
+              const result = results[index]
+              const previous = current[projectId]
+              return [
+                projectId,
+                result.status === 'fulfilled'
+                  ? result.value
+                  : previous
+                    ? { ...previous, stale: true }
+                    : null,
+              ]
+            }),
+          ),
+        )
+      } finally {
+        inFlight = false
+      }
+    }
+
+    void refreshArchitectures()
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshArchitectures()
+      }
+    }
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void refreshArchitectures()
+      }
+    }, ARCHITECTURE_REFRESH_INTERVAL_MS)
+    document.addEventListener('visibilitychange', refreshWhenVisible)
+    return () => {
+      window.clearInterval(interval)
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
+      controller.abort()
+    }
+  }, [architectureProjectKey])
 
   const projectStatusTargets = useMemo(
     () =>
@@ -6248,6 +6313,7 @@ function App() {
           onProjectPlacementChange={persistPlacement}
           onSelectionChange={handleCanvasSelectionChange}
           projectAccents={resolvedProjectAccents}
+          projectArchitectures={projectArchitectures}
           projectRelationships={projectRelationships}
           projectStatusReports={projectStatusReports}
           projects={projects}

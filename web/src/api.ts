@@ -52,6 +52,7 @@ import type {
   PaneManagementBatchResult,
   PaneManagementPreview,
   Project,
+  ProjectArchitecture,
   Projects,
   ProvisionYardOrchestratorInput,
   RecoverYardOrchestratorInput,
@@ -237,6 +238,16 @@ export function fetchProject(
 ): Promise<Project> {
   return requestJson(
     `/api/v1/projects/${encodeURIComponent(projectId)}`,
+    { signal },
+  )
+}
+
+export function fetchProjectArchitecture(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ProjectArchitecture> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/architecture`,
     { signal },
   )
 }

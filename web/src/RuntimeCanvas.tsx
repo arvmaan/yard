@@ -64,6 +64,7 @@ import type {
   ObservedStatus,
   ObservedWorker,
   Project,
+  ProjectArchitecture,
   ProjectRelationship,
   ProviderSessionRef,
   RuntimeInventory,
@@ -99,7 +100,7 @@ import { createLatestFrameQueue } from './latestFrameQueue'
 import {
   EMPTY_SCENE,
   stableHash,
-  territoryBuildings,
+  architectureLayout,
   type ProjectedAnchor,
   type ProjectedAnchorKind,
   type ProjectedRoute,
@@ -141,6 +142,7 @@ interface RuntimeCanvasProps {
   coordinationNodeRoutes: CoordinationNodeRoute[]
   inventory: RuntimeInventory | null
   projectAccents: Record<string, string>
+  projectArchitectures: Record<string, ProjectArchitecture | null>
   projectRelationships: ProjectRelationship[]
   projectStatusReports: ProjectStatusReports
   projects: Project[]
@@ -188,9 +190,7 @@ interface RuntimeCanvasProps {
 interface ProjectNodeData extends Record<string, unknown> {
   project: Project
   accent: string
-  buildingCount: number
-  completedBuildingCount: number
-  projectTokenTotal: number
+  architecture: ProjectArchitecture | null | undefined
   workspace: WorkspaceObservation | null
   runtimePending: boolean
   visibleWorkerCount: number
@@ -386,12 +386,6 @@ type RuntimeCanvasProperties = CSSProperties & {
   '--billboard-zoom-compensation': string
 }
 
-type BuildingProperties = CSSProperties & {
-  '--building-depth': string
-  '--building-height': string
-  '--building-width': string
-}
-
 function motionProperties(identity: string): MotionProperties {
   const hash = stableHash(identity)
   return {
@@ -400,30 +394,6 @@ function motionProperties(identity: string): MotionProperties {
     '--drift-x': `${2 + ((hash >>> 8) % 4)}px`,
     '--drift-y': `${2 + ((hash >>> 12) % 3)}px`,
   }
-}
-
-function cityBuildingStyles(
-  projectId: string,
-  buildingCount: number,
-  completedBuildingCount: number,
-): BuildingProperties[] {
-  return Array.from({ length: buildingCount }, (_, index) => {
-    const hash = stableHash(`${projectId}:building:${index}`)
-    const isCompleted =
-      index >= Math.max(1, buildingCount - completedBuildingCount)
-    const height = Math.min(
-      94,
-      24 +
-        (hash % 44) +
-        Math.round(buildingCount * 1.4) +
-        (isCompleted ? 12 : 0),
-    )
-    return {
-      '--building-depth': `${5 + ((hash >>> 12) % 4)}px`,
-      '--building-height': `${height}%`,
-      '--building-width': `${7 + ((hash >>> 8) % 8)}%`,
-    }
-  })
 }
 
 function workerPosition(index: number) {
@@ -675,8 +645,7 @@ function ProjectRegion({ data, selected }: NodeProps<ProjectNode>) {
   const {
     project,
     accent,
-    buildingCount,
-    completedBuildingCount,
+    architecture,
     workspace,
     runtimePending,
     visibleWorkerCount,
@@ -694,8 +663,12 @@ function ProjectRegion({ data, selected }: NodeProps<ProjectNode>) {
         workspace ? 'online' : runtimePending ? 'loading' : 'offline'
       }
       data-status={workspace?.status ?? 'unknown'}
-      data-building-count={buildingCount}
-      data-completed-building-count={completedBuildingCount}
+      data-architecture-node-count={
+        architecture?.repositories.reduce(
+          (total, repository) => total + repository.nodes.length,
+          0,
+        ) ?? 0
+      }
       style={{ '--project-accent': accent } as TerritoryProperties}
     >
       {/*
@@ -750,15 +723,6 @@ function ProjectRegion({ data, selected }: NodeProps<ProjectNode>) {
         position={Position.Top}
         type="target"
       />
-      <div aria-hidden="true" className="city-silhouette">
-        {cityBuildingStyles(
-          project.id,
-          buildingCount,
-          completedBuildingCount,
-        ).map((style, index) => (
-          <span key={index} style={style} />
-        ))}
-      </div>
       <div className="workspace-region__heading">
         <div className="workspace-region__title">
           <span className="workspace-region__index">Y</span>
@@ -1846,6 +1810,7 @@ function buildNodes(
   inventory: RuntimeInventory | null,
   theme: ThemeDefinition,
   projectAccents: Record<string, string>,
+  projectArchitectures: Record<string, ProjectArchitecture | null>,
   projectStatusReports: ProjectStatusReports,
   projects: Project[],
   runtimeLoading: boolean,
@@ -1984,37 +1949,12 @@ function buildNodes(
       linkedChildren,
       agentPositions,
     )
-    const completedBuildingCount = allProjectAssignments.filter(
-      (assignment) => assignment.completion_receipt !== null,
-    ).length
-    // Real observed usage, not a simulated figure: summed from each assigned
-    // worker's own Herdr-reported token counts, the same `tokens` field
-    // already on ObservedWorker but never surfaced anywhere in the UI before.
-    const projectTokenTotal = allProjectAssignments.reduce(
-      (total, assignment) => {
-        const worker = capabilitiesForRuntime(
-          assignment.worker.runtime,
-        ).observedWorker
-        if (!worker) return total
-        const workerTotal = Object.values(worker.tokens).reduce(
-          (sum, value) => sum + (Number.parseInt(value, 10) || 0),
-          0,
-        )
-        return total + workerTotal
-      },
-      0,
-    )
-    const artifactCount = allProjectAssignments.reduce(
-      (total, assignment) =>
-        total + (assignment.completion_receipt?.artifacts.length ?? 0),
-      0,
-    )
-    const buildingCount = Math.min(
-      18,
-      3 +
-        allProjectAssignments.length +
-        Math.min(artifactCount, 6),
-    )
+    const architecture = projectArchitectures[project.id]
+    const architectureNodeCount =
+      architecture?.repositories.reduce(
+        (total, repository) => total + repository.nodes.length,
+        0,
+      ) ?? 0
     const minimumHeight = treeLayout.minimumHeight
     const minimumWidth = treeLayout.minimumWidth
     const geometry = project.placement.geometry
@@ -2028,9 +1968,7 @@ function buildNodes(
       data: {
         project,
         accent,
-        buildingCount,
-        completedBuildingCount,
-        projectTokenTotal,
+        architecture,
         workspace,
         runtimePending,
         visibleWorkerCount,
@@ -2052,7 +1990,7 @@ function buildNodes(
           : runtimePending
             ? 'loading'
             : 'connection status unknown'
-      }, ${visibleWorkerCount} visible workers, ${childAgentCount} live child agents, ${buildingCount} city structures, ${completedBuildingCount} completed`,
+      }, ${visibleWorkerCount} visible workers, ${childAgentCount} live child agents, ${architectureNodeCount} architecture buildings`,
       focusable: true,
     }
     const orchestratorState = resolvedRuntimeState(
@@ -2674,6 +2612,7 @@ export function RuntimeCanvas({
   onOpenProjectPulse,
   onProjectConnect,
   projectAccents,
+  projectArchitectures,
   projectRelationships,
   projectStatusReports,
   projects,
@@ -3478,15 +3417,34 @@ export function RuntimeCanvas({
           x: rect.x + rect.width / 2,
           y: rect.y + rect.height / 2,
         })
+        const architecture = data.architecture
+        const layout = architectureLayout(
+          architecture?.repositories ?? [],
+          rect,
+        )
+        const architectureNodeCount =
+          architecture?.repositories.reduce(
+            (total, repository) => total + repository.nodes.length,
+            0,
+          ) ?? 0
         territories.push({
           accent: data.accent,
           allocationTarget: data.isAllocationTarget,
-          buildings: territoryBuildings(
-            data.project.id,
-            data.buildingCount,
-            data.completedBuildingCount,
-            rect,
-          ),
+          architectureScannedAt: architecture?.scanned_at_unix_ms,
+          architectureStale: architecture?.stale,
+          architectureTruncated: architecture?.truncated,
+          buildings: layout.buildings,
+          districts: layout.districts,
+          emptyLabel:
+            architecture === undefined
+              ? 'Architecture loading'
+              : architecture === null
+                ? 'Architecture unavailable'
+                : architecture.repositories.length === 0
+                  ? 'No repositories linked'
+                  : architectureNodeCount === 0
+                    ? 'No supported architecture nodes'
+                    : undefined,
           kind: 'project',
           label: data.project.name,
           nodeId: node.id,
@@ -3498,7 +3456,6 @@ export function RuntimeCanvas({
               : 'offline',
           selected: node.selected === true,
           status: data.workspace?.status ?? 'unknown',
-          tokenTotal: data.projectTokenTotal,
         })
         continue
       }
@@ -3522,6 +3479,7 @@ export function RuntimeCanvas({
           accent,
           allocationTarget: false,
           buildings: [],
+          districts: [],
           kind: 'workspace',
           label: data.managedLabel ?? data.workspace.label,
           nodeId: node.id,
@@ -3797,6 +3755,7 @@ export function RuntimeCanvas({
         inventory,
         theme,
         projectAccents,
+        projectArchitectures,
         projectStatusReports,
         projects,
         runtimeLoading,
@@ -3835,6 +3794,7 @@ export function RuntimeCanvas({
     onProjectPlacementChange,
     theme,
     projectAccents,
+    projectArchitectures,
     projects,
     projectStatusReports,
     runtimeLoading,
