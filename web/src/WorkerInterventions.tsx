@@ -16,6 +16,7 @@ import {
 import { YardApiError, openTerminalInGhostty } from './api'
 import {
   resolveRuntimeCapabilities,
+  runtimeBindingReason,
   runtimeCapabilityDetail,
   runtimeCapabilityLabel,
   runtimeCapabilityStatus,
@@ -29,6 +30,7 @@ import type {
   YardOrchestrator,
   YardOrchestratorRoute,
 } from './types'
+import { workerDisplayLabel } from './workerDisplay'
 
 type InterventionTarget =
   | { kind: 'assignment'; assignment: Assignment }
@@ -89,13 +91,24 @@ export function WorkerInterventions({
   const runtimeSession = runtime?.session
   const targetKey = agentWorkspaceKey(target)
   const label =
-    target.kind === 'orchestrator'
-      ? `${project?.name ?? 'Project'} orchestrator`
-      : target.kind === 'yard-orchestrator'
-        ? 'Superintendent'
-        : target.kind === 'coordination-node'
-          ? coordinationNode?.name ?? 'Workstream orchestrator'
-          : assignment?.profile_name ?? 'Worker'
+    target.kind === 'coordination-node'
+      ? coordinationNode?.name ?? 'Workstream orchestrator'
+      : workerDisplayLabel({
+          assignmentRole: assignment?.role,
+          profileName: assignment?.profile_name,
+          projectName: assignment
+            ? projects?.find(
+                (candidate) => candidate.id === assignment.project_id,
+              )?.name
+            : null,
+          projectOrchestratorName:
+            target.kind === 'yard-orchestrator'
+              ? 'Yard'
+              : target.kind === 'orchestrator'
+                ? project?.name
+                : null,
+          workerId,
+        })
   const terminalTarget =
     target.kind === 'assignment' && assignmentId
       ? {
@@ -176,7 +189,13 @@ export function WorkerInterventions({
         : target.kind === 'orchestrator'
           ? 'Orchestrator'
           : assignment?.role ?? 'Worker'
+  const bindingDetail = runtimeBindingReason(
+    snapshotCurrent,
+    runtime,
+    inventory,
+  )
   const workspaceTarget: Omit<AgentWorkspaceTarget, 'returnFocus'> = {
+    capabilityDetail: bindingDetail ?? null,
     capabilityReason: capabilities.reason,
     chatAvailable: capabilities.chat,
     contextLabel,
@@ -218,7 +237,8 @@ export function WorkerInterventions({
     .map(shellQuote)
     .join(' ')
   const capabilityLabel = runtimeCapabilityLabel(capabilities)
-  const capabilityDetail = runtimeCapabilityDetail(capabilities)
+  const capabilityDetail =
+    bindingDetail ?? runtimeCapabilityDetail(capabilities)
   const lastKnownContext = [
     `session ${runtimeSession}`,
     `terminal ${terminalId}`,

@@ -22,6 +22,7 @@ export function isTerminalWorkspaceMode(
 }
 
 export interface AgentWorkspaceTarget {
+  capabilityDetail: string | null
   capabilityReason: RuntimeCapabilityReason
   chatAvailable: boolean
   contextLabel: string

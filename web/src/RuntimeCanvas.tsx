@@ -111,6 +111,7 @@ import {
 } from './mapScene'
 import type { ThemeDefinition } from './theme'
 import type { MapVisualMode } from './mapVisualMode'
+import { workerDisplayLabel } from './workerDisplay'
 
 export type CanvasSelection =
   | { kind: 'yard-orchestrator' }
@@ -152,6 +153,7 @@ interface RuntimeCanvasProps {
   theme: ThemeDefinition
   visualMode: MapVisualMode
   visibleWorkers: ObservedWorker[]
+  workerLabels: Record<string, string>
   yardOrchestrator: YardOrchestrator | null
   yardOrchestratorRoutes: YardOrchestratorRoute[]
   onAllocationDrop: (
@@ -205,6 +207,7 @@ interface ProjectNodeData extends Record<string, unknown> {
 
 interface ObservedWorkerNodeData extends Record<string, unknown> {
   allocationPayload?: AllocationDragPayload
+  label: string
   worker: ObservedWorker
 }
 
@@ -218,6 +221,7 @@ interface WorkspaceNodeData extends Record<string, unknown> {
 }
 
 interface OrchestratorNodeData extends Record<string, unknown> {
+  label: string
   observed: ObservedWorker | null
   project: Project
   statusReport: StatusReport | null
@@ -225,6 +229,7 @@ interface OrchestratorNodeData extends Record<string, unknown> {
 }
 
 interface YardOrchestratorNodeData extends Record<string, unknown> {
+  label: string
   observed: ObservedWorker | null
   orchestrator: YardOrchestrator
 }
@@ -239,6 +244,7 @@ interface AutomationNodeData extends Record<string, unknown> {
 
 interface AssignedWorkerNodeData extends Record<string, unknown> {
   assignment: Assignment
+  label: string
   observed: ObservedWorker | null
 }
 
@@ -801,10 +807,8 @@ function WorkspaceRegion({ data, selected }: NodeProps<WorkspaceNode>) {
 }
 
 function WorkerMarker({ data, selected }: NodeProps<ObservedWorkerNode>) {
-  const { allocationPayload, worker } = data
+  const { allocationPayload, label, worker } = data
   const StatusIcon = STATUS_ICONS[worker.status]
-  const label =
-    worker.name ?? worker.display_provider ?? worker.provider ?? 'Worker'
   const activity =
     worker.status === 'blocked'
       ? attentionActivity('Blocked: needs input')
@@ -950,10 +954,6 @@ function resolvedRuntimeState(
   }
 }
 
-function workerLabel(worker: ObservedWorker) {
-  return worker.name ?? worker.display_provider ?? worker.provider ?? 'Worker'
-}
-
 type WorkerActivityState = 'active' | 'attention' | 'quiet'
 
 interface WorkerActivity {
@@ -1013,7 +1013,7 @@ function YardOrchestratorMarker({
   data,
   selected,
 }: NodeProps<YardOrchestratorNode>) {
-  const { observed, orchestrator } = data
+  const { label, observed, orchestrator } = data
   const worker = orchestrator.worker
   const runtimeState = resolvedRuntimeState(worker?.runtime ?? null, observed)
   const StatusIcon = STATUS_ICONS[runtimeState.status]
@@ -1034,10 +1034,10 @@ function YardOrchestratorMarker({
   return (
     <div className="yard-hub-node">
       <button
-        aria-label="Move Superintendent"
+        aria-label={`Move ${label}`}
         className="yard-hub-node__placement-handle"
         onClick={(event) => event.stopPropagation()}
-        title="Move Superintendent"
+        title={`Move ${label}`}
         type="button"
       >
         <GripVertical aria-hidden="true" size={15} />
@@ -1086,7 +1086,7 @@ function YardOrchestratorMarker({
           />
         </span>
         <span className="yard-orchestrator-marker__label">
-          <strong>Superintendent</strong>
+          <strong>{label}</strong>
           <small>{configured ? 'Portfolio control' : 'Configure'}</small>
         </span>
       </div>
@@ -1156,13 +1156,12 @@ function OrchestratorMarker({
   data,
   selected,
 }: NodeProps<OrchestratorNode>) {
-  const { observed, project, statusReport, worker } = data
+  const { label, observed, project, statusReport, worker } = data
   const runtimeState = resolvedRuntimeState(worker.runtime, observed)
   const StatusIcon = STATUS_ICONS[runtimeState.status]
   const WorkflowIcon = statusReport
     ? WORKFLOW_ICONS[statusReport.state]
     : null
-  const label = observed ? workerLabel(observed) : 'Orchestrator'
   const activity =
     statusReport?.state === 'needs_attention'
       ? attentionActivity(
@@ -1269,7 +1268,7 @@ function AssignedWorkerMarker({
   data,
   selected,
 }: NodeProps<AssignedWorkerNode>) {
-  const { assignment, observed } = data
+  const { assignment, label, observed } = data
   const runtimeState = resolvedRuntimeState(assignment.worker.runtime, observed)
   const StatusIcon = STATUS_ICONS[runtimeState.status]
   const activity = runtimeActivity(
@@ -1285,7 +1284,7 @@ function AssignedWorkerMarker({
   return (
     <div className="worker-node-shell">
       <button
-        aria-label={`Move ${assignment.profile_name}`}
+        aria-label={`Move ${label}`}
         className="worker-marker__placement-handle"
         onClick={(event) => event.stopPropagation()}
         title="Move agent"
@@ -1341,7 +1340,7 @@ function AssignedWorkerMarker({
           </span>
         </span>
         <span className="worker-marker__label">
-          <strong>{assignment.profile_name}</strong>
+          <strong>{label}</strong>
           <small>
             {assignment.lifecycle === 'active' &&
             runtimeState.status === 'done'
@@ -1816,6 +1815,7 @@ function buildNodes(
   runtimeTopology: RuntimeTopology | null,
   selectedSession: string,
   visibleWorkers: ObservedWorker[],
+  workerLabels: Record<string, string>,
   yardOrchestrator: YardOrchestrator | null,
   allocationTargetId: string | null,
   workspacePositions: Record<string, CanvasPoint>,
@@ -1825,6 +1825,23 @@ function buildNodes(
     placement: CanvasPlacement,
   ) => void,
 ): RuntimeNode[] {
+  const observedWorkerIds = visibleWorkers.map((worker) => worker.runtime_id)
+  const observedWorkerLabel = (worker: ObservedWorker) =>
+    workerDisplayLabel(
+      {
+        observedDisplayProvider: worker.display_provider,
+        observedName: worker.name,
+        observedProvider: worker.provider,
+        tabLabel: inventory?.tabs.find(
+          (tab) => tab.runtime_id === worker.tab_id,
+        )?.label,
+        workerId: worker.runtime_id,
+        workspaceLabel: inventory?.workspaces.find(
+          (workspace) => workspace.runtime_id === worker.workspace_id,
+        )?.label,
+      },
+      observedWorkerIds,
+    )
   const activeTopology =
     runtimeTopology?.session === selectedSession ? runtimeTopology : null
   const capabilitiesForRuntime = (
@@ -1996,6 +2013,12 @@ function buildNodes(
       project.orchestrator.runtime,
       orchestratorObserved,
     )
+    const orchestratorLabel =
+      workerLabels[project.orchestrator.id] ??
+      workerDisplayLabel({
+        projectOrchestratorName: project.name,
+        workerId: project.orchestrator.id,
+      })
     const orchestratorNode: OrchestratorNode = {
       id: orchestratorNodeId,
       type: 'orchestrator',
@@ -2012,12 +2035,13 @@ function buildNodes(
       },
       deletable: false,
       data: {
+        label: orchestratorLabel,
         observed: orchestratorObserved,
         project,
         statusReport,
         worker: project.orchestrator,
       },
-      ariaLabel: `${project.name} orchestrator, observed runtime ${orchestratorState.status}, process ${orchestratorState.processState}${
+      ariaLabel: `${orchestratorLabel}, observed runtime ${orchestratorState.status}, process ${orchestratorState.processState}${
         statusReport
           ? `, reported workflow ${statusReport.state.replace('_', ' ')}`
           : ''
@@ -2027,6 +2051,7 @@ function buildNodes(
     const workerNodes: ObservedWorkerNode[] = workers.map(
       (worker, workerIndex) => {
         const nodeId = `worker:${worker.runtime_id}`
+        const label = observedWorkerLabel(worker)
         return {
           id: nodeId,
           type: 'worker',
@@ -2045,9 +2070,10 @@ function buildNodes(
           deletable: false,
           data: {
             allocationPayload: allocationPayloadByRuntimeId[worker.runtime_id],
+            label,
             worker,
           },
-          ariaLabel: `${worker.name ?? worker.provider ?? 'Worker'}, ${worker.status}`,
+          ariaLabel: `${label}, ${worker.status}`,
           focusable: true,
         }
       },
@@ -2063,6 +2089,14 @@ function buildNodes(
           observed,
         )
         const nodeId = `assigned-worker:${assignment.worker.id}`
+        const label =
+          workerLabels[assignment.worker.id] ??
+          workerDisplayLabel({
+            assignmentRole: assignment.role,
+            profileName: assignment.profile_name,
+            projectName: project.name,
+            workerId: assignment.worker.id,
+          })
         return {
           id: nodeId,
           type: 'assigned-worker',
@@ -2078,8 +2112,8 @@ function buildNodes(
             height: WORKER_NODE_HEIGHT,
           },
           deletable: false,
-          data: { assignment, observed },
-          ariaLabel: `${assignment.profile_name}, ${assignment.role}, ${runtimeState.status}, process ${runtimeState.processState}, assignment ${assignment.lifecycle}, coordinated by the ${project.name} orchestrator`,
+          data: { assignment, label, observed },
+          ariaLabel: `${label}, ${assignment.role}, ${runtimeState.status}, process ${runtimeState.processState}, assignment ${assignment.lifecycle}, coordinated by the ${project.name} orchestrator`,
           focusable: true,
         }
       },
@@ -2248,6 +2282,7 @@ function buildNodes(
     })
     workers.forEach((worker, workerIndex) => {
       const nodeId = `worker:${worker.runtime_id}`
+      const label = observedWorkerLabel(worker)
       workspaceNodes.push({
         id: nodeId,
         type: 'worker',
@@ -2264,9 +2299,10 @@ function buildNodes(
         deletable: false,
         data: {
           allocationPayload: allocationPayloadByRuntimeId[worker.runtime_id],
+          label,
           worker,
         },
-        ariaLabel: `${worker.name ?? worker.provider ?? 'Worker'}, ${worker.status}`,
+        ariaLabel: `${label}, ${worker.status}`,
         focusable: true,
       })
     })
@@ -2397,6 +2433,13 @@ function buildNodes(
         yardWorker?.runtime ?? null,
         yardObserved,
       )
+      const label = yardWorker
+        ? workerLabels[yardWorker.id] ??
+          workerDisplayLabel({
+            projectOrchestratorName: 'Yard',
+            workerId: yardWorker.id,
+          })
+        : 'Yard orchestrator'
       managedWorkspaceNodes.push({
         id: 'yard-orchestrator',
         type: 'yard-orchestrator',
@@ -2415,12 +2458,13 @@ function buildNodes(
         },
         deletable: false,
         data: {
+          label,
           observed: yardObserved,
           orchestrator: yardOrchestrator,
         },
         ariaLabel: yardWorker
-          ? `Superintendent, ${runtimeState.status}, process ${runtimeState.processState}`
-          : 'Superintendent, not configured',
+          ? `${label}, ${runtimeState.status}, process ${runtimeState.processState}`
+          : `${label}, not configured`,
         focusable: true,
       } satisfies YardOrchestratorNode)
     }
@@ -2491,6 +2535,13 @@ function buildNodes(
       worker?.runtime ?? null,
       observed,
     )
+    const label = worker
+      ? workerLabels[worker.id] ??
+        workerDisplayLabel({
+          projectOrchestratorName: 'Yard',
+          workerId: worker.id,
+        })
+      : 'Yard orchestrator'
     yardNodes.push({
       id: nodeId,
       type: 'yard-orchestrator',
@@ -2504,12 +2555,13 @@ function buildNodes(
       },
       deletable: false,
       data: {
+        label,
         observed,
         orchestrator: yardOrchestrator,
       },
       ariaLabel: worker
-        ? `Superintendent, ${runtimeState.status}, process ${runtimeState.processState}`
-        : 'Superintendent, not configured',
+        ? `${label}, ${runtimeState.status}, process ${runtimeState.processState}`
+        : `${label}, not configured`,
       focusable: true,
     } satisfies YardOrchestratorNode)
     linkedChildren.forEach(({ agent, parentNodeId }, index) => {
@@ -2620,6 +2672,7 @@ export function RuntimeCanvas({
   theme,
   visualMode,
   visibleWorkers,
+  workerLabels,
   yardOrchestrator,
   yardOrchestratorRoutes,
   onProjectPlacementChange,
@@ -3794,6 +3847,7 @@ export function RuntimeCanvas({
         runtimeTopology,
         selectedSession,
         visibleWorkers,
+        workerLabels,
         yardOrchestrator,
         allocationTargetId,
         workspacePositions,
@@ -3834,6 +3888,7 @@ export function RuntimeCanvas({
     selectedSession,
     setNodes,
     visibleWorkers,
+    workerLabels,
     workspacePositions,
     yardOrchestrator,
     agentPositions,

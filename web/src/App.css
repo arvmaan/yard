@@ -530,12 +530,14 @@ select:focus-visible {
 }
 
 .resource-shelf .resource-list {
-  display: flex;
+  display: grid;
   min-width: 0;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  align-content: start;
   gap: 8px;
   margin: 0;
-  overflow-x: auto;
-  overflow-y: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   border: 0;
   scrollbar-color: var(--line-strong) transparent;
   scrollbar-width: thin;
@@ -544,15 +546,30 @@ select:focus-visible {
 .resource-shelf .profile-row,
 .resource-shelf .worker-row,
 .resource-shelf .workspace-row {
-  width: 196px;
-  min-width: 196px;
-  height: 100%;
-  min-height: 0;
+  width: 100%;
+  min-width: 0;
+  height: auto;
+  min-height: 54px;
   align-content: center;
   padding: 7px 8px;
   border: 1px solid var(--line);
   border-radius: 5px;
   background: var(--surface-muted);
+}
+
+.resource-shelf .profile-row strong,
+.resource-shelf .profile-row small,
+.resource-shelf .worker-row strong,
+.resource-shelf .worker-row small,
+.resource-shelf .workspace-row strong,
+.resource-shelf .workspace-row small {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.resource-shelf .worker-row small {
+  line-height: 1.35;
 }
 
 .resource-shelf .profile-row:hover,
@@ -6708,7 +6725,7 @@ html[data-yard-allocation-dragging="true"]
   }
 
   .resource-shelf .resource-list {
-    flex-direction: column;
+    grid-template-columns: minmax(0, 1fr);
     overflow-x: hidden;
     overflow-y: auto;
   }

@@ -530,6 +530,31 @@ export interface ChangedProjectOrchestrator {
   replayed: boolean
 }
 
+export interface ReplaceProjectOrchestratorInput {
+  command_id: string
+  actor: string
+  expected_project_version: string
+  expected_orchestrator_worker_id: string
+  expected_orchestrator_worker_version: string
+  expected_orchestrator_runtime: WorkerRuntimeBinding
+  profile_id: string
+  expected_profile_version: string
+  objective: string
+  role: string
+  old_session_disposition: 'retain_for_inspection'
+  handoff_artifact_ref: null
+}
+
+export interface ReplacedProjectOrchestrator {
+  command_id: string
+  project: Project
+  assignment: Assignment
+  displaced_worker_id: string
+  old_session_disposition: 'retain_for_inspection'
+  cleanup_pending: boolean
+  replayed: boolean
+}
+
 export type ProjectRelationshipKind = 'depends_on'
 
 export interface ProjectRelationship {

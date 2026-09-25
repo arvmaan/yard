@@ -81,6 +81,7 @@ import {
   provisionYardOrchestrator,
   receiveSummaryWorker,
   recoverYardOrchestrator,
+  replaceProjectOrchestrator,
   resetOrchestratorWorkflowProfile,
   provisionCoordinationNode,
   recordCompletionReceipt,
@@ -135,6 +136,7 @@ import { ProjectPulseWorkspace } from './ProjectPulseWorkspace'
 import { HerdrInventoryWorkspace } from './HerdrInventoryWorkspace'
 import {
   resolveRuntimeCapabilities,
+  runtimeBindingReason,
   runtimeCapabilityDetail,
   runtimeCapabilityLabel,
   runtimeCapabilityObservationState,
@@ -194,6 +196,10 @@ import {
   projectOrchestratorEligibility,
   type ProjectOrchestratorEligibilityReason,
 } from './projectOrchestratorEligibility'
+import {
+  workerDisplayLabel,
+  type WorkerLabelSource,
+} from './workerDisplay'
 import {
   beginProjectTransferRefresh,
   emptyProjectTransferContext,
@@ -360,15 +366,33 @@ function matchesFilter(candidate: WorkerCandidate, filter: Filter) {
   return false
 }
 
-function workerLabel(worker: ObservedWorker) {
-  return worker.name ?? worker.display_provider ?? worker.provider ?? 'Worker'
+function workerLabel(
+  worker: ObservedWorker,
+  inventory?: RuntimeInventory | null,
+  peerWorkerIds: string[] = [],
+) {
+  return workerDisplayLabel(
+    {
+      observedDisplayProvider: worker.display_provider,
+      observedName: worker.name,
+      observedProvider: worker.provider,
+      tabLabel: inventory?.tabs.find(
+        (tab) => tab.runtime_id === worker.tab_id,
+      )?.label,
+      workerId: worker.runtime_id,
+      workspaceLabel: inventory?.workspaces.find(
+        (workspace) => workspace.runtime_id === worker.workspace_id,
+      )?.label,
+    },
+    peerWorkerIds,
+  )
 }
 
 function candidateLabel(candidate: WorkerCandidate) {
-  return (
-    candidate.profile_name ??
-    `Worker ${candidate.worker.id.slice(0, 8)}`
-  )
+  return workerDisplayLabel({
+    profileName: candidate.profile_name,
+    workerId: candidate.worker.id,
+  })
 }
 
 function canAllocateCandidate(candidate: WorkerCandidate) {
@@ -413,10 +437,12 @@ function agentTargetRuntimeMetadata(
   runtime: WorkerRuntimeBinding,
   capabilities: ResolvedRuntimeCapabilities,
   fallbackCwd: string | null = null,
+  capabilityDetail: string | null = null,
 ) {
   const observed = capabilities.observedWorker
   const current = observed ?? capabilities.observedPane
   return {
+    capabilityDetail,
     capabilityReason: capabilities.reason,
     chatAvailable: capabilities.chat,
     cwd:
@@ -457,6 +483,55 @@ function findCandidateForObservedWorker(
     )
   })
   return matches.length === 1 ? matches[0] : undefined
+}
+
+function workerLabelSource(
+  candidate: WorkerCandidate,
+  assignments: Assignment[],
+  projects: Project[],
+  inventory: RuntimeInventory | null,
+  snapshotCurrent: boolean,
+): WorkerLabelSource {
+  const assignment = assignments.find(
+    (item) =>
+      item.worker.id === candidate.worker.id &&
+      item.id === candidate.assignment_id,
+  )
+  const project = projects.find(
+    (item) => item.id === (assignment?.project_id ?? candidate.project_id),
+  )
+  const observed = resolveRuntimeCapabilities(
+    snapshotCurrent,
+    candidate.worker.runtime,
+    inventory,
+  ).observedWorker
+  const workspace = observed
+    ? inventory?.workspaces.find(
+        (item) => item.runtime_id === observed.workspace_id,
+      )
+    : null
+  const tab = observed
+    ? inventory?.tabs.find((item) => item.runtime_id === observed.tab_id)
+    : null
+  const orchestratorName =
+    candidate.availability === 'yard_orchestrator'
+      ? 'Yard'
+      : candidate.availability === 'orchestrator'
+        ? project?.name
+        : null
+
+  return {
+    assignmentRole: assignment?.role,
+    observedDisplayProvider: observed?.display_provider,
+    observedName: observed?.name,
+    observedProvider: observed?.provider,
+    profileName: orchestratorName ? null : candidate.profile_name,
+    projectName: assignment ? project?.name : null,
+    projectOrchestratorName: orchestratorName,
+    tabLabel: tab?.label,
+    workerId: candidate.worker.id,
+    workspaceLabel: workspace?.label,
+  }
 }
 
 function projectOrchestratorTransferStatus(
@@ -589,22 +664,28 @@ function ProcessStateBadge({ state }: { state: RuntimeProcessState }) {
 
 function ObservationStateBadge({
   capabilities,
+  detail,
   state,
 }: {
   capabilities: RuntimeCapabilities
+  detail?: string
   state: RuntimeObservationState
 }) {
   const Icon = OBSERVATION_ICONS[state]
   const label = runtimeCapabilityLabel(capabilities)
-  const detail = runtimeCapabilityDetail(capabilities)
+  const resolvedDetail = detail ?? runtimeCapabilityDetail(capabilities)
   return (
     <span
-      aria-label={detail ? `${label}. ${detail}` : `Observation state: ${state}`}
+      aria-label={
+        resolvedDetail
+          ? `${label}. ${resolvedDetail}`
+          : `Observation state: ${state}`
+      }
       className="observation-state-badge"
       data-observation-state={
         capabilities.reason === 'stale' ? 'stale' : state
       }
-      title={detail}
+      title={resolvedDetail}
     >
       <Icon aria-hidden="true" size={14} />
       {label}
@@ -636,7 +717,9 @@ function RuntimeStateSummary({
     capabilities,
     runtime,
   )
-  const capabilityDetail = runtimeCapabilityDetail(capabilities)
+  const capabilityDetail =
+    runtimeBindingReason(snapshotCurrent, runtime, inventory) ??
+    runtimeCapabilityDetail(capabilities)
 
   return (
     <dl
@@ -665,6 +748,7 @@ function RuntimeStateSummary({
         <dd>
           <ObservationStateBadge
             capabilities={capabilities}
+            detail={capabilityDetail}
             state={currentObservationState}
           />
         </dd>
@@ -696,7 +780,13 @@ function DetailRow({
   )
 }
 
-function ObservedWorkerInspector({ worker }: { worker: ObservedWorker }) {
+function ObservedWorkerInspector({
+  label,
+  worker,
+}: {
+  label: string
+  worker: ObservedWorker
+}) {
   return (
     <>
       <div className="inspector__identity">
@@ -705,7 +795,7 @@ function ObservedWorkerInspector({ worker }: { worker: ObservedWorker }) {
         </span>
         <div>
           <p className="eyebrow">Observed worker</p>
-          <h2>{workerLabel(worker)}</h2>
+          <h2>{label}</h2>
         </div>
       </div>
       <StatusBadge status={worker.status} />
@@ -778,6 +868,7 @@ function WorkerCandidateInspector({
   candidate,
   completedAssignment,
   inventory,
+  label,
   onAllocate,
   onDelete,
   onEndSession,
@@ -789,6 +880,7 @@ function WorkerCandidateInspector({
   candidate: WorkerCandidate
   completedAssignment: Assignment | undefined
   inventory: RuntimeInventory | null
+  label: string
   onAllocate: (project: Project) => void
   onDelete: () => void
   onEndSession: () => void
@@ -834,7 +926,7 @@ function WorkerCandidateInspector({
           <p className="eyebrow">
             {candidate.default_role ?? 'Worker'}
           </p>
-          <h2>{candidateLabel(candidate)}</h2>
+          <h2>{label}</h2>
           <span
             className="availability-badge"
             data-availability={candidate.availability}
@@ -1003,6 +1095,7 @@ function WorkerCandidateInspector({
 function YardOrchestratorInspector({
   busy,
   inventory,
+  label,
   onCoordinationChange,
   onProvision,
   onRecover,
@@ -1016,6 +1109,7 @@ function YardOrchestratorInspector({
 }: {
   busy: boolean
   inventory: RuntimeInventory | null
+  label: string
   onCoordinationChange: (route: YardOrchestratorRoute) => void
   onProvision: (profile: WorkerProfile) => void
   onRecover: () => void
@@ -1049,7 +1143,16 @@ function YardOrchestratorInspector({
   const sessionStopped = isDedicated && sessionRunning === false
   const agentStopped =
     isDedicated && runtimeState.processState !== 'running'
-  const recoveryRequired = sessionStopped || agentStopped
+  const bindingRecoveryRequired =
+    capabilities.reason === 'binding_missing' ||
+    capabilities.reason === 'identity_mismatch'
+  const recoveryRequired =
+    sessionStopped || agentStopped || bindingRecoveryRequired
+  const bindingDetail = runtimeBindingReason(
+    snapshotCurrent,
+    worker?.runtime,
+    inventory,
+  )
 
   useEffect(() => {
     if (!eligibleProfiles.some((profile) => profile.id === profileId)) {
@@ -1072,7 +1175,7 @@ function YardOrchestratorInspector({
         </span>
         <div>
           <p className="eyebrow">Portfolio control</p>
-          <h2>Superintendent</h2>
+          <h2>{label}</h2>
         </div>
       </div>
       {worker ? (
@@ -1102,7 +1205,9 @@ function YardOrchestratorInspector({
                 <span>
                   <strong>{sessionStopped ? 'Herdr session is offline' : 'Superintendent agent is offline'}</strong>
                   <small>
-                    Restart this agent and reconcile it without replacing ownership.
+                    {bindingRecoveryRequired
+                      ? bindingDetail
+                      : 'Restart this agent and reconcile it without replacing ownership.'}
                   </small>
                 </span>
               </div>
@@ -1358,6 +1463,176 @@ function ProjectOrchestratorTransferDialog({
   )
 }
 
+interface ProjectOrchestratorReplacementDetails {
+  objective: string
+  profileId: string
+  role: string
+}
+
+function ProjectOrchestratorReplacementDialog({
+  busy,
+  error,
+  onClose,
+  onConfirm,
+  profiles,
+  project,
+  returnFocus,
+}: {
+  busy: boolean
+  error: string | null
+  onClose: () => void
+  onConfirm: (details: ProjectOrchestratorReplacementDetails) => Promise<void>
+  profiles: WorkerProfile[]
+  project: Project
+  returnFocus: HTMLElement | null
+}) {
+  const dialogRef = useRef<HTMLElement>(null)
+  const eligibleProfiles = profiles.filter(
+    (profile) => profile.runtime_adapter === project.runtime.adapter,
+  )
+  const preferredProfile =
+    eligibleProfiles.find((profile) => profile.default_role === 'orchestrator') ??
+    eligibleProfiles[0]
+  const [profileId, setProfileId] = useState(preferredProfile?.id ?? '')
+  const [objective, setObjective] = useState(
+    `Continue orchestration for ${project.name}.`,
+  )
+  const [role, setRole] = useState(
+    preferredProfile?.default_role ?? 'orchestrator',
+  )
+  useModalDialog({
+    canClose: !busy,
+    dialogRef,
+    onClose,
+    returnFocus,
+  })
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault()
+    void onConfirm({ objective, profileId, role })
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section
+        aria-labelledby="project-orchestrator-replacement-title"
+        aria-modal="true"
+        className="control-dialog orchestrator-transfer-dialog"
+        ref={dialogRef}
+        role="dialog"
+      >
+        <header className="dialog-heading">
+          <div>
+            <p className="eyebrow">Binding recovery</p>
+            <h2 id="project-orchestrator-replacement-title">
+              Replace orchestrator
+            </h2>
+          </div>
+          <button
+            aria-label="Close orchestrator replacement"
+            className="icon-button"
+            disabled={busy}
+            onClick={onClose}
+            title="Close"
+            type="button"
+          >
+            <X aria-hidden="true" size={17} />
+          </button>
+        </header>
+        <form className="dialog-form" onSubmit={submit}>
+          <label>
+            <span>Replacement profile</span>
+            <select
+              autoFocus
+              disabled={busy || eligibleProfiles.length === 0}
+              onChange={(event) => {
+                const nextProfile = eligibleProfiles.find(
+                  (profile) => profile.id === event.target.value,
+                )
+                setProfileId(event.target.value)
+                if (nextProfile) setRole(nextProfile.default_role)
+              }}
+              value={profileId}
+            >
+              {eligibleProfiles.map((profile) => (
+                <option key={profile.id} value={profile.id}>
+                  {profile.name} · v{profile.version}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>Objective</span>
+            <textarea
+              disabled={busy}
+              maxLength={16000}
+              onChange={(event) => setObjective(event.target.value)}
+              required
+              rows={4}
+              value={objective}
+            />
+          </label>
+          <label>
+            <span>Role</span>
+            <input
+              disabled={busy}
+              maxLength={240}
+              onChange={(event) => setRole(event.target.value)}
+              required
+              value={role}
+            />
+          </label>
+          <div className="end-session-impact">
+            <CircleAlert aria-hidden="true" size={17} />
+            <p>
+              Yard starts and verifies a fresh worker before cutover. The
+              current worker loses project ownership but remains available for
+              inspection; replacement does not mark its work complete.
+            </p>
+          </div>
+          {error ? (
+            <p className="dialog-error" role="alert">
+              <CircleAlert aria-hidden="true" size={16} />
+              <span>{error}</span>
+            </p>
+          ) : null}
+          <footer className="dialog-actions">
+            <button
+              className="secondary-button"
+              disabled={busy}
+              onClick={onClose}
+              type="button"
+            >
+              Keep current worker
+            </button>
+            <button
+              className="command-button"
+              disabled={
+                busy ||
+                !profileId ||
+                !objective.trim() ||
+                !role.trim()
+              }
+              type="submit"
+            >
+              {busy ? (
+                <LoaderCircle
+                  aria-hidden="true"
+                  className="status-spin"
+                  size={16}
+                />
+              ) : (
+                <RefreshCw aria-hidden="true" size={16} />
+              )}
+              Replace orchestrator
+            </button>
+          </footer>
+        </form>
+      </section>
+    </div>
+  )
+}
+
 function ProjectOrchestratorInspector({
   busy,
   candidates,
@@ -1365,9 +1640,11 @@ function ProjectOrchestratorInspector({
   inventory,
   inventoryError,
   inventoryLoading,
+  label,
   onChange,
   onCreateSummary,
   onReceiveSummary,
+  onReplace,
   onRefresh,
   project,
   profiles,
@@ -1381,9 +1658,11 @@ function ProjectOrchestratorInspector({
   inventory: RuntimeInventory | null
   inventoryError: string | null
   inventoryLoading: boolean
+  label: string
   onChange: (trigger: HTMLButtonElement) => void
   onCreateSummary: (profile: WorkerProfile) => void
   onReceiveSummary: (summary: SummaryWorker) => void
+  onReplace: (trigger: HTMLButtonElement) => void
   onRefresh: () => void
   project: Project
   profiles: WorkerProfile[]
@@ -1398,8 +1677,10 @@ function ProjectOrchestratorInspector({
     runtime,
     inventory,
   )
-  const observed = capabilities.observedWorker
   const runtimeState = resolvedRuntimeState(runtime, capabilities)
+  const bindingRecoveryRequired =
+    capabilities.reason === 'binding_missing' ||
+    capabilities.reason === 'identity_mismatch'
   const transferStatusId = `project-orchestrator-transfer-status-${project.id}`
   const compatibleProfiles = profiles.filter(
     (profile) => profile.runtime_adapter === project.runtime.adapter,
@@ -1424,7 +1705,7 @@ function ProjectOrchestratorInspector({
         </span>
         <div>
           <p className="eyebrow">Project orchestrator</p>
-          <h2>{project.name}</h2>
+          <h2>{label}</h2>
         </div>
       </div>
       {statusReport ? (
@@ -1440,10 +1721,20 @@ function ProjectOrchestratorInspector({
           runtime={runtime}
           snapshotCurrent={snapshotCurrent}
         />
+        {bindingRecoveryRequired ? (
+          <button
+            className="command-button project-orchestrator-replace"
+            onClick={(event) => onReplace(event.currentTarget)}
+            type="button"
+          >
+            <RefreshCw aria-hidden="true" size={15} />
+            Replace orchestrator
+          </button>
+        ) : null}
         <dl className="detail-list">
           <DetailRow
             label="Worker"
-            value={observed ? workerLabel(observed) : 'Durable worker'}
+            value={label}
           />
           <DetailRow label="Worker ID" value={project.orchestrator.id} mono />
           <DetailRow label="Herdr session" value={runtime?.session} mono />
@@ -1550,6 +1841,7 @@ function ProjectOrchestratorInspector({
 function ProjectInspector({
   accent,
   inventory,
+  orchestratorLabel,
   onAccentChange,
   onArchive,
   onDelete,
@@ -1563,6 +1855,7 @@ function ProjectInspector({
 }: {
   accent: string
   inventory: RuntimeInventory | null
+  orchestratorLabel: string
   onAccentChange: (accent: string) => void
   onArchive: (trigger: HTMLButtonElement) => void
   onDelete: (trigger: HTMLButtonElement) => void
@@ -1589,7 +1882,6 @@ function ProjectInspector({
     orchestratorRuntime,
     inventory,
   )
-  const orchestrator = orchestratorCapabilities.observedWorker
   const orchestratorState = resolvedRuntimeState(
     orchestratorRuntime,
     orchestratorCapabilities,
@@ -1707,7 +1999,7 @@ function ProjectInspector({
         <dl className="detail-list">
           <DetailRow
             label="Orchestrator"
-            value={orchestrator ? workerLabel(orchestrator) : 'Durable worker'}
+            value={orchestratorLabel}
           />
           <DetailRow
             label="Worker ID"
@@ -1848,6 +2140,7 @@ function ProfileInspector({
 function AssignmentInspector({
   assignment,
   inventory,
+  label,
   onDelete,
   onEndSession,
   onRecordCompletion,
@@ -1856,6 +2149,7 @@ function AssignmentInspector({
 }: {
   assignment: Assignment
   inventory: RuntimeInventory | null
+  label: string
   onDelete?: () => void
   onEndSession?: () => void
   onRecordCompletion: () => void
@@ -1881,7 +2175,7 @@ function AssignmentInspector({
         </span>
         <div>
           <p className="eyebrow">Assignment</p>
-          <h2>{assignment.profile_name}</h2>
+          <h2>{label}</h2>
         </div>
       </div>
       <span className="runtime-badge">{assignment.lifecycle}</span>
@@ -2386,7 +2680,16 @@ function WorkspaceInspector({
             >
               {workers.map((worker) => (
                 <option key={worker.runtime_id} value={worker.runtime_id}>
-                  {workerLabel(worker)}
+                  {workerDisplayLabel(
+                    {
+                      observedDisplayProvider: worker.display_provider,
+                      observedName: worker.name,
+                      observedProvider: worker.provider,
+                      workerId: worker.runtime_id,
+                      workspaceLabel: workspace.label,
+                    },
+                    workers.map((candidate) => candidate.runtime_id),
+                  )}
                 </option>
               ))}
             </select>
@@ -2593,6 +2896,20 @@ function App() {
     useState(false)
   const [projectOrchestratorTransferError, setProjectOrchestratorTransferError] =
     useState<string | null>(null)
+  const [projectOrchestratorReplacement, setProjectOrchestratorReplacement] =
+    useState<{
+      commandId: string
+      projectId: string
+      returnFocus: HTMLElement | null
+    } | null>(null)
+  const [
+    projectOrchestratorReplacementBusy,
+    setProjectOrchestratorReplacementBusy,
+  ] = useState(false)
+  const [
+    projectOrchestratorReplacementError,
+    setProjectOrchestratorReplacementError,
+  ] = useState<string | null>(null)
   const [completionProposal, setCompletionProposal] = useState<{
     assignment: Assignment
     commandId: string
@@ -3437,6 +3754,30 @@ function App() {
     }
   }, [projectStatusTargets, yardOrchestratorRoutes])
 
+  const workerLabels = useMemo(() => {
+    const peerWorkerIds = workerCandidates.map(({ worker }) => worker.id)
+    return Object.fromEntries(
+      workerCandidates.map((candidate) => [
+        candidate.worker.id,
+        workerDisplayLabel(
+          workerLabelSource(
+            candidate,
+            assignments,
+            projects,
+            inventory,
+            inventoryCurrent,
+          ),
+          peerWorkerIds,
+        ),
+      ]),
+    )
+  }, [
+    assignments,
+    inventory,
+    inventoryCurrent,
+    projects,
+    workerCandidates,
+  ])
   const visibleCandidates = useMemo(
     () => workerCandidates.filter((candidate) => matchesFilter(candidate, filter)),
     [filter, workerCandidates],
@@ -3630,6 +3971,13 @@ function App() {
       projectOrchestratorTransferSnapshot,
     ],
   )
+  const projectOrchestratorReplacementProject =
+    projectOrchestratorReplacement
+      ? projects.find(
+          (project) =>
+            project.id === projectOrchestratorReplacement.projectId,
+        )
+      : undefined
   const selectedYardOrchestrator =
     selection?.kind === 'yard-orchestrator'
       ? yardOrchestrator ?? undefined
@@ -3678,7 +4026,14 @@ function App() {
           {
             assignment,
             kind: 'assignment',
-            label: assignment.profile_name,
+            label:
+              workerLabels[assignment.worker.id] ??
+              workerDisplayLabel({
+                assignmentRole: assignment.role,
+                profileName: assignment.profile_name,
+                projectName: project?.name,
+                workerId: assignment.worker.id,
+              }),
             projectName: project?.name ?? 'Yard project',
             status: runtimeCapabilityStatus(
               assignment.worker.runtime,
@@ -3699,7 +4054,12 @@ function App() {
       return [
         {
           kind: 'orchestrator',
-          label: `${project.name} orchestrator`,
+          label:
+            workerLabels[project.orchestrator.id] ??
+            workerDisplayLabel({
+              projectOrchestratorName: project.name,
+              workerId: project.orchestrator.id,
+            }),
           project,
           status: runtimeCapabilityStatus(
             project.orchestrator.runtime,
@@ -3708,7 +4068,14 @@ function App() {
         },
       ]
     })
-  }, [assignments, inventory, inventoryCurrent, projects, selection])
+  }, [
+    assignments,
+    inventory,
+    inventoryCurrent,
+    projects,
+    selection,
+    workerLabels,
+  ])
   const selectedCandidateCompletion = selectedWorkerCandidate
     ? assignments
         .filter(
@@ -3861,10 +4228,17 @@ function App() {
         ...agentTargetRuntimeMetadata(
           yardRuntime,
           capabilitiesForRuntime(yardRuntime),
+          null,
+          runtimeBindingReason(inventoryCurrent, yardRuntime, inventory) ?? null,
         ),
         contextLabel: 'Yard portfolio',
         key: 'yard-orchestrator',
-        label: 'Superintendent',
+        label:
+          workerLabels[yardWorker.id] ??
+          workerDisplayLabel({
+            projectOrchestratorName: 'Yard',
+            workerId: yardWorker.id,
+          }),
         role: 'superintendent',
         roleLabel: 'Superintendent',
         session: yardRuntime.session,
@@ -3894,6 +4268,7 @@ function App() {
           runtime,
           capabilitiesForRuntime(runtime),
           node.cwd ?? node.folder_path,
+          runtimeBindingReason(inventoryCurrent, runtime, inventory) ?? null,
         ),
         contextLabel:
           attachedProjects.join(', ') || 'Yard workstream',
@@ -3924,10 +4299,17 @@ function App() {
         ...agentTargetRuntimeMetadata(
           runtime,
           capabilitiesForRuntime(runtime),
+          null,
+          runtimeBindingReason(inventoryCurrent, runtime, inventory) ?? null,
         ),
         contextLabel: project.name,
         key: `orchestrator:${project.id}`,
-        label: `${project.name} orchestrator`,
+        label:
+          workerLabels[project.orchestrator.id] ??
+          workerDisplayLabel({
+            projectOrchestratorName: project.name,
+            workerId: project.orchestrator.id,
+          }),
         role: 'orchestrator',
         roleLabel: 'Orchestrator',
         session: runtime.session,
@@ -3953,11 +4335,20 @@ function App() {
         ...agentTargetRuntimeMetadata(
           runtime,
           capabilitiesForRuntime(runtime),
+          null,
+          runtimeBindingReason(inventoryCurrent, runtime, inventory) ?? null,
         ),
         contextLabel:
           projectNames.get(assignment.project_id) ?? 'Yard project',
         key: `assignment:${assignment.id}`,
-        label: assignment.profile_name,
+        label:
+          workerLabels[assignment.worker.id] ??
+          workerDisplayLabel({
+            assignmentRole: assignment.role,
+            profileName: assignment.profile_name,
+            projectName: projectNames.get(assignment.project_id),
+            workerId: assignment.worker.id,
+          }),
         role: 'worker',
         roleLabel: assignment.role,
         session: runtime.session,
@@ -3982,6 +4373,7 @@ function App() {
     inventory,
     inventoryCurrent,
     projects,
+    workerLabels,
     yardOrchestrator,
   ])
   const currentAgentWorkspaceTarget = agentWorkspaceTarget
@@ -4313,6 +4705,102 @@ function App() {
       projectOrchestratorTransferSnapshot,
       projects,
       refreshProjectTransferContext,
+      selectedSession,
+    ],
+  )
+
+  const proposeProjectOrchestratorReplacement = useCallback(
+    (project: Project, returnFocus: HTMLElement) => {
+      setActionError(null)
+      setActionNotice(null)
+      setProjectOrchestratorReplacementError(null)
+      setProjectOrchestratorReplacement({
+        commandId: crypto.randomUUID(),
+        projectId: project.id,
+        returnFocus,
+      })
+    },
+    [],
+  )
+
+  const replaceSelectedProjectOrchestrator = useCallback(
+    async ({
+      objective,
+      profileId,
+      role,
+    }: ProjectOrchestratorReplacementDetails) => {
+      if (
+        !projectOrchestratorReplacement ||
+        !projectOrchestratorReplacementProject
+      ) {
+        return
+      }
+      const project = projectOrchestratorReplacementProject
+      const runtime = project.orchestrator.runtime
+      const profile = profiles.find((candidate) => candidate.id === profileId)
+      if (!runtime || !profile) {
+        setProjectOrchestratorReplacementError(
+          'The current runtime or replacement profile is no longer available.',
+        )
+        return
+      }
+
+      setProjectOrchestratorReplacementBusy(true)
+      setProjectOrchestratorReplacementError(null)
+      try {
+        const result = await replaceProjectOrchestrator(project.id, {
+          command_id: projectOrchestratorReplacement.commandId,
+          actor: 'local-user',
+          expected_project_version: project.version,
+          expected_orchestrator_worker_id: project.orchestrator.id,
+          expected_orchestrator_worker_version:
+            project.orchestrator.version,
+          expected_orchestrator_runtime: runtime,
+          profile_id: profile.id,
+          expected_profile_version: profile.version,
+          objective,
+          role,
+          old_session_disposition: 'retain_for_inspection',
+          handoff_artifact_ref: null,
+        })
+        setProjects((current) =>
+          current.map((candidate) =>
+            candidate.id === result.project.id
+              ? result.project
+              : candidate,
+          ),
+        )
+        setProjectOrchestratorReplacement(null)
+        setActionNotice(
+          result.cleanup_pending
+            ? 'Orchestrator replaced. Previous runtime cleanup is pending.'
+            : 'Orchestrator replaced. The previous worker remains available for inspection.',
+        )
+        await Promise.all([
+          loadAssignments(projects.map(({ id }) => id)),
+          loadInventory(selectedSession),
+          loadProjects(),
+          loadWorkers(),
+        ])
+      } catch (caught) {
+        setProjectOrchestratorReplacementError(
+          caught instanceof Error
+            ? caught.message
+            : 'Orchestrator replacement failed',
+        )
+      } finally {
+        setProjectOrchestratorReplacementBusy(false)
+      }
+    },
+    [
+      loadAssignments,
+      loadInventory,
+      loadProjects,
+      loadWorkers,
+      profiles,
+      projectOrchestratorReplacement,
+      projectOrchestratorReplacementProject,
+      projects,
       selectedSession,
     ],
   )
@@ -6259,17 +6747,34 @@ function App() {
                     data-status={runtimeState.status}
                     data-worker-id={candidate.worker.id}
                     data-selected={
-                      selection?.kind === 'worker' &&
-                      selection.id === candidate.worker.id
+                      (selection?.kind === 'worker' &&
+                        selection.id === candidate.worker.id) ||
+                      (candidate.availability === 'yard_orchestrator' &&
+                        selection?.kind === 'yard-orchestrator') ||
+                      (candidate.availability === 'orchestrator' &&
+                        selection?.kind === 'orchestrator' &&
+                        selection.projectId === candidate.project_id)
                     }
                     draggable={draggable}
                     key={candidate.worker.id}
-                    onClick={() =>
-                      setSelection({
-                        kind: 'worker',
-                        id: candidate.worker.id,
-                      })
-                    }
+                    onClick={() => {
+                      if (candidate.availability === 'yard_orchestrator') {
+                        setSelection({ kind: 'yard-orchestrator' })
+                      } else if (
+                        candidate.availability === 'orchestrator' &&
+                        candidate.project_id
+                      ) {
+                        setSelection({
+                          kind: 'orchestrator',
+                          projectId: candidate.project_id,
+                        })
+                      } else {
+                        setSelection({
+                          kind: 'worker',
+                          id: candidate.worker.id,
+                        })
+                      }
+                    }}
                     onDragStart={(event) => {
                       if (!draggable) {
                         event.preventDefault()
@@ -6298,7 +6803,9 @@ function App() {
                       />
                     </span>
                     <span>
-                      <strong>{candidateLabel(candidate)}</strong>
+                      <strong title={workerLabels[candidate.worker.id]}>
+                        {workerLabels[candidate.worker.id]}
+                      </strong>
                       <small>
                         {AVAILABILITY_LABELS[candidate.availability]}
                         {' / '}
@@ -6405,6 +6912,7 @@ function App() {
           theme={themeDefinition(theme)}
           visualMode={mapVisualMode}
           visibleWorkers={visibleWorkers}
+          workerLabels={workerLabels}
           yardOrchestrator={yardOrchestrator}
           yardOrchestratorRoutes={yardOrchestratorRoutes}
         />
@@ -6491,6 +6999,15 @@ function App() {
           <YardOrchestratorInspector
             busy={yardOrchestratorBusy}
             inventory={inventory}
+            label={
+              selectedYardOrchestrator.worker
+                ? workerLabels[selectedYardOrchestrator.worker.id] ??
+                  workerDisplayLabel({
+                    projectOrchestratorName: 'Yard',
+                    workerId: selectedYardOrchestrator.worker.id,
+                  })
+                : 'Yard orchestrator'
+            }
             onCoordinationChange={recordYardRoute}
             onProvision={provisionCentralOrchestrator}
             onRecover={() => void recoverCentralOrchestrator()}
@@ -6543,6 +7060,13 @@ function App() {
             inventoryLoading={
               selectedProjectTransferContext?.loading ?? true
             }
+            label={
+              workerLabels[selectedProjectOrchestrator.orchestrator.id] ??
+              workerDisplayLabel({
+                projectOrchestratorName: selectedProjectOrchestrator.name,
+                workerId: selectedProjectOrchestrator.orchestrator.id,
+              })
+            }
             onChange={(trigger) =>
               selectedProjectOrchestratorContextProject &&
               proposeProjectOrchestratorTransfer(
@@ -6565,6 +7089,13 @@ function App() {
                 summary,
               )
             }
+            onReplace={(trigger) =>
+              proposeProjectOrchestratorReplacement(
+                selectedProjectOrchestratorContextProject ??
+                  selectedProjectOrchestrator,
+                trigger,
+              )
+            }
             project={
               selectedProjectOrchestratorContextProject ??
               selectedProjectOrchestrator
@@ -6585,6 +7116,13 @@ function App() {
           <ProjectInspector
             accent={resolvedProjectAccents[selectedProject.id]}
             inventory={inventory}
+            orchestratorLabel={
+              workerLabels[selectedProject.orchestrator.id] ??
+              workerDisplayLabel({
+                projectOrchestratorName: selectedProject.name,
+                workerId: selectedProject.orchestrator.id,
+              })
+            }
             onAccentChange={(accent) =>
               setProjectAccent(selectedProject.id, accent)
             }
@@ -6612,6 +7150,17 @@ function App() {
           <AssignmentInspector
             assignment={selectedAssignment}
             inventory={inventory}
+            label={
+              workerLabels[selectedAssignment.worker.id] ??
+              workerDisplayLabel({
+                assignmentRole: selectedAssignment.role,
+                profileName: selectedAssignment.profile_name,
+                projectName: projects.find(
+                  (project) => project.id === selectedAssignment.project_id,
+                )?.name,
+                workerId: selectedAssignment.worker.id,
+              })
+            }
             onDelete={
               selectedAssignmentCandidate &&
               canDeleteCandidate(selectedAssignmentCandidate)
@@ -6651,6 +7200,7 @@ function App() {
             candidate={selectedWorkerCandidate}
             completedAssignment={selectedCandidateCompletion}
             inventory={inventory}
+            label={workerLabels[selectedWorkerCandidate.worker.id]}
             onAllocate={(project) =>
               proposeAllocation(
                 { kind: 'worker', id: selectedWorkerCandidate.worker.id },
@@ -6668,7 +7218,14 @@ function App() {
             snapshotCurrent={inventoryCurrent}
           />
         ) : selectedObservedWorker ? (
-          <ObservedWorkerInspector worker={selectedObservedWorker} />
+          <ObservedWorkerInspector
+            label={workerLabel(
+              selectedObservedWorker,
+              inventory,
+              visibleWorkers.map((worker) => worker.runtime_id),
+            )}
+            worker={selectedObservedWorker}
+          />
         ) : selectedProviderChild ? (
           <ProviderChildInspector agent={selectedProviderChild} />
         ) : selectedWorkspace ? (
@@ -6734,6 +7291,16 @@ function App() {
         onModeChange={setAgentWorkspaceMode}
         onPresentationChange={setTerminalPresentation}
         onRefresh={() => void refresh()}
+        onRecoverTarget={(target, trigger) => {
+          if (target.target.kind === 'orchestrator') {
+            proposeProjectOrchestratorReplacement(
+              target.target.project,
+              trigger,
+            )
+          } else if (target.target.kind === 'yard-orchestrator') {
+            void recoverCentralOrchestrator()
+          }
+        }}
         onTargetChange={(target) => {
           setAgentWorkspaceTarget({
             ...target,
@@ -6874,6 +7441,22 @@ function App() {
           onConfirm={transferProjectOrchestrator}
           project={projectOrchestratorTransferProject}
           returnFocus={projectOrchestratorTransfer.returnFocus}
+        />
+      ) : null}
+      {projectOrchestratorReplacement &&
+      projectOrchestratorReplacementProject ? (
+        <ProjectOrchestratorReplacementDialog
+          busy={projectOrchestratorReplacementBusy}
+          error={projectOrchestratorReplacementError}
+          onClose={() => {
+            if (projectOrchestratorReplacementBusy) return
+            setProjectOrchestratorReplacementError(null)
+            setProjectOrchestratorReplacement(null)
+          }}
+          onConfirm={replaceSelectedProjectOrchestrator}
+          profiles={profiles}
+          project={projectOrchestratorReplacementProject}
+          returnFocus={projectOrchestratorReplacement.returnFocus}
         />
       ) : null}
       {completionProposal ? (

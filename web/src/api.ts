@@ -57,6 +57,8 @@ import type {
   ProvisionYardOrchestratorInput,
   RecoverYardOrchestratorInput,
   RecoveredYardOrchestrator,
+  ReplacedProjectOrchestrator,
+  ReplaceProjectOrchestratorInput,
   ResetOrchestratorWorkflowProfileInput,
   ProvisionCoordinationNodeInput,
   PromptAcknowledgement,
@@ -295,6 +297,22 @@ export function changeProjectOrchestrator(
       body: JSON.stringify(command),
       headers: { 'Content-Type': 'application/json' },
       method: 'PUT',
+      signal,
+    },
+  )
+}
+
+export function replaceProjectOrchestrator(
+  projectId: string,
+  command: ReplaceProjectOrchestratorInput,
+  signal?: AbortSignal,
+): Promise<ReplacedProjectOrchestrator> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/orchestrator/replace`,
+    {
+      body: JSON.stringify(command),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
       signal,
     },
   )

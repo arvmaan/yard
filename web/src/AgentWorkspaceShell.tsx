@@ -121,7 +121,9 @@ function targetConnectionSummary(target: AgentWorkspaceTarget) {
   }
   const label = runtimeCapabilityLabel(capabilities)
   const detail =
-    runtimeCapabilityDetail(capabilities) ?? UNKNOWN_CONNECTION_DETAIL
+    target.capabilityDetail ??
+    runtimeCapabilityDetail(capabilities) ??
+    UNKNOWN_CONNECTION_DETAIL
   return `${label}. ${detail}`
 }
 
@@ -147,6 +149,14 @@ function targetTitle(target: AgentWorkspaceTarget) {
 
 function targetDetailsControlLabel(target: AgentWorkspaceTarget) {
   return `Show runtime details for ${target.label}, ${target.contextLabel}, workspace ${target.workspaceId}, ${target.session} terminal ${target.terminalId}`
+}
+
+function targetRecoveryLabel(target: AgentWorkspaceTarget) {
+  if (target.target.kind === 'orchestrator') return 'Replace orchestrator'
+  if (target.target.kind === 'yard-orchestrator') {
+    return 'Recover Yard orchestrator'
+  }
+  return null
 }
 
 function AgentWindowDetailsDialog({
@@ -246,6 +256,7 @@ export function AgentWorkspaceShell({
   onModeChange,
   onPresentationChange,
   onRefresh,
+  onRecoverTarget,
   onTargetChange,
   presentation,
   projects,
@@ -267,6 +278,10 @@ export function AgentWorkspaceShell({
   onModeChange: (mode: AgentWorkspaceView) => void
   onPresentationChange: (presentation: TerminalPresentation) => void
   onRefresh: () => void
+  onRecoverTarget: (
+    target: AgentWorkspaceTarget,
+    trigger: HTMLButtonElement,
+  ) => void
   onTargetChange: (target: AgentWorkspaceTarget) => void
   presentation: TerminalPresentation
   projects: Project[]
@@ -703,7 +718,8 @@ export function AgentWorkspaceShell({
                             <strong>{target.label}</strong>
                             <small>
                               {!target.interactive
-                                ? runtimeCapabilityLabel(
+                                ? target.capabilityDetail ??
+                                  runtimeCapabilityLabel(
                                     targetCapabilities(target),
                                   )
                                 : target.observation === 'stale'
@@ -920,7 +936,8 @@ export function AgentWorkspaceShell({
                   {target.label} ·{' '}
                   {target.interactive
                     ? `observed ${target.status}`
-                    : runtimeCapabilityLabel(targetCapabilities(target))}
+                    : target.capabilityDetail ??
+                      runtimeCapabilityLabel(targetCapabilities(target))}
                 </option>
               ))}
               {mode === 'terminal' && unassignedTargetCount > 0 ? (
@@ -998,6 +1015,18 @@ export function AgentWorkspaceShell({
             <span>{targetConnectionSummary(activeTarget)}</span>
             <small>Last known runtime: {lastKnownRuntime}</small>
             <div className="inspector-actions">
+              {targetRecoveryLabel(activeTarget) ? (
+                <button
+                  className="command-button"
+                  onClick={(event) =>
+                    onRecoverTarget(activeTarget, event.currentTarget)
+                  }
+                  type="button"
+                >
+                  <RefreshCw aria-hidden="true" size={15} />
+                  {targetRecoveryLabel(activeTarget)}
+                </button>
+              ) : null}
               <button
                 className="secondary-button"
                 onClick={onRefresh}
@@ -1015,6 +1044,18 @@ export function AgentWorkspaceShell({
             <span>{targetConnectionSummary(activeTarget)}</span>
             <small>Last known runtime: {lastKnownRuntime}</small>
             <div className="inspector-actions">
+              {targetRecoveryLabel(activeTarget) ? (
+                <button
+                  className="command-button"
+                  onClick={(event) =>
+                    onRecoverTarget(activeTarget, event.currentTarget)
+                  }
+                  type="button"
+                >
+                  <RefreshCw aria-hidden="true" size={15} />
+                  {targetRecoveryLabel(activeTarget)}
+                </button>
+              ) : null}
               <button
                 className="secondary-button"
                 onClick={onRefresh}

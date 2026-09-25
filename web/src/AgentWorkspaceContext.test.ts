@@ -5,6 +5,7 @@ import {
 } from './AgentWorkspaceContext'
 import {
   resolveRuntimeCapabilities,
+  runtimeBindingReason,
   runtimeCapabilityDetail,
   runtimeCapabilityLabel,
 } from './runtimeCapabilities'
@@ -238,6 +239,46 @@ describe('agent workspace terminal presentation', () => {
       terminal: false,
     })
     expect(runtimeCapabilityLabel(stale)).toBe('Connection status stale')
+  })
+
+  it('explains replaced, missing, and unseen durable pane bindings', () => {
+    expect(
+      runtimeBindingReason(
+        true,
+        runtime(),
+        inventory({
+          panes: [pane({ terminal_id: 'terminal-2' })],
+          workers: [],
+        }),
+      ),
+    ).toBe('Pane pane-1 now runs a different terminal.')
+
+    const paneMissing = inventory({ panes: [], workers: [] })
+    paneMissing.workspaces = [
+      {
+        runtime_id: 'workspace-1',
+        order: 1,
+        label: 'Yard',
+        focused: false,
+        active_tab_id: 'tab-1',
+        pane_count: 0,
+        tab_count: 1,
+        status: 'idle',
+        tokens: {},
+        worktree: null,
+      },
+    ]
+    expect(runtimeBindingReason(true, runtime(), paneMissing)).toBe(
+      'Pane pane-1 no longer exists.',
+    )
+
+    expect(
+      runtimeBindingReason(
+        true,
+        runtime(),
+        inventory({ panes: [], workers: [] }),
+      ),
+    ).toBe('Not seen in the latest snapshot.')
   })
 
   it('disables capabilities for binding-missing, ambiguous, or identity-mismatched evidence', () => {

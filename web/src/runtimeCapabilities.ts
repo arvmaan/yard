@@ -284,6 +284,69 @@ export function runtimeCapabilityDetail(
   }
 }
 
+export function runtimeBindingReason(
+  snapshotCurrent: boolean,
+  runtime: WorkerRuntimeBinding | null | undefined,
+  inventory: RuntimeInventory | null | undefined,
+) {
+  if (!runtime) return 'No runtime binding recorded.'
+  if (!snapshotCurrent) {
+    return 'Latest Herdr snapshot refresh failed. Showing last-known details; live controls are unavailable.'
+  }
+  if (
+    !inventory ||
+    inventory.adapter !== runtime.adapter ||
+    inventory.session !== runtime.session
+  ) {
+    return `Not seen in the latest ${runtime.session} snapshot.`
+  }
+  if (
+    inventory.workers.some((worker) =>
+      workerMatchesRuntimeIdentity(runtime, worker),
+    ) ||
+    inventory.panes.some((pane) =>
+      paneMatchesRuntimeTopology(runtime, pane),
+    )
+  ) {
+    return undefined
+  }
+
+  const paneAtStoredSlot =
+    inventory.panes.find((pane) => pane.runtime_id === runtime.pane_id) ??
+    inventory.workers.find((worker) => worker.pane_id === runtime.pane_id)
+  if (
+    paneAtStoredSlot &&
+    paneAtStoredSlot.terminal_id !== runtime.terminal_id
+  ) {
+    return `Pane ${runtime.pane_id} now runs a different terminal.`
+  }
+
+  const terminal = [
+    ...inventory.panes.map((pane) => ({
+      paneId: pane.runtime_id,
+      terminalId: pane.terminal_id,
+    })),
+    ...inventory.workers.map((worker) => ({
+      paneId: worker.pane_id,
+      terminalId: worker.terminal_id,
+    })),
+  ].find((candidate) => candidate.terminalId === runtime.terminal_id)
+  if (terminal && terminal.paneId !== runtime.pane_id) {
+    return `Terminal ${runtime.terminal_id} is now in pane ${terminal.paneId}; Yard will not re-link it automatically.`
+  }
+
+  const workspaceExists = inventory.workspaces.some(
+    (workspace) => workspace.runtime_id === runtime.workspace_id,
+  )
+  const tabExists = inventory.tabs.some(
+    (tab) => tab.runtime_id === (runtime.tab_id ?? ''),
+  )
+  if (workspaceExists || tabExists) {
+    return `Pane ${runtime.pane_id} no longer exists.`
+  }
+  return 'Not seen in the latest snapshot.'
+}
+
 export function runtimeCapabilityObservationState(
   capabilities: ResolvedRuntimeCapabilities,
   runtime: WorkerRuntimeBinding | null | undefined,

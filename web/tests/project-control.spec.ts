@@ -37,6 +37,7 @@ import type {
   RecoverYardOrchestratorInput,
   ReceiveSummaryWorkerInput,
   RequestSummaryWorkerInput,
+  ReplaceProjectOrchestratorInput,
   ResetOrchestratorWorkflowProfileInput,
   RuntimeInventory,
   RuntimeTopology,
@@ -511,6 +512,7 @@ interface MockState {
   projectRequests: number
   projectDetailRequests: number
   projectOrchestratorCommands: ChangeProjectOrchestratorInput[]
+  projectOrchestratorReplacementCommands: ReplaceProjectOrchestratorInput[]
   projectArchiveCommands: ArchiveProjectInput[]
   assignmentRequests: number
   profiles: ReturnType<typeof profile>[]
@@ -828,6 +830,7 @@ async function mockApi(
     projectRequests: 0,
     projectDetailRequests: 0,
     projectOrchestratorCommands: [],
+    projectOrchestratorReplacementCommands: [],
     projectArchiveCommands: [],
     assignmentRequests: 0,
     profiles: initialProfileState,
@@ -1928,6 +1931,9 @@ async function mockApi(
     const orchestratorTransferMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)\/orchestrator$/,
     )
+    const orchestratorReplacementMatch = url.pathname.match(
+      /^\/api\/v1\/projects\/([^/]+)\/orchestrator\/replace$/,
+    )
     const assignmentMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)\/assignments$/,
     )
@@ -2218,6 +2224,79 @@ async function mockApi(
         return
       }
       await route.fulfill({ json: selectedProject })
+      return
+    }
+
+    if (orchestratorReplacementMatch && request.method() === 'POST') {
+      const projectId = decodeURIComponent(orchestratorReplacementMatch[1])
+      const input =
+        request.postDataJSON() as ReplaceProjectOrchestratorInput
+      state.projectOrchestratorReplacementCommands.push(input)
+      const projectIndex = state.projects.findIndex(
+        (candidate) => candidate.id === projectId,
+      )
+      const currentProject = state.projects[projectIndex]
+      const selectedProfile = state.profiles.find(
+        (candidate) => candidate.id === input.profile_id,
+      )
+      if (!currentProject || !selectedProfile) {
+        await route.fulfill({ status: 404 })
+        return
+      }
+      const replacement = durableWorker(
+        `${projectId}-replacement`,
+        'terminal-2',
+        selectedProfile,
+        currentProject.runtime.workspace_id,
+        currentProject.runtime.session,
+        false,
+      )
+      const updatedProject = {
+        ...currentProject,
+        orchestrator: replacement,
+        version: String(Number(currentProject.version) + 1),
+        updated_at_unix_ms: Date.now(),
+      }
+      state.projects[projectIndex] = updatedProject
+      const oldCandidateIndex = state.workerCandidates.findIndex(
+        ({ worker }) => worker.id === currentProject.orchestrator.id,
+      )
+      if (oldCandidateIndex >= 0) {
+        state.workerCandidates[oldCandidateIndex] = {
+          ...state.workerCandidates[oldCandidateIndex],
+          availability: 'unassigned_live',
+          project_id: null,
+          reason: 'Replaced project orchestrator retained for inspection.',
+        }
+      }
+      state.workerCandidates.push({
+        worker: replacement,
+        profile_name: selectedProfile.name,
+        default_role: selectedProfile.default_role,
+        availability: 'orchestrator',
+        project_id: projectId,
+        reason: 'Project orchestrators cannot be reallocated.',
+      })
+      const replacementAssignment = assignment(
+        `${projectId}-replacement-assignment`,
+        projectId,
+        selectedProfile,
+        input.objective,
+        input.role,
+        replacement,
+      )
+      state.assignments.push(replacementAssignment)
+      await route.fulfill({
+        json: {
+          command_id: input.command_id,
+          project: updatedProject,
+          assignment: replacementAssignment,
+          displaced_worker_id: currentProject.orchestrator.id,
+          old_session_disposition: 'retain_for_inspection',
+          cleanup_pending: false,
+          replayed: false,
+        },
+      })
       return
     }
 
@@ -4627,7 +4706,9 @@ test('opens Chat and Terminal globally without a selected or connected agent', a
     '[data-target-key="orchestrator:project-1"]',
   )
   await expect(disconnected).toBeEnabled()
-  await expect(disconnected).toContainText('Binding missing')
+  await expect(disconnected).toContainText(
+    'Pane workspace-1:pane-1 no longer exists.',
+  )
   await disconnected.click()
   await expect(
     page.getByRole('region', {
@@ -4666,6 +4747,43 @@ test('opens Chat and Terminal globally without a selected or connected agent', a
   })
   await page.keyboard.press('Escape')
   await expect(chat).toBeFocused()
+})
+
+test('uses one worker name in the shelf, inspector, map, and workspace picker', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const seeded = seedAssignedCandidateAssignment(state)
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.goto('/')
+
+  const label = 'Implementer · API migration'
+  const marker = page.locator(
+    `.assigned-worker-marker[data-worker-id="${seeded.worker.id}"]`,
+  )
+  await expect(marker.locator('.worker-marker__label strong')).toHaveText(label)
+
+  await openResources(page, 'Workers')
+  const row = page.locator(
+    `.worker-row[data-worker-id="${seeded.worker.id}"]`,
+  )
+  await expect(row.locator('strong')).toHaveText(label)
+  await row.click()
+  await expect(
+    page.locator('.inspector').getByRole('heading', {
+      name: label,
+      exact: true,
+    }),
+  ).toBeVisible()
+
+  await page.getByRole('tab', { name: 'Chat view' }).click()
+  await expect(
+    page.locator(`[data-target-key="assignment:${seeded.id}"] strong`),
+  ).toHaveText(label)
+  await page.screenshot({
+    path: '/tmp/yard-lane2-evidence/rev4-worker-naming.png',
+    fullPage: true,
+  })
 })
 
 test('keeps worker filters visible and scrolls resources inside the shelf', async ({
@@ -4711,11 +4829,18 @@ test('keeps worker filters visible and scrolls resources inside the shelf', asyn
     expect(
       canvasBounds ? canvasBounds.y + canvasBounds.height : 0,
     ).toBe(viewport.height)
+    const list = shelf.locator('.worker-list')
+    const horizontalOverflow = await list.evaluate(
+      (element) => element.scrollWidth - element.clientWidth,
+    )
+    expect(horizontalOverflow).toBeLessThanOrEqual(0)
+    await expect(list.locator('.worker-row').first().locator('small')).toContainText(
+      /\w+ \/ \w+/,
+    )
 
     if (viewport.width === 390) {
       expect(shelfBounds?.x).toBe(0)
       expect(shelfBounds?.width).toBe(390)
-      const list = shelf.locator('.worker-list')
       const scroll = await list.evaluate((element) => ({
         clientHeight: element.clientHeight,
         scrollHeight: element.scrollHeight,
@@ -4728,12 +4853,10 @@ test('keeps worker filters visible and scrolls resources inside the shelf', asyn
         .toBeGreaterThan(0)
     }
 
-    if (viewport.width === 1440) {
-      await page.screenshot({
-        path: '/tmp/yard-lane2-evidence/rev3-command-bar-desktop.png',
-        fullPage: true,
-      })
-    }
+    await page.screenshot({
+      path: `/tmp/yard-lane2-evidence/rev4-shelf-${viewport.width}.png`,
+      fullPage: true,
+    })
   }
 })
 
@@ -5235,7 +5358,7 @@ test('keeps depth-mode workers visible and clickable at minimum zoom', async ({
 
   await marker.click()
   await expect(page.locator('.inspector h2')).toHaveText(
-    seeded.profile_name,
+    'Implementer · API migration',
   )
   await page.screenshot({
     path: testInfo.outputPath('worker-minimum-zoom-depth.png'),
@@ -5719,11 +5842,11 @@ test('reports a fresh missing binding despite an auxiliary refresh failure', asy
   await expect(connection).toHaveText('Binding missing')
   await expect(connection).toHaveAttribute(
     'title',
-    'Worker not found in latest Herdr snapshot.',
+    `Pane ${assignment.worker.runtime?.pane_id} no longer exists.`,
   )
   await expect(connection).toHaveAttribute(
     'aria-label',
-    'Binding missing. Worker not found in latest Herdr snapshot.',
+    `Binding missing. Pane ${assignment.worker.runtime?.pane_id} no longer exists.`,
   )
   await expect(
     inspector.getByRole('button', { name: 'Refresh inventory', exact: true }),
@@ -5749,7 +5872,7 @@ test('reports a fresh missing binding despite an auxiliary refresh failure', asy
   await expect(connection).toHaveText('Binding missing')
   await expect(connection).toHaveAttribute(
     'title',
-    'Worker not found in latest Herdr snapshot.',
+    `Pane ${assignment.worker.runtime?.pane_id} no longer exists.`,
   )
 
   await page.screenshot({
@@ -5768,6 +5891,89 @@ test('reports a fresh missing binding despite an auxiliary refresh failure', asy
   await page.screenshot({
     path: testInfo.outputPath('connection-status-unknown-mobile.png'),
     fullPage: true,
+  })
+})
+
+test('explains a replaced project pane and uses the replacement endpoint', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const project = state.projects[0]
+  const runtime = project.orchestrator.runtime
+  if (!runtime) throw new Error('Project orchestrator runtime is missing')
+  const observed = state.runtimeInventory.workers.find(
+    (worker) => worker.terminal_id === runtime.terminal_id,
+  )
+  if (!observed) throw new Error('Project orchestrator observation is missing')
+  observed.runtime_id = 'terminal-reused'
+  observed.terminal_id = 'terminal-reused'
+
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.goto('/')
+  await page.getByRole('tab', { name: 'Chat view' }).click()
+
+  const target = page.locator('[data-target-key="orchestrator:project-1"]')
+  await expect(target).toContainText(
+    `Pane ${runtime.pane_id} now runs a different terminal.`,
+  )
+  await target.click()
+  await expect(
+    page.getByText(
+      `Pane ${runtime.pane_id} now runs a different terminal.`,
+      { exact: true },
+    ),
+  ).toBeVisible()
+  await expect(
+    page.getByRole('button', {
+      name: 'Replace orchestrator',
+      exact: true,
+    }),
+  ).toBeVisible()
+
+  await page.getByRole('button', { name: 'Back to Map' }).click()
+  await page
+    .locator(
+      `.orchestrator-marker[data-worker-id="${project.orchestrator.id}"]`,
+    )
+    .click()
+  const inspector = page.locator('.inspector')
+  await expect(
+    inspector.getByRole('heading', {
+      name: 'API migration orchestrator',
+      exact: true,
+    }),
+  ).toBeVisible()
+  await expect(inspector).toContainText(
+    `Pane ${runtime.pane_id} now runs a different terminal.`,
+  )
+  await inspector
+    .getByRole('button', {
+      name: 'Replace orchestrator',
+      exact: true,
+    })
+    .click()
+
+  const dialog = page.getByRole('dialog', { name: 'Replace orchestrator' })
+  await expect(dialog).toBeVisible()
+  await page.screenshot({
+    path: '/tmp/yard-lane2-evidence/rev4-binding-recovery.png',
+    fullPage: true,
+  })
+  await dialog
+    .getByRole('button', {
+      name: 'Replace orchestrator',
+      exact: true,
+    })
+    .click()
+
+  await expect.poll(
+    () => state.projectOrchestratorReplacementCommands.length,
+  ).toBe(1)
+  expect(state.projectOrchestratorReplacementCommands[0]).toMatchObject({
+    expected_orchestrator_worker_id: project.orchestrator.id,
+    expected_orchestrator_runtime: runtime,
+    old_session_disposition: 'retain_for_inspection',
+    profile_id: 'profile-1',
   })
 })
 
@@ -6187,7 +6393,7 @@ test('resnapshots inventory, retains stale state, and recovers after failure', a
   await expect(page.locator('.worker-marker')).toHaveCount(
     workers.length + 2,
   )
-  await page.getByText('worker-10', { exact: true }).click()
+  await page.getByText('worker-10 · API migration', { exact: true }).click()
   await expect(page.locator('.inspector .status-badge')).toHaveAttribute(
     'data-status',
     'working',
@@ -6204,7 +6410,9 @@ test('resnapshots inventory, retains stale state, and recovers after failure', a
   await expect(page.locator('.worker-marker')).toHaveCount(
     workers.length + 2,
   )
-  await expect(page.locator('.inspector h2')).toHaveText('worker-10')
+  await expect(page.locator('.inspector h2')).toHaveText(
+    'worker-10 · API migration',
+  )
 
   const requestsBeforeRecovery = state.inventoryRequests
   state.runtimeInventory = {
@@ -6723,7 +6931,9 @@ test('adopts an observed workspace and keeps it after reload', async ({ page }) 
 
   await page.reload()
   await expect(page.locator('.project-region')).toHaveCount(3)
-  await expect(page.getByText('Release project')).toBeVisible()
+  await expect(
+    page.getByText('Release project', { exact: true }),
+  ).toBeVisible()
 })
 
 test('creates a project orchestrator from a selected profile', async ({
@@ -7726,7 +7936,10 @@ test('connects the assignment terminal and relays frames, input, resize, and rel
     },
   ])
   await expect(
-    page.getByRole('region', { name: 'Implementer', exact: true }),
+    page.getByRole('region', {
+      name: 'Implementer · API migration',
+      exact: true,
+    }),
   ).toBeVisible()
   const terminalViewport = terminal.locator('.xterm-scrollable-element')
   const historyScrollHeight = await terminalViewport.evaluate(
@@ -7918,7 +8131,7 @@ test('keeps a worker terminal theme and scrollback authoritative under TUI mouse
     .click()
 
   const workerDialog = page.getByRole('region', {
-    name: 'Implementer',
+    name: 'Implementer · API migration',
     exact: true,
   })
   const terminal = workerDialog.locator('.terminal-session')
@@ -8594,7 +8807,7 @@ test('provisions a dedicated Superintendent and shows project updates', async ({
   )
   await hub.click()
   await expect(
-    page.getByRole('heading', { name: 'Superintendent' }),
+    page.getByRole('heading', { name: 'Yard orchestrator' }),
   ).toBeVisible()
   await expect(page.getByLabel('Orchestrator profile')).toHaveValue('profile-1')
   await page
@@ -8704,8 +8917,63 @@ test('provisions a dedicated Superintendent and shows project updates', async ({
     page.getByText('Project orchestrator', { exact: true }),
   ).toBeVisible()
   await expect(
-    page.getByRole('heading', { name: 'API migration' }),
+    page.getByRole('heading', {
+      name: 'API migration orchestrator',
+      exact: true,
+    }),
   ).toBeVisible()
+})
+
+test('recovers a binding-missing Yard orchestrator through the existing endpoint', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const configuredWorker = durableWorker(
+    'worker-yard-orchestrator',
+    'terminal-yard-orchestrator',
+    state.profiles[0],
+    'workspace-1',
+    'alpha',
+  )
+  state.yardOrchestrator = {
+    worker: configuredWorker,
+    version: '3',
+    workflow_profile_version: '1',
+    created_at_unix_ms: Date.now(),
+    updated_at_unix_ms: Date.now(),
+  }
+  const runtime = configuredWorker.runtime
+  if (!runtime) throw new Error('Yard orchestrator runtime is missing')
+  state.runtimeInventory.workers.push({
+    ...worker(77, runtime.workspace_id),
+    runtime_id: 'terminal-reused',
+    terminal_id: 'terminal-reused',
+    tab_id: runtime.tab_id ?? '',
+    pane_id: runtime.pane_id,
+  })
+
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await page.getByRole('tab', { name: 'Terminal view' }).click()
+  const target = page.locator('[data-target-key="yard-orchestrator"]')
+  await expect(target).toContainText(
+    `Pane ${runtime.pane_id} now runs a different terminal.`,
+  )
+  await target.click()
+  await page
+    .getByRole('button', {
+      name: 'Recover Yard orchestrator',
+      exact: true,
+    })
+    .click()
+
+  await expect.poll(
+    () => state.yardOrchestratorRecoveryCommands.length,
+  ).toBe(1)
+  expect(state.yardOrchestratorRecoveryCommands[0]).toMatchObject({
+    actor: 'local-user',
+    expected_orchestrator_version: '3',
+  })
 })
 
 test('recovers a stopped dedicated Superintendent session without replacing it', async ({
@@ -8984,7 +9252,7 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
     '[data-target-key="orchestrator:project-2"]',
   )
   await expect(durableRow).toBeEnabled()
-  await expect(durableRow).toContainText('Binding missing')
+  await expect(durableRow).toContainText(/Not seen in the latest/)
   await durableRow.click()
   await expect(shell.getByText('Agent chat unavailable')).toBeVisible()
 
@@ -9239,15 +9507,19 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
 
   await page.setViewportSize({ width: 320, height: 844 })
   const implementerDetails = navigator.getByRole('button', {
-    name: 'Show runtime details for Implementer, API migration, workspace workspace-1, alpha terminal assignment-1-terminal',
+    name: 'Show runtime details for Implementer · API migration, API migration, workspace workspace-1, alpha terminal assignment-1-terminal',
     exact: true,
   })
   const reviewerDetails = navigator.getByRole('button', {
-    name: 'Show runtime details for Implementer, API migration, workspace workspace-2, alpha terminal terminal-reviewer',
+    name: 'Show runtime details for Reviewer · API migration, API migration, workspace workspace-2, alpha terminal terminal-reviewer',
     exact: true,
   })
-  await expect(implementerRow.locator('strong')).toHaveText('Implementer')
-  await expect(reviewerRow.locator('strong')).toHaveText('Implementer')
+  await expect(implementerRow.locator('strong')).toHaveText(
+    'Implementer · API migration',
+  )
+  await expect(reviewerRow.locator('strong')).toHaveText(
+    'Reviewer · API migration',
+  )
   await expect(implementerDetails).toBeVisible()
   await expect(reviewerDetails).toBeVisible()
   expect(await implementerDetails.getAttribute('aria-label')).not.toBe(
@@ -12442,7 +12714,10 @@ test('opens chat and terminal from an assigned worker in the worker rail', async
     .getByRole('button', { name: 'Open chat', exact: true })
     .click()
   await expect(
-    page.getByRole('region', { name: 'Implementer', exact: true }),
+    page.getByRole('region', {
+      name: 'Implementer · API migration',
+      exact: true,
+    }),
   ).toBeVisible()
   await page.getByRole('button', { name: 'Back to Map' }).click()
   await page
@@ -12742,7 +13017,9 @@ test('selects multiple agents and broadcasts one sourced group order', async ({
   await expect(answers).toHaveCount(2)
   await expect(
     snapshots.filter({ hasText: 'Implementer' })
-      .getByRole('button', { name: 'Copy Implementer answer' }),
+      .getByRole('button', {
+        name: 'Copy Implementer · API migration answer',
+      }),
   ).toBeVisible()
   await expect(
     snapshots.filter({ hasText: 'API migration orchestrator' })
