@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::{Component, Path, PathBuf},
+    path::{Component, Path},
 };
 
 use serde::{Deserialize, Serialize};
@@ -135,21 +135,33 @@ pub fn compile_profile_launch(
         &mut components,
     );
 
-    if worker.spec.permission_policy == "yolo" {
-        approvals.push("permission bypass requires a separate launch approval".to_owned());
+    if let Some(requested) = manifest.imported_permission_intent() {
+        approvals.push(
+            "imported permission bypass requires an explicit Yard profile policy edit".to_owned(),
+        );
         components.push(ProfileComponentPlan {
             kind: "policy".to_owned(),
             id: "permissions.full_access".to_owned(),
             required: true,
             status: CapabilitySupportStatus::ApprovalRequired,
-            reason: "permission bypass is never inferred from profile import or allocation"
-                .to_owned(),
-            surface: "launch approval".to_owned(),
+            reason: format!(
+                "import requested {requested}; explicitly edit the Yard permission policy to approve it"
+            ),
+            surface: "Yard profile revision".to_owned(),
         });
         args.retain(|arg| {
             arg != "--yolo"
                 && arg != "--dangerously-skip-permissions"
                 && arg != "--dangerously-bypass-approvals-and-sandbox"
+        });
+    } else if worker.spec.permission_policy == "yolo" {
+        components.push(ProfileComponentPlan {
+            kind: "policy".to_owned(),
+            id: "permissions.full_access".to_owned(),
+            required: true,
+            status: CapabilitySupportStatus::Supported,
+            reason: "full access was explicitly saved on this Yard profile revision".to_owned(),
+            surface: "provider arguments".to_owned(),
         });
     }
     for result in &negotiation.results {
@@ -265,8 +277,7 @@ fn compile_instructions(
 pub fn materialize_profile_launch(
     compiled: &CompiledProfileLaunch,
     cwd: &Path,
-    command_id: &str,
-) -> Result<PathBuf, ProfileRuntimeError> {
+) -> Result<(), ProfileRuntimeError> {
     let root = cwd.canonicalize()?;
     if !root.is_dir() {
         return Err(ProfileRuntimeError::UnsupportedFileType(
@@ -276,21 +287,7 @@ pub fn materialize_profile_launch(
     for file in &compiled.files {
         write_managed_file(&root, file)?;
     }
-    let receipt = PathBuf::from(".yard")
-        .join("runs")
-        .join(run_key(command_id))
-        .join("profile-launch.json");
-    let content = serde_json::to_string_pretty(&compiled.plan)
-        .map_err(|error| ProfileRuntimeError::InvalidManifest(error.to_string()))?;
-    write_managed_file(
-        &root,
-        &MaterializedProfileFile {
-            path: path_string(&receipt),
-            media_type: "application/json".to_owned(),
-            content,
-        },
-    )?;
-    Ok(root.join(receipt))
+    Ok(())
 }
 
 /// Removes unchanged generated files while preserving user-modified content.
@@ -646,13 +643,6 @@ fn sha256_hex(content: &[u8]) -> String {
     format!("{:x}", Sha256::digest(content))
 }
 
-fn path_string(path: &Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 #[cfg(test)]
 mod tests {
     use std::{fs, os::unix::fs::symlink};
@@ -795,21 +785,43 @@ mod tests {
     }
 
     #[test]
-    fn full_access_requires_approval_and_never_emits_bypass_args() {
+    fn yard_authored_full_access_is_supported_and_emits_provider_args() {
         let mut worker = worker("codex", Vec::new());
         worker.spec.permission_policy = "yolo".to_owned();
         let compiled = compile_profile_launch(&worker, &portable(&worker), "command").unwrap();
 
+        assert!(compiled.plan.compatible);
+        assert!(compiled.plan.approvals.is_empty());
+        assert!(compiled.plan.args.iter().any(|arg| arg == "--yolo"));
+        assert_eq!(compiled.plan.permissions, ["yolo"]);
+        assert!(compiled.plan.components.iter().any(|component| {
+            component.id == "permissions.full_access"
+                && component.status == CapabilitySupportStatus::Supported
+        }));
+    }
+
+    #[test]
+    fn imported_full_access_requires_yard_edit_and_never_emits_bypass_args() {
+        let worker = worker("codex", Vec::new());
+        let mut portable = portable(&worker);
+        portable.manifest["spec"]["extensions"]["dev.yard.import"] = serde_json::json!({
+            "apiVersion": "yard.dev/import/v1alpha1",
+            "permissionApproval": {
+                "requested": "yolo",
+                "status": "approval_required",
+                "resolution": "edit_permission_policy_in_yard",
+            },
+        });
+        let compiled = compile_profile_launch(&worker, &portable, "command").unwrap();
+
         assert!(!compiled.plan.compatible);
         assert!(!compiled.plan.approvals.is_empty());
         assert!(!compiled.plan.args.iter().any(|arg| arg == "--yolo"));
-        assert!(
-            compiled
-                .plan
-                .components
-                .iter()
-                .any(|component| { component.status == CapabilitySupportStatus::ApprovalRequired })
-        );
+        assert_eq!(compiled.plan.permissions, ["runtime_default"]);
+        assert!(compiled.plan.components.iter().any(|component| {
+            component.id == "permissions.full_access"
+                && component.status == CapabilitySupportStatus::ApprovalRequired
+        }));
     }
 
     #[test]
@@ -818,10 +830,11 @@ mod tests {
         let worker = worker("codex", vec!["herdr-cli"]);
         let compiled = compile_profile_launch(&worker, &portable(&worker), "command").unwrap();
 
-        materialize_profile_launch(&compiled, temp.path(), "command").unwrap();
+        materialize_profile_launch(&compiled, temp.path()).unwrap();
         let skill = temp.path().join(".agents/skills/herdr-cli/SKILL.md");
         assert!(skill.is_file());
         assert!(!temp.path().join("CLAUDE.md").exists());
+        assert!(!temp.path().join(".yard").exists());
 
         fs::write(&skill, "user replacement").unwrap();
         cleanup_profile_launch(&compiled.plan, temp.path()).unwrap();
@@ -836,7 +849,7 @@ mod tests {
         let worker = worker("codex", vec!["herdr-cli"]);
         let compiled = compile_profile_launch(&worker, &portable(&worker), "command").unwrap();
 
-        let error = materialize_profile_launch(&compiled, temp.path(), "command").unwrap_err();
+        let error = materialize_profile_launch(&compiled, temp.path()).unwrap_err();
 
         assert!(error.to_string().contains("symlink"));
         assert!(!outside.path().join("skills/herdr-cli/SKILL.md").exists());

@@ -53,11 +53,17 @@ dry run returns:
 - one compatible/blocked result.
 
 Import never resolves credentials, expands permissions, bypasses sandboxing,
-enables network access, or authorizes token spend. Full-access policy compiles
-to `approval_required` and the bypass argument is removed until a separate
-launch-approval contract exists. Required unsupported behavior blocks launch;
-optional unsupported behavior remains a warning unless it originated from a
-legacy raw list that previously claimed injection.
+enables network access, or authorizes token spend. Imported full-access intent
+is preserved under the `dev.yard.import` extension but normalized to
+`runtime-default`, and dry run reports the unresolved intent as
+`approval_required`. Resolving it requires an explicit Worker Profile policy
+edit in Yard, which creates a new immutable revision and clears the import
+marker. A full-access policy authored in Yard remains supported: confirmed
+allocation is the user's explicit approval, so the plan and durable audit
+record the permission and retain the existing provider argument. Required
+unsupported behavior blocks launch; optional unsupported behavior remains a
+warning unless it originated from a legacy raw list that previously claimed
+injection.
 
 Each wired launch records the complete plan in `profile_launch_audits` before
 runtime mutation. Runtime status is not used as completion proof.
@@ -73,12 +79,15 @@ Providers without a tested project skill surface report unsupported.
 Primary runtime references: [Codex skill discovery][codex-skills] and
 [Claude Code skills][claude-skills].
 
-Managed files are written atomically by rename under the selected project
-working directory. Every existing path component is checked with
-`symlink_metadata`; links and unsupported file types fail closed. Existing
-identical files are reused, conflicting files are not overwritten, and
+The dry run lists every generated repository path before launch. Managed skill
+files are written atomically by rename under the selected launch working
+directory at `.agents/skills/<skill>/SKILL.md` or
+`.claude/skills/<skill>/SKILL.md`. Every existing path component is checked
+with `symlink_metadata`; links and unsupported file types fail closed.
+Existing identical files are reused, conflicting files are refused, and
 cleanup removes only unchanged files whose digest matches the launch plan.
-A run receipt is written under `.yard/runs/<command-digest>/`.
+The durable database launch audit is the receipt; no repository-local receipt
+file is written.
 
 ## Built-in orchestrator kit
 
@@ -98,7 +107,8 @@ requiring `CLAUDE.md`. No live model session is launched by tests.
 profile revision and performs no filesystem or runtime mutation. The profile
 editor no longer exposes raw tool, skill, or MCP text fields. It preserves
 existing compatibility data, shows packaged skills, and previews the
-server-compiled launch plan for a saved revision.
+server-compiled launch plan, including exact generated paths, for a saved
+revision.
 
 ## Migration and scope
 
@@ -114,7 +124,7 @@ their existing strict rejection until they adopt the same compiler.
 
 Deferred ecosystems include archive/directory upload, binary package media,
 provider-native plugins/hooks/subagents, MCP transport and credential
-resolution, Kiro/Hermes lowering, explicit permission-bypass approval, and
+resolution, Kiro/Hermes lowering, a dedicated import-approval UI, and
 automatic managed-file cleanup.
 
 [codex-skills]: https://developers.openai.com/plugins/build/skills

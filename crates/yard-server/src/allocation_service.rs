@@ -1227,7 +1227,7 @@ impl AllocationService {
             )));
         }
         if !compiled.plan.generated_files.is_empty() {
-            materialize_profile_launch(&compiled, std::path::Path::new(cwd), command_id)
+            materialize_profile_launch(&compiled, std::path::Path::new(cwd))
                 .map_err(|error| AllocationServiceError::RuntimeProvision(error.to_string()))?;
         }
         Ok(compiled.plan.args)

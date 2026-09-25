@@ -10630,6 +10630,7 @@ mod tests {
     async fn agent_profile_import_preserves_but_dry_run_blocks_unsupported_capability() {
         let (app, _temp) = test_router().await;
         let mut manifest = agent_profile_fixture();
+        manifest["spec"]["policies"]["permissions"] = serde_json::json!("full-access");
         manifest["spec"]["capabilities"]["optional"] = serde_json::json!([]);
         manifest["spec"]["capabilities"]["required"]
             .as_array_mut()
@@ -10655,6 +10656,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         let created = response_json(response).await;
         assert_eq!(created["validation"]["compatible"], false);
+        assert_eq!(
+            created["manifest"]["spec"]["policies"]["permissions"],
+            "runtime-default"
+        );
+        assert_eq!(
+            created["manifest"]["spec"]["extensions"]["dev.yard.import"]["permissionApproval"]["status"],
+            "approval_required"
+        );
         let profile_id = created["id"].as_str().unwrap();
 
         let response = app
@@ -10673,6 +10682,24 @@ mod tests {
         let plan = response_json(response).await;
         assert_eq!(plan["compatible"], false);
         assert_eq!(plan["missingCapabilities"][0], "tool.mcp.client v1");
+        assert_eq!(plan["permissions"][0], "runtime_default");
+        assert!(
+            plan["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|component| {
+                    component["id"] == "permissions.full_access"
+                        && component["status"] == "approval_required"
+                })
+        );
+        assert!(
+            !plan["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--yolo")
+        );
 
         let response = app
             .oneshot(
@@ -11424,7 +11451,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn confirms_allocation_and_replays_evidence_backed_completion() {
-        let (app, _temp) = providerless_test_router().await;
+        let (app, temp) = providerless_test_router().await;
         let project_response = app
             .clone()
             .oneshot(
@@ -11439,6 +11466,9 @@ mod tests {
             .unwrap();
         let project = response_json(project_response).await;
         let project_id = project["id"].as_str().unwrap();
+        let mut profile_spec =
+            serde_json::from_str::<serde_json::Value>(&profile_body("Implementer")).unwrap();
+        profile_spec["permission_policy"] = serde_json::json!("yolo");
         let profile_response = app
             .clone()
             .oneshot(
@@ -11446,7 +11476,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/api/v1/worker-profiles")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(profile_body("Implementer")))
+                    .body(Body::from(profile_spec.to_string()))
                     .unwrap(),
             )
             .await
@@ -11486,6 +11516,34 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(created["replayed"], false);
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let plan_json: String = connection
+            .query_row(
+                "SELECT plan_json FROM profile_launch_audits
+                  WHERE command_id = 'allocation-command-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let plan: serde_json::Value = serde_json::from_str(&plan_json).unwrap();
+        assert_eq!(plan["permissions"][0], "yolo");
+        assert!(
+            plan["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--yolo")
+        );
+        assert!(
+            plan["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|component| {
+                    component["id"] == "permissions.full_access"
+                        && component["status"] == "supported"
+                })
+        );
 
         let replay = app
             .clone()

@@ -891,7 +891,7 @@ impl ProjectService {
             )));
         }
         if !compiled.plan.generated_files.is_empty() {
-            materialize_profile_launch(&compiled, Path::new(cwd), command_id)
+            materialize_profile_launch(&compiled, Path::new(cwd))
                 .map_err(|error| ProjectServiceError::RuntimeProvision(error.to_string()))?;
         }
         Ok(compiled.plan.args)

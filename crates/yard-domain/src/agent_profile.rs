@@ -13,9 +13,11 @@ use crate::WorkerProfileSpec;
 pub const AGENT_PROFILE_API_VERSION: &str = "yard.dev/agent-profile/v1alpha1";
 pub const AGENT_PROFILE_KIND: &str = "AgentProfile";
 pub const HERDR_EXTENSION_KEY: &str = "dev.yard.herdr";
+pub const IMPORT_EXTENSION_KEY: &str = "dev.yard.import";
 pub const WORKER_PROFILE_EXTENSION_KEY: &str = "dev.yard.worker-profile";
 
 const HERDR_EXTENSION_API_VERSION: &str = "yard.dev/adapters/herdr/v1alpha1";
+const IMPORT_EXTENSION_API_VERSION: &str = "yard.dev/import/v1alpha1";
 const WORKER_PROFILE_EXTENSION_API_VERSION: &str = "yard.dev/compatibility/worker-profile/v1alpha1";
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_NAME_BYTES: usize = 120;
@@ -495,9 +497,24 @@ impl AgentProfileManifest {
     }
 
     #[must_use]
+    pub fn imported_permission_intent(&self) -> Option<&str> {
+        let extension = self
+            .spec
+            .extensions
+            .get(IMPORT_EXTENSION_KEY)?
+            .as_object()?;
+        let approval = extension.get("permissionApproval")?.as_object()?;
+        (approval.get("status").and_then(Value::as_str) == Some("approval_required"))
+            .then(|| approval.get("requested").and_then(Value::as_str))
+            .flatten()
+    }
+
+    #[must_use]
     pub fn with_worker_profile(&self, spec: &WorkerProfileSpec) -> Self {
         let generated = Self::from_worker_profile(spec);
         let mut updated = self.clone();
+        let resolves_imported_permission = self.imported_permission_intent().is_some()
+            && legacy_permission_policy(&self.spec.policies.permissions) != spec.permission_policy;
         updated.metadata.name = generated.metadata.name;
         updated.spec.role.default = generated.spec.role.default;
         updated.spec.instructions =
@@ -532,6 +549,9 @@ impl AgentProfileManifest {
         updated.spec.policies.completion = generated.spec.policies.completion;
         for (key, value) in generated.spec.extensions {
             merge_extension(&mut updated.spec.extensions, key, value);
+        }
+        if resolves_imported_permission {
+            updated.spec.extensions.remove(IMPORT_EXTENSION_KEY);
         }
         updated
     }
@@ -696,20 +716,45 @@ fn prepare_manifest(
         });
     }
     reject_secret_values(&manifest, "$")?;
-    let canonical_manifest: AgentProfileManifest = serde_json::from_value(manifest.clone())
+    let mut canonical_manifest: AgentProfileManifest = serde_json::from_value(manifest.clone())
         .map_err(|error| AgentProfileValidationError::InvalidManifest(error.to_string()))?;
+    let normalized_permission = normalize_imported_permission(&mut canonical_manifest);
     validate_manifest(&canonical_manifest)?;
     validate_files(&canonical_manifest.artifacts, &files)?;
     let worker_profile = canonical_manifest.worker_profile_projection()?;
     let descriptor = compatibility_adapter_descriptor(&worker_profile);
     let validation = canonical_manifest.negotiate(&descriptor);
     Ok(PreparedAgentProfile {
-        original_manifest: manifest,
+        original_manifest: if normalized_permission {
+            serde_json::to_value(&canonical_manifest)
+                .expect("AgentProfileManifest serialization is infallible")
+        } else {
+            manifest
+        },
         canonical_manifest,
         files,
         worker_profile,
         validation,
     })
+}
+
+fn normalize_imported_permission(manifest: &mut AgentProfileManifest) -> bool {
+    if legacy_permission_policy(&manifest.spec.policies.permissions) != "yolo" {
+        return false;
+    }
+    "runtime-default".clone_into(&mut manifest.spec.policies.permissions);
+    manifest.spec.extensions.insert(
+        IMPORT_EXTENSION_KEY.to_owned(),
+        json!({
+            "apiVersion": IMPORT_EXTENSION_API_VERSION,
+            "permissionApproval": {
+                "requested": "yolo",
+                "status": "approval_required",
+                "resolution": "edit_permission_policy_in_yard",
+            },
+        }),
+    );
+    true
 }
 
 fn validate_manifest(manifest: &AgentProfileManifest) -> Result<(), AgentProfileValidationError> {
@@ -1569,6 +1614,43 @@ mod tests {
         assert!(prepared.validation.results.iter().any(|result| {
             result.id == "tool.mcp.client" && result.status == CapabilitySupportStatus::Unsupported
         }));
+    }
+
+    #[test]
+    fn imported_full_access_requires_an_explicit_yard_policy_edit() {
+        let mut manifest = fixture();
+        manifest["spec"]["policies"]["permissions"] = json!("full-access");
+        let prepared = CreateAgentProfile {
+            manifest,
+            files: Vec::new(),
+        }
+        .prepare()
+        .unwrap();
+
+        assert_eq!(prepared.worker_profile.permission_policy, "runtime_default");
+        assert_eq!(
+            prepared.canonical_manifest.imported_permission_intent(),
+            Some("yolo")
+        );
+        assert_eq!(
+            prepared.original_manifest["spec"]["policies"]["permissions"],
+            "runtime-default"
+        );
+
+        let mut renamed = prepared.worker_profile.clone();
+        renamed.name = "Renamed only".to_owned();
+        assert_eq!(
+            prepared
+                .canonical_manifest
+                .with_worker_profile(&renamed)
+                .imported_permission_intent(),
+            Some("yolo")
+        );
+
+        renamed.permission_policy = "yolo".to_owned();
+        let approved = prepared.canonical_manifest.with_worker_profile(&renamed);
+        assert_eq!(approved.imported_permission_intent(), None);
+        assert_eq!(approved.spec.policies.permissions, "yolo");
     }
 
     #[test]

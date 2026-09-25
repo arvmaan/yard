@@ -25835,6 +25835,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_profile_policy_edit_resolves_imported_permission_intent() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let mut manifest = agent_profile_fixture();
+        manifest["spec"]["policies"]["permissions"] = json!("full-access");
+        let imported = store
+            .create_agent_profile(CreateAgentProfile {
+                manifest,
+                files: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let mut worker = store.get_worker_profile(&imported.id).await.unwrap();
+        assert_eq!(worker.spec.permission_policy, "runtime_default");
+        assert_eq!(
+            imported.manifest["spec"]["extensions"]["dev.yard.import"]["permissionApproval"]["status"],
+            "approval_required"
+        );
+
+        worker.spec.permission_policy = "yolo".to_owned();
+        let updated = store
+            .update_worker_profile(
+                &worker.id,
+                UpdateWorkerProfile {
+                    spec: worker.spec,
+                    expected_version: worker.version,
+                },
+            )
+            .await
+            .unwrap();
+        let approved = store.get_agent_profile(&imported.id).await.unwrap();
+        let original = store
+            .get_agent_profile_revision(&imported.id, imported.version)
+            .await
+            .unwrap();
+
+        assert_eq!(updated.version, 2);
+        assert_eq!(updated.spec.permission_policy, "yolo");
+        assert!(
+            approved.manifest["spec"]["extensions"]
+                .get("dev.yard.import")
+                .is_none()
+        );
+        assert_eq!(
+            original.manifest["spec"]["extensions"]["dev.yard.import"]["permissionApproval"]["status"],
+            "approval_required"
+        );
+    }
+
+    #[tokio::test]
     async fn worker_profile_update_preserves_imported_opaque_content() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;

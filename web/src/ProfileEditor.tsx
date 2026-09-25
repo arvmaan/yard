@@ -303,6 +303,13 @@ export function ProfileEditor({
                       ? ` · ${plan.approvals.length} approval required`
                       : ''}
                   </p>
+                  {plan.generatedFiles.length > 0 ? (
+                    <ul aria-label="Generated profile files">
+                      {plan.generatedFiles.map((file) => (
+                        <li key={file.path}>{file.path}</li>
+                      ))}
+                    </ul>
+                  ) : null}
                   <ul>
                     {plan.components.map((component) => (
                       <li key={`${component.kind}:${component.id}`}>

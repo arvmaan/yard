@@ -13208,6 +13208,12 @@ test('previews packaged profile lowering without exposing raw capability fields'
 
   await expect(dialog.getByText('Launch compatible · codex')).toBeVisible()
   await expect(dialog.getByText('2 managed files')).toBeVisible()
+  await expect(dialog.getByLabel('Generated profile files')).toContainText(
+    '.agents/skills/herdr-orchestration/SKILL.md',
+  )
+  await expect(dialog.getByLabel('Generated profile files')).toContainText(
+    '.agents/skills/herdr-cli/SKILL.md',
+  )
   await expect(dialog.getByText('herdr-orchestration: supported')).toBeVisible()
   await expect(dialog.getByText('herdr-cli: supported')).toBeVisible()
   await expect(dialog.getByLabel('Tools')).toHaveCount(0)
