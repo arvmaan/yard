@@ -613,10 +613,12 @@ function ObservationStateBadge({
 }
 
 function RuntimeStateSummary({
+  compact = false,
   inventory,
   runtime,
   snapshotCurrent,
 }: {
+  compact?: boolean
   inventory: RuntimeInventory | null
   runtime: WorkerRuntimeBinding | null
   snapshotCurrent: boolean
@@ -634,10 +636,13 @@ function RuntimeStateSummary({
     capabilities,
     runtime,
   )
+  const capabilityDetail = runtimeCapabilityDetail(capabilities)
 
   return (
     <dl
-      className="runtime-state-summary"
+      className={`runtime-state-summary${
+        compact ? ' runtime-state-summary--compact' : ''
+      }`}
       data-current-observation={
         snapshotCurrent &&
         Boolean(capabilities.observedWorker || capabilities.observedPane)
@@ -664,6 +669,12 @@ function RuntimeStateSummary({
           />
         </dd>
       </div>
+      {compact ? (
+        <div className="runtime-state-summary__reason">
+          <dt>Runtime detail</dt>
+          <dd>{capabilityDetail ?? 'Live controls ready.'}</dd>
+        </div>
+      ) : null}
     </dl>
   )
 }
@@ -820,62 +831,25 @@ function WorkerCandidateInspector({
           <AvailabilityIcon aria-hidden="true" size={20} />
         </span>
         <div>
-          <p className="eyebrow">Worker candidate</p>
+          <p className="eyebrow">
+            {candidate.default_role ?? 'Worker'}
+          </p>
           <h2>{candidateLabel(candidate)}</h2>
+          <span
+            className="availability-badge"
+            data-availability={candidate.availability}
+          >
+            <AvailabilityIcon aria-hidden="true" size={12} />
+            {AVAILABILITY_LABELS[candidate.availability]}
+          </span>
         </div>
       </div>
-      <span
-        className="availability-badge"
-        data-availability={candidate.availability}
-      >
-        <AvailabilityIcon aria-hidden="true" size={14} />
-        {AVAILABILITY_LABELS[candidate.availability]}
-      </span>
       <RuntimeStateSummary
+        compact
         inventory={inventory}
         runtime={candidate.worker.runtime}
         snapshotCurrent={snapshotCurrent}
       />
-      <dl className="detail-list">
-        <DetailRow label="Worker ID" value={candidate.worker.id} mono />
-        <DetailRow label="Profile" value={candidate.profile_name} />
-        <DetailRow label="Default role" value={candidate.default_role} />
-        <DetailRow
-          label="Provider"
-          value={observed?.provider ?? current?.provider}
-        />
-        <DetailRow label="Project ID" value={candidate.project_id} mono />
-        <DetailRow
-          label="Assignment"
-          value={candidate.assignment_id}
-          mono
-        />
-        <DetailRow
-          label="Terminal"
-          value={candidate.worker.runtime?.terminal_id}
-          mono
-        />
-        <DetailRow
-          label="State sequence"
-          value={candidate.worker.runtime?.state_change_sequence}
-          mono
-        />
-        <DetailRow
-          label="Runtime revision"
-          value={candidate.worker.runtime?.revision}
-          mono
-        />
-        <DetailRow label="Reason" value={candidate.reason} />
-        <DetailRow
-          label="Disposition"
-          value={candidate.worker.desired_state}
-        />
-        <DetailRow
-          label="Worker rev"
-          value={`v${candidate.worker.version}`}
-          mono
-        />
-      </dl>
       {activeAssignment ? (
         <WorkerInterventions
           key={[
@@ -961,6 +935,67 @@ function WorkerCandidateInspector({
           </button>
         </div>
       ) : null}
+      <details className="worker-inspector-details">
+        <summary>Details</summary>
+        <dl className="detail-list">
+          <DetailRow label="Worker ID" value={candidate.worker.id} mono />
+          {candidate.profile_name ? (
+            <DetailRow label="Profile" value={candidate.profile_name} />
+          ) : null}
+          {candidate.default_role ? (
+            <DetailRow label="Default role" value={candidate.default_role} />
+          ) : null}
+          {observed?.provider ?? current?.provider ? (
+            <DetailRow
+              label="Provider"
+              value={observed?.provider ?? current?.provider}
+            />
+          ) : null}
+          {candidate.project_id ? (
+            <DetailRow label="Project ID" value={candidate.project_id} mono />
+          ) : null}
+          {candidate.assignment_id ? (
+            <DetailRow
+              label="Assignment"
+              value={candidate.assignment_id}
+              mono
+            />
+          ) : null}
+          {candidate.worker.runtime?.terminal_id ? (
+            <DetailRow
+              label="Terminal"
+              value={candidate.worker.runtime.terminal_id}
+              mono
+            />
+          ) : null}
+          {candidate.worker.runtime?.state_change_sequence !== undefined ? (
+            <DetailRow
+              label="State sequence"
+              value={candidate.worker.runtime.state_change_sequence}
+              mono
+            />
+          ) : null}
+          {candidate.worker.runtime?.revision !== undefined ? (
+            <DetailRow
+              label="Runtime revision"
+              value={candidate.worker.runtime.revision}
+              mono
+            />
+          ) : null}
+          {candidate.reason ? (
+            <DetailRow label="Reason" value={candidate.reason} />
+          ) : null}
+          <DetailRow
+            label="Disposition"
+            value={candidate.worker.desired_state}
+          />
+          <DetailRow
+            label="Worker rev"
+            value={`v${candidate.worker.version}`}
+            mono
+          />
+        </dl>
+      </details>
     </>
   )
 }
@@ -2639,6 +2674,7 @@ function App() {
   const resourceShelfTrigger = useRef<HTMLButtonElement | null>(null)
   const resourceShelf = useRef<HTMLElement | null>(null)
   const settingsTrigger = useRef<HTMLButtonElement | null>(null)
+  const agentWorkspaceReturnFocus = useRef<HTMLElement | null>(null)
 
 
   useEffect(() => {
@@ -3958,15 +3994,17 @@ function App() {
         ...currentAgentWorkspaceTarget,
         returnFocus: agentWorkspaceTarget?.returnFocus,
       }
-    : agentWorkspaceTargets[0] ?? null
+    : null
   const openAgentChat = useCallback((target: AgentWorkspaceTarget) => {
     if (!target.chatAvailable) return
+    agentWorkspaceReturnFocus.current = target.returnFocus ?? null
     setAgentWorkspaceTarget(target)
     setAgentWorkspaceMode('chat')
   }, [])
   const openAgentTerminal = useCallback(
     (target: AgentWorkspaceTarget) => {
       if (!target.interactive) return
+      agentWorkspaceReturnFocus.current = target.returnFocus ?? null
       setAgentWorkspaceTarget(target)
       setTerminalPresentation(DEFAULT_TERMINAL_PRESENTATION)
       setAgentWorkspaceMode('terminal')
@@ -6045,6 +6083,14 @@ function App() {
             setHerdrInventoryOpen(false)
             setResourceShelfOpen((open) => !open)
           }}
+          onWorkspaceModeChange={(mode, trigger) => {
+            agentWorkspaceReturnFocus.current = trigger
+            setHerdrInventoryOpen(false)
+            if (mode === 'terminal') {
+              setTerminalPresentation(DEFAULT_TERMINAL_PRESENTATION)
+            }
+            setAgentWorkspaceMode(mode)
+          }}
           onSessionChange={setSelectedSession}
           projectPulseTriggerRef={projectPulseTrigger}
           resourceShelfOpen={resourceShelfOpen}
@@ -6058,6 +6104,7 @@ function App() {
               : `${automaticCoordination.length} automatic coordination behaviors enabled`
           }`}
           settingsTriggerRef={settingsTrigger}
+          workspaceMode={agentWorkspaceMode}
         />
 
         {resourceShelfOpen && !herdrInventoryOpen ? (
@@ -6678,42 +6725,33 @@ function App() {
           }
         />
       ) : null}
-      {activeAgentWorkspaceTarget ? (
-        <AgentWorkspaceShell
-          activeTarget={activeAgentWorkspaceTarget}
-          coordinationRoutes={coordinationNodeRoutes}
-          mode={agentWorkspaceMode}
-          onCoordinationChange={recordYardRoute}
-          onCoordinationNodeChange={recordCoordinationNodeRoute}
-          onModeChange={setAgentWorkspaceMode}
-          onPresentationChange={setTerminalPresentation}
-          onRefresh={() => void refresh()}
-          onTargetChange={(target) => {
-            if (!target.interactive) return
-            setAgentWorkspaceTarget({
-              ...target,
-              returnFocus: activeAgentWorkspaceTarget.returnFocus,
-            })
-            setTerminalPresentation(DEFAULT_TERMINAL_PRESENTATION)
-            setAgentWorkspaceMode((current) =>
-              current === 'changes'
-                ? 'changes'
-                : current === 'chat' && target.chatAvailable
-                  ? 'chat'
-                  : 'terminal',
-            )
-          }}
-          presentation={terminalPresentation}
-          inventory={inventory}
-          inventoryCurrent={inventoryCurrent}
-          lensEntries={lensEntries}
-          projects={projects}
-          selectedSession={selectedSession}
-          sessions={sessions}
-          targets={agentWorkspaceTargets}
-          yardRoutes={yardOrchestratorRoutes}
-        />
-      ) : null}
+      <AgentWorkspaceShell
+        activeTarget={activeAgentWorkspaceTarget}
+        coordinationRoutes={coordinationNodeRoutes}
+        mode={agentWorkspaceMode}
+        onCoordinationChange={recordYardRoute}
+        onCoordinationNodeChange={recordCoordinationNodeRoute}
+        onModeChange={setAgentWorkspaceMode}
+        onPresentationChange={setTerminalPresentation}
+        onRefresh={() => void refresh()}
+        onTargetChange={(target) => {
+          setAgentWorkspaceTarget({
+            ...target,
+            returnFocus: agentWorkspaceReturnFocus.current,
+          })
+          setTerminalPresentation(DEFAULT_TERMINAL_PRESENTATION)
+        }}
+        presentation={terminalPresentation}
+        inventory={inventory}
+        inventoryCurrent={inventoryCurrent}
+        lensEntries={lensEntries}
+        projects={projects}
+        selectedSession={selectedSession}
+        sessions={sessions}
+        targets={agentWorkspaceTargets}
+        returnFocus={agentWorkspaceReturnFocus.current}
+        yardRoutes={yardOrchestratorRoutes}
+      />
       {projectPulseOpen ? (
         <ProjectPulseWorkspace
           assignments={assignments}

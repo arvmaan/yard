@@ -16,8 +16,10 @@ import {
   FolderPlus,
   LoaderCircle,
   Map as MapIcon,
+  MessageSquareText,
   RefreshCw,
   Settings,
+  SquareTerminal,
   Wifi,
   WifiOff,
   Workflow,
@@ -25,6 +27,7 @@ import {
   Zap,
 } from 'lucide-react'
 import type { MapVisualMode } from './mapVisualMode'
+import type { AgentWorkspaceView } from './AgentWorkspaceContext'
 import type {
   RuntimeSession,
   TokenSpendSettings,
@@ -238,10 +241,15 @@ interface GlobalCommandBarProps extends RuntimeHealthPopoverProps {
   onOpenProjectPulse: (trigger: HTMLButtonElement) => void
   onOpenSettings: () => void
   onToggleResources: (trigger: HTMLButtonElement) => void
+  onWorkspaceModeChange: (
+    mode: Extract<AgentWorkspaceView, 'map' | 'chat' | 'terminal'>,
+    trigger: HTMLButtonElement,
+  ) => void
   projectPulseTriggerRef: RefObject<HTMLButtonElement | null>
   resourceShelfOpen: boolean
   settingsLabel: string
   settingsTriggerRef: RefObject<HTMLButtonElement | null>
+  workspaceMode: AgentWorkspaceView
 }
 
 const RESOURCE_ICONS = {
@@ -268,13 +276,21 @@ export function GlobalCommandBar({
   onRefresh,
   onSessionChange,
   onToggleResources,
+  onWorkspaceModeChange,
   projectPulseTriggerRef,
   resourceShelfOpen,
   selectedSession,
   sessions,
   settingsLabel,
   settingsTriggerRef,
+  workspaceMode,
 }: GlobalCommandBarProps) {
+  const workspaceModes = [
+    { icon: MapIcon, label: 'Map', value: 'map' },
+    { icon: MessageSquareText, label: 'Chat', value: 'chat' },
+    { icon: SquareTerminal, label: 'Terminal', value: 'terminal' },
+  ] as const
+
   return (
     <header className="command-bar">
       <button
@@ -312,6 +328,57 @@ export function GlobalCommandBar({
         <Boxes aria-hidden="true" size={16} />
         <span>Resources</span>
       </button>
+
+      <div
+        aria-label="Workspace view"
+        className="workspace-mode-switcher global-workspace-switcher"
+        onKeyDown={(event) => {
+          if (
+            !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)
+          ) {
+            return
+          }
+          event.preventDefault()
+          const tabs = Array.from(
+            event.currentTarget.querySelectorAll<HTMLButtonElement>(
+              '[role="tab"]',
+            ),
+          )
+          const current = tabs.indexOf(
+            document.activeElement as HTMLButtonElement,
+          )
+          const next =
+            event.key === 'Home'
+              ? 0
+              : event.key === 'End'
+                ? tabs.length - 1
+                : (current +
+                    (event.key === 'ArrowRight' ? 1 : -1) +
+                    tabs.length) %
+                  tabs.length
+          tabs[next]?.focus()
+          tabs[next]?.click()
+        }}
+        role="tablist"
+      >
+        {workspaceModes.map(({ icon: Icon, label, value }) => (
+          <button
+            aria-label={`${label} view`}
+            aria-selected={workspaceMode === value}
+            key={value}
+            onClick={(event) =>
+              onWorkspaceModeChange(value, event.currentTarget)
+            }
+            role="tab"
+            tabIndex={workspaceMode === value ? 0 : -1}
+            title={`${label} view`}
+            type="button"
+          >
+            <Icon aria-hidden="true" size={14} />
+            <span>{label}</span>
+          </button>
+        ))}
+      </div>
 
       {attentionCount > 0 ? (
         <button

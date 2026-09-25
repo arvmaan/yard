@@ -4578,7 +4578,7 @@ test('keeps the canvas visible under a compact collapsible resource shelf', asyn
   await expect(shelf).toBeVisible()
   await expect(resources).toHaveAttribute('aria-expanded', 'true')
   const shelfBounds = await shelf.boundingBox()
-  expect(shelfBounds?.height).toBeLessThanOrEqual(96)
+  expect(shelfBounds?.height).toBeLessThanOrEqual(320)
   await expect
     .poll(async () => (await canvas.boundingBox())?.height ?? 0)
     .toBeLessThan(canvasBounds?.height ?? 0)
@@ -4592,6 +4592,151 @@ test('keeps the canvas visible under a compact collapsible resource shelf', asyn
   await expect(resources).toBeFocused()
 })
 
+test('opens Chat and Terminal globally without a selected or connected agent', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  state.runtimeInventory.workers = []
+  state.runtimeInventory.panes = []
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.goto('/')
+
+  const commandBar = page.locator('.command-bar')
+  const switcher = commandBar.getByRole('tablist', {
+    name: 'Workspace view',
+  })
+  const map = switcher.getByRole('tab', { name: 'Map view' })
+  const chat = switcher.getByRole('tab', { name: 'Chat view' })
+  const terminal = switcher.getByRole('tab', { name: 'Terminal view' })
+
+  await map.focus()
+  await page.keyboard.press('ArrowRight')
+  await expect(chat).toBeFocused()
+  await expect(chat).toHaveAttribute('aria-selected', 'true')
+  const shell = page.locator('.agent-workspace-shell')
+  await expect(shell).toHaveAttribute('data-mode', 'chat')
+  await expect(
+    shell.locator('.agent-workspace-picker-state'),
+  ).toContainText('Choose an agent')
+  await page.screenshot({
+    path: '/tmp/yard-lane2-evidence/rev3-chat-no-target.png',
+    fullPage: true,
+  })
+
+  const disconnected = shell.locator(
+    '[data-target-key="orchestrator:project-1"]',
+  )
+  await expect(disconnected).toBeEnabled()
+  await expect(disconnected).toContainText('Binding missing')
+  await disconnected.click()
+  await expect(
+    page.getByRole('region', {
+      name: 'API migration orchestrator',
+      exact: true,
+    }),
+  ).toBeVisible()
+  await expect(shell.getByText('Agent chat unavailable')).toBeVisible()
+  await expect(page.getByLabel('Agent conversation')).toHaveCount(0)
+  await page.keyboard.press('Escape')
+  await expect(shell).toBeHidden()
+  await expect(chat).toBeFocused()
+
+  await page.reload()
+  await terminal.click()
+  await expect(shell).toHaveAttribute('data-mode', 'terminal')
+  await expect(
+    shell.locator('.agent-workspace-picker-state'),
+  ).toContainText('Choose an agent')
+  await expect(page.locator('.terminal-session')).toHaveCount(0)
+  await page.screenshot({
+    path: '/tmp/yard-lane2-evidence/rev3-terminal-no-target.png',
+    fullPage: true,
+  })
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.reload()
+  await chat.click()
+  const picker = shell.getByLabel('Choose agent for chat')
+  await expect(picker).toBeVisible()
+  await picker.selectOption('orchestrator:project-1')
+  await expect(shell).toHaveAttribute('aria-label', 'API migration orchestrator')
+  await page.screenshot({
+    path: '/tmp/yard-lane2-evidence/rev3-mobile-bar-chat.png',
+    fullPage: true,
+  })
+  await page.keyboard.press('Escape')
+  await expect(chat).toBeFocused()
+})
+
+test('keeps worker filters visible and scrolls resources inside the shelf', async ({
+  page,
+}) => {
+  await mockApi(page)
+
+  for (const viewport of [
+    { width: 1440, height: 900 },
+    { width: 1280, height: 720 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport)
+    await page.goto('/')
+    const shelf = await openResources(page, 'Workers')
+    const filters = page
+      .getByLabel('Filter workers')
+      .getByRole('button')
+    await expect(filters).toHaveCount(5)
+    const shelfBounds = await shelf.boundingBox()
+    expect(shelfBounds).not.toBeNull()
+    for (let index = 0; index < 5; index += 1) {
+      const filterBounds = await filters.nth(index).boundingBox()
+      expect(filterBounds).not.toBeNull()
+      expect(filterBounds?.y ?? -1).toBeGreaterThanOrEqual(
+        shelfBounds?.y ?? 0,
+      )
+      expect(
+        filterBounds ? filterBounds.y + filterBounds.height : Infinity,
+      ).toBeLessThanOrEqual(
+        (shelfBounds?.y ?? 0) + (shelfBounds?.height ?? 0),
+      )
+    }
+    expect(shelfBounds?.height ?? Infinity).toBeLessThanOrEqual(
+      Math.min(
+        viewport.width <= 760 ? viewport.height * 0.44 : viewport.height * 0.4,
+        360,
+      ) + 1,
+    )
+
+    const canvasBounds = await page.locator('.canvas-stage').boundingBox()
+    expect(canvasBounds?.height ?? 0).toBeGreaterThan(300)
+    expect(
+      canvasBounds ? canvasBounds.y + canvasBounds.height : 0,
+    ).toBe(viewport.height)
+
+    if (viewport.width === 390) {
+      expect(shelfBounds?.x).toBe(0)
+      expect(shelfBounds?.width).toBe(390)
+      const list = shelf.locator('.worker-list')
+      const scroll = await list.evaluate((element) => ({
+        clientHeight: element.clientHeight,
+        scrollHeight: element.scrollHeight,
+      }))
+      expect(scroll.scrollHeight).toBeGreaterThan(scroll.clientHeight)
+      await list.evaluate((element) => {
+        element.scrollTop = 80
+      })
+      await expect.poll(() => list.evaluate((element) => element.scrollTop))
+        .toBeGreaterThan(0)
+    }
+
+    if (viewport.width === 1440) {
+      await page.screenshot({
+        path: '/tmp/yard-lane2-evidence/rev3-command-bar-desktop.png',
+        fullPage: true,
+      })
+    }
+  }
+})
+
 test('shows only actionable conditional chrome and routes attention to workers', async ({
   page,
 }) => {
@@ -4602,7 +4747,10 @@ test('shows only actionable conditional chrome and routes attention to workers',
   await page.goto('/')
 
   const commandBar = page.locator('.command-bar')
-  await expect(commandBar.getByRole('tab')).toHaveCount(0)
+  await expect(commandBar.getByRole('tab')).toHaveCount(3)
+  await expect(
+    commandBar.getByRole('tab', { name: 'Map view' }),
+  ).toHaveAttribute('aria-selected', 'true')
   await expect(
     commandBar.getByRole('button', { name: /workers need attention/ }),
   ).toHaveCount(0)
@@ -5390,6 +5538,9 @@ test('scopes terminal projection identity to adapter and session', async ({
     '.react-flow__node-worker[data-id="worker:terminal-2"]',
   )
   await alphaWorker.click()
+  await page
+    .locator('.inspector details.worker-inspector-details summary')
+    .click()
   await expect(
     page
       .locator('.inspector .detail-row')
@@ -5489,6 +5640,59 @@ test('uses durable status for missing ambiguous and exited worker candidates', a
   }))
   expect(overflow.horizontal).toBeLessThanOrEqual(0)
   expect(overflow.right).toBeLessThanOrEqual(0)
+})
+
+test('keeps worker actions prominent and identifiers in collapsed Details', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedAssignedCandidateAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await openResources(page, 'Workers')
+  await page
+    .locator('.worker-row[data-worker-id="worker-assigned"]')
+    .click()
+
+  const inspector = page.locator('.inspector')
+  const details = inspector.locator('details.worker-inspector-details')
+  const summary = details.locator('summary')
+  const openChat = inspector.getByRole('button', {
+    name: 'Open chat',
+    exact: true,
+  })
+  await expect(details).not.toHaveAttribute('open', '')
+  await expect(openChat).toBeVisible()
+  await expect(inspector.getByText('Not reported', { exact: true })).toHaveCount(
+    0,
+  )
+  const [actionBounds, detailsBounds] = await Promise.all([
+    openChat.boundingBox(),
+    summary.boundingBox(),
+  ])
+  expect(actionBounds?.y ?? Infinity).toBeLessThan(detailsBounds?.y ?? 0)
+
+  await summary.click()
+  for (const label of [
+    'Worker ID',
+    'Project ID',
+    'Terminal',
+    'State sequence',
+    'Runtime revision',
+    'Disposition',
+    'Worker rev',
+  ]) {
+    await expect(
+      details.locator('.detail-row').filter({ hasText: label }),
+    ).toBeVisible()
+  }
+  await expect(details.getByText('Not reported', { exact: true })).toHaveCount(
+    0,
+  )
+  await page.screenshot({
+    path: '/tmp/yard-lane2-evidence/rev3-inspector.png',
+    fullPage: true,
+  })
 })
 
 test('reports a fresh missing binding despite an auxiliary refresh failure', async ({
@@ -5861,10 +6065,12 @@ test('keeps topology-only shells terminal-only', async ({ page }) => {
     inspector.getByRole('button', { name: 'Open chat', exact: true }),
   ).toHaveCount(0)
   await expect(
-    inspector.getByText(
-      'Terminal reattach is still available, but chat stays disabled until Yard reports a foreground agent.',
-      { exact: true },
-    ),
+    inspector
+      .getByRole('region', { name: 'Agent controls' })
+      .getByText(
+        'Terminal reattach is still available, but chat stays disabled until Yard reports a foreground agent.',
+        { exact: true },
+      ),
   ).toBeVisible()
 })
 
@@ -5900,7 +6106,12 @@ test('invalidates live controls after a failed refresh and restores them after r
     page.locator(
       `.agent-window-row[data-target-key="assignment:${seeded.id}"]`,
     ),
-  ).toBeDisabled()
+  ).toBeEnabled()
+  await expect(
+    page.locator(
+      `.agent-window-row[data-target-key="assignment:${seeded.id}"]`,
+    ),
+  ).toContainText('Connection status stale')
   await expect(
     page.locator(
       '.inspector .observation-state-badge[data-observation-state="stale"]',
@@ -5920,12 +6131,22 @@ test('invalidates live controls after a failed refresh and restores them after r
   await expect(page.getByRole('tab', { name: 'Chat', exact: true })).toBeDisabled()
   await expect(page.getByRole('tab', { name: 'Terminal', exact: true })).toBeDisabled()
 
-  const requestsBeforeRecovery = state.inventoryRequests
-  state.inventoryFailure = false
-  await page
+  const recoveryButton = page
     .locator('.agent-workspace-shell')
     .getByRole('button', { name: 'Refresh inventory', exact: true })
-    .click()
+  const recoveryHandle = await recoveryButton.elementHandle()
+  expect(recoveryHandle).not.toBeNull()
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      value: 'hidden',
+    })
+  })
+  const requestsBeforeRecovery = state.inventoryRequests
+  state.inventoryFailure = false
+  await recoveryHandle?.evaluate((button) =>
+    (button as HTMLButtonElement).click(),
+  )
   await expect
     .poll(() => state.inventoryRequests, { timeout: 3_000 })
     .toBeGreaterThan(requestsBeforeRecovery)
@@ -5936,6 +6157,8 @@ test('invalidates live controls after a failed refresh and restores them after r
     'connected',
   )
   await expect.poll(() => state.terminalSockets.length).toBe(2)
+  await page.waitForTimeout(1_100)
+  expect(state.terminalSockets).toHaveLength(2)
 })
 
 test('resnapshots inventory, retains stale state, and recovers after failure', async ({
@@ -6017,7 +6240,7 @@ test('shows selected worker details on mobile', async ({ page }, testInfo) => {
   await openResources(page, 'Workers')
   await page.locator('.worker-row').first().click()
   await expect(page.locator('.inspector.has-selection')).toBeVisible()
-  await expect(page.getByText('Worker candidate')).toBeVisible()
+  await expect(page.locator('.inspector h2')).not.toBeEmpty()
 
   const overflow = await page.evaluate(() => ({
     horizontal: document.documentElement.scrollWidth - window.innerWidth,
@@ -6813,7 +7036,7 @@ test('allocates a profileless live worker from the keyboard inspector action', a
   ).toHaveAttribute('draggable', 'false')
 
   await liveWorker.press('Enter')
-  await expect(page.getByText('Worker candidate')).toBeVisible()
+  await expect(page.locator('.inspector h2')).not.toBeEmpty()
   await page
     .getByRole('button', { name: 'Assign worker', exact: true })
     .click()
@@ -8760,9 +8983,10 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   const durableRow = navigator.locator(
     '[data-target-key="orchestrator:project-2"]',
   )
-  await expect(durableRow).toBeDisabled()
-  await expect(durableRow).toContainText('Connection status unknown')
-  await durableRow.click({ force: true })
+  await expect(durableRow).toBeEnabled()
+  await expect(durableRow).toContainText('Binding missing')
+  await durableRow.click()
+  await expect(shell.getByText('Agent chat unavailable')).toBeVisible()
 
   await selectRuntimeSession(page, 'alpha')
   await expect(navigator).toContainText(
@@ -8772,6 +8996,7 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   const implementerRow = navigator.locator(
     '[data-target-key="assignment:assignment-1"]',
   )
+  await implementerRow.click()
   await expect(implementerRow).toHaveAttribute('aria-current', 'page')
   await expect(implementerRow).toContainText('Implementer')
   await expect(implementerRow).toContainText('implementer · API migration')
@@ -13231,7 +13456,7 @@ test('records a durable manual completion receipt', async ({ page }) => {
   await expect(resumableWorker).toBeVisible()
   await expect(resumableWorker).toHaveAttribute('draggable', 'true')
   await resumableWorker.press('Enter')
-  await expect(page.getByText('Worker candidate')).toBeVisible()
+  await expect(page.locator('.inspector h2')).not.toBeEmpty()
   await expect(
     page.getByRole('button', { name: 'Replace runtime and assign', exact: true }),
   ).toBeVisible()
@@ -14162,6 +14387,33 @@ test("projects the selected session into a read-only unassigned navigator", asyn
     ),
   ).toBe(false)
   expect(browserErrors).toEqual([])
+})
+
+test('lists unbound Herdr panes from global Terminal without granting input', async ({
+  page,
+}) => {
+  await mockApi(page, { productionLensFixture: true })
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await page
+    .getByRole('tab', { name: 'Terminal view', exact: true })
+    .click()
+
+  const shell = page.locator('.agent-workspace-shell')
+  const navigator = shell.getByLabel('Herdr windows', { exact: true })
+  const toggle = navigator.getByRole('button', { name: /Other Herdr/ })
+  await expect(
+    shell.locator('.agent-workspace-picker-state'),
+  ).toContainText('Choose an agent')
+  await toggle.click()
+  const unbound = navigator.locator('.agent-window-lens-row').first()
+  await expect(unbound).toContainText('Unbound · read-only unavailable')
+  await expect(unbound).toContainText(
+    'Yard must bind this pane before terminal output or input is available.',
+  )
+  await expect(unbound.getByRole('button')).toHaveCount(0)
+  await expect(unbound.locator('input, textarea')).toHaveCount(0)
+  await expect(page.locator('.terminal-session')).toHaveCount(0)
 })
 
 

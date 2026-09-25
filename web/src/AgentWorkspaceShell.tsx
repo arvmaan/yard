@@ -249,13 +249,14 @@ export function AgentWorkspaceShell({
   onTargetChange,
   presentation,
   projects,
+  returnFocus,
   selectedSession,
   sessions,
   targets,
   yardRoutes,
   coordinationRoutes,
 }: {
-  activeTarget: AgentWorkspaceTarget
+  activeTarget: AgentWorkspaceTarget | null
   coordinationRoutes: CoordinationNodeRoute[]
   inventory: RuntimeInventory | null
   inventoryCurrent: boolean
@@ -269,6 +270,7 @@ export function AgentWorkspaceShell({
   onTargetChange: (target: AgentWorkspaceTarget) => void
   presentation: TerminalPresentation
   projects: Project[]
+  returnFocus: HTMLElement | null
   selectedSession: string
   sessions: RuntimeSession[]
   targets: AgentWorkspaceTarget[]
@@ -276,11 +278,14 @@ export function AgentWorkspaceShell({
 }) {
   const closeWorkspace = () => {
     onModeChange('map')
-    window.setTimeout(() => activeTarget.returnFocus?.focus(), 0)
+    window.setTimeout(
+      () => (activeTarget?.returnFocus ?? returnFocus)?.focus(),
+      0,
+    )
   }
 
   const coordinationNode =
-    activeTarget.target.kind === 'coordination-node'
+    activeTarget?.target.kind === 'coordination-node'
       ? activeTarget.target.node
       : null
   const chatProjects =
@@ -292,7 +297,7 @@ export function AgentWorkspaceShell({
         )
       : projects
   const chatRoutes =
-    activeTarget.target.kind === 'yard-orchestrator'
+    activeTarget?.target.kind === 'yard-orchestrator'
       ? yardRoutes
       : coordinationNode
         ? coordinationRoutes.filter(
@@ -300,16 +305,20 @@ export function AgentWorkspaceShell({
           )
         : []
   const terminalVisible =
-    isTerminalWorkspaceMode(mode) && activeTarget.interactive
-  const chatVisible = mode === 'chat' && activeTarget.chatAvailable
-  const lastKnownRuntime = [
-    `session ${activeTarget.session}`,
-    `terminal ${activeTarget.terminalId}`,
-    activeTarget.paneId ? `pane ${activeTarget.paneId}` : null,
-    activeTarget.cwd,
-  ]
-    .filter(Boolean)
-    .join(' · ')
+    isTerminalWorkspaceMode(mode) && Boolean(activeTarget?.interactive)
+  const chatVisible =
+    mode === 'chat' && Boolean(activeTarget?.chatAvailable)
+  const renderedTarget = activeTarget ?? targets[0] ?? null
+  const lastKnownRuntime = activeTarget
+    ? [
+        `session ${activeTarget.session}`,
+        `terminal ${activeTarget.terminalId}`,
+        activeTarget.paneId ? `pane ${activeTarget.paneId}` : null,
+        activeTarget.cwd,
+      ]
+        .filter(Boolean)
+        .join(' · ')
+    : ''
   const navigatorRef = useRef<HTMLElement>(null)
   const mobileNavigatorTriggerRef = useRef<HTMLButtonElement>(null)
   const [detailsTarget, setDetailsTarget] = useState<{
@@ -336,6 +345,17 @@ export function AgentWorkspaceShell({
   const sessionTargets = useMemo(
     () => selectAgentWindowSessionTargets(targets, selectedSession),
     [selectedSession, targets],
+  )
+  const pickerTargets = useMemo(
+    () =>
+      [...sessionTargets.selected].sort(
+        (left, right) =>
+          Number(!left.interactive) - Number(!right.interactive) ||
+          Number(left.observation !== 'observed') -
+            Number(right.observation !== 'observed') ||
+          left.label.localeCompare(right.label),
+      ),
+    [sessionTargets.selected],
   )
   const groupedTargets = useMemo(() => {
     const selected = sessionTargets.selected
@@ -403,12 +423,24 @@ export function AgentWorkspaceShell({
   const otherSessionCount = sessionTargets.elsewhereCount
   return (
     <section
-      aria-label={activeTarget.label}
+      aria-label={activeTarget?.label ?? `${mode} workspace`}
       className="agent-workspace-shell"
       data-mobile-navigator-open={mobileNavigatorOpen || undefined}
       data-mode={mode}
       data-presentation={terminalVisible ? presentation : undefined}
       hidden={mode === 'map'}
+      onKeyDown={(event) => {
+        if (
+          event.key !== 'Escape' ||
+          mobileNavigatorOpen ||
+          detailsTarget !== null
+        ) {
+          return
+        }
+        event.preventDefault()
+        event.stopPropagation()
+        closeWorkspace()
+      }}
       role="region"
     >
       {mode !== 'map' ? (
@@ -514,15 +546,17 @@ export function AgentWorkspaceShell({
                     >
                       <strong>{runtimeLensEntryLabel(entry)}</strong>
                       <small>
-                        {entry.snapshot_current ? 'Fresh' : 'Stale'} ·{' '}
-                        {entry.classification.replaceAll('_', ' ')}
+                        Unbound · read-only unavailable
                       </small>
                       <code>
                         {entry.session} · {entry.terminal_id} ·{' '}
                         {entry.tab_id ? `tab ${entry.tab_id} · ` : ''}
                         pane {entry.pane_id}
                       </code>
-                      <small>{entry.reason}</small>
+                      <small>
+                        {entry.reason} Yard must bind this pane before terminal
+                        output or input is available.
+                      </small>
                     </div>
                   ))}
                 </section>
@@ -639,7 +673,7 @@ export function AgentWorkspaceShell({
                         aria-describedby={descriptionId}
                         aria-label={`${target.label}, ${target.roleLabel}, ${target.contextLabel}`}
                         aria-current={
-                          target.key === activeTarget.key
+                          target.key === activeTarget?.key
                             ? 'page'
                             : undefined
                         }
@@ -647,7 +681,6 @@ export function AgentWorkspaceShell({
                         data-observation={target.observation}
                         data-status={target.status}
                         data-target-key={target.key}
-                        disabled={!target.interactive}
                         onClick={() => {
                           onTargetChange(target)
                           setMobileNavigatorOpen(false)
@@ -669,7 +702,11 @@ export function AgentWorkspaceShell({
                           <span className="agent-window-row__identity">
                             <strong>{target.label}</strong>
                             <small>
-                              {target.observation === 'stale'
+                              {!target.interactive
+                                ? runtimeCapabilityLabel(
+                                    targetCapabilities(target),
+                                  )
+                                : target.observation === 'stale'
                                 ? 'Connection status stale'
                                 : target.observation === 'observed'
                                   ? target.interactive
@@ -791,7 +828,7 @@ export function AgentWorkspaceShell({
           >
             <button
               aria-selected={mode === 'chat'}
-              disabled={!activeTarget.chatAvailable}
+              disabled={Boolean(activeTarget && !activeTarget.chatAvailable)}
               onClick={() => onModeChange('chat')}
               role="tab"
               tabIndex={mode === 'chat' ? 0 : -1}
@@ -802,7 +839,7 @@ export function AgentWorkspaceShell({
             </button>
             <button
               aria-selected={mode === 'terminal'}
-              disabled={!activeTarget.interactive}
+              disabled={Boolean(activeTarget && !activeTarget.interactive)}
               onClick={() => onModeChange('terminal')}
               role="tab"
               tabIndex={mode === 'terminal' ? 0 : -1}
@@ -813,6 +850,7 @@ export function AgentWorkspaceShell({
             </button>
             <button
               aria-selected={mode === 'changes'}
+              disabled={!activeTarget}
               onClick={() => onModeChange('changes')}
               role="tab"
               tabIndex={mode === 'changes' ? 0 : -1}
@@ -864,10 +902,49 @@ export function AgentWorkspaceShell({
               <Server aria-hidden="true" size={15} />
             </button>
           ) : null}
+          <label className="agent-workspace-mobile-picker">
+            <span className="visually-hidden">Agent target</span>
+            <select
+              aria-label={`Choose agent for ${mode}`}
+              onChange={(event) => {
+                const target = targets.find(
+                  (candidate) => candidate.key === event.target.value,
+                )
+                if (target) onTargetChange(target)
+              }}
+              value={activeTarget?.key ?? ''}
+            >
+              <option value="">Choose agent</option>
+              {pickerTargets.map((target) => (
+                <option key={target.key} value={target.key}>
+                  {target.label} ·{' '}
+                  {target.interactive
+                    ? `observed ${target.status}`
+                    : runtimeCapabilityLabel(targetCapabilities(target))}
+                </option>
+              ))}
+              {mode === 'terminal' && unassignedTargetCount > 0 ? (
+                <optgroup label="Unbound Herdr panes">
+                  {unassignedGroups.flatMap((group) =>
+                    group.entries.map((entry) => (
+                      <option
+                        disabled
+                        key={runtimeLensEntryKey(entry)}
+                        value={`unbound:${runtimeLensEntryKey(entry)}`}
+                      >
+                        {runtimeLensEntryLabel(entry)} · Unbound · read-only
+                        unavailable
+                      </option>
+                    )),
+                  )}
+                </optgroup>
+              ) : null}
+            </select>
+          </label>
           <div className="agent-workspace-toolbar__target">
-            <span data-status={activeTarget.status} />
-            <strong>{activeTarget.label}</strong>
-            <small>{activeTarget.terminalId}</small>
+            <span data-status={activeTarget?.status} />
+            <strong>{activeTarget?.label ?? 'Choose an agent'}</strong>
+            <small>{activeTarget?.terminalId ?? selectedSession}</small>
             <button
               aria-label="Back to Map"
               className="icon-button"
@@ -882,23 +959,40 @@ export function AgentWorkspaceShell({
       ) : null}
 
       <main className="agent-workspace-content">
-        <AgentChatWorkspace
-          closeOnEscape={
-            !mobileNavigatorOpen && detailsTarget === null
-          }
-          label={activeTarget.label}
-          onCoordinationChange={onCoordinationChange}
-          onCoordinationNodeChange={onCoordinationNodeChange}
-          onClose={closeWorkspace}
-          open={chatVisible}
-          projects={chatProjects}
-          returnFocus={null}
-          routes={chatRoutes}
-          status={activeTarget.status}
-          target={activeTarget.target}
-          variant="workspace"
-        />
-        {mode === 'chat' && !activeTarget.chatAvailable ? (
+        {renderedTarget ? (
+          <AgentChatWorkspace
+            closeOnEscape={
+              !mobileNavigatorOpen && detailsTarget === null
+            }
+            label={renderedTarget.label}
+            onCoordinationChange={onCoordinationChange}
+            onCoordinationNodeChange={onCoordinationNodeChange}
+            onClose={closeWorkspace}
+            open={chatVisible}
+            projects={chatProjects}
+            returnFocus={null}
+            routes={chatRoutes}
+            status={renderedTarget.status}
+            target={renderedTarget.target}
+            variant="workspace"
+          />
+        ) : null}
+        {!activeTarget ? (
+          <div className="agent-workspace-picker-state" role="status">
+            {mode === 'chat' ? (
+              <MessageSquareText aria-hidden="true" size={22} />
+            ) : (
+              <SquareTerminal aria-hidden="true" size={22} />
+            )}
+            <strong>Choose an agent</strong>
+            <span>
+              {mode === 'chat'
+                ? 'Select any Yard agent. Disconnected agents remain available with their last known status.'
+                : 'Select a bound agent for terminal access. Unbound Herdr panes are listed without input control.'}
+            </span>
+          </div>
+        ) : null}
+        {activeTarget && mode === 'chat' && !activeTarget.chatAvailable ? (
           <div className="terminal-mode-loading" role="status">
             <strong>Agent chat unavailable</strong>
             <span>{targetConnectionSummary(activeTarget)}</span>
@@ -915,7 +1009,7 @@ export function AgentWorkspaceShell({
             </div>
           </div>
         ) : null}
-        {mode === 'terminal' && !activeTarget.interactive ? (
+        {activeTarget && mode === 'terminal' && !activeTarget.interactive ? (
           <div className="terminal-mode-loading" role="status">
             <strong>Live controls unavailable</strong>
             <span>{targetConnectionSummary(activeTarget)}</span>
@@ -935,7 +1029,7 @@ export function AgentWorkspaceShell({
             </small>
           </div>
         ) : null}
-        {mode === 'changes' ? (
+        {activeTarget && mode === 'changes' ? (
           <section
             aria-label={"Files for " + activeTarget.label}
             className="changes-workspace"
@@ -957,7 +1051,7 @@ export function AgentWorkspaceShell({
             </div>
           </section>
         ) : null}
-        {terminalVisible ? (
+        {terminalVisible && activeTarget ? (
           <Suspense
             fallback={
               <div className="terminal-mode-loading" role="status">
