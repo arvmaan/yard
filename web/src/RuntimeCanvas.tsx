@@ -2397,13 +2397,16 @@ function buildNodes(
   })
 
   const centralManagedWorkspace = managedWorkspaces.find(
-    (workspace) => workspace.kind === 'yard_central',
+    (workspace) =>
+      workspace.kind === 'yard_central' &&
+      workspace.occupants.length > 0,
   )
   const renderedManagedWorkspaces = managedWorkspaces.filter(
     (workspace) =>
       workspace.kind !== 'coordination' &&
-      (workspace.kind === 'yard_central' ||
-        !representedWorkspaceIds.has(workspace.workspace_id)),
+      (workspace.kind === 'yard_central'
+        ? workspace.occupants.length > 0
+        : !representedWorkspaceIds.has(workspace.workspace_id)),
   )
   const managedWorkspaceNodes: RuntimeNode[] = []
   const minimumProjectX =

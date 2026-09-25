@@ -35,6 +35,10 @@ import type {
   TokenSpendSettings,
 } from './types'
 import { THEME_OPTIONS, type ThemeId } from './theme'
+import {
+  sessionOptionLabel,
+  type SessionRoleCounts,
+} from './sessionSelection'
 import { useModalDialog } from './useModalDialog'
 
 export type ResourceView = 'archived' | 'profiles' | 'workspaces' | 'workers'
@@ -50,6 +54,7 @@ interface RuntimeHealthPopoverProps {
   onRefresh: () => void
   onSessionChange: (session: string) => void
   selectedSession: string
+  sessionRoleCounts: SessionRoleCounts
   sessions: RuntimeSession[]
 }
 
@@ -94,6 +99,7 @@ export function RuntimeHealthPopover({
   onRefresh,
   onSessionChange,
   selectedSession,
+  sessionRoleCounts,
   sessions,
 }: RuntimeHealthPopoverProps) {
   const popoverId = useId()
@@ -181,6 +187,7 @@ export function RuntimeHealthPopover({
           <label className="runtime-health__field">
             <span>Herdr session</span>
             <select
+              aria-describedby={`${popoverId}-session-hint`}
               aria-label="Herdr session"
               disabled={sessions.length === 0}
               onChange={(event) => onSessionChange(event.target.value)}
@@ -196,11 +203,18 @@ export function RuntimeHealthPopover({
                   key={session.name}
                   value={session.name}
                 >
-                  {session.name}
-                  {session.running ? '' : ' (stopped)'}
+                  {sessionOptionLabel(session, sessionRoleCounts)}
                 </option>
               ))}
             </select>
+            <small
+              className="runtime-health__hint"
+              id={`${popoverId}-session-hint`}
+            >
+              Sets the health badge, what Refresh re-reads, which Herdr
+              workspaces can be adopted, and where new projects are created.
+              Existing project tracking is unaffected.
+            </small>
           </label>
           <button
             className="runtime-health__refresh"
@@ -293,6 +307,7 @@ export function GlobalCommandBar({
   projectPulseTriggerRef,
   resourceShelfOpen,
   selectedSession,
+  sessionRoleCounts,
   sessions,
   settingsLabel,
   settingsTriggerRef,
@@ -433,6 +448,7 @@ export function GlobalCommandBar({
         onRefresh={onRefresh}
         onSessionChange={onSessionChange}
         selectedSession={selectedSession}
+        sessionRoleCounts={sessionRoleCounts}
         sessions={sessions}
       />
 

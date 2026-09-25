@@ -131,6 +131,29 @@ export function CoordinationNodeInspector({
         <code>v{node.version}</code>
       </div>
 
+      {node.kind === 'workstream' ? (
+        <div className="inspector-actions disposition-actions">
+          <button
+            className="secondary-button"
+            disabled={busy}
+            onClick={(event) => onArchive(node, event.currentTarget)}
+            type="button"
+          >
+            <FolderArchive aria-hidden="true" size={16} />
+            Archive workstream
+          </button>
+          <button
+            className="destructive-button"
+            disabled={busy}
+            onClick={(event) => onDelete(node, event.currentTarget)}
+            type="button"
+          >
+            <Trash2 aria-hidden="true" size={16} />
+            Delete workstream…
+          </button>
+        </div>
+      ) : null}
+
       <section className="coordination-node-settings">
         <label className="field-label" htmlFor="coordination-node-edit-name">
           Name
@@ -285,29 +308,6 @@ export function CoordinationNodeInspector({
           )}
         </section>
       )}
-
-      {node.kind === 'workstream' ? (
-        <div className="inspector-actions disposition-actions">
-          <button
-            className="secondary-button"
-            disabled={busy}
-            onClick={(event) => onArchive(node, event.currentTarget)}
-            type="button"
-          >
-            <FolderArchive aria-hidden="true" size={16} />
-            Archive workstream
-          </button>
-          <button
-            className="destructive-button"
-            disabled={busy}
-            onClick={(event) => onDelete(node, event.currentTarget)}
-            type="button"
-          >
-            <Trash2 aria-hidden="true" size={16} />
-            Delete workstream…
-          </button>
-        </div>
-      ) : null}
     </>
   )
 }

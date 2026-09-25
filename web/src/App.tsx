@@ -228,6 +228,12 @@ import {
   writeMapVisualMode,
   type MapVisualMode,
 } from './mapVisualMode'
+import {
+  countSessionRoles,
+  readStoredSession,
+  resolveSelectedSession,
+  writeStoredSession,
+} from './sessionSelection'
 import { useModalDialog } from './useModalDialog'
 import {
   ARCHIVE_UNDO_WINDOW_MS,
@@ -3034,6 +3040,9 @@ function App() {
   const [herdrInventoryOpen, setHerdrInventoryOpen] = useState(false)
   const [sessions, setSessions] = useState<RuntimeSession[]>([])
   const [selectedSession, setSelectedSession] = useState('')
+  const [projectsResolved, setProjectsResolved] = useState(false)
+  const explicitSessionRef = useRef<string | null>(readStoredSession())
+  const sessionSelectionSettledRef = useRef(false)
   const [inventory, setInventory] = useState<RuntimeInventory | null>(null)
   const [inventoryCurrent, setInventoryCurrent] = useState(false)
   const [lensEntries, setLensEntries] = useState<RuntimeLensEntry[]>([])
@@ -3365,26 +3374,48 @@ function App() {
   const loadSessions = useCallback(async (signal?: AbortSignal) => {
     const result = await fetchSessions(signal)
     setSessions(result.sessions)
-    setSelectedSession((current) => {
-      if (
-        current &&
-        result.sessions.some(
-          (session) => session.name === current && session.running,
-        )
-      ) {
-        return current
-      }
-      const next =
-        result.sessions.find(
-          (session) => session.is_default && session.running,
-        )?.name ??
-        result.sessions.find((session) => session.running)?.name ??
-        ''
-      return next
-    })
     return result.sessions
   }, [])
 
+  const sessionRoleCounts = useMemo(
+    () => countSessionRoles(projects, coordinationNodes),
+    [coordinationNodes, projects],
+  )
+
+  useEffect(() => {
+    const explicit = explicitSessionRef.current
+    const explicitRunning = Boolean(
+      explicit &&
+        sessions.some(
+          (session) => session.name === explicit && session.running,
+        ),
+    )
+    // Wait for project data before an automatic choice so the selection does
+    // not start on Herdr's default session and then jump. A stored choice
+    // only skips the wait while that session is running.
+    if (!projectsResolved && !explicitRunning) return
+    // Read the ref now: React may run the updater later, after the ref below
+    // has already been flipped.
+    const settled = sessionSelectionSettledRef.current
+    setSelectedSession((current) =>
+      resolveSelectedSession({
+        counts: sessionRoleCounts,
+        current,
+        explicit,
+        sessions,
+        settled,
+      }),
+    )
+    if (projectsResolved && sessions.some((session) => session.running)) {
+      sessionSelectionSettledRef.current = true
+    }
+  }, [projectsResolved, sessionRoleCounts, sessions])
+
+  const chooseSession = useCallback((session: string) => {
+    explicitSessionRef.current = session || null
+    writeStoredSession(session)
+    setSelectedSession(session)
+  }, [])
 
   const loadAssignments = useCallback(
     async (projectIds: string[], signal?: AbortSignal) => {
@@ -3420,6 +3451,7 @@ function App() {
     async (signal?: AbortSignal) => {
       const result = await fetchProjects(signal)
       setProjects(result.projects)
+      setProjectsResolved(true)
       const projectIds = result.projects.map((project) => project.id)
       const [loadedAssignments] = await Promise.all([
         loadAssignments(projectIds, signal),
@@ -3782,7 +3814,11 @@ function App() {
     const controller = new AbortController()
     setProjectLoading(true)
     Promise.all([
-      loadProjects(controller.signal),
+      loadProjects(controller.signal).catch((caught: unknown) => {
+        // Let the automatic Herdr session choice proceed without projects.
+        if (!controller.signal.aborted) setProjectsResolved(true)
+        throw caught
+      }),
       loadYardOrchestrator(controller.signal),
       loadCoordination(controller.signal),
       loadAutomations(controller.signal),
@@ -4777,15 +4813,13 @@ function App() {
         loadWorkers(),
         loadYardOrchestrator(),
       ])
-      const refreshedSession =
-        refreshedSessions.find(
-          (session) => session.name === selectedSession && session.running,
-        )?.name ??
-        refreshedSessions.find(
-          (session) => session.is_default && session.running,
-        )?.name ??
-        refreshedSessions.find((session) => session.running)?.name ??
-        ''
+      const refreshedSession = resolveSelectedSession({
+        counts: sessionRoleCounts,
+        current: selectedSession,
+        explicit: explicitSessionRef.current,
+        sessions: refreshedSessions,
+        settled: true,
+      })
       await loadInventory(refreshedSession)
     } catch (caught) {
       setActionError(
@@ -4806,6 +4840,7 @@ function App() {
     loadYardOrchestrator,
     loadTokenSpendSettings,
     selectedSession,
+    sessionRoleCounts,
   ])
 
   const saveTokenSpendSettings = useCallback(
@@ -7743,10 +7778,11 @@ function App() {
             }
             setAgentWorkspaceMode(mode)
           }}
-          onSessionChange={setSelectedSession}
+          onSessionChange={chooseSession}
           projectPulseTriggerRef={projectPulseTrigger}
           resourceShelfOpen={resourceShelfOpen}
           selectedSession={selectedSession}
+          sessionRoleCounts={sessionRoleCounts}
           sessions={sessions}
           settingsLabel={`Settings, ${themeDefinition(theme).label} theme, ${
             mapVisualMode === 'depth' ? '2.5D' : '2D'

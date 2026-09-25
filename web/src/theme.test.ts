@@ -120,6 +120,16 @@ describe('theme registry', () => {
     }
   })
 
+  it('keeps the Purple theme from the live checkout', () => {
+    expect(readTheme(environment('purple', false))).toBe('purple')
+    const purple = themeDefinition('purple')
+    expect(purple.label).toBe('Purple')
+    expect(purple.colorScheme).toBe('dark')
+    expect(purple.tokens.surfaceCanvas).toBe('#100b18')
+    expect(terminalTheme('purple').background).toBe('#17101f')
+    expect(THEME_OPTIONS.some(({ id }) => id === 'purple')).toBe(true)
+  })
+
   it('separates Solarized panels and strong borders without changing layout', () => {
     for (const id of ['solarized-dark', 'solarized-light']) {
       const theme = themeDefinition(id)
