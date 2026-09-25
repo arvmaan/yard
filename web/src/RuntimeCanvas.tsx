@@ -28,7 +28,6 @@ import {
   type ResizeParams,
 } from '@xyflow/react'
 import {
-  Activity,
   Bot,
   CircleAlert,
   CircleCheck,
@@ -39,6 +38,7 @@ import {
   GitBranch,
   GripVertical,
   LoaderCircle,
+  Ellipsis,
   Network,
   Orbit,
   Pause,
@@ -183,7 +183,6 @@ interface RuntimeCanvasProps {
     sourceProjectId: string,
     targetProjectId: string,
   ) => void
-  onOpenProjectPulse: (trigger: HTMLButtonElement) => void
   onSelectionChange: (selection: CanvasSelection) => void
 }
 
@@ -2609,7 +2608,6 @@ export function RuntimeCanvas({
   onCoordinationNodePlacementChange,
   onCreateCoordinationNode,
   onCreateAutomation,
-  onOpenProjectPulse,
   onProjectConnect,
   projectAccents,
   projectArchitectures,
@@ -2635,6 +2633,10 @@ export function RuntimeCanvas({
     targetLabel?: string
     top: number
   } | null>(null)
+  const [mapActionsOpen, setMapActionsOpen] = useState(false)
+  const mapActionsRef = useRef<HTMLDivElement>(null)
+  const mapActionsTriggerRef = useRef<HTMLButtonElement>(null)
+  const arrangeSpacesRef = useRef<HTMLButtonElement>(null)
   const [nodes, setNodes, onNodesChange] = useNodesState<RuntimeNode>([])
   const [allocationTargetId, setAllocationTargetId] = useState<string | null>(
     null,
@@ -2695,6 +2697,36 @@ export function RuntimeCanvas({
     },
     [visualMode],
   )
+  useEffect(() => {
+    if (!mapActionsOpen) return
+    const frame = window.requestAnimationFrame(() =>
+      arrangeSpacesRef.current?.focus(),
+    )
+    const close = () => {
+      setMapActionsOpen(false)
+      window.requestAnimationFrame(() => mapActionsTriggerRef.current?.focus())
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      close()
+    }
+    const onPointerDown = (event: PointerEvent) => {
+      if (
+        event.target instanceof window.Node &&
+        !mapActionsRef.current?.contains(event.target)
+      ) {
+        close()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('pointerdown', onPointerDown)
+    return () => {
+      window.cancelAnimationFrame(frame)
+      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('pointerdown', onPointerDown)
+    }
+  }, [mapActionsOpen])
   const handleSelectionChange = useCallback(
     ({ nodes: selectedNodes }: { nodes: RuntimeNode[] }) => {
       if (selectedNodes.length > 0) {
@@ -3966,29 +3998,63 @@ export function RuntimeCanvas({
           />
         </ViewportPortal>
       ) : null}
-      <Panel className="canvas-tools-panel" position="top-left">
-        <button
-          aria-label="Project pulse"
-          onClick={(event) => onOpenProjectPulse(event.currentTarget)}
-          title="Open Project pulse"
-          type="button"
-        >
-          <Activity aria-hidden="true" size={15} />
-          <span>Project pulse</span>
-        </button>
-        <button
-          aria-label="Arrange spaces"
-          disabled={
-            !yardOrchestrator ||
-            (projects.length === 0 && coordinationNodes.length === 0)
-          }
-          onClick={arrangeSpaces}
-          title="Arrange project spaces around Yard"
-          type="button"
-        >
-          <Orbit aria-hidden="true" size={15} />
-          <span>Arrange spaces</span>
-        </button>
+      <Panel className="map-actions-panel" position="top-right">
+        <div className="map-actions" ref={mapActionsRef}>
+          <button
+            aria-controls="map-actions-menu"
+            aria-expanded={mapActionsOpen}
+            aria-haspopup="menu"
+            aria-label="Map actions"
+            onClick={() => setMapActionsOpen((open) => !open)}
+            ref={mapActionsTriggerRef}
+            title="Map actions"
+            type="button"
+          >
+            <Ellipsis aria-hidden="true" size={17} />
+          </button>
+          {mapActionsOpen ? (
+            <div
+              aria-label="Map actions"
+              className="map-actions__menu"
+              id="map-actions-menu"
+              role="menu"
+            >
+              <button
+                aria-disabled={
+                  !yardOrchestrator ||
+                  (projects.length === 0 && coordinationNodes.length === 0)
+                }
+                onClick={() => {
+                  if (
+                    !yardOrchestrator ||
+                    (projects.length === 0 &&
+                      coordinationNodes.length === 0)
+                  ) {
+                    return
+                  }
+                  arrangeSpaces()
+                  setMapActionsOpen(false)
+                }}
+                ref={arrangeSpacesRef}
+                role="menuitem"
+                type="button"
+              >
+                <Orbit aria-hidden="true" size={15} />
+                <span>
+                  <strong>Arrange spaces</strong>
+                  <small>
+                    {!yardOrchestrator
+                      ? 'Start the Superintendent first'
+                      : projects.length === 0 &&
+                          coordinationNodes.length === 0
+                        ? 'No project spaces to arrange'
+                        : 'Place project spaces around Yard'}
+                  </small>
+                </span>
+              </button>
+            </div>
+          ) : null}
+        </div>
       </Panel>
       {contextMenu ? (
         <div

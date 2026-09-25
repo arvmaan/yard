@@ -6,29 +6,29 @@ import {
   type RefObject,
 } from 'react'
 import {
+  Activity,
   Bot,
   Box,
   Boxes,
   ChevronDown,
   CircleAlert,
   FileCode2,
-  Files,
   FolderPlus,
   LoaderCircle,
   Map as MapIcon,
-  MessageSquareText,
   RefreshCw,
   Settings,
-  Settings2,
-  SquareTerminal,
   Wifi,
   WifiOff,
   Workflow,
   X,
+  Zap,
 } from 'lucide-react'
-import type { AgentWorkspaceMode } from './AgentWorkspaceContext'
 import type { MapVisualMode } from './mapVisualMode'
-import type { RuntimeSession } from './types'
+import type {
+  RuntimeSession,
+  TokenSpendSettings,
+} from './types'
 import { THEME_OPTIONS, type ThemeId } from './theme'
 import { useModalDialog } from './useModalDialog'
 
@@ -39,6 +39,9 @@ type RuntimeHealth = 'degraded' | 'loading' | 'observed' | 'unavailable'
 interface RuntimeHealthPopoverProps {
   busy: boolean
   health: RuntimeHealth
+  herdrInventoryOpen: boolean
+  herdrInventoryTriggerRef: RefObject<HTMLButtonElement | null>
+  onOpenHerdrInventory: () => void
   onRefresh: () => void
   onSessionChange: (session: string) => void
   selectedSession: string
@@ -80,6 +83,9 @@ function RuntimeHealthIcon({
 export function RuntimeHealthPopover({
   busy,
   health,
+  herdrInventoryOpen,
+  herdrInventoryTriggerRef,
+  onOpenHerdrInventory,
   onRefresh,
   onSessionChange,
   selectedSession,
@@ -96,6 +102,11 @@ export function RuntimeHealthPopover({
   useEffect(() => {
     if (!open) return
     const frame = window.requestAnimationFrame(() => selectRef.current?.focus())
+    return () => window.cancelAnimationFrame(frame)
+  }, [open])
+
+  useEffect(() => {
+    if (!open || herdrInventoryOpen) return
     const closeAndRestoreFocus = () => {
       setOpen(false)
       window.requestAnimationFrame(() => triggerRef.current?.focus())
@@ -117,11 +128,10 @@ export function RuntimeHealthPopover({
     window.addEventListener('keydown', handleKeyDown)
     window.addEventListener('pointerdown', handlePointerDown)
     return () => {
-      window.cancelAnimationFrame(frame)
       window.removeEventListener('keydown', handleKeyDown)
       window.removeEventListener('pointerdown', handlePointerDown)
     }
-  }, [open])
+  }, [herdrInventoryOpen, open])
 
   return (
     <div className="runtime-health" ref={containerRef}>
@@ -200,6 +210,17 @@ export function RuntimeHealthPopover({
             />
             <span>{busy ? 'Refreshing state' : 'Refresh state'}</span>
           </button>
+          <button
+            aria-controls="herdr-inventory-workspace"
+            aria-expanded={herdrInventoryOpen}
+            className="runtime-health__refresh"
+            onClick={onOpenHerdrInventory}
+            ref={herdrInventoryTriggerRef}
+            type="button"
+          >
+            <Boxes aria-hidden="true" size={15} />
+            <span>Open Herdr inventory</span>
+          </button>
         </section>
       ) : null}
     </div>
@@ -207,20 +228,17 @@ export function RuntimeHealthPopover({
 }
 
 interface GlobalCommandBarProps extends RuntimeHealthPopoverProps {
-  activeAgentWorkspaceChat: boolean
-  activeAgentWorkspaceTerminal: boolean
-  activeAgentWorkspaceTarget: boolean
-  agentWorkspaceMode: AgentWorkspaceMode | 'map'
-  onAgentWorkspaceModeChange: (
-    mode: AgentWorkspaceMode | 'map',
-  ) => void
-  herdrInventoryOpen: boolean
-  herdrInventoryTriggerRef: RefObject<HTMLButtonElement | null>
+  attentionCount: number
+  automaticCoordinationLabel: string
+  automaticCoordinationEnabledCount: number
   onCreateProject: () => void
-  onOpenHerdrInventory: () => void
+  onHome: () => void
+  onOpenAttention: (trigger: HTMLButtonElement) => void
+  onOpenAutomaticCoordination: () => void
+  onOpenProjectPulse: (trigger: HTMLButtonElement) => void
   onOpenSettings: () => void
-  onResourceViewChange: (view: ResourceView) => void
-  railView: ResourceView
+  onToggleResources: (trigger: HTMLButtonElement) => void
+  projectPulseTriggerRef: RefObject<HTMLButtonElement | null>
   resourceShelfOpen: boolean
   settingsLabel: string
   settingsTriggerRef: RefObject<HTMLButtonElement | null>
@@ -233,22 +251,24 @@ const RESOURCE_ICONS = {
 }
 
 export function GlobalCommandBar({
-  activeAgentWorkspaceChat,
-  activeAgentWorkspaceTerminal,
-  activeAgentWorkspaceTarget,
-  agentWorkspaceMode,
+  attentionCount,
+  automaticCoordinationEnabledCount,
+  automaticCoordinationLabel,
   busy,
   health,
   herdrInventoryOpen,
   herdrInventoryTriggerRef,
-  onAgentWorkspaceModeChange,
   onCreateProject,
+  onHome,
+  onOpenAttention,
+  onOpenAutomaticCoordination,
   onOpenHerdrInventory,
+  onOpenProjectPulse,
   onOpenSettings,
   onRefresh,
-  onResourceViewChange,
   onSessionChange,
-  railView,
+  onToggleResources,
+  projectPulseTriggerRef,
   resourceShelfOpen,
   selectedSession,
   sessions,
@@ -257,62 +277,18 @@ export function GlobalCommandBar({
 }: GlobalCommandBarProps) {
   return (
     <header className="command-bar">
-      <div aria-label="Yard" className="brand">
+      <button
+        aria-label="Yard map"
+        className="brand"
+        onClick={onHome}
+        title="Return to map"
+        type="button"
+      >
         <span className="brand__mark" aria-hidden="true">
           Y
         </span>
         <strong>Yard</strong>
-      </div>
-
-      <div
-        aria-label="Application mode"
-        className="workspace-mode-switcher command-bar__modes"
-        role="tablist"
-      >
-        <button
-          aria-selected={agentWorkspaceMode === 'map'}
-          onClick={() => onAgentWorkspaceModeChange('map')}
-          role="tab"
-          title="Map"
-          type="button"
-        >
-          <MapIcon aria-hidden="true" size={14} />
-          <span>Map</span>
-        </button>
-        <button
-          aria-selected={agentWorkspaceMode === 'chat'}
-          disabled={!activeAgentWorkspaceChat}
-          onClick={() => onAgentWorkspaceModeChange('chat')}
-          role="tab"
-          title="Chat"
-          type="button"
-        >
-          <MessageSquareText aria-hidden="true" size={14} />
-          <span>Chat</span>
-        </button>
-        <button
-          aria-selected={agentWorkspaceMode === 'terminal'}
-          disabled={!activeAgentWorkspaceTerminal}
-          onClick={() => onAgentWorkspaceModeChange('terminal')}
-          role="tab"
-          title="Terminal"
-          type="button"
-        >
-          <SquareTerminal aria-hidden="true" size={14} />
-          <span>Terminal</span>
-        </button>
-        <button
-          aria-selected={agentWorkspaceMode === 'changes'}
-          disabled={!activeAgentWorkspaceTarget}
-          onClick={() => onAgentWorkspaceModeChange('changes')}
-          role="tab"
-          title="Files"
-          type="button"
-        >
-          <Files aria-hidden="true" size={14} />
-          <span>Files</span>
-        </button>
-      </div>
+      </button>
 
       <button
         aria-label="Create project"
@@ -326,57 +302,66 @@ export function GlobalCommandBar({
       </button>
 
       <button
-        aria-controls="herdr-inventory-workspace"
-        aria-expanded={herdrInventoryOpen}
-        aria-pressed={herdrInventoryOpen}
+        aria-controls="resource-shelf"
+        aria-expanded={resourceShelfOpen}
         className="top-command top-command--secondary"
-        onClick={onOpenHerdrInventory}
-        ref={herdrInventoryTriggerRef}
-        title="Live Herdr panes"
+        onClick={(event) => onToggleResources(event.currentTarget)}
+        title="Resources"
         type="button"
       >
         <Boxes aria-hidden="true" size={16} />
-        <span>Herdr</span>
+        <span>Resources</span>
       </button>
 
-      <div
-        aria-label="Observed resources"
-        className="command-bar__resources"
-        role="tablist"
+      {attentionCount > 0 ? (
+        <button
+          aria-label={`${attentionCount} workers need attention`}
+          className="chrome-telltale chrome-telltale--attention"
+          onClick={(event) => onOpenAttention(event.currentTarget)}
+          title={`${attentionCount} workers need attention`}
+          type="button"
+        >
+          <CircleAlert aria-hidden="true" size={15} />
+          <span>{attentionCount}</span>
+        </button>
+      ) : null}
+
+      <button
+        aria-label="Project pulse"
+        className="top-command top-command--secondary project-pulse-trigger"
+        onClick={(event) => onOpenProjectPulse(event.currentTarget)}
+        ref={projectPulseTriggerRef}
+        title="Project pulse"
+        type="button"
       >
-        {(['profiles', 'workers', 'workspaces'] as const).map((view) => {
-          const Icon = RESOURCE_ICONS[view]
-          const label =
-            view === 'profiles'
-              ? 'Profiles'
-              : view === 'workers'
-                ? 'Workers'
-                : 'Workspaces'
-          return (
-            <button
-              aria-controls="resource-shelf"
-              aria-selected={resourceShelfOpen && railView === view}
-              key={view}
-              onClick={() => onResourceViewChange(view)}
-              role="tab"
-              title={label}
-              type="button"
-            >
-              <Icon aria-hidden="true" size={13} />
-              <span>{label}</span>
-            </button>
-          )
-        })}
-      </div>
+        <Activity aria-hidden="true" size={16} />
+        <span>Project pulse</span>
+      </button>
 
       <RuntimeHealthPopover
         busy={busy}
         health={health}
+        herdrInventoryOpen={herdrInventoryOpen}
+        herdrInventoryTriggerRef={herdrInventoryTriggerRef}
+        onOpenHerdrInventory={onOpenHerdrInventory}
         onRefresh={onRefresh}
         onSessionChange={onSessionChange}
         selectedSession={selectedSession}
         sessions={sessions}
       />
+
+      {automaticCoordinationEnabledCount > 0 ? (
+        <button
+          aria-label={automaticCoordinationLabel}
+          className="chrome-telltale chrome-telltale--automatic"
+          onClick={onOpenAutomaticCoordination}
+          title={automaticCoordinationLabel}
+          type="button"
+        >
+          <Zap aria-hidden="true" size={14} />
+          <span>Auto {automaticCoordinationEnabledCount}</span>
+        </button>
+      ) : null}
 
       <button
         aria-label={settingsLabel}
@@ -392,11 +377,86 @@ export function GlobalCommandBar({
   )
 }
 
+export function ResourceShelfTabs({
+  counts,
+  onChange,
+  value,
+}: {
+  counts: Record<ResourceView, number>
+  onChange: (view: ResourceView) => void
+  value: ResourceView
+}) {
+  return (
+    <nav
+      aria-label="Resources"
+      className="resource-shelf__tabs"
+      onKeyDown={(event) => {
+        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+          return
+        }
+        event.preventDefault()
+        const tabs = Array.from(
+          event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
+        )
+        const current = tabs.indexOf(
+          document.activeElement as HTMLButtonElement,
+        )
+        const next =
+          event.key === 'Home'
+            ? 0
+            : event.key === 'End'
+              ? tabs.length - 1
+              : (current +
+                  (event.key === 'ArrowRight' ? 1 : -1) +
+                  tabs.length) %
+                tabs.length
+        tabs[next]?.focus()
+      }}
+      role="tablist"
+    >
+      {(['profiles', 'workers', 'workspaces'] as const).map((view) => {
+        const Icon = RESOURCE_ICONS[view]
+        const label =
+          view === 'profiles'
+            ? 'Profiles'
+            : view === 'workers'
+              ? 'Workers'
+              : 'Workspaces'
+        return (
+          <button
+            aria-selected={value === view}
+            key={view}
+            onClick={() => onChange(view)}
+            role="tab"
+            tabIndex={value === view ? 0 : -1}
+            type="button"
+          >
+            <Icon aria-hidden="true" size={13} />
+            <span>{label}</span>
+            <small>{counts[view]}</small>
+          </button>
+        )
+      })}
+    </nav>
+  )
+}
+
+export interface AutomaticCoordinationSelection {
+  projectOrchestrators: boolean
+  scheduled: boolean
+  superintendent: boolean
+}
+
 interface SettingsDialogProps {
-  automaticCoordinationEnabledCount: number | null
+  automaticCoordinationBusy: boolean
+  automaticCoordinationError: string | null
+  automaticCoordinationSettings: TokenSpendSettings | null
+  initialFocus: 'appearance' | 'automatic'
   mapVisualMode: MapVisualMode
   onClose: () => void
-  onOpenAutomaticCoordination: () => void
+  onSaveAutomaticCoordination: (
+    selection: AutomaticCoordinationSelection,
+  ) => void
   onOpenOrchestratorWorkflow: () => void
   onMapVisualModeChange: (mode: MapVisualMode) => void
   onThemeChange: (theme: ThemeId) => void
@@ -406,10 +466,13 @@ interface SettingsDialogProps {
 }
 
 export function SettingsDialog({
-  automaticCoordinationEnabledCount,
+  automaticCoordinationBusy,
+  automaticCoordinationError,
+  automaticCoordinationSettings,
+  initialFocus,
   mapVisualMode,
   onClose,
-  onOpenAutomaticCoordination,
+  onSaveAutomaticCoordination,
   onOpenOrchestratorWorkflow,
   onMapVisualModeChange,
   onThemeChange,
@@ -419,10 +482,42 @@ export function SettingsDialog({
 }: SettingsDialogProps) {
   const titleId = useId()
   const dialogRef = useRef<HTMLElement>(null)
-  const initialFocusRef = useRef<HTMLSelectElement>(null)
+  const appearanceFocusRef = useRef<HTMLSelectElement>(null)
+  const automaticFocusRef = useRef<HTMLInputElement>(null)
+  const [superintendent, setSuperintendent] = useState(
+    automaticCoordinationSettings?.superintendent_auto_requests_project_summaries ??
+      false,
+  )
+  const [projectOrchestrators, setProjectOrchestrators] = useState(
+    automaticCoordinationSettings?.project_orchestrators_auto_request_worker_summaries ??
+      false,
+  )
+  const [scheduled, setScheduled] = useState(
+    automaticCoordinationSettings?.scheduled_automatic_summaries ?? false,
+  )
+  useEffect(() => {
+    if (!automaticCoordinationSettings) return
+    setSuperintendent(
+      automaticCoordinationSettings.superintendent_auto_requests_project_summaries,
+    )
+    setProjectOrchestrators(
+      automaticCoordinationSettings.project_orchestrators_auto_request_worker_summaries,
+    )
+    setScheduled(automaticCoordinationSettings.scheduled_automatic_summaries)
+  }, [automaticCoordinationSettings])
+  const automaticDirty =
+    automaticCoordinationSettings !== null &&
+    (superintendent !==
+      automaticCoordinationSettings.superintendent_auto_requests_project_summaries ||
+      projectOrchestrators !==
+        automaticCoordinationSettings.project_orchestrators_auto_request_worker_summaries ||
+      scheduled !==
+        automaticCoordinationSettings.scheduled_automatic_summaries)
   const requestClose = useModalDialog({
+    canClose: !automaticCoordinationBusy,
     dialogRef,
-    initialFocusRef,
+    initialFocusRef:
+      initialFocus === 'automatic' ? automaticFocusRef : appearanceFocusRef,
     onClose,
     returnFocus,
   })
@@ -463,7 +558,7 @@ export function SettingsDialog({
                 aria-label="Theme"
                 className="settings-theme-select"
                 onChange={(event) => onThemeChange(event.target.value)}
-                ref={initialFocusRef}
+                ref={appearanceFocusRef}
                 value={theme}
               >
                 {THEME_OPTIONS.map((option) => (
@@ -504,30 +599,90 @@ export function SettingsDialog({
               </div>
             </div>
           </section>
-          <section aria-labelledby={`${titleId}-coordination`}>
-            <h3 id={`${titleId}-coordination`}>Coordination</h3>
-            <div className="settings-row">
-              <div>
-                <strong>Automatic coordination</strong>
-                <small>
-                  {automaticCoordinationEnabledCount === null
-                    ? 'Durable settings unavailable'
-                    : automaticCoordinationEnabledCount === 0
-                      ? 'Off by default; automatic requests may spend tokens'
-                      : `${automaticCoordinationEnabledCount} of 3 automatic behaviors enabled`}
-                </small>
-              </div>
+          <section aria-labelledby={`${titleId}-automatic`}>
+            <h3 id={`${titleId}-automatic`}>Automatic coordination</h3>
+            <p className="settings-section-copy">
+              Automatic requests may use provider tokens. Manual requests and
+              Run now remain available when these are off.
+            </p>
+            <label className="settings-switch-row">
+              <span>
+                <strong>Request project summaries automatically</strong>
+                <small>Superintendent to project orchestrators</small>
+              </span>
+              <input
+                checked={superintendent}
+                disabled={!automaticCoordinationSettings}
+                onChange={(event) => setSuperintendent(event.target.checked)}
+                ref={automaticFocusRef}
+                role="switch"
+                type="checkbox"
+              />
+            </label>
+            <label className="settings-switch-row">
+              <span>
+                <strong>Request worker summaries automatically</strong>
+                <small>Project orchestrators to workers</small>
+              </span>
+              <input
+                checked={projectOrchestrators}
+                disabled={!automaticCoordinationSettings}
+                onChange={(event) =>
+                  setProjectOrchestrators(event.target.checked)
+                }
+                role="switch"
+                type="checkbox"
+              />
+            </label>
+            <label className="settings-switch-row">
+              <span>
+                <strong>Run scheduled summaries automatically</strong>
+                <small>Unrelated automations and Run now stay available</small>
+              </span>
+              <input
+                checked={scheduled}
+                disabled={!automaticCoordinationSettings}
+                onChange={(event) => setScheduled(event.target.checked)}
+                role="switch"
+                type="checkbox"
+              />
+            </label>
+            <div className="settings-save-row">
+              <small>
+                {automaticCoordinationSettings
+                  ? automaticDirty
+                    ? 'Unsaved automatic coordination changes'
+                    : 'Durable settings are current'
+                  : 'Durable settings unavailable'}
+              </small>
               <button
-                aria-label="Automatic token use settings"
-                className="secondary-button settings-action"
-                disabled={automaticCoordinationEnabledCount === null}
-                onClick={onOpenAutomaticCoordination}
+                className="command-button"
+                disabled={
+                  automaticCoordinationBusy ||
+                  !automaticCoordinationSettings ||
+                  !automaticDirty
+                }
+                onClick={() =>
+                  onSaveAutomaticCoordination({
+                    projectOrchestrators,
+                    scheduled,
+                    superintendent,
+                  })
+                }
                 type="button"
               >
-                <Settings2 aria-hidden="true" size={14} />
-                Configure
+                {automaticCoordinationBusy ? 'Saving' : 'Save automatic settings'}
               </button>
             </div>
+            {automaticCoordinationError ? (
+              <p className="dialog-error" role="alert">
+                <CircleAlert aria-hidden="true" size={15} />
+                <span>{automaticCoordinationError}</span>
+              </p>
+            ) : null}
+          </section>
+          <section aria-labelledby={`${titleId}-coordination`}>
+            <h3 id={`${titleId}-coordination`}>Coordination</h3>
             <div className="settings-row">
               <div>
                 <strong>Orchestrator workflow</strong>

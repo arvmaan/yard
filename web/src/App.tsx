@@ -104,7 +104,9 @@ import {
 } from './RuntimeCanvas'
 import {
   GlobalCommandBar,
+  ResourceShelfTabs,
   SettingsDialog,
+  type ResourceView,
 } from './AppChrome'
 import {
   AgentGroupChat,
@@ -151,7 +153,6 @@ import {
   type AutomationDetails,
 } from './AutomationDialog'
 import { AutomationInspector } from './AutomationInspector'
-import { TokenSpendSettingsDialog } from './TokenSpendSettingsDialog'
 import { OrchestratorWorkflowProfileDialog } from './OrchestratorWorkflowProfileDialog'
 import {
   parseStatusReport,
@@ -259,7 +260,6 @@ const ArtifactInspector = lazy(() =>
 )
 
 type Filter = 'current' | 'available' | 'allocated' | 'attention' | 'history'
-type RailView = 'profiles' | 'workspaces' | 'workers'
 type ProjectCreationDetails =
   | {
       mode: 'existing'
@@ -2425,6 +2425,9 @@ function App() {
   const [mapVisualMode, setMapVisualMode] =
     useState<MapVisualMode>(readMapVisualMode)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsInitialFocus, setSettingsInitialFocus] = useState<
+    'appearance' | 'automatic'
+  >('appearance')
   const [herdrInventoryOpen, setHerdrInventoryOpen] = useState(false)
   const [sessions, setSessions] = useState<RuntimeSession[]>([])
   const [selectedSession, setSelectedSession] = useState('')
@@ -2460,7 +2463,6 @@ function App() {
   const [automations, setAutomations] = useState<Automation[]>([])
   const [tokenSpendSettings, setTokenSpendSettings] =
     useState<TokenSpendSettings | null>(null)
-  const [tokenSpendSettingsOpen, setTokenSpendSettingsOpen] = useState(false)
   const [tokenSpendSettingsBusy, setTokenSpendSettingsBusy] = useState(false)
   const [tokenSpendSettingsError, setTokenSpendSettingsError] = useState<
     string | null
@@ -2491,8 +2493,10 @@ function App() {
     useState<ProjectStatusReports>({})
   const [projectPulseOpen, setProjectPulseOpen] = useState(false)
   const [filter, setFilter] = useState<Filter>('current')
-  const [railView, setRailView] = useState<RailView>('profiles')
-  const [resourceShelfOpen, setResourceShelfOpen] = useState(true)
+  const [railView, setRailView] = useState<ResourceView>('profiles')
+  const [resourceShelfOpen, setResourceShelfOpen] = useState(
+    () => !window.matchMedia('(max-width: 760px)').matches,
+  )
   const [selection, setSelection] = useState<CanvasSelection>(null)
   const [agentWorkspaceMode, setAgentWorkspaceMode] =
     useState<AgentWorkspaceView>('map')
@@ -2634,6 +2638,8 @@ function App() {
   )
   const projectPulseTrigger = useRef<HTMLButtonElement | null>(null)
   const herdrInventoryTrigger = useRef<HTMLButtonElement | null>(null)
+  const resourceShelfTrigger = useRef<HTMLButtonElement | null>(null)
+  const resourceShelf = useRef<HTMLElement | null>(null)
   const settingsTrigger = useRef<HTMLButtonElement | null>(null)
 
 
@@ -2644,6 +2650,18 @@ function App() {
   useEffect(() => {
     writeMapVisualMode(mapVisualMode)
   }, [mapVisualMode])
+
+  useEffect(() => {
+    if (!resourceShelfOpen || !resourceShelfTrigger.current) return
+    const frame = window.requestAnimationFrame(() =>
+      resourceShelf.current
+        ?.querySelector<HTMLButtonElement>(
+          '.resource-shelf__tabs [aria-selected="true"]',
+        )
+        ?.focus(),
+    )
+    return () => window.cancelAnimationFrame(frame)
+  }, [resourceShelfOpen])
 
   useEffect(() => {
     projectsRef.current = projects
@@ -3389,6 +3407,26 @@ function App() {
     () => workerCandidates.filter((candidate) => matchesFilter(candidate, filter)),
     [filter, workerCandidates],
   )
+  const attentionCount = useMemo(
+    () =>
+      workerCandidates.filter((candidate) =>
+        matchesFilter(candidate, 'attention'),
+      ).length,
+    [workerCandidates],
+  )
+  const automaticCoordination = tokenSpendSettings
+    ? [
+        tokenSpendSettings.superintendent_auto_requests_project_summaries
+          ? 'project summaries'
+          : null,
+        tokenSpendSettings.project_orchestrators_auto_request_worker_summaries
+          ? 'worker summaries'
+          : null,
+        tokenSpendSettings.scheduled_automatic_summaries
+          ? 'scheduled summaries'
+          : null,
+      ].filter((label): label is string => label !== null)
+    : []
   const visibleWorkers = inventory?.workers ?? []
   const allocationPayloadByRuntimeId = useMemo(
     () =>
@@ -4012,7 +4050,6 @@ function App() {
           scheduled_automatic_summaries: scheduled,
         })
         setTokenSpendSettings(updated)
-        setTokenSpendSettingsOpen(false)
       } catch (caught) {
         setTokenSpendSettingsError(
           caught instanceof Error
@@ -5938,15 +5975,6 @@ function App() {
     },
     [],
   )
-  const toggleResourceShelf = useCallback(
-    (view: RailView) => {
-      setRailView(view)
-      setResourceShelfOpen(
-        (current) => view !== railView || !current,
-      )
-    },
-    [railView],
-  )
   const handleCanvasSelectionChange = useCallback(
     (nextSelection: CanvasSelection) => {
       setWorkspaceProjectOpen(false)
@@ -5973,32 +6001,18 @@ function App() {
         data-shelf-open={resourceShelfOpen && !herdrInventoryOpen}
       >
         <GlobalCommandBar
-          activeAgentWorkspaceChat={Boolean(
-            activeAgentWorkspaceTarget?.chatAvailable,
-          )}
-          activeAgentWorkspaceTerminal={Boolean(
-            activeAgentWorkspaceTarget?.interactive,
-          )}
-          activeAgentWorkspaceTarget={Boolean(activeAgentWorkspaceTarget)}
-          agentWorkspaceMode={agentWorkspaceMode}
+          attentionCount={attentionCount}
+          automaticCoordinationEnabledCount={automaticCoordination.length}
+          automaticCoordinationLabel={`Automatic coordination enabled: ${automaticCoordination.join(
+            ', ',
+          )}`}
           busy={runtimeLoading || projectLoading}
           health={runtimeHealth}
           herdrInventoryOpen={herdrInventoryOpen}
           herdrInventoryTriggerRef={herdrInventoryTrigger}
-          onAgentWorkspaceModeChange={(mode) => {
-            if (
-              (mode === 'chat' &&
-                !activeAgentWorkspaceTarget?.chatAvailable) ||
-              (mode === 'terminal' &&
-                !activeAgentWorkspaceTarget?.interactive)
-            ) {
-              return
-            }
-            if (mode === 'terminal') {
-              setTerminalPresentation(DEFAULT_TERMINAL_PRESENTATION)
-            }
+          onHome={() => {
             setHerdrInventoryOpen(false)
-            setAgentWorkspaceMode(mode)
+            setAgentWorkspaceMode('map')
           }}
           onCreateProject={() => {
             setHerdrInventoryOpen(false)
@@ -6008,20 +6022,43 @@ function App() {
           onOpenHerdrInventory={() =>
             setHerdrInventoryOpen((open) => !open)
           }
-          onOpenSettings={() => setSettingsOpen(true)}
-          onRefresh={() => void refresh()}
-          onResourceViewChange={(view) => {
+          onOpenAttention={(trigger) => {
+            resourceShelfTrigger.current = trigger
             setHerdrInventoryOpen(false)
-            toggleResourceShelf(view)
+            setRailView('workers')
+            setFilter('attention')
+            setResourceShelfOpen(true)
+          }}
+          onOpenAutomaticCoordination={() => {
+            setSettingsInitialFocus('automatic')
+            setSettingsOpen(true)
+          }}
+          onOpenProjectPulse={(trigger) => {
+            projectPulseTrigger.current = trigger
+            setProjectPulseOpen(true)
+          }}
+          onOpenSettings={() => {
+            setSettingsInitialFocus('appearance')
+            setSettingsOpen(true)
+          }}
+          onRefresh={() => void refresh()}
+          onToggleResources={(trigger) => {
+            resourceShelfTrigger.current = trigger
+            setHerdrInventoryOpen(false)
+            setResourceShelfOpen((open) => !open)
           }}
           onSessionChange={setSelectedSession}
-          railView={railView}
+          projectPulseTriggerRef={projectPulseTrigger}
           resourceShelfOpen={resourceShelfOpen}
           selectedSession={selectedSession}
           sessions={sessions}
           settingsLabel={`Settings, ${themeDefinition(theme).label} theme, ${
             mapVisualMode === 'depth' ? '2.5D' : '2D'
-          } map`}
+          } map, ${
+            automaticCoordination.length === 0
+              ? 'automatic coordination off'
+              : `${automaticCoordination.length} automatic coordination behaviors enabled`
+          }`}
           settingsTriggerRef={settingsTrigger}
         />
 
@@ -6030,11 +6067,34 @@ function App() {
             aria-label={`${railView} shelf`}
             className="resource-shelf"
             id="resource-shelf"
+            onKeyDown={(event) => {
+              if (event.key !== 'Escape') return
+              event.preventDefault()
+              setResourceShelfOpen(false)
+              window.requestAnimationFrame(() =>
+                resourceShelfTrigger.current?.focus(),
+              )
+            }}
+            ref={resourceShelf}
           >
+          <ResourceShelfTabs
+            counts={{
+              profiles: profiles.length,
+              workers: workerCandidates.length,
+              workspaces: availableWorkspaces.length,
+            }}
+            onChange={setRailView}
+            value={railView}
+          />
           <button
             aria-label="Collapse resource shelf"
             className="icon-button resource-shelf__collapse"
-            onClick={() => setResourceShelfOpen(false)}
+            onClick={() => {
+              setResourceShelfOpen(false)
+              window.requestAnimationFrame(() =>
+                resourceShelfTrigger.current?.focus(),
+              )
+            }}
             title="Collapse resource shelf"
             type="button"
           >
@@ -6059,17 +6119,6 @@ function App() {
               </button>
             </div>
             <div className="resource-list profile-list">
-              <div className="profile-list__mobile-actions">
-                <button
-                  aria-label="Create worker profile"
-                  className="icon-button"
-                  onClick={() => setProfileEditor(null)}
-                  title="New profile"
-                  type="button"
-                >
-                  <Plus aria-hidden="true" size={16} />
-                </button>
-              </div>
               {profiles.map((profile) => (
                 <button
                   className="profile-row"
@@ -6105,14 +6154,6 @@ function App() {
               {!projectLoading && profiles.length === 0 ? (
                 <div className="empty-state profile-empty">
                   <p>No worker profiles.</p>
-                  <button
-                    className="secondary-button"
-                    onClick={() => setProfileEditor(null)}
-                    type="button"
-                  >
-                    <Plus aria-hidden="true" size={15} />
-                    New profile
-                  </button>
                 </div>
               ) : null}
             </div>
@@ -6302,10 +6343,6 @@ function App() {
           onCreateAutomation={(placement, initialScope) => {
             setAutomationError(null)
             setAutomationCreation({ initialScope, placement })
-          }}
-          onOpenProjectPulse={(trigger) => {
-            projectPulseTrigger.current = trigger
-            setProjectPulseOpen(true)
           }}
           onProjectConnect={(sourceProjectId, targetProjectId) =>
             void connectProjects(sourceProjectId, targetProjectId)
@@ -6615,30 +6652,21 @@ function App() {
       </div>
       {settingsOpen ? (
         <SettingsDialog
-          automaticCoordinationEnabledCount={
-            tokenSpendSettings
-              ? Number(
-                  tokenSpendSettings.superintendent_auto_requests_project_summaries,
-                ) +
-                Number(
-                  tokenSpendSettings.project_orchestrators_auto_request_worker_summaries,
-                ) +
-                Number(tokenSpendSettings.scheduled_automatic_summaries)
-              : null
-          }
+          automaticCoordinationBusy={tokenSpendSettingsBusy}
+          automaticCoordinationError={tokenSpendSettingsError}
+          automaticCoordinationSettings={tokenSpendSettings}
+          initialFocus={settingsInitialFocus}
           mapVisualMode={mapVisualMode}
           onClose={() => setSettingsOpen(false)}
           onMapVisualModeChange={setMapVisualMode}
-          onOpenAutomaticCoordination={() => {
-            setSettingsOpen(false)
-            setTokenSpendSettingsError(null)
-            setTokenSpendSettingsOpen(true)
-          }}
           onOpenOrchestratorWorkflow={() => {
             setSettingsOpen(false)
             setOrchestratorWorkflowError(null)
             setOrchestratorWorkflowOpen(true)
           }}
+          onSaveAutomaticCoordination={(selection) =>
+            void saveTokenSpendSettings(selection)
+          }
           onThemeChange={setTheme}
           returnFocus={settingsTrigger.current}
           theme={theme}
@@ -6742,21 +6770,6 @@ function App() {
           onCreate={(details) => void createScheduledAutomation(details)}
           placement={automationCreation.placement}
           projects={projects}
-        />
-      ) : null}
-      {tokenSpendSettingsOpen && tokenSpendSettings ? (
-        <TokenSpendSettingsDialog
-          busy={tokenSpendSettingsBusy}
-          error={tokenSpendSettingsError}
-          key={tokenSpendSettings.version}
-          onClose={() => {
-            if (tokenSpendSettingsBusy) return
-            setTokenSpendSettingsError(null)
-            setTokenSpendSettingsOpen(false)
-          }}
-          onSave={(selection) => void saveTokenSpendSettings(selection)}
-          returnFocus={settingsTrigger.current}
-          settings={tokenSpendSettings}
         />
       ) : null}
       {orchestratorWorkflowOpen && orchestratorWorkflowProfile ? (

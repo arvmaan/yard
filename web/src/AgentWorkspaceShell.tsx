@@ -15,12 +15,15 @@ import {
   Folder,
   GitBranch,
   Info,
+  Map as MapIcon,
+  MessageSquareText,
   Network,
   PanelLeftClose,
   RefreshCw,
   Search,
   Server,
   SquareTerminal,
+  Files,
   X,
 } from 'lucide-react'
 import { AgentChatWorkspace } from './AgentChatWorkspace'
@@ -398,9 +401,6 @@ export function AgentWorkspaceShell({
     0,
   )
   const otherSessionCount = sessionTargets.elsewhereCount
-  const closeLabel =
-    mode === 'chat' ? 'chat' : mode === 'changes' ? 'files' : 'terminal'
-
   return (
     <section
       aria-label={activeTarget.label}
@@ -409,7 +409,7 @@ export function AgentWorkspaceShell({
       data-mode={mode}
       data-presentation={terminalVisible ? presentation : undefined}
       hidden={mode === 'map'}
-      role="dialog"
+      role="region"
     >
       {mode !== 'map' ? (
         <aside
@@ -758,6 +758,70 @@ export function AgentWorkspaceShell({
 
       {mode !== 'map' ? (
         <header className="agent-workspace-toolbar">
+          <div
+            aria-label="Agent workspace surface"
+            className="workspace-mode-switcher agent-workspace-surfaces"
+            onKeyDown={(event) => {
+              if (
+                !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)
+              ) {
+                return
+              }
+              event.preventDefault()
+              const tabs = Array.from(
+                event.currentTarget.querySelectorAll<HTMLButtonElement>(
+                  '[role="tab"]:not(:disabled)',
+                ),
+              )
+              const current = tabs.indexOf(
+                document.activeElement as HTMLButtonElement,
+              )
+              const next =
+                event.key === 'Home'
+                  ? 0
+                  : event.key === 'End'
+                    ? tabs.length - 1
+                    : (current +
+                        (event.key === 'ArrowRight' ? 1 : -1) +
+                        tabs.length) %
+                      tabs.length
+              tabs[next]?.focus()
+            }}
+            role="tablist"
+          >
+            <button
+              aria-selected={mode === 'chat'}
+              disabled={!activeTarget.chatAvailable}
+              onClick={() => onModeChange('chat')}
+              role="tab"
+              tabIndex={mode === 'chat' ? 0 : -1}
+              type="button"
+            >
+              <MessageSquareText aria-hidden="true" size={14} />
+              <span>Chat</span>
+            </button>
+            <button
+              aria-selected={mode === 'terminal'}
+              disabled={!activeTarget.interactive}
+              onClick={() => onModeChange('terminal')}
+              role="tab"
+              tabIndex={mode === 'terminal' ? 0 : -1}
+              type="button"
+            >
+              <SquareTerminal aria-hidden="true" size={14} />
+              <span>Terminal</span>
+            </button>
+            <button
+              aria-selected={mode === 'changes'}
+              onClick={() => onModeChange('changes')}
+              role="tab"
+              tabIndex={mode === 'changes' ? 0 : -1}
+              type="button"
+            >
+              <Files aria-hidden="true" size={14} />
+              <span>Files</span>
+            </button>
+          </div>
           {terminalVisible ? (
             <div
               aria-label="Terminal presentation"
@@ -805,13 +869,13 @@ export function AgentWorkspaceShell({
             <strong>{activeTarget.label}</strong>
             <small>{activeTarget.terminalId}</small>
             <button
-              aria-label={`Close ${closeLabel}`}
+              aria-label="Back to Map"
               className="icon-button"
               onClick={closeWorkspace}
-              title={`Close ${closeLabel}`}
+              title="Back to Map"
               type="button"
             >
-              <X aria-hidden="true" size={16} />
+              <MapIcon aria-hidden="true" size={16} />
             </button>
           </div>
         </header>
@@ -825,7 +889,7 @@ export function AgentWorkspaceShell({
           label={activeTarget.label}
           onCoordinationChange={onCoordinationChange}
           onCoordinationNodeChange={onCoordinationNodeChange}
-          onClose={() => onModeChange('map')}
+          onClose={closeWorkspace}
           open={chatVisible}
           projects={chatProjects}
           returnFocus={null}

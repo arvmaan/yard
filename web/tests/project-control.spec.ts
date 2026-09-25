@@ -4144,6 +4144,27 @@ async function openRuntimeHealth(page: Page) {
   return popover
 }
 
+async function openHerdrInventory(page: Page) {
+  const health = await openRuntimeHealth(page)
+  const trigger = page.locator(
+    'button[aria-controls="herdr-inventory-workspace"]',
+  )
+  await health.getByRole('button', { name: 'Open Herdr inventory' }).click()
+  await expect(
+    page.getByRole('dialog', { name: 'Herdr inventory' }),
+  ).toBeVisible()
+  return trigger
+}
+
+async function openMapActions(page: Page) {
+  const menu = page.getByRole('menu', { name: 'Map actions' })
+  if (!(await menu.isVisible().catch(() => false))) {
+    await page.getByRole('button', { name: 'Map actions' }).click()
+  }
+  await expect(menu).toBeVisible()
+  return menu
+}
+
 async function selectRuntimeSession(page: Page, session: string) {
   const popover = await openRuntimeHealth(page)
   await popover.getByLabel('Herdr session').selectOption(session)
@@ -4514,21 +4535,22 @@ test('keeps the canvas visible under a compact collapsible resource shelf', asyn
     name: 'Create project',
     exact: true,
   })
-  const resourceTabs = page.getByRole('tablist', {
-    name: 'Observed resources',
+  const resources = page.getByRole('button', {
+    name: 'Resources',
+    exact: true,
   })
 
-  const [commandBounds, shelfBounds, canvasBounds, createBounds, tabsBounds] =
+  const [commandBounds, shelfBounds, canvasBounds, createBounds, resourcesBounds] =
     await Promise.all([
       commandBar.boundingBox(),
       shelf.boundingBox(),
       canvas.boundingBox(),
       createProject.boundingBox(),
-      resourceTabs.boundingBox(),
+      resources.boundingBox(),
     ])
   expect(commandBounds?.height).toBeLessThanOrEqual(48)
   expect(shelfBounds?.height).toBeLessThanOrEqual(96)
-  expect(createBounds?.x ?? Infinity).toBeLessThan(tabsBounds?.x ?? 0)
+  expect(createBounds?.x ?? Infinity).toBeLessThan(resourcesBounds?.x ?? 0)
   expect(canvasBounds?.height ?? 0).toBeGreaterThan(600)
 
   await page
@@ -4540,8 +4562,57 @@ test('keeps the canvas visible under a compact collapsible resource shelf', asyn
     .poll(async () => (await canvas.boundingBox())?.height ?? 0)
     .toBeGreaterThan(canvasBounds?.height ?? 0)
 
-  await page.getByRole('tab', { name: 'Profiles' }).click()
+  await resources.focus()
+  await resources.press('Enter')
   await expect(shelf).toBeVisible()
+  await expect(page.getByRole('tab', { name: 'Profiles' })).toBeFocused()
+  await page.keyboard.press('ArrowRight')
+  await expect(page.getByRole('tab', { name: 'Workers' })).toBeFocused()
+  await page.keyboard.press('Enter')
+  await expect(page.getByLabel('Filter workers')).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(shelf).toHaveCount(0)
+  await expect(resources).toBeFocused()
+})
+
+test('shows only actionable conditional chrome and routes attention to workers', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const candidates = state.workerCandidates
+  state.workerCandidates = []
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  const commandBar = page.locator('.command-bar')
+  await expect(commandBar.getByRole('tab')).toHaveCount(0)
+  await expect(
+    commandBar.getByRole('button', { name: /workers need attention/ }),
+  ).toHaveCount(0)
+  await expect(
+    commandBar.getByRole('button', {
+      name: /Automatic coordination enabled/,
+    }),
+  ).toHaveCount(0)
+
+  state.workerCandidates = candidates
+  await page.reload()
+  const attention = commandBar.getByRole('button', {
+    name: /workers need attention/,
+  })
+  await expect(attention).toBeVisible()
+  await attention.click()
+  await expect(page.getByRole('tab', { name: 'Workers' })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  )
+  await expect(
+    page.getByLabel('Filter workers').getByRole('button', {
+      name: 'Attention',
+    }),
+  ).toHaveAttribute('aria-pressed', 'true')
+  await page.keyboard.press('Escape')
+  await expect(attention).toBeFocused()
 })
 
 test('provides one-click runtime health and persistent appearance settings', async ({
@@ -4578,7 +4649,7 @@ test('provides one-click runtime health and persistent appearance settings', asy
     'Runtime health: alpha, Herdr observed',
   )
   await expect(settingsTrigger).toHaveAccessibleName(
-    'Settings, Yard Light theme, 2.5D map',
+    'Settings, Yard Light theme, 2.5D map, automatic coordination off',
   )
   await expect(page.locator('.command-bar__metrics')).toHaveCount(0)
   await expect(page.locator('.canvas-stage__label')).toHaveCount(0)
@@ -4670,6 +4741,8 @@ test('keeps Slice 1 chrome visible and motion-safe at mobile widths', async ({
       name: /Runtime health: alpha, Herdr observed/,
     })
     await expect(healthTrigger).toBeVisible()
+    await expect(page.locator('.resource-shelf')).toHaveCount(0)
+    await expect(page.locator('.react-flow__minimap')).toBeHidden()
     expect((await commandBar.boundingBox())?.height).toBeLessThanOrEqual(46)
     const overflow = await page.evaluate(() => {
       const bar = document.querySelector<HTMLElement>('.command-bar')
@@ -5923,6 +5996,7 @@ test('shows selected worker details on mobile', async ({ page }, testInfo) => {
   await page.goto('/')
 
   await expect(page.locator('.project-region').first()).toBeVisible()
+  await page.getByRole('button', { name: 'Resources' }).click()
   await page.getByRole('tab', { name: 'Workers' }).click()
   await page.locator('.worker-row').first().click()
   await expect(page.locator('.inspector.has-selection')).toBeVisible()
@@ -5946,6 +6020,7 @@ test('keeps profile creation available on mobile', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 })
   await page.goto('/')
 
+  await page.getByRole('button', { name: 'Resources' }).click()
   await expect(page.locator('.profile-row')).toHaveCount(1)
   await page.getByRole('button', { name: 'Create worker profile' }).click()
 
@@ -6945,7 +7020,7 @@ test('shows the latest answer on the full chat surface and copies it', async ({
     .toBe(0)
   expect(state.terminalOutputRequests.length).toBeGreaterThanOrEqual(2)
 
-  await page.getByRole('button', { name: 'Close chat' }).click()
+  await page.getByRole('button', { name: 'Back to Map' }).click()
   await page
     .getByRole('button', { name: 'Open chat', exact: true })
     .click()
@@ -7412,7 +7487,7 @@ test('connects the assignment terminal and relays frames, input, resize, and rel
     },
   ])
   await expect(
-    page.getByRole('dialog', { name: 'Implementer' }),
+    page.getByRole('region', { name: 'Implementer' }),
   ).toBeVisible()
   const terminalViewport = terminal.locator('.xterm-scrollable-element')
   const historyScrollHeight = await terminalViewport.evaluate(
@@ -7576,7 +7651,7 @@ test('connects the assignment terminal and relays frames, input, resize, and rel
     )
     .toBeGreaterThan(initialResizeCount)
 
-  await page.getByRole('button', { name: 'Close terminal' }).click()
+  await page.getByRole('button', { name: 'Back to Map' }).click()
   await expect
     .poll(() =>
       state.terminalMessages.some(
@@ -7603,7 +7678,7 @@ test('keeps a worker terminal theme and scrollback authoritative under TUI mouse
     .getByRole('button', { name: 'Open terminal', exact: true })
     .click()
 
-  const workerDialog = page.getByRole('dialog', { name: 'Implementer' })
+  const workerDialog = page.getByRole('region', { name: 'Implementer' })
   const terminal = workerDialog.locator('.terminal-session')
   const xtermViewport = terminal.locator('.xterm-scrollable-element')
   const renderedRows = terminal.locator('.xterm-rows')
@@ -7860,7 +7935,7 @@ test('keeps one terminal lease and viewport across Terminal and Focus presentati
     fullPage: true,
   })
 
-  await shell.getByRole('button', { name: 'Close terminal' }).click()
+  await shell.getByRole('button', { name: 'Back to Map' }).click()
   await expect
     .poll(
       () =>
@@ -8317,7 +8392,7 @@ test('provisions a dedicated Superintendent and shows project updates', async ({
   expect(new URL(state.terminalConnectionUrls[0]).pathname).toBe(
     '/api/v1/yard/orchestrator/terminal',
   )
-  await page.getByRole('button', { name: 'Close terminal' }).click()
+  await page.getByRole('button', { name: 'Back to Map' }).click()
 
   await page
     .getByRole('button', { name: 'Open chat', exact: true })
@@ -8374,7 +8449,7 @@ test('provisions a dedicated Superintendent and shows project updates', async ({
     page.locator('.coordination-edge.coordination-edge--active'),
   ).toHaveCount(1)
 
-  await page.getByRole('button', { name: 'Close chat' }).click()
+  await page.getByRole('button', { name: 'Back to Map' }).click()
   await page.screenshot({
     path: testInfo.outputPath('yard-orchestrator-desktop.png'),
     fullPage: true,
@@ -9079,7 +9154,7 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
     ),
   ).toBe(false)
   await expect(page.getByLabel('Agent conversation')).toBeVisible()
-  await shell.getByRole('button', { name: 'Close chat' }).click()
+  await shell.getByRole('button', { name: 'Back to Map' }).click()
   await expect(shell).toBeHidden()
   await expect(openChat).toBeFocused()
 })
@@ -9725,31 +9800,24 @@ test('persists independent automatic token-use settings while keeping manual act
   const state = await mockApi(page)
   await page.goto('/')
 
-  const openAutomaticCoordination = async () => {
-    const settings = await openSettings(page)
-    const settingsButton = settings.getByRole('button', {
-      name: 'Automatic token use settings',
-    })
-    await expect(settingsButton).toBeEnabled()
-    await settingsButton.click()
-    return page.getByRole('dialog', {
-      name: 'Coordination settings',
-    })
-  }
-  const dialog = await openAutomaticCoordination()
+  const dialog = await openSettings(page)
   const superintendent = dialog.getByRole('switch', {
-    name: /Superintendent to project orchestrators/,
+    name: /Request project summaries automatically/,
   })
   const projectOrchestrators = dialog.getByRole('switch', {
-    name: /Project orchestrators to workers/,
+    name: /Request worker summaries automatically/,
   })
   const scheduled = dialog.getByRole('switch', {
-    name: /Scheduled automatic summaries/,
+    name: /Run scheduled summaries automatically/,
   })
   await expect(superintendent).not.toBeChecked()
   await expect(projectOrchestrators).not.toBeChecked()
   await expect(scheduled).not.toBeChecked()
-  await expect(dialog.getByText('Manual actions')).toBeVisible()
+  await expect(
+    dialog.getByText(
+      /Manual requests and Run now remain available when these are off/,
+    ),
+  ).toBeVisible()
 
   await superintendent.check()
   await dialog.getByRole('button', {
@@ -9762,22 +9830,32 @@ test('persists independent automatic token-use settings while keeping manual act
     project_orchestrators_auto_request_worker_summaries: false,
     scheduled_automatic_summaries: false,
   })
-  await expect(dialog).toBeHidden()
-
-  const reopened = await openAutomaticCoordination()
+  await expect(dialog).toBeVisible()
+  await dialog.getByRole('button', { name: 'Close settings' }).click()
+  const auto = page.getByRole('button', {
+    name: /Automatic coordination enabled: project summaries/,
+  })
+  await expect(auto).toBeVisible()
+  await auto.click()
+  const reopened = page.getByRole('dialog', { name: 'Settings' })
   await expect(
     reopened.getByRole('switch', {
-      name: /Superintendent to project orchestrators/,
+      name: /Request project summaries automatically/,
+    }),
+  ).toBeFocused()
+  await expect(
+    reopened.getByRole('switch', {
+      name: /Request project summaries automatically/,
     }),
   ).toBeChecked()
   await expect(
     reopened.getByRole('switch', {
-      name: /Project orchestrators to workers/,
+      name: /Request worker summaries automatically/,
     }),
   ).not.toBeChecked()
   await expect(
     reopened.getByRole('switch', {
-      name: /Scheduled automatic summaries/,
+      name: /Run scheduled summaries automatically/,
     }),
   ).not.toBeChecked()
 
@@ -9787,17 +9865,43 @@ test('persists independent automatic token-use settings while keeping manual act
   })
   await page.setViewportSize({ width: 390, height: 844 })
   const manualCopy = reopened.getByText(
-    'Prompts, routes, and Run now remain independently available.',
+    /Manual requests and Run now remain available when these are off/,
   )
   const manualBox = await manualCopy.boundingBox()
-  const actionsBox = await reopened
-    .locator('.token-spend-dialog__actions')
-    .boundingBox()
+  const actionsBox = await reopened.locator('.settings-save-row').boundingBox()
   expect(manualBox).not.toBeNull()
   expect(actionsBox).not.toBeNull()
   expect(manualBox!.y + manualBox!.height).toBeLessThanOrEqual(actionsBox!.y)
   await page.screenshot({
     path: testInfo.outputPath('token-spend-settings-mobile.png'),
+    fullPage: true,
+  })
+  await page.setViewportSize({ width: 320, height: 844 })
+  const commandBarLayout = await page.locator('.command-bar').evaluate((bar) => {
+    const bounds = bar.getBoundingClientRect()
+    return {
+      children: Array.from(bar.children).map((child) => {
+        const childBounds = child.getBoundingClientRect()
+        return {
+          left: childBounds.left,
+          right: childBounds.right,
+        }
+      }),
+      clientWidth: bar.clientWidth,
+      left: bounds.left,
+      right: bounds.right,
+      scrollWidth: bar.scrollWidth,
+    }
+  })
+  expect(commandBarLayout.scrollWidth).toBeLessThanOrEqual(
+    commandBarLayout.clientWidth,
+  )
+  for (const child of commandBarLayout.children) {
+    expect(child.left).toBeGreaterThanOrEqual(commandBarLayout.left)
+    expect(child.right).toBeLessThanOrEqual(commandBarLayout.right)
+  }
+  await page.screenshot({
+    path: testInfo.outputPath('token-spend-settings-320.png'),
     fullPage: true,
   })
 })
@@ -10231,7 +10335,7 @@ test('provisions a workstream orchestrator and routes work to an attached projec
   expect(new URL(state.terminalConnectionUrls[0]).pathname).toMatch(
     /^\/api\/v1\/coordination-nodes\/[^/]+\/terminal$/,
   )
-  await page.getByRole('button', { name: 'Close terminal' }).click()
+  await page.getByRole('button', { name: 'Back to Map' }).click()
 
   await page
     .getByRole('button', { name: 'Open chat', exact: true })
@@ -10712,7 +10816,7 @@ test('renders the map as one projected world and persists the view mode', async 
   await page.setViewportSize({ width: 390, height: 844 })
   await page.reload()
   await expect(canvas).toHaveAttribute('data-visual-mode', 'depth')
-  const toolsBounds = await page.locator('.canvas-tools-panel').boundingBox()
+  const toolsBounds = await page.locator('.map-actions-panel').boundingBox()
   expect(toolsBounds).not.toBeNull()
   expect(toolsBounds!.x).toBeGreaterThanOrEqual(0)
   expect(toolsBounds!.x + toolsBounds!.width).toBeLessThanOrEqual(390)
@@ -10751,7 +10855,16 @@ test('arranges and persists non-overlapping project spaces around Yard', async (
   const yardPosition = await yardNode.evaluate(
     (element) => (element as HTMLElement).style.transform,
   )
-  await page.getByRole('button', { name: 'Arrange spaces' }).click()
+  const mapActionsTrigger = page.getByRole('button', { name: 'Map actions' })
+  await mapActionsTrigger.focus()
+  await mapActionsTrigger.press('Enter')
+  await expect(
+    page.getByRole('menuitem', { name: /Arrange spaces/ }),
+  ).toBeFocused()
+  await page.keyboard.press('Escape')
+  await expect(mapActionsTrigger).toBeFocused()
+  const mapActions = await openMapActions(page)
+  await mapActions.getByRole('menuitem', { name: /Arrange spaces/ }).click()
   await expect
     .poll(() => state.placementUpdates, { timeout: 5_000 })
     .toBe(state.projects.length)
@@ -10994,7 +11107,7 @@ test('controls the project orchestrator terminal, output, and prompt idempotentl
   expect(terminalUrl.pathname).toBe(
     '/api/v1/projects/project-1/orchestrator/terminal',
   )
-  await page.getByRole('button', { name: 'Close terminal' }).click()
+  await page.getByRole('button', { name: 'Back to Map' }).click()
   await expect
     .poll(() =>
       state.terminalMessages.some(
@@ -11067,7 +11180,7 @@ test('controls the project orchestrator terminal, output, and prompt idempotentl
     retainedCommandId,
   ])
 
-  await page.getByRole('button', { name: 'Close chat' }).click()
+  await page.getByRole('button', { name: 'Back to Map' }).click()
   await page
     .getByRole('button', { name: 'Open terminal', exact: true })
     .click()
@@ -11226,7 +11339,7 @@ test('changes a project orchestrator only to an eligible live workspace worker',
     page.locator('.agent-workspace-toolbar__target small'),
   ).toHaveText('terminal-2')
   await expect.poll(() => state.terminalSockets.length).toBe(1)
-  await page.getByRole('button', { name: 'Close terminal' }).click()
+  await page.getByRole('button', { name: 'Back to Map' }).click()
   await page.getByRole('tab', { name: 'Workers' }).click()
   await expect(
     page.locator(
@@ -12085,9 +12198,9 @@ test('opens chat and terminal from an assigned worker in the worker rail', async
     .getByRole('button', { name: 'Open chat', exact: true })
     .click()
   await expect(
-    page.getByRole('dialog', { name: 'Implementer' }),
+    page.getByRole('region', { name: 'Implementer' }),
   ).toBeVisible()
-  await page.getByRole('button', { name: 'Close chat' }).click()
+  await page.getByRole('button', { name: 'Back to Map' }).click()
   await page
     .getByRole('button', { name: 'Open terminal', exact: true })
     .click()
@@ -12783,7 +12896,7 @@ test('keeps assignment intervention controls within the mobile inspector', async
     path: testInfo.outputPath('terminal-workspace-mobile.png'),
     fullPage: true,
   })
-  await page.getByRole('button', { name: 'Close terminal' }).click()
+  await page.getByRole('button', { name: 'Back to Map' }).click()
 
   await page
     .getByRole('button', { name: 'Open chat', exact: true })
@@ -12991,7 +13104,7 @@ test('records a durable manual completion receipt', async ({ page }) => {
   await expect(page.getByLabel('Message')).toHaveValue(
     /Prepare an evidence-backed completion handoff/,
   )
-  await page.getByRole('button', { name: 'Close chat' }).click()
+  await page.getByRole('button', { name: 'Back to Map' }).click()
 
   await page
     .getByRole('button', { name: 'Record completion', exact: true })
@@ -14048,8 +14161,7 @@ test('layers Herdr inventory above Terminal without releasing state and restores
     element.dataset.lifecycleMarker = 'preserved-terminal'
   })
 
-  const trigger = page.getByRole('button', { name: 'Herdr', exact: true })
-  await trigger.click()
+  const trigger = await openHerdrInventory(page)
   const overlay = page.getByRole('dialog', { name: 'Herdr inventory' })
   const inventory = overlay.getByRole('region', { name: 'Live Herdr inventory' })
   await expect(inventory).toBeVisible()
@@ -14089,8 +14201,7 @@ test('layers Herdr inventory above Terminal without releasing state and restores
   await page.getByRole('tab', { name: 'Chat', exact: true }).click()
   const conversation = page.getByLabel('Agent conversation')
   await expect(conversation).toBeVisible()
-  await trigger.click()
-  await expect(page.getByRole('dialog', { name: 'Herdr inventory' })).toBeVisible()
+  await openHerdrInventory(page)
   await page.keyboard.press('Escape')
   await expect(conversation).toBeVisible()
   await expect(page.getByRole('tab', { name: 'Chat', exact: true })).toHaveAttribute(
@@ -14101,8 +14212,7 @@ test('layers Herdr inventory above Terminal without releasing state and restores
   await page.getByRole('tab', { name: 'Files', exact: true }).click()
   const files = page.getByLabel('Files for Implementer')
   await expect(files).toBeVisible()
-  await trigger.click()
-  await expect(page.getByRole('dialog', { name: 'Herdr inventory' })).toBeVisible()
+  await openHerdrInventory(page)
   await page.keyboard.press('Escape')
   await expect(files).toBeVisible()
   await expect(page.getByRole('tab', { name: 'Files', exact: true })).toHaveAttribute(
@@ -14113,13 +14223,13 @@ test('layers Herdr inventory above Terminal without releasing state and restores
 
 test('constrains large Herdr inventories with and without failure banners', async ({ page }) => {
   test.setTimeout(60_000)
-  await mockApi(page, {
+  const options = {
     fleetPaneCount: 80,
-    fleetPartialAfterFirst: true,
-  })
+    fleetPartialAfterFirst: false,
+  }
+  await mockApi(page, options)
   await page.setViewportSize({ width: 1280, height: 600 })
   await page.goto('/')
-  const trigger = page.getByRole('button', { name: 'Herdr', exact: true })
 
   const assertLayout = async (
     name: string,
@@ -14169,10 +14279,11 @@ test('constrains large Herdr inventories with and without failure banners', asyn
     }
   }
 
-  await trigger.click()
+  const trigger = await openHerdrInventory(page)
   await assertLayout('desktop success', 81, false)
   await page.getByRole('button', { name: 'Close Herdr inventory' }).click()
 
+  options.fleetPartialAfterFirst = true
   await trigger.click()
   await page.setViewportSize({ width: 390, height: 640 })
   await assertLayout('mobile partial failure', 80, true)
@@ -14183,6 +14294,7 @@ test('shows every live Herdr pane in a separate details-only inventory', async (
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
+  await openRuntimeHealth(page)
   const trigger = page.locator(
     'button[aria-controls="herdr-inventory-workspace"]',
   )
@@ -14217,7 +14329,7 @@ test('shows every live Herdr pane in a separate details-only inventory', async (
 test('retains failed refreshes as stale details and restores fresh state', async ({ page }) => {
   await mockApi(page)
   await page.goto('/')
-  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  await openHerdrInventory(page)
   const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
   const pane = inventory.getByRole('button', {
     name: /Unnamed agent · terminal-1, Agent pane, alpha/,
@@ -14260,7 +14372,7 @@ test('retains failed refreshes as stale details and restores fresh state', async
 test('total refresh failure replaces prior per-session errors', async ({ page }) => {
   await mockApi(page, { fleetFailure: 'partial' })
   await page.goto('/')
-  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  await openHerdrInventory(page)
   const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
   await expect(inventory).toContainText(
     'beta Herdr snapshot was unavailable for this session.',
@@ -14302,7 +14414,7 @@ test('shows immutable duplicate session ids and searchable unattached evidence',
   state.runtimeInventory.workers[1].status = 'idle'
   state.runtimeInventory.workers[2].status = 'blocked'
   await page.goto('/')
-  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  await openHerdrInventory(page)
   const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
   const rows = inventory.locator('[data-herdr-pane-row]')
   const search = inventory.getByLabel('Search live Herdr panes')
@@ -14395,8 +14507,7 @@ test('shows immutable duplicate session ids and searchable unattached evidence',
 test('keeps Herdr inventory as the single topmost Escape owner', async ({ page }) => {
   await mockApi(page)
   await page.goto('/')
-  const trigger = page.getByRole('button', { name: 'Herdr', exact: true })
-  await trigger.click()
+  const trigger = await openHerdrInventory(page)
   const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
   await expect(page.locator('#root')).toHaveAttribute('inert', '')
   await page.keyboard.press('Escape')
@@ -14413,7 +14524,7 @@ test('aborts an in-flight manual fleet refresh when inventory closes', async ({ 
     fleetWaits: [Promise.resolve(), Promise.resolve(), refreshWait],
   })
   await page.goto('/')
-  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  await openHerdrInventory(page)
   const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
   const refresh = inventory.getByRole('button', {
     name: 'Refresh Herdr inventory',
@@ -14425,7 +14536,7 @@ test('aborts an in-flight manual fleet refresh when inventory closes', async ({ 
   await inventory.getByRole('button', { name: 'Close Herdr inventory' }).click()
   releaseRefresh()
   await expect(inventory).toBeHidden()
-  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  await openHerdrInventory(page)
   const reopened = page.getByRole('region', { name: 'Live Herdr inventory' })
   await expect(reopened.getByLabel('Herdr inventory counts')).toHaveText(
     '4 fresh · 4 shown · 2 agents · 2 runtime · 0 stale · 0 failed sessions',
@@ -14438,7 +14549,7 @@ test('aborts an in-flight manual fleet refresh when inventory closes', async ({ 
 test('keeps one concise live inventory summary for counts filters and failures', async ({ page }) => {
   await mockApi(page, { fleetFailure: 'partial', fleetPaneCount: 1 })
   await page.goto('/')
-  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  await openHerdrInventory(page)
   const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
   const live = inventory.locator('[aria-live]')
   const search = inventory.getByLabel('Search live Herdr panes')
@@ -14475,7 +14586,7 @@ test('keeps one concise live inventory summary for counts filters and failures',
 test('keeps stable pane selection across provider and display metadata refreshes', async ({ page }) => {
   const state = await mockApi(page)
   await page.goto('/')
-  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  await openHerdrInventory(page)
   const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
   const linked = inventory.getByRole('button', {
     name: /Unnamed agent · terminal-1, Agent pane, alpha/,
@@ -14493,8 +14604,7 @@ test('keeps unbound agents and runtime panes details-only with roving keyboard f
   await mockApi(page)
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
-  const trigger = page.getByRole('button', { name: 'Herdr', exact: true })
-  await trigger.click()
+  const trigger = await openHerdrInventory(page)
   const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
   const search = inventory.getByLabel('Search live Herdr panes')
   await expect(search).toBeFocused()
@@ -14547,7 +14657,7 @@ test('keeps unbound agents and runtime panes details-only with roving keyboard f
 test('shows provider pane evidence without an agent record as ambiguous agent', async ({ page }) => {
   await mockApi(page, { fleetMissingAgentEvidence: true })
   await page.goto('/')
-  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  await openHerdrInventory(page)
   const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
   const pane = inventory.getByRole('button', {
     name: /Unnamed agent · terminal-1, Agent pane, alpha/,
@@ -14571,7 +14681,7 @@ test('shows provider pane evidence without an agent record as ambiguous agent', 
 test('shows ambiguous duplicate-agent evidence without conflicting metadata', async ({ page }) => {
   await mockApi(page, { fleetAmbiguousAgent: true })
   await page.goto('/')
-  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  await openHerdrInventory(page)
   const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
   const pane = inventory.getByRole('button', {
     name: /Unnamed agent · terminal-1, Agent pane, alpha/,
@@ -14589,7 +14699,7 @@ test('shows ambiguous duplicate-agent evidence without conflicting metadata', as
 test('shows conflicting tab identity without fabricated or untrusted metadata', async ({ page }) => {
   await mockApi(page, { fleetConflictingTab: true })
   await page.goto('/')
-  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  await openHerdrInventory(page)
   const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
   const pane = inventory.getByRole('button', {
     name: /Unnamed agent · terminal-1, Agent pane, alpha/,
@@ -14606,7 +14716,7 @@ test('shows conflicting tab identity without fabricated or untrusted metadata', 
 test('preserves search focus and only recovers focus for a removed roving row', async ({ page }) => {
   const state = await mockApi(page)
   await page.goto('/')
-  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  await openHerdrInventory(page)
   const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
   const rows = inventory.locator('[data-herdr-pane-row]')
   const search = inventory.getByLabel('Search live Herdr panes')
@@ -14655,7 +14765,7 @@ test('preserves search focus and only recovers focus for a removed roving row', 
 test('reports a sanitized session discovery outage without snapshot counts', async ({ page }) => {
   await mockApi(page, { fleetFailure: 'discovery' })
   await page.goto('/')
-  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  await openHerdrInventory(page)
   const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
 
   await expect(inventory).toContainText(
@@ -14671,7 +14781,7 @@ test('reports a sanitized session discovery outage without snapshot counts', asy
 test('reports sanitized partial and total Herdr fleet failures', async ({ page }) => {
   await mockApi(page, { fleetFailure: 'partial' })
   await page.goto('/')
-  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  await openHerdrInventory(page)
   const inventory = page.getByRole('region', { name: 'Live Herdr inventory' })
   await expect(inventory).toContainText(
     'beta Herdr snapshot was unavailable for this session.',
@@ -14687,7 +14797,7 @@ test('reports sanitized partial and total Herdr fleet failures', async ({ page }
   await page.unrouteAll({ behavior: 'wait' })
   await mockApi(page, { fleetFailure: 'total' })
   await page.reload()
-  await page.getByRole('button', { name: 'Herdr', exact: true }).click()
+  await openHerdrInventory(page)
   await expect(
     page.getByRole('region', { name: 'Live Herdr inventory' }),
   ).toContainText(
