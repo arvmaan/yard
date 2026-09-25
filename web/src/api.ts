@@ -65,6 +65,9 @@ import type {
   RuntimeLens,
   RuntimeSessions,
   RuntimeTopology,
+  ReceiveSummaryWorkerInput,
+  ReceivedSummaryWorker,
+  RequestSummaryWorkerInput,
   RunAutomationInput,
   SendAssignmentPromptInput,
   SendCoordinationNodePromptInput,
@@ -73,6 +76,8 @@ import type {
   SendYardOrchestratorPromptInput,
   SendYardOrchestratorRouteInput,
   TerminalOutput,
+  SummaryWorker,
+  SummaryWorkers,
   TokenSpendSettings,
   UpdateCoordinationNodeInput,
   UpdateCoordinationNodePlacementInput,
@@ -820,6 +825,49 @@ export function fetchProjectAssignments(
   return requestJson(
     `/api/v1/projects/${encodeURIComponent(projectId)}/assignments`,
     { signal },
+  )
+}
+
+export function fetchSummaryWorkers(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<SummaryWorkers> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/orchestrator/summary-workers`,
+    { signal },
+  )
+}
+
+export function requestSummaryWorker(
+  projectId: string,
+  command: RequestSummaryWorkerInput,
+  signal?: AbortSignal,
+): Promise<SummaryWorker> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/orchestrator/summary-workers`,
+    {
+      body: JSON.stringify(command),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal,
+    },
+  )
+}
+
+export function receiveSummaryWorker(
+  projectId: string,
+  assignmentId: string,
+  command: ReceiveSummaryWorkerInput,
+  signal?: AbortSignal,
+): Promise<ReceivedSummaryWorker> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/orchestrator/summary-workers/${encodeURIComponent(assignmentId)}/handoff`,
+    {
+      body: JSON.stringify(command),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal,
+    },
   )
 }
 

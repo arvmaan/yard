@@ -60,6 +60,12 @@ trait WorkerCleanupPersistence: Send + Sync {
     ) -> Result<(), ProjectStoreError>;
     async fn latest_runs(&self) -> Result<yard_domain::WorkerCleanupRuns, ProjectStoreError>;
     async fn claim(&self) -> Result<Vec<ClaimedWorkerCleanupItem>, ProjectStoreError>;
+    async fn claim_run(
+        &self,
+        _run_id: &str,
+    ) -> Result<Vec<ClaimedWorkerCleanupItem>, ProjectStoreError> {
+        self.claim().await
+    }
     async fn finish(
         &self,
         item: &ClaimedWorkerCleanupItem,
@@ -116,6 +122,15 @@ impl WorkerCleanupPersistence for StorePersistence {
     async fn claim(&self) -> Result<Vec<ClaimedWorkerCleanupItem>, ProjectStoreError> {
         self.store
             .claim_worker_cleanup_items(None, CLAIM_LIMIT, CLAIM_TTL_MS)
+            .await
+    }
+
+    async fn claim_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<ClaimedWorkerCleanupItem>, ProjectStoreError> {
+        self.store
+            .claim_worker_cleanup_items(Some(run_id), 1, CLAIM_TTL_MS)
             .await
     }
 
@@ -228,8 +243,30 @@ impl WorkerCleanupService {
         }
     }
 
+    /// Process the next bounded batch of pending cleanup items.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when durable cleanup state cannot be read or updated.
     pub async fn process_pending(&self) -> Result<usize, ProjectStoreError> {
         let items = self.persistence.claim().await?;
+        self.process_items(items).await
+    }
+
+    /// Process only pending cleanup items belonging to one durable run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when durable cleanup state cannot be read or updated.
+    pub async fn process_run(&self, run_id: &str) -> Result<usize, ProjectStoreError> {
+        let items = self.persistence.claim_run(run_id).await?;
+        self.process_items(items).await
+    }
+
+    async fn process_items(
+        &self,
+        items: Vec<ClaimedWorkerCleanupItem>,
+    ) -> Result<usize, ProjectStoreError> {
         let count = items.len();
         for item in items {
             self.process_item(&item).await?;
@@ -279,6 +316,7 @@ impl WorkerCleanupService {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn process_item(&self, item: &ClaimedWorkerCleanupItem) -> Result<(), ProjectStoreError> {
         if item.preview {
             return self
@@ -286,18 +324,15 @@ impl WorkerCleanupService {
                 .finish(item, WorkerCleanupItemStatus::Keep, "preview_only")
                 .await;
         }
-        let inventory = match self.source.inventory(&item.runtime.session).await {
-            Ok(inventory) => inventory,
-            Err(_) => {
-                return self
-                    .persistence
-                    .finish(
-                        item,
-                        WorkerCleanupItemStatus::Review,
-                        "inventory_unreachable",
-                    )
-                    .await;
-            }
+        let Ok(inventory) = self.source.inventory(&item.runtime.session).await else {
+            return self
+                .persistence
+                .finish(
+                    item,
+                    WorkerCleanupItemStatus::Review,
+                    "inventory_unreachable",
+                )
+                .await;
         };
         if inventory.adapter != item.runtime.adapter || inventory.session != item.runtime.session {
             return self
@@ -311,6 +346,16 @@ impl WorkerCleanupService {
         }
         match observed_identity(&inventory, item) {
             ObservedIdentity::Missing => {
+                if item.is_summary_worker {
+                    return self
+                        .persistence
+                        .finish(
+                            item,
+                            WorkerCleanupItemStatus::Review,
+                            "runtime_identity_missing",
+                        )
+                        .await;
+                }
                 return self
                     .persistence
                     .reconcile_missing(item, inventory.observed_at_unix_ms)
@@ -329,7 +374,7 @@ impl WorkerCleanupService {
             ObservedIdentity::Exact => {}
         }
 
-        if !item.is_cleanup_advisor {
+        if !item.is_cleanup_advisor && !item.is_summary_worker {
             let Some(profile_id) = item.advisor_profile_id.as_deref() else {
                 return self
                     .persistence
@@ -426,6 +471,20 @@ impl WorkerCleanupService {
             Ok(lease) => lease,
             Err(error) => return self.lease_review(item, error).await,
         };
+        if item
+            .pane_instance_id
+            .as_deref()
+            .is_some_and(|expected| expected != lease.pane_instance_id)
+        {
+            return self
+                .persistence
+                .finish(
+                    item,
+                    WorkerCleanupItemStatus::Review,
+                    "lease:pane instance mismatch",
+                )
+                .await;
+        }
         let request = CloseManagedPaneRequest {
             request_id: format!("worker-cleanup:{}:{}", item.run_id, item.worker_id),
             session: item.runtime.session.clone(),
@@ -499,6 +558,12 @@ fn observed_identity(
             if pane.terminal_id == item.runtime.terminal_id
                 && pane.runtime_id == item.runtime.pane_id
                 && pane.workspace_id == item.runtime.workspace_id
+                && Some(pane.tab_id.as_str()) == item.runtime.tab_id.as_deref()
+                && pane.provider_session == item.runtime.provider_session
+                && item
+                    .pane_instance_id
+                    .as_deref()
+                    .is_none_or(|expected| pane.pane_instance_id.as_deref() == Some(expected))
             {
                 return ObservedIdentity::Exact;
             }
@@ -560,6 +625,54 @@ mod tests {
             observed_identity(&inventory, &item),
             ObservedIdentity::Exact
         ));
+        inventory.panes[0].tab_id = "other-tab".to_owned();
+        assert!(matches!(
+            observed_identity(&inventory, &item),
+            ObservedIdentity::Conflict
+        ));
+    }
+
+    #[tokio::test]
+    async fn summary_retirement_defers_when_owned_lease_instance_changes() {
+        let authorized = Arc::new(AtomicBool::new(false));
+        let persistence = Arc::new(RecordingPersistence {
+            authorized: Arc::clone(&authorized),
+            finished: Mutex::new(Vec::new()),
+            reconciled: Mutex::new(Vec::new()),
+            retried: Mutex::new(Vec::new()),
+            recorded_advisors: Mutex::new(Vec::new()),
+        });
+        let retirement = Arc::new(RecordingRetirement {
+            authorized,
+            lease_lookups: Mutex::new(Vec::new()),
+            closes: Mutex::new(Vec::new()),
+        });
+        let mut exact = inventory();
+        let mut pane = observed_pane("pane-1");
+        pane.pane_instance_id = Some("captured-instance".to_owned());
+        exact.panes.push(pane);
+        let service = WorkerCleanupService::with_components(
+            Arc::new(StaticInventory(exact)),
+            persistence.clone(),
+            retirement.clone(),
+            Arc::new(UnsupportedCleanupAdvisor),
+        );
+        let mut cleanup_item = item();
+        cleanup_item.is_cleanup_advisor = true;
+        cleanup_item.is_summary_worker = true;
+        cleanup_item.pane_instance_id = Some("captured-instance".to_owned());
+
+        service.process_item(&cleanup_item).await.unwrap();
+
+        assert_eq!(
+            persistence.finished.lock().unwrap().as_slice(),
+            [(
+                WorkerCleanupItemStatus::Review,
+                "lease:pane instance mismatch".to_owned()
+            )]
+        );
+        assert!(!persistence.authorized.load(Ordering::SeqCst));
+        assert!(retirement.closes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -998,10 +1111,12 @@ mod tests {
                 version: 1,
                 last_observed_at_unix_ms: 1,
             },
+            pane_instance_id: None,
             preview: false,
             advisor_profile_id: None,
             advisor_assignment_id: None,
             is_cleanup_advisor: false,
+            is_summary_worker: false,
             claim_token: "claim-1".to_owned(),
             attempts: 0,
         }

@@ -68,6 +68,7 @@ import {
   fetchOrchestratorStatusOutput,
   fetchProject,
   fetchProjectAssignments,
+  fetchSummaryWorkers,
   fetchProjectRelationships,
   fetchProjects,
   fetchSessions,
@@ -77,11 +78,13 @@ import {
   fetchWorkerProfiles,
   fetchWorkers,
   provisionYardOrchestrator,
+  receiveSummaryWorker,
   recoverYardOrchestrator,
   resetOrchestratorWorkflowProfile,
   provisionCoordinationNode,
   recordCompletionReceipt,
   requestCoordinationSnapshot,
+  requestSummaryWorker,
   runAutomation,
   uploadArtifact,
   updateAutomation,
@@ -229,6 +232,7 @@ import type {
   RuntimeSession,
   RuntimeTopology,
   StatusReport,
+  SummaryWorker,
   TokenSpendSettings,
   WorkerAvailability,
   WorkerCandidate,
@@ -1317,25 +1321,37 @@ function ProjectOrchestratorTransferDialog({
 }
 
 function ProjectOrchestratorInspector({
+  busy,
   candidates,
   eligibilityReason,
   inventory,
   inventoryError,
   inventoryLoading,
   onChange,
+  onCreateSummary,
+  onReceiveSummary,
   onRefresh,
   project,
+  profiles,
   statusReport,
+  summaries,
+  summaryError,
 }: {
+  busy: boolean
   candidates: WorkerCandidate[]
   eligibilityReason: ProjectOrchestratorEligibilityReason
   inventory: RuntimeInventory | null
   inventoryError: string | null
   inventoryLoading: boolean
   onChange: (trigger: HTMLButtonElement) => void
+  onCreateSummary: (profile: WorkerProfile) => void
+  onReceiveSummary: (summary: SummaryWorker) => void
   onRefresh: () => void
   project: Project
+  profiles: WorkerProfile[]
   statusReport: StatusReport | undefined
+  summaries: SummaryWorker[]
+  summaryError: string | null
 }) {
   const runtime = project.orchestrator.runtime
   const snapshotCurrent = Boolean(inventory && !inventoryError)
@@ -1347,6 +1363,20 @@ function ProjectOrchestratorInspector({
   const observed = capabilities.observedWorker
   const runtimeState = resolvedRuntimeState(runtime, capabilities)
   const transferStatusId = `project-orchestrator-transfer-status-${project.id}`
+  const compatibleProfiles = profiles.filter(
+    (profile) => profile.runtime_adapter === project.runtime.adapter,
+  )
+  const [summaryProfileId, setSummaryProfileId] = useState(
+    compatibleProfiles[0]?.id ?? '',
+  )
+  useEffect(() => {
+    if (!compatibleProfiles.some((profile) => profile.id === summaryProfileId)) {
+      setSummaryProfileId(compatibleProfiles[0]?.id ?? '')
+    }
+  }, [compatibleProfiles, summaryProfileId])
+  const summaryProfile = compatibleProfiles.find(
+    (profile) => profile.id === summaryProfileId,
+  )
 
   return (
     <>
@@ -1404,6 +1434,64 @@ function ProjectOrchestratorInspector({
             inventoryError,
           )}
         </p>
+      </section>
+      <section aria-label="Ephemeral summary workers" className="durable-runtime-section">
+        <p className="eyebrow">Ephemeral summary</p>
+        <p className="project-orchestrator-transfer-status">
+          This user-initiated action creates and prompts a short-lived worker,
+          which spends provider tokens. It opens a background tab in this
+          orchestrator&apos;s captured workspace.
+        </p>
+        <label>
+          Worker profile
+          <select
+            disabled={busy || compatibleProfiles.length === 0}
+            onChange={(event) => setSummaryProfileId(event.target.value)}
+            value={summaryProfileId}
+          >
+            {compatibleProfiles.map((profile) => (
+              <option key={profile.id} value={profile.id}>
+                {profile.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button
+          className="secondary-button"
+          disabled={busy || !summaryProfile}
+          onClick={() => summaryProfile && onCreateSummary(summaryProfile)}
+          type="button"
+        >
+          {busy ? (
+            <LoaderCircle aria-hidden="true" className="status-spin" size={15} />
+          ) : (
+            <Bot aria-hidden="true" size={15} />
+          )}
+          Create summary worker
+        </button>
+        {summaryError ? (
+          <div className="dialog-error" role="alert">
+            <CircleAlert aria-hidden="true" size={16} />
+            <span>{summaryError}</span>
+          </div>
+        ) : null}
+        {summaries.map((summary) => (
+          <div className="project-orchestrator-transfer-status" key={summary.command_id}>
+            <strong>{summary.state.replaceAll('_', ' ')}</strong>
+            {summary.retirement_reason ? ` — ${summary.retirement_reason}` : null}
+            {summary.error ? ` — ${summary.error}` : null}
+            {summary.state === 'ready' ? (
+              <button
+                className="secondary-button"
+                disabled={busy}
+                onClick={() => onReceiveSummary(summary)}
+                type="button"
+              >
+                Receive summary
+              </button>
+            ) : null}
+          </div>
+        ))}
       </section>
       <WorkerInterventions
         key={[
@@ -2388,6 +2476,11 @@ function App() {
     WorkerCandidate[]
   >([])
   const [assignments, setAssignments] = useState<Assignment[]>([])
+  const [summaryWorkers, setSummaryWorkers] = useState<SummaryWorker[]>([])
+  const [summaryWorkerBusy, setSummaryWorkerBusy] = useState(false)
+  const [summaryWorkerError, setSummaryWorkerError] = useState<string | null>(
+    null,
+  )
   const [projectStatusReports, setProjectStatusReports] =
     useState<ProjectStatusReports>({})
   const [projectPulseOpen, setProjectPulseOpen] = useState(false)
@@ -2600,16 +2693,30 @@ function App() {
     [],
   )
 
+  const loadSummaryWorkers = useCallback(
+    async (projectIds: string[], signal?: AbortSignal) => {
+      const results = await Promise.all(
+        projectIds.map((projectId) => fetchSummaryWorkers(projectId, signal)),
+      )
+      const summaries = results.flatMap((result) => result.summaries)
+      setSummaryWorkers(summaries)
+      return summaries
+    },
+    [],
+  )
+
   const loadProjects = useCallback(
     async (signal?: AbortSignal) => {
       const result = await fetchProjects(signal)
       setProjects(result.projects)
-      return loadAssignments(
-        result.projects.map((project) => project.id),
-        signal,
-      )
+      const projectIds = result.projects.map((project) => project.id)
+      const [loadedAssignments] = await Promise.all([
+        loadAssignments(projectIds, signal),
+        loadSummaryWorkers(projectIds, signal),
+      ])
+      return loadedAssignments
     },
-    [loadAssignments],
+    [loadAssignments, loadSummaryWorkers],
   )
 
   const loadYardOrchestrator = useCallback(
@@ -3089,6 +3196,10 @@ function App() {
           projectsRef.current.map((project) => project.id),
           controller.signal,
         )
+        await loadSummaryWorkers(
+          projectsRef.current.map((project) => project.id),
+          controller.signal,
+        )
       } catch (caught) {
         if (!(caught instanceof DOMException && caught.name === 'AbortError')) {
           // Assignment refresh is independent from runtime health. Keep the
@@ -3115,7 +3226,7 @@ function App() {
       document.removeEventListener('visibilitychange', refreshWhenVisible)
       controller.abort()
     }
-  }, [loadAssignments])
+  }, [loadAssignments, loadSummaryWorkers])
 
   const projectStatusTargets = useMemo(
     () =>
@@ -5430,6 +5541,102 @@ function App() {
     [assignments, profiles, projects, workerCandidates],
   )
 
+  const createSummaryWorker = useCallback(
+    async (project: Project, profile: WorkerProfile) => {
+      setSummaryWorkerBusy(true)
+      setSummaryWorkerError(null)
+      try {
+        const summary = await requestSummaryWorker(project.id, {
+          command_id: crypto.randomUUID(),
+          actor: 'local-user',
+          parent_worker_id: project.orchestrator.id,
+          expected_parent_worker_version: project.orchestrator.version,
+          expected_project_version: project.version,
+          profile_id: profile.id,
+          expected_profile_version: profile.version,
+          artifact_id: crypto.randomUUID(),
+          objective:
+            'Summarize the current project status, decisions, evidence, risks, and next steps for the parent orchestrator.',
+        })
+        setSummaryWorkers((current) => [
+          summary,
+          ...current.filter(
+            (candidate) => candidate.command_id !== summary.command_id,
+          ),
+        ])
+        const assignment = summary.assignment
+        if (assignment) {
+          setAssignments((current) => [
+            ...current.filter(
+              (candidate) => candidate.id !== assignment.id,
+            ),
+            assignment,
+          ])
+        }
+        await Promise.all([
+          loadInventory(selectedSession),
+          loadWorkers(),
+        ])
+      } catch (caught) {
+        setSummaryWorkerError(
+          caught instanceof Error
+            ? caught.message
+            : 'Summary worker creation failed',
+        )
+      } finally {
+        setSummaryWorkerBusy(false)
+      }
+    },
+    [loadInventory, loadWorkers, selectedSession],
+  )
+
+  const handoffSummaryWorker = useCallback(
+    async (project: Project, summary: SummaryWorker) => {
+      if (!summary.assignment) return
+      setSummaryWorkerBusy(true)
+      setSummaryWorkerError(null)
+      try {
+        const received = await receiveSummaryWorker(
+          project.id,
+          summary.assignment.id,
+          {
+            command_id: crypto.randomUUID(),
+            actor: 'local-user',
+            expected_parent_worker_version: project.orchestrator.version,
+          },
+        )
+        setSummaryWorkers((current) => [
+          received.summary,
+          ...current.filter(
+            (candidate) =>
+              candidate.command_id !== received.summary.command_id,
+          ),
+        ])
+        const assignment = received.summary.assignment
+        if (assignment) {
+          setAssignments((current) => [
+            ...current.filter(
+              (candidate) => candidate.id !== assignment.id,
+            ),
+            assignment,
+          ])
+          setSelection({
+            kind: 'assignment',
+            id: assignment.id,
+          })
+        }
+        await loadInventory(selectedSession)
+      } catch (caught) {
+        setSummaryWorkerError(
+          caught instanceof Error ? caught.message : 'Summary handoff failed',
+        )
+      } finally {
+        setSummaryWorkerBusy(false)
+      }
+    },
+    [loadInventory, selectedSession],
+  )
+
   const allocateWorker = useCallback(
     async ({ objective, role, profileId }: AllocationDetails) => {
       if (!allocationProposal) return
@@ -6176,6 +6383,7 @@ function App() {
           />
         ) : selectedProjectOrchestrator ? (
           <ProjectOrchestratorInspector
+            busy={summaryWorkerBusy}
             candidates={selectedProjectOrchestratorEligibility.candidates}
             eligibilityReason={
               selectedProjectOrchestratorEligibility.reason
@@ -6194,14 +6402,36 @@ function App() {
                 trigger,
               )
             }
+            onCreateSummary={(profile) =>
+              void createSummaryWorker(
+                selectedProjectOrchestratorContextProject ??
+                  selectedProjectOrchestrator,
+                profile,
+              )
+            }
             onRefresh={() => void refresh()}
+            onReceiveSummary={(summary) =>
+              void handoffSummaryWorker(
+                selectedProjectOrchestratorContextProject ??
+                  selectedProjectOrchestrator,
+                summary,
+              )
+            }
             project={
               selectedProjectOrchestratorContextProject ??
               selectedProjectOrchestrator
             }
+            profiles={profiles}
             statusReport={
               projectStatusReports[selectedProjectOrchestrator.id]
             }
+            summaries={summaryWorkers.filter(
+              (summary) =>
+                summary.project_id === selectedProjectOrchestrator.id &&
+                summary.parent_worker_id ===
+                  selectedProjectOrchestrator.orchestrator.id,
+            )}
+            summaryError={summaryWorkerError}
           />
         ) : selectedProject ? (
           <ProjectInspector

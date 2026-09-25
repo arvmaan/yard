@@ -26,13 +26,14 @@ use yard_domain::{
     OrchestratorPromptAcknowledgement, OrchestratorTerminalOutput, OrchestratorWorkflowProfile,
     OrchestratorWorkflowProfiles, PaneManagementBatchResult, PaneManagementPreview, Project,
     ProjectRelationships, Projects, PromptAcknowledgement, ProvisionCoordinationNode,
-    ProvisionYardOrchestrator, RecordCompletionReceipt, RecordedCompletionReceipt,
-    RecoverYardOrchestrator, RecoveredYardOrchestrator, ReplaceProjectOrchestrator,
-    ReplacedProjectOrchestrator, RequestCoordinationSnapshot, ResetOrchestratorWorkflowProfile,
-    RunAutomationNow, RuntimeInventory, RuntimeSessions, RuntimeTopology, SendAssignmentPrompt,
-    SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
-    SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SetAutomationPaused,
-    StartWorkerCleanupRun, TerminalOutput, TokenSpendSettings, TransferProjectOrchestrator,
+    ProvisionYardOrchestrator, ReceiveSummaryWorker, RecordCompletionReceipt,
+    RecordedCompletionReceipt, RecoverYardOrchestrator, RecoveredYardOrchestrator,
+    ReplaceProjectOrchestrator, ReplacedProjectOrchestrator, RequestCoordinationSnapshot,
+    RequestSummaryWorker, ResetOrchestratorWorkflowProfile, RunAutomationNow, RuntimeInventory,
+    RuntimeSessions, RuntimeTopology, SendAssignmentPrompt, SendCoordinationNodePrompt,
+    SendCoordinationNodeRoute, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
+    SendYardOrchestratorRoute, SetAutomationPaused, StartWorkerCleanupRun, SummaryWorker,
+    SummaryWorkers, TerminalOutput, TokenSpendSettings, TransferProjectOrchestrator,
     TransferredProjectOrchestrator, UpdateAgentProfile, UpdateAutomation,
     UpdateAutomationPlacement, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
     UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
@@ -67,6 +68,7 @@ use crate::project_orchestrator_transfer_service::{
 };
 use crate::project_service::{ProjectService, ProjectServiceError};
 use crate::reconciliation_service::{ReconciliationService, ReconciliationServiceError};
+use crate::summary_worker_service::{SummaryWorkerService, SummaryWorkerServiceError};
 use crate::terminal_service::{RuntimeTerminal, TerminalService};
 use crate::worker_cleanup_service::WorkerCleanupService;
 use crate::worker_session_service::{WorkerSessionService, WorkerSessionServiceError};
@@ -91,6 +93,7 @@ struct AppState {
     orchestrator_transfers: ProjectOrchestratorTransferService,
     worker_sessions: WorkerSessionService,
     worker_cleanup: WorkerCleanupService,
+    summary_workers: SummaryWorkerService,
     interventions: InterventionService,
     terminals: TerminalService,
     artifacts: ArtifactService,
@@ -259,6 +262,14 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
     let yard_orchestrator_intervention = Arc::clone(&intervention);
     let interventions =
         InterventionService::new(Arc::clone(&source), intervention, Arc::clone(&store));
+    let summary_workers = SummaryWorkerService::new(
+        Arc::clone(&source),
+        Arc::clone(&store),
+        allocations.clone(),
+        interventions.clone(),
+        artifacts.clone(),
+        worker_cleanup.clone(),
+    );
     let terminals =
         TerminalService::new(interventions.clone(), coordination_nodes.clone(), terminal);
     let yard_orchestrator = YardOrchestratorService::new(
@@ -491,6 +502,14 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             axum::routing::post(prompt_orchestrator),
         )
         .route(
+            "/api/v1/projects/{project_id}/orchestrator/summary-workers",
+            get(list_summary_workers).post(request_summary_worker),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/orchestrator/summary-workers/{assignment_id}/handoff",
+            axum::routing::post(receive_summary_worker),
+        )
+        .route(
             "/api/v1/projects/{project_id}/orchestrator/replace",
             axum::routing::post(replace_project_orchestrator),
         )
@@ -567,6 +586,7 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             orchestrator_transfers,
             worker_sessions,
             worker_cleanup,
+            summary_workers,
             interventions,
             terminals,
             artifacts,
@@ -1742,6 +1762,59 @@ async fn list_project_assignments(
         .list_project(&project_id)
         .await
         .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn list_summary_workers(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<NoStoreJson<SummaryWorkers>, ApiError> {
+    let project = state
+        .projects
+        .get(&project_id)
+        .await
+        .map_err(ApiError::from)?;
+    state
+        .summary_workers
+        .list(&project_id, &project.orchestrator.id)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn request_summary_worker(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(command): Json<RequestSummaryWorker>,
+) -> Result<NoStoreJson<SummaryWorker>, ApiError> {
+    state
+        .summary_workers
+        .request(&project_id, command)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn receive_summary_worker(
+    State(state): State<AppState>,
+    Path((project_id, assignment_id)): Path<(String, String)>,
+    Json(command): Json<ReceiveSummaryWorker>,
+) -> Result<UntrustedJson<yard_domain::ReceivedSummaryWorker>, ApiError> {
+    let project = state
+        .projects
+        .get(&project_id)
+        .await
+        .map_err(ApiError::from)?;
+    state
+        .summary_workers
+        .receive(
+            &project_id,
+            &project.orchestrator.id,
+            &assignment_id,
+            command,
+        )
+        .await
+        .map(UntrustedJson)
         .map_err(ApiError::from)
 }
 
@@ -3144,6 +3217,51 @@ impl From<InterventionServiceError> for ApiError {
             InterventionServiceError::Runtime(error) => runtime_intervention_error(error),
             InterventionServiceError::Inventory(error) => Self::from(error),
             InterventionServiceError::Store(error) => intervention_store_error(error),
+        }
+    }
+}
+
+impl From<SummaryWorkerServiceError> for ApiError {
+    fn from(error: SummaryWorkerServiceError) -> Self {
+        match error {
+            SummaryWorkerServiceError::Invalid(error) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid_summary_worker",
+                message: error.to_string(),
+            },
+            SummaryWorkerServiceError::Store(ProjectStoreError::SummaryWorkerNotFound) => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "summary_worker_not_found",
+                message: "Summary worker was not found".to_owned(),
+            },
+            SummaryWorkerServiceError::Store(
+                error @ (ProjectStoreError::SummaryParentNotCurrent
+                | ProjectStoreError::SummaryParentRuntimeUnverified
+                | ProjectStoreError::SummaryWorkerAllocationMismatch
+                | ProjectStoreError::SummaryWorkerHandoffNotReady
+                | ProjectStoreError::IdempotencyConflict
+                | ProjectStoreError::ProjectVersionConflict { .. }
+                | ProjectStoreError::WorkerVersionConflict { .. }
+                | ProjectStoreError::ProfileVersionConflict { .. }),
+            ) => Self {
+                status: StatusCode::CONFLICT,
+                code: "summary_worker_conflict",
+                message: error.to_string(),
+            },
+            SummaryWorkerServiceError::Store(ProjectStoreError::DatabaseBusy) => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "database_busy",
+                message: "Yard storage is busy; retry the request".to_owned(),
+            },
+            SummaryWorkerServiceError::Allocation(error) => Self::from(error),
+            SummaryWorkerServiceError::Intervention(error) => Self::from(error),
+            SummaryWorkerServiceError::Artifact(error) => Self::from(error),
+            SummaryWorkerServiceError::Inventory(error) => Self::from(error),
+            SummaryWorkerServiceError::Store(_) => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "summary_worker_failed",
+                message: "Yard could not complete the summary worker request".to_owned(),
+            },
         }
     }
 }

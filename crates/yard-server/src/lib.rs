@@ -18,6 +18,7 @@ mod provider_agents;
 pub mod reconciliation_service;
 pub mod runtime_cleanup_service;
 mod status_protocol;
+pub mod summary_worker_service;
 pub mod terminal_service;
 pub mod worker_cleanup_service;
 pub mod worker_session_service;

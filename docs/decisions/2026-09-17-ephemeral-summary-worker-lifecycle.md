@@ -53,6 +53,33 @@ Model an ephemeral summary worker as an ordinary Yard `Worker` plus
 `Assignment`, with explicit lifecycle policy and parentage. It is not a
 provider-native child agent.
 
+## Implementation status (2026-09-25)
+
+Implemented in the first vertical slice:
+
+- an explicit, idempotent summary-worker command and contextual orchestrator
+  UI action with token-spend disclosure;
+- exact parent-pane observation capture at request time, followed by existing
+  provider-neutral allocation into a non-focused tab in that captured
+  workspace;
+- `system_ephemeral` ownership plus `parent_worker_id`, reusing the existing
+  worker-cleanup model rather than adding another worker lifecycle;
+- a deterministic contract requiring one exact Markdown Artifact before the
+  structured completion receipt, with project, assignment, attempt, and worker
+  provenance revalidated at handoff;
+- parent Artifact retrieval before a targeted cleanup run can start; and
+- exact workspace, tab, pane, terminal, provider-session, and pane-instance
+  checks through the existing cleanup and lease boundary.
+
+Production retirement remains deliberately deferred. Herdr 0.9.0 does not
+advertise the required pane-management lease capability, so the production
+adapter records `lease_capability_unsupported`, preserves the child for
+review, and never treats terminal output or process exit as completion proof.
+The capable close path remains covered through the existing fake retirement
+adapter. The broader approval-state, durable terminal-registration fence,
+observation-generation, and tombstone design below remains proposed future
+work rather than a claim about this slice.
+
 ### Durable identity and policy
 
 The durable worker record gains:

@@ -14,6 +14,7 @@ mod profile;
 mod project;
 pub mod serde_u64;
 mod status_report;
+mod summary_worker;
 mod token_spend;
 mod worker;
 mod worker_cleanup;
@@ -113,6 +114,10 @@ pub use status_report::{
     MAX_STATUS_BLOCKER_BYTES, MAX_STATUS_BLOCKERS, MAX_STATUS_COMMAND_ID_BYTES,
     MAX_STATUS_REPORT_LINE_BYTES, MAX_STATUS_TEXT_BYTES, ORCHESTRATOR_STATUS_REPORT_VERSION,
     OrchestratorStatusReport, OrchestratorStatusReportError, OrchestratorStatusState,
+};
+pub use summary_worker::{
+    ReceiveSummaryWorker, ReceivedSummaryWorker, RequestSummaryWorker, SummaryParentRuntimeCapture,
+    SummaryWorker, SummaryWorkerState, SummaryWorkerValidationError, SummaryWorkers,
 };
 pub use token_spend::{
     AutomaticSummaryRequestKind, TokenSpendSettings, TokenSpendSettingsValidationError,

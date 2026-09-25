@@ -1041,7 +1041,7 @@ fn candidate_from_row(
     if runtime_missing_or_failed || row.get::<_, bool>(40)? {
         reasons.push(CompletedRuntimeRetentionReason::RuntimeConflict);
     }
-    if is_cleanup_advisor && !row.get::<_, bool>(42)? {
+    if role != "summary_worker" && is_cleanup_advisor && !row.get::<_, bool>(42)? {
         reasons.push(CompletedRuntimeRetentionReason::CleanupAdvisorArtifactMissing);
     }
     if role == "cleanup_advisor" && !is_cleanup_advisor {
@@ -1179,7 +1179,13 @@ fn select_claimed_item(
                     item.runtime_workspace_id, item.terminal_id, item.tab_id,
                     item.pane_id, item.provider_session_json, run.preview,
                     run.advisor_profile_id, item.advisor_assignment_id,
-                    item.is_cleanup_advisor, item.claim_token, item.attempts
+                    item.is_cleanup_advisor, item.claim_token, item.attempts,
+                    item.pane_instance_id,
+                    EXISTS (
+                        SELECT 1 FROM summary_worker_commands summary
+                         WHERE summary.cleanup_run_id = item.run_id
+                           AND summary.result_worker_id = item.worker_id
+                    )
                FROM worker_cleanup_run_items item
                JOIN worker_cleanup_runs run ON run.id = item.run_id
               WHERE item.run_id = ?1 AND item.worker_id = ?2",
@@ -1226,6 +1232,8 @@ fn select_claimed_item(
                     is_cleanup_advisor: row.get(17)?,
                     claim_token: row.get(18)?,
                     attempts: u32::try_from(row.get::<_, i64>(19)?).unwrap_or(u32::MAX),
+                    pane_instance_id: row.get(20)?,
+                    is_summary_worker: row.get(21)?,
                 })
             },
         )
@@ -1398,6 +1406,30 @@ fn cleanup_item_authorized(
                             ON link.artifact_id = artifact.id
                            WHERE artifact.worker_id = worker.id
                              AND link.receipt_id = receipt.id
+                      )
+                  )
+                  OR (
+                      worker.ownership_kind = 'system_ephemeral'
+                      AND worker.parent_worker_id IS NOT NULL
+                      AND assignment.role = 'summary_worker'
+                      AND EXISTS (
+                          SELECT 1 FROM summary_worker_commands summary
+                          JOIN projects project ON project.id = summary.project_id
+                          JOIN completion_receipt_artifact_links link
+                            ON link.receipt_id = receipt.id
+                           AND link.artifact_id = summary.expected_artifact_id
+                           WHERE summary.cleanup_run_id = item.run_id
+                             AND summary.result_worker_id = worker.id
+                             AND summary.result_assignment_id = assignment.id
+                             AND summary.project_id = item.project_id
+                             AND summary.parent_worker_id = worker.parent_worker_id
+                             AND project.orchestrator_worker_id = summary.parent_worker_id
+                             AND summary.handoff_command_id = run.command_id
+                             AND (
+                                 SELECT COUNT(*)
+                                   FROM completion_receipt_artifact_links exact_link
+                                  WHERE exact_link.receipt_id = receipt.id
+                             ) = 1
                       )
                   )
               )

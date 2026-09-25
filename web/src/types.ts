@@ -861,6 +861,62 @@ export interface ConfirmedAllocation {
   replayed: boolean
 }
 
+export type SummaryWorkerState =
+  | 'allocating'
+  | 'active'
+  | 'ready'
+  | 'retirement_pending'
+  | 'retirement_deferred'
+  | 'retired'
+  | 'failed'
+
+export interface RequestSummaryWorkerInput {
+  command_id: string
+  actor: string
+  parent_worker_id: string
+  expected_parent_worker_version: string
+  expected_project_version: string
+  profile_id: string
+  expected_profile_version: string
+  artifact_id: string
+  objective: string
+}
+
+export interface ReceiveSummaryWorkerInput {
+  command_id: string
+  actor: string
+  expected_parent_worker_version: string
+}
+
+export interface SummaryWorker {
+  command_id: string
+  project_id: string
+  parent_worker_id: string
+  profile_id: string
+  profile_version: string
+  objective: string
+  expected_artifact_id: string
+  captured_workspace_id: string
+  state: SummaryWorkerState
+  assignment: Assignment | null
+  artifact: Artifact | null
+  cleanup_run_id: string | null
+  retirement_reason: string | null
+  error: string | null
+  created_at_unix_ms: number
+  updated_at_unix_ms: number
+}
+
+export interface SummaryWorkers {
+  summaries: SummaryWorker[]
+}
+
+export interface ReceivedSummaryWorker {
+  summary: SummaryWorker
+  artifact: ArtifactContent
+  replayed: boolean
+}
+
 export interface ConfirmWorkerHandoffInput {
   command_id: string
   actor: string

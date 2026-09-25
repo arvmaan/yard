@@ -41,13 +41,14 @@ use yard_domain::{
     PaneManagementBatchResult, PaneObservation, PreparedAgentProfile, Project, ProjectPlacement,
     ProjectRelationship, ProjectRelationshipKind, ProjectRelationships, ProjectRepositories,
     ProjectRepository, ProjectRuntimeBinding, ProjectWorkflowProfilePin, Projects,
-    ProviderSessionRef, ProvisionCoordinationNode, ProvisionYardOrchestrator,
+    ProviderSessionRef, ProvisionCoordinationNode, ProvisionYardOrchestrator, ReceiveSummaryWorker,
     RecordCompletionReceipt, RecordedCompletionReceipt, ReplaceProjectOrchestrator,
-    ReplacedProjectOrchestrator, RequestCoordinationSnapshot, ResetOrchestratorWorkflowProfile,
-    RunAutomationNow, RuntimeInventory, RuntimeObservationState, RuntimeProcessState,
-    RuntimeReconciliation, RuntimeTopology, SendAssignmentPrompt, SendCoordinationNodePrompt,
-    SendCoordinationNodeRoute, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
-    SendYardOrchestratorRoute, SetAutomationPaused, TokenSpendSettings,
+    ReplacedProjectOrchestrator, RequestCoordinationSnapshot, RequestSummaryWorker,
+    ResetOrchestratorWorkflowProfile, RunAutomationNow, RuntimeInventory, RuntimeObservationState,
+    RuntimeProcessState, RuntimeReconciliation, RuntimeTopology, SendAssignmentPrompt,
+    SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
+    SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SetAutomationPaused,
+    SummaryParentRuntimeCapture, SummaryWorker, SummaryWorkers, TokenSpendSettings,
     TransferProjectOrchestrator, TransferredProjectOrchestrator, UpdateAgentProfile,
     UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
     UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
@@ -68,6 +69,7 @@ mod automation_store;
 mod coordination_node_store;
 mod orchestrator_workflow_profile_store;
 mod pane_management_store;
+mod summary_worker_store;
 mod token_spend_store;
 mod worker_cleanup_store;
 
@@ -75,7 +77,7 @@ pub use pane_management_store::{
     BeginPaneManagementBatch, ManagedPaneAdoption, StoredLeaseToken, StoredPaneManagementLease,
 };
 
-const SCHEMA_VERSION: i64 = 32;
+const SCHEMA_VERSION: i64 = 33;
 const PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS: u64 = 120_000;
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_projects.sql");
 const PROFILE_ASSIGNMENT_MIGRATION: &str =
@@ -134,6 +136,8 @@ const BLANK_WORKER_PROFILE_ID: &str = "yard:managed-blank-profile";
 const WORKER_CLEANUP_MIGRATION: &str = include_str!("../migrations/0031_worker_cleanup.sql");
 const PORTABLE_PROFILE_BUNDLES_MIGRATION: &str =
     include_str!("../migrations/0032_portable_profile_bundles.sql");
+const SUMMARY_WORKER_MIGRATION: &str =
+    include_str!("../migrations/0033_ephemeral_summary_workers.sql");
 const BLANK_WORKER_PROFILE_NAME: &str = "Blank profile";
 const MAX_ROUTE_LIST_LIMIT: usize = 500;
 pub const MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT: usize = 100;
@@ -566,6 +570,41 @@ pub trait YardStore: Send + Sync {
         run_limit: usize,
     ) -> Result<WorkerCleanupDashboard, ProjectStoreError>;
     async fn get_worker_cleanup_policy(&self) -> Result<WorkerCleanupPolicy, ProjectStoreError>;
+    async fn begin_summary_worker(
+        &self,
+        project_id: &str,
+        command: RequestSummaryWorker,
+        capture: SummaryParentRuntimeCapture,
+    ) -> Result<BeginSummaryWorker, ProjectStoreError>;
+    async fn complete_summary_worker(
+        &self,
+        command_id: &str,
+        allocation: ConfirmedAllocation,
+    ) -> Result<SummaryWorker, ProjectStoreError>;
+    async fn fail_summary_worker(
+        &self,
+        command_id: &str,
+        message: &str,
+    ) -> Result<(), ProjectStoreError>;
+    async fn list_summary_workers(
+        &self,
+        project_id: &str,
+        parent_worker_id: &str,
+    ) -> Result<SummaryWorkers, ProjectStoreError>;
+    async fn get_summary_worker(
+        &self,
+        project_id: &str,
+        parent_worker_id: &str,
+        assignment_id: &str,
+    ) -> Result<SummaryWorker, ProjectStoreError>;
+    async fn start_summary_worker_handoff(
+        &self,
+        project_id: &str,
+        parent_worker_id: &str,
+        assignment_id: &str,
+        command: ReceiveSummaryWorker,
+        pane_instance_id: Option<String>,
+    ) -> Result<PreparedSummaryWorkerHandoff, ProjectStoreError>;
     async fn update_worker_cleanup_policy(
         &self,
         command: UpdateWorkerCleanupPolicy,
@@ -933,6 +972,19 @@ pub enum BeginProfileAllocation {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum BeginSummaryWorker {
+    Started,
+    Replayed(Box<SummaryWorker>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedSummaryWorkerHandoff {
+    pub summary: SummaryWorker,
+    pub artifact_id: String,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum BeginProfileProjectCreation {
     Started(Box<ProfileProjectCreationContext>),
     Replayed(Box<ConfirmedProjectCreation>),
@@ -1104,10 +1156,12 @@ pub struct ClaimedWorkerCleanupItem {
     pub expected_worker_version: u64,
     pub expected_runtime_version: u64,
     pub runtime: WorkerRuntimeBinding,
+    pub pane_instance_id: Option<String>,
     pub preview: bool,
     pub advisor_profile_id: Option<String>,
     pub advisor_assignment_id: Option<String>,
     pub is_cleanup_advisor: bool,
+    pub is_summary_worker: bool,
     pub claim_token: String,
     pub attempts: u32,
 }
@@ -5046,6 +5100,67 @@ impl YardStore for SqliteProjectStore {
 
     async fn get_worker_cleanup_policy(&self) -> Result<WorkerCleanupPolicy, ProjectStoreError> {
         worker_cleanup_store::get_policy(self).await
+    }
+
+    async fn begin_summary_worker(
+        &self,
+        project_id: &str,
+        command: RequestSummaryWorker,
+        capture: SummaryParentRuntimeCapture,
+    ) -> Result<BeginSummaryWorker, ProjectStoreError> {
+        summary_worker_store::begin(self, project_id, command, capture).await
+    }
+
+    async fn complete_summary_worker(
+        &self,
+        command_id: &str,
+        allocation: ConfirmedAllocation,
+    ) -> Result<SummaryWorker, ProjectStoreError> {
+        summary_worker_store::complete(self, command_id, allocation).await
+    }
+
+    async fn fail_summary_worker(
+        &self,
+        command_id: &str,
+        message: &str,
+    ) -> Result<(), ProjectStoreError> {
+        summary_worker_store::fail(self, command_id, message).await
+    }
+
+    async fn list_summary_workers(
+        &self,
+        project_id: &str,
+        parent_worker_id: &str,
+    ) -> Result<SummaryWorkers, ProjectStoreError> {
+        summary_worker_store::list(self, project_id, parent_worker_id).await
+    }
+
+    async fn get_summary_worker(
+        &self,
+        project_id: &str,
+        parent_worker_id: &str,
+        assignment_id: &str,
+    ) -> Result<SummaryWorker, ProjectStoreError> {
+        summary_worker_store::get(self, project_id, parent_worker_id, assignment_id).await
+    }
+
+    async fn start_summary_worker_handoff(
+        &self,
+        project_id: &str,
+        parent_worker_id: &str,
+        assignment_id: &str,
+        command: ReceiveSummaryWorker,
+        pane_instance_id: Option<String>,
+    ) -> Result<PreparedSummaryWorkerHandoff, ProjectStoreError> {
+        summary_worker_store::start_handoff(
+            self,
+            project_id,
+            parent_worker_id,
+            assignment_id,
+            command,
+            pane_instance_id,
+        )
+        .await
     }
 
     async fn update_worker_cleanup_policy(
@@ -12394,6 +12509,13 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         transaction.execute_batch(PORTABLE_PROFILE_BUNDLES_MIGRATION)?;
         ensure_foreign_keys(&transaction)?;
         transaction.commit()?;
+        current = 32;
+    }
+    if current == 32 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SUMMARY_WORKER_MIGRATION)?;
+        ensure_foreign_keys(&transaction)?;
+        transaction.commit()?;
     }
     ensure_foreign_keys(connection)?;
     Ok(())
@@ -19109,6 +19231,18 @@ pub enum ProjectStoreError {
     CompletedRuntimeCleanupPreviewLimitInvalid { max: usize },
     #[error(transparent)]
     InvalidWorkerCleanup(#[from] yard_domain::WorkerCleanupValidationError),
+    #[error(transparent)]
+    InvalidSummaryWorker(#[from] yard_domain::SummaryWorkerValidationError),
+    #[error("summary worker was not found")]
+    SummaryWorkerNotFound,
+    #[error("summary request parent is not the current project orchestrator")]
+    SummaryParentNotCurrent,
+    #[error("summary request parent runtime could not be verified")]
+    SummaryParentRuntimeUnverified,
+    #[error("summary worker allocation does not match its captured parent workspace")]
+    SummaryWorkerAllocationMismatch,
+    #[error("summary worker has not produced one valid Markdown artifact and completion receipt")]
+    SummaryWorkerHandoffNotReady,
     #[error("worker cleanup policy version conflict; current version is {current_version}")]
     WorkerCleanupPolicyVersionConflict { current_version: u64 },
     #[error("worker cleanup run was not found")]
@@ -19404,12 +19538,13 @@ mod tests {
         ManagedRuntimeWorkspaceKind, ObservedStatus, ObservedWorker, OldSessionDisposition,
         PaneObservation, Project, ProjectRelationshipKind, ProjectRuntimeBinding,
         ProviderSessionRef, ProvisionCoordinationNode, ProvisionYardOrchestrator,
-        RecordCompletionReceipt, ReplaceProjectOrchestrator, RequestCoordinationSnapshot,
-        RunAutomationNow, RuntimeInventory, RuntimeObservationState, RuntimeProcessState,
-        SendAssignmentPrompt, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
-        SendOrchestratorPrompt, SendYardOrchestratorPrompt, SendYardOrchestratorRoute,
-        SnapshotCollectionStatus, StartWorkerCleanupRun, TransferProjectOrchestrator,
-        UpdateAgentProfile, UpdateAutomation, UpdateCoordinationNode,
+        ReceiveSummaryWorker, RecordCompletionReceipt, ReplaceProjectOrchestrator,
+        RequestCoordinationSnapshot, RequestSummaryWorker, RunAutomationNow, RuntimeInventory,
+        RuntimeObservationState, RuntimeProcessState, SendAssignmentPrompt,
+        SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
+        SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SnapshotCollectionStatus,
+        StartWorkerCleanupRun, SummaryParentRuntimeCapture, SummaryWorkerState,
+        TransferProjectOrchestrator, UpdateAgentProfile, UpdateAutomation, UpdateCoordinationNode,
         UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
         UpdateProjectWorkflowProfile, UpdateTokenSpendSettings, UpdateWorkerProfile,
         WorkerAvailability, WorkerCleanupItemStatus, WorkerCleanupRunStatus,
@@ -19421,15 +19556,15 @@ mod tests {
         AUTOMATIONS_MIGRATION, BLANK_WORKER_PROFILE_ID, BLANK_WORKER_PROFILE_NAME,
         BeginAssignmentPrompt, BeginCoordinationNodePrompt, BeginCoordinationNodeRoute,
         BeginOrchestratorPrompt, BeginProfileAllocation, BeginProfileProjectCreation,
-        BeginProjectOrchestratorReplacement, BeginWorkerAllocation, BeginWorkerHandoff,
-        BeginWorkspaceProjectCreation, BeginYardOrchestratorPrompt, BeginYardOrchestratorRoute,
-        COMPLETION_RECEIPT_MIGRATION, FINAL_BACKEND_SAFETY_MIGRATION, INITIAL_MIGRATION,
-        OrchestratorReplacementRecoveryOutcome, OrchestratorReplacementRecoveryTarget,
-        OrchestratorReplacementRuntimeRole, OrchestratorReplacementStartEvidence,
-        PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS, PROFILE_ASSIGNMENT_MIGRATION,
-        ProjectStoreError, SCHEMA_VERSION, SnapshotDeliveryResult, SnapshotProjectFolder,
-        SqliteProjectStore, TokenSpendCommandSource, YardStore, insert_worker_runtime_binding,
-        insert_worker_runtime_binding_unchecked,
+        BeginProjectOrchestratorReplacement, BeginSummaryWorker, BeginWorkerAllocation,
+        BeginWorkerHandoff, BeginWorkspaceProjectCreation, BeginYardOrchestratorPrompt,
+        BeginYardOrchestratorRoute, COMPLETION_RECEIPT_MIGRATION, FINAL_BACKEND_SAFETY_MIGRATION,
+        INITIAL_MIGRATION, OrchestratorReplacementRecoveryOutcome,
+        OrchestratorReplacementRecoveryTarget, OrchestratorReplacementRuntimeRole,
+        OrchestratorReplacementStartEvidence, PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS,
+        PROFILE_ASSIGNMENT_MIGRATION, ProjectStoreError, SCHEMA_VERSION, SnapshotDeliveryResult,
+        SnapshotProjectFolder, SqliteProjectStore, TokenSpendCommandSource, YardStore,
+        insert_worker_runtime_binding, insert_worker_runtime_binding_unchecked,
     };
 
     const HISTORICAL_PROVIDER_NEUTRAL_WORKFLOW_V25_MIGRATION: &str =
@@ -20691,6 +20826,196 @@ mod tests {
             .await
             .unwrap();
         (project_id, assignment, receipt_id)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn summary_worker_handoff_requires_exact_artifact_then_schedules_guarded_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, orchestrator_runtime) = draft("workspace-summary", "terminal-parent");
+        let project = store
+            .create_project(project_draft, orchestrator_runtime)
+            .await
+            .unwrap();
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Summarizer"),
+            })
+            .await
+            .unwrap();
+        let artifact_id = Uuid::now_v7().to_string();
+        let command = RequestSummaryWorker {
+            command_id: Uuid::now_v7().to_string(),
+            actor: "local-user".to_owned(),
+            parent_worker_id: project.orchestrator.id.clone(),
+            expected_parent_worker_version: project.orchestrator.version,
+            expected_project_version: project.version,
+            profile_id: profile.id.clone(),
+            expected_profile_version: profile.version,
+            artifact_id: artifact_id.clone(),
+            objective: "Summarize the durable state.".to_owned(),
+        };
+        let parent_runtime = project.orchestrator.runtime.as_ref().unwrap();
+        assert_eq!(
+            store
+                .begin_summary_worker(
+                    &project.id,
+                    command.clone(),
+                    SummaryParentRuntimeCapture {
+                        adapter: parent_runtime.adapter.clone(),
+                        session: parent_runtime.session.clone(),
+                        workspace_id: parent_runtime.workspace_id.clone(),
+                        terminal_id: parent_runtime.terminal_id.clone(),
+                        tab_id: parent_runtime.tab_id.clone().unwrap(),
+                        pane_id: parent_runtime.pane_id.clone(),
+                        pane_instance_id: Some("parent-instance".to_owned()),
+                        provider_session: parent_runtime.provider_session.clone(),
+                        observed_at_unix_ms: 2,
+                    },
+                )
+                .await
+                .unwrap(),
+            BeginSummaryWorker::Started
+        );
+        store
+            .begin_profile_allocation(
+                &project.id,
+                ConfirmProfileAllocation {
+                    command_id: command.command_id.clone(),
+                    actor: command.actor.clone(),
+                    profile_id: profile.id,
+                    expected_profile_version: profile.version,
+                    expected_project_version: project.version,
+                    objective: command.objective.clone(),
+                    role: "summary_worker".to_owned(),
+                    isolation_policy: IsolationPolicy::ProjectWorkspace,
+                },
+            )
+            .await
+            .unwrap();
+        let (_, mut child_runtime) = draft("workspace-summary", "terminal-child");
+        child_runtime.tab_id = Some("tab-child".to_owned());
+        child_runtime.pane_id = "pane-child".to_owned();
+        child_runtime.owns_tab = true;
+        store
+            .claim_provisioning_runtime(&command.command_id, child_runtime.clone())
+            .await
+            .unwrap();
+        store
+            .persist_runtime_allocation(&command.command_id, child_runtime)
+            .await
+            .unwrap();
+        let allocation = store
+            .activate_profile_allocation(&command.command_id)
+            .await
+            .unwrap();
+        let summary = store
+            .complete_summary_worker(&command.command_id, allocation)
+            .await
+            .unwrap();
+        let assignment = summary.assignment.unwrap();
+        assert!(matches!(
+            store
+                .start_summary_worker_handoff(
+                    &project.id,
+                    &project.orchestrator.id,
+                    &assignment.id,
+                    ReceiveSummaryWorker {
+                        command_id: Uuid::now_v7().to_string(),
+                        actor: "local-user".to_owned(),
+                        expected_parent_worker_version: project.orchestrator.version,
+                    },
+                    Some("child-instance".to_owned()),
+                )
+                .await,
+            Err(ProjectStoreError::SummaryWorkerHandoffNotReady)
+        ));
+        store
+            .register_artifact(
+                &project.id,
+                &assignment.id,
+                &artifact_id,
+                ArtifactRegistration {
+                    actor: "summary-worker".to_owned(),
+                    attempt_id: assignment.attempt.id.clone(),
+                    expected_assignment_version: assignment.version,
+                    expected_attempt_version: assignment.attempt.version,
+                    kind: ArtifactKind::Markdown,
+                    display_name: "summary.md".to_owned(),
+                    byte_size: 7,
+                    sha256: "0".repeat(64),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .record_completion_receipt(
+                &project.id,
+                &assignment.id,
+                RecordCompletionReceipt {
+                    command_id: Uuid::now_v7().to_string(),
+                    actor: "summary-worker".to_owned(),
+                    attempt_id: assignment.attempt.id.clone(),
+                    expected_assignment_version: assignment.version,
+                    expected_attempt_version: assignment.attempt.version,
+                    outcome: CompletionOutcome::Completed,
+                    summary: "Summary committed.".to_owned(),
+                    artifact_refs: Vec::new(),
+                    artifact_ids: vec![artifact_id.clone()],
+                    evidence_refs: Vec::new(),
+                    unresolved_blockers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let handoff_command = ReceiveSummaryWorker {
+            command_id: Uuid::now_v7().to_string(),
+            actor: "local-user".to_owned(),
+            expected_parent_worker_version: project.orchestrator.version,
+        };
+        let handoff = store
+            .start_summary_worker_handoff(
+                &project.id,
+                &project.orchestrator.id,
+                &assignment.id,
+                handoff_command.clone(),
+                Some("child-instance".to_owned()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(handoff.artifact_id, artifact_id);
+        assert_eq!(handoff.summary.state, SummaryWorkerState::RetirementPending);
+        let claimed = store
+            .claim_worker_cleanup_items(handoff.summary.cleanup_run_id.as_deref(), 1, 10_000)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].pane_instance_id.as_deref(),
+            Some("child-instance")
+        );
+        assert!(!claimed[0].is_cleanup_advisor);
+        assert!(claimed[0].is_summary_worker);
+        store
+            .authorize_worker_cleanup_close(&claimed[0])
+            .await
+            .unwrap();
+        let replayed = store
+            .start_summary_worker_handoff(
+                &project.id,
+                &project.orchestrator.id,
+                &assignment.id,
+                handoff_command,
+                Some("child-instance".to_owned()),
+            )
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(
+            replayed.summary.cleanup_run_id,
+            handoff.summary.cleanup_run_id
+        );
     }
 
     async fn preview_retained_reasons(

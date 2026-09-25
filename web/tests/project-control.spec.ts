@@ -34,6 +34,8 @@ import type {
   ProjectRelationship,
   ProvisionYardOrchestratorInput,
   RecoverYardOrchestratorInput,
+  ReceiveSummaryWorkerInput,
+  RequestSummaryWorkerInput,
   ResetOrchestratorWorkflowProfileInput,
   RuntimeInventory,
   RuntimeTopology,
@@ -47,6 +49,7 @@ import type {
   SendYardOrchestratorPromptInput,
   SendYardOrchestratorRouteInput,
   StatusReport,
+  SummaryWorker,
   TokenSpendSettings,
   TerminalClientMessage,
   Worker,
@@ -446,6 +449,9 @@ interface MockState {
   workerCandidates: WorkerCandidate[]
   workerRequests: number
   assignments: Assignment[]
+  summaryWorkers: SummaryWorker[]
+  summaryWorkerCommands: RequestSummaryWorkerInput[]
+  summaryHandoffCommands: ReceiveSummaryWorkerInput[]
   runtimeInventory: typeof inventory
   runtimeTopology: RuntimeTopology
   runtimeSessions: Array<{
@@ -762,6 +768,9 @@ async function mockApi(
     ),
     workerRequests: 0,
     assignments: [],
+    summaryWorkers: [],
+    summaryWorkerCommands: [],
+    summaryHandoffCommands: [],
     runtimeInventory: {
       ...inventory,
       focus: { ...inventory.focus },
@@ -1853,6 +1862,12 @@ async function mockApi(
     const assignmentMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)\/assignments$/,
     )
+    const summaryWorkerMatch = url.pathname.match(
+      /^\/api\/v1\/projects\/([^/]+)\/orchestrator\/summary-workers$/,
+    )
+    const summaryHandoffMatch = url.pathname.match(
+      /^\/api\/v1\/projects\/([^/]+)\/orchestrator\/summary-workers\/([^/]+)\/handoff$/,
+    )
     const handoffMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)\/assignments\/([^/]+)\/handoffs$/,
     )
@@ -1880,6 +1895,123 @@ async function mockApi(
     const projectDetailMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)$/,
     )
+
+    if (summaryWorkerMatch && request.method() === 'GET') {
+      const projectId = decodeURIComponent(summaryWorkerMatch[1])
+      await route.fulfill({
+        json: {
+          summaries: state.summaryWorkers.filter(
+            (summary) => summary.project_id === projectId,
+          ),
+        },
+      })
+      return
+    }
+
+    if (summaryWorkerMatch && request.method() === 'POST') {
+      const projectId = decodeURIComponent(summaryWorkerMatch[1])
+      const input = request.postDataJSON() as RequestSummaryWorkerInput
+      state.summaryWorkerCommands.push(input)
+      const workerProfile =
+        state.profiles.find((profile) => profile.id === input.profile_id) ??
+        state.profiles[0]
+      const active = assignment(
+        `summary-assignment-${state.summaryWorkers.length + 1}`,
+        projectId,
+        workerProfile,
+        input.objective,
+        'summary_worker',
+      )
+      const artifact: Artifact = {
+        id: input.artifact_id,
+        project_id: projectId,
+        assignment_id: active.id,
+        attempt_id: active.attempt.id,
+        worker_id: active.worker.id,
+        kind: 'markdown',
+        media_type: 'text/markdown',
+        display_name: 'summary.md',
+        byte_size: 17,
+        sha256: '0'.repeat(64),
+        source: 'upload',
+        created_by: 'summary-worker',
+        created_at_unix_ms: Date.now(),
+      }
+      const completed: Assignment = {
+        ...active,
+        lifecycle: 'completed',
+        version: '2',
+        attempt: { ...active.attempt, lifecycle: 'completed', version: '2' },
+        completion_receipt: {
+          id: `summary-receipt-${state.summaryWorkers.length + 1}`,
+          assignment_id: active.id,
+          attempt_id: active.attempt.id,
+          outcome: 'completed',
+          summary: 'Summary committed.',
+          artifact_refs: [],
+          artifacts: [artifact],
+          evidence_refs: [],
+          unresolved_blockers: [],
+          actor: 'summary-worker',
+          created_at_unix_ms: Date.now(),
+        },
+      }
+      state.assignments.push(completed)
+      state.artifacts.set(artifact.id, {
+        artifact,
+        content: '# Project summary',
+      })
+      const summary: SummaryWorker = {
+        command_id: input.command_id,
+        project_id: projectId,
+        parent_worker_id: input.parent_worker_id,
+        profile_id: input.profile_id,
+        profile_version: input.expected_profile_version,
+        objective: input.objective,
+        expected_artifact_id: input.artifact_id,
+        captured_workspace_id: 'workspace-1',
+        state: 'ready',
+        assignment: completed,
+        artifact,
+        cleanup_run_id: null,
+        retirement_reason: null,
+        error: null,
+        created_at_unix_ms: Date.now(),
+        updated_at_unix_ms: Date.now(),
+      }
+      state.summaryWorkers.push(summary)
+      await route.fulfill({ json: summary })
+      return
+    }
+
+    if (summaryHandoffMatch && request.method() === 'POST') {
+      const assignmentId = decodeURIComponent(summaryHandoffMatch[2])
+      const input = request.postDataJSON() as ReceiveSummaryWorkerInput
+      state.summaryHandoffCommands.push(input)
+      const index = state.summaryWorkers.findIndex(
+        (summary) => summary.assignment?.id === assignmentId,
+      )
+      const current = state.summaryWorkers[index]
+      if (!current?.artifact) {
+        await route.fulfill({ status: 409 })
+        return
+      }
+      const summary = {
+        ...current,
+        state: 'retirement_deferred' as const,
+        cleanup_run_id: `cleanup-${assignmentId}`,
+        retirement_reason: 'lease_capability_unsupported',
+      }
+      state.summaryWorkers[index] = summary
+      await route.fulfill({
+        json: {
+          summary,
+          artifact: state.artifacts.get(current.artifact.id),
+          replayed: false,
+        },
+      })
+      return
+    }
 
     if (archiveMatch && request.method() === 'POST') {
       const projectId = decodeURIComponent(archiveMatch[1])
@@ -11051,6 +11183,53 @@ test('loads transfer inventory from the project session without changing the glo
   expect(
     state.projectOrchestratorCommands[0].expected_orchestrator_runtime.session,
   ).toBe('beta')
+})
+
+test('creates, receives, and safely defers an ephemeral summary worker', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page
+    .locator('.orchestrator-marker[data-project-id="project-1"]')
+    .click()
+  const inspector = page.locator('.inspector')
+  const summaryRegion = inspector.getByRole('region', {
+    name: 'Ephemeral summary workers',
+  })
+  await expect(summaryRegion).toContainText('spends provider tokens')
+  await summaryRegion
+    .getByRole('button', { name: 'Create summary worker' })
+    .click()
+
+  await expect.poll(() => state.summaryWorkerCommands.length).toBe(1)
+  expect(state.summaryWorkerCommands[0]).toMatchObject({
+    actor: 'local-user',
+    parent_worker_id: 'project-1-orchestrator',
+    expected_parent_worker_version: '1',
+    expected_project_version: '1',
+    profile_id: 'profile-1',
+    expected_profile_version: '1',
+  })
+  expect(state.summaryWorkerCommands[0].artifact_id).toMatch(
+    /^[0-9a-f-]{36}$/,
+  )
+  await expect(summaryRegion).toContainText('ready')
+  await summaryRegion
+    .getByRole('button', { name: 'Receive summary' })
+    .click()
+  await expect.poll(() => state.summaryHandoffCommands.length).toBe(1)
+
+  await page
+    .locator('.orchestrator-marker[data-project-id="project-1"]')
+    .click()
+  await expect(
+    page
+      .locator('.inspector')
+      .getByRole('region', { name: 'Ephemeral summary workers' }),
+  ).toContainText('retirement deferred — lease_capability_unsupported')
 })
 
 test('submits full runtimes from a timestamp-reconciled transfer snapshot', async ({
