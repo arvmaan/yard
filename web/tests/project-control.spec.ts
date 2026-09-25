@@ -13627,6 +13627,20 @@ test('previews packaged profile lowering without exposing raw capability fields'
   await page.setViewportSize({ width: 1200, height: 760 })
   await page.goto('/')
 
+  const shelf = page.locator('.resource-shelf')
+  if (!(await shelf.isVisible().catch(() => false))) {
+    await page
+      .getByRole('button', { name: 'Resources', exact: true })
+      .click()
+  }
+  await expect(shelf).toBeVisible()
+  const profilesTab = page.getByRole('tab', { name: 'Profiles' })
+  if (
+    (await profilesTab.isVisible().catch(() => false)) &&
+    (await profilesTab.getAttribute('aria-selected')) !== 'true'
+  ) {
+    await profilesTab.click()
+  }
   await page.getByRole('button', { name: /Implementer/ }).click()
   await page.getByRole('button', { name: 'Edit profile' }).click()
   const dialog = page.getByRole('dialog', { name: 'Edit profile' })
