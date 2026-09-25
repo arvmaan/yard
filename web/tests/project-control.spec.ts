@@ -7503,7 +7503,7 @@ test('connects the assignment terminal and relays frames, input, resize, and rel
     },
   ])
   await expect(
-    page.getByRole('region', { name: 'Implementer' }),
+    page.getByRole('region', { name: 'Implementer', exact: true }),
   ).toBeVisible()
   const terminalViewport = terminal.locator('.xterm-scrollable-element')
   const historyScrollHeight = await terminalViewport.evaluate(
@@ -7694,7 +7694,10 @@ test('keeps a worker terminal theme and scrollback authoritative under TUI mouse
     .getByRole('button', { name: 'Open terminal', exact: true })
     .click()
 
-  const workerDialog = page.getByRole('region', { name: 'Implementer' })
+  const workerDialog = page.getByRole('region', {
+    name: 'Implementer',
+    exact: true,
+  })
   const terminal = workerDialog.locator('.terminal-session')
   const xtermViewport = terminal.locator('.xterm-scrollable-element')
   const renderedRows = terminal.locator('.xterm-rows')
@@ -12214,7 +12217,7 @@ test('opens chat and terminal from an assigned worker in the worker rail', async
     .getByRole('button', { name: 'Open chat', exact: true })
     .click()
   await expect(
-    page.getByRole('region', { name: 'Implementer' }),
+    page.getByRole('region', { name: 'Implementer', exact: true }),
   ).toBeVisible()
   await page.getByRole('button', { name: 'Back to Map' }).click()
   await page
