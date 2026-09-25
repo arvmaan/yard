@@ -2494,9 +2494,7 @@ function App() {
   const [projectPulseOpen, setProjectPulseOpen] = useState(false)
   const [filter, setFilter] = useState<Filter>('current')
   const [railView, setRailView] = useState<ResourceView>('profiles')
-  const [resourceShelfOpen, setResourceShelfOpen] = useState(
-    () => !window.matchMedia('(max-width: 760px)').matches,
-  )
+  const [resourceShelfOpen, setResourceShelfOpen] = useState(false)
   const [selection, setSelection] = useState<CanvasSelection>(null)
   const [agentWorkspaceMode, setAgentWorkspaceMode] =
     useState<AgentWorkspaceView>('map')

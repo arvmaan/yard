@@ -4144,6 +4144,24 @@ async function openRuntimeHealth(page: Page) {
   return popover
 }
 
+async function openResources(
+  page: Page,
+  view: 'Profiles' | 'Workers' | 'Workspaces' = 'Profiles',
+) {
+  const shelf = page.locator('.resource-shelf')
+  if (!(await shelf.isVisible().catch(() => false))) {
+    await page
+      .getByRole('button', { name: 'Resources', exact: true })
+      .click()
+  }
+  await expect(shelf).toBeVisible()
+  const tab = page.getByRole('tab', { name: view })
+  if ((await tab.getAttribute('aria-selected')) !== 'true') {
+    await tab.click()
+  }
+  return shelf
+}
+
 async function openHerdrInventory(page: Page) {
   const health = await openRuntimeHealth(page)
   const trigger = page.locator(
@@ -4505,7 +4523,8 @@ test('renders durable, offline, and unbound resources on desktop', async ({
   )
   await expect(page.locator('.orchestrator-marker')).toHaveCount(2)
 
-  await page.getByRole('tab', { name: 'Workspaces' }).click()
+  await expect(page.locator('.resource-shelf')).toHaveCount(0)
+  await openResources(page, 'Workspaces')
   await expect(page.locator('.workspace-row')).toHaveCount(3)
 
   const overflow = await page.evaluate(() => ({
@@ -4540,31 +4559,29 @@ test('keeps the canvas visible under a compact collapsible resource shelf', asyn
     exact: true,
   })
 
-  const [commandBounds, shelfBounds, canvasBounds, createBounds, resourcesBounds] =
+  await expect(shelf).toHaveCount(0)
+  await expect(resources).toHaveAttribute('aria-expanded', 'false')
+  const [commandBounds, canvasBounds, createBounds, resourcesBounds] =
     await Promise.all([
       commandBar.boundingBox(),
-      shelf.boundingBox(),
       canvas.boundingBox(),
       createProject.boundingBox(),
       resources.boundingBox(),
     ])
   expect(commandBounds?.height).toBeLessThanOrEqual(48)
-  expect(shelfBounds?.height).toBeLessThanOrEqual(96)
   expect(createBounds?.x ?? Infinity).toBeLessThan(resourcesBounds?.x ?? 0)
-  expect(canvasBounds?.height ?? 0).toBeGreaterThan(600)
-
-  await page
-    .getByRole('button', { name: 'Collapse resource shelf' })
-    .click()
-  await expect(shelf).toHaveCount(0)
+  expect(canvasBounds?.height ?? 0).toBeGreaterThan(700)
   await expect(page.locator('.project-region').first()).toBeVisible()
-  await expect
-    .poll(async () => (await canvas.boundingBox())?.height ?? 0)
-    .toBeGreaterThan(canvasBounds?.height ?? 0)
 
   await resources.focus()
   await resources.press('Enter')
   await expect(shelf).toBeVisible()
+  await expect(resources).toHaveAttribute('aria-expanded', 'true')
+  const shelfBounds = await shelf.boundingBox()
+  expect(shelfBounds?.height).toBeLessThanOrEqual(96)
+  await expect
+    .poll(async () => (await canvas.boundingBox())?.height ?? 0)
+    .toBeLessThan(canvasBounds?.height ?? 0)
   await expect(page.getByRole('tab', { name: 'Profiles' })).toBeFocused()
   await page.keyboard.press('ArrowRight')
   await expect(page.getByRole('tab', { name: 'Workers' })).toBeFocused()
@@ -5417,7 +5434,7 @@ test('uses durable status for missing ambiguous and exited worker candidates', a
   retainTopologyWithoutObservedWorker(state, exited.worker)
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
 
   const inspector = page.locator('.inspector')
   const resumable = page.locator(
@@ -5740,7 +5757,7 @@ test('keeps terminal and chat controls for an adopted running pane even when int
 
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   await page
     .locator('.worker-row[data-worker-id="worker-assigned"]')
     .click()
@@ -5791,7 +5808,7 @@ test('keeps launch-pending panes disabled and shows recovery controls', async ({
 
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   await page
     .locator('.worker-row[data-worker-id="worker-assigned"]')
     .click()
@@ -5828,7 +5845,7 @@ test('keeps topology-only shells terminal-only', async ({ page }) => {
 
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   await page
     .locator('.worker-row[data-worker-id="worker-assigned"]')
     .click()
@@ -5858,7 +5875,7 @@ test('invalidates live controls after a failed refresh and restores them after r
   const seeded = seedAssignedCandidateAssignment(state)
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   await page
     .locator('.worker-row[data-worker-id="worker-assigned"]')
     .click()
@@ -5997,7 +6014,7 @@ test('shows selected worker details on mobile', async ({ page }, testInfo) => {
 
   await expect(page.locator('.project-region').first()).toBeVisible()
   await page.getByRole('button', { name: 'Resources' }).click()
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   await page.locator('.worker-row').first().click()
   await expect(page.locator('.inspector.has-selection')).toBeVisible()
   await expect(page.getByText('Worker candidate')).toBeVisible()
@@ -6020,7 +6037,7 @@ test('keeps profile creation available on mobile', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 })
   await page.goto('/')
 
-  await page.getByRole('button', { name: 'Resources' }).click()
+  await openResources(page)
   await expect(page.locator('.profile-row')).toHaveCount(1)
   await page.getByRole('button', { name: 'Create worker profile' }).click()
 
@@ -6078,10 +6095,6 @@ test('creates a project workspace and orchestrator from the empty inspector', as
   await page.goto('/')
 
   const shelf = page.locator('.resource-shelf')
-  await expect(shelf).toBeVisible()
-  await page
-    .getByRole('button', { name: 'Collapse resource shelf' })
-    .click()
   await expect(shelf).toHaveCount(0)
 
   const createProject = page.getByRole('button', {
@@ -6455,7 +6468,7 @@ test('renders central cleanup and Superintendent despite a project workspace col
     page.locator('[data-id="worker:quarantined-terminal"]'),
   ).toHaveCount(0)
 
-  await page.getByRole('tab', { name: 'Workspaces' }).click()
+  await openResources(page, 'Workspaces')
   await expect(page.locator('.workspace-list')).not.toContainText(
     'Yard central',
   )
@@ -6467,7 +6480,7 @@ test('adopts an observed workspace and keeps it after reload', async ({ page }) 
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
-  await page.getByRole('tab', { name: 'Workspaces' }).click()
+  await openResources(page, 'Workspaces')
   await page.locator('.workspace-row').first().click()
   await expect(
     page.getByRole('paragraph').filter({ hasText: 'Create project' }),
@@ -6497,7 +6510,7 @@ test('creates a project orchestrator from a selected profile', async ({
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
-  await page.getByRole('tab', { name: 'Workspaces' }).click()
+  await openResources(page, 'Workspaces')
   await page.locator('.workspace-row').first().click()
   await page.getByRole('button', { name: 'Profile', exact: true }).click()
   await page.locator('#project-name').fill('Profile-backed project')
@@ -6535,6 +6548,7 @@ test('confirms profile allocation before rendering a durable worker', async ({
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
+  await openResources(page)
   await expect(page.locator('.profile-row')).toHaveCount(1)
   await dragToProject(page.locator('.profile-row').first(), page)
   await expect(
@@ -6679,7 +6693,7 @@ test('replaces a target orchestrator through the keyboard handoff path', async (
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   const worker = page.locator(
     '.worker-row[data-worker-id="worker-assigned"]',
   )
@@ -6731,7 +6745,7 @@ test('retains the handoff command ID while a proposal remains open', async ({
   await page.setViewportSize({ width: 1200, height: 760 })
   await page.goto('/')
 
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   await page
     .locator('.worker-row[data-worker-id="worker-assigned"]')
     .press('Enter')
@@ -6771,11 +6785,12 @@ test('allocates a profileless live worker from the keyboard inspector action', a
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
+  await openResources(page)
   await expect(page.locator('.profile-row')).toHaveAttribute(
     'draggable',
     'true',
   )
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   const liveWorker = page.locator(
     '.worker-row[data-worker-id="worker-unassigned"]',
   )
@@ -6834,7 +6849,7 @@ test('replaces a profiled worker runtime through the generalized drag payload', 
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   await dragToProject(
     page.locator('.worker-row[data-worker-id="worker-resumable"]'),
     page,
@@ -6874,6 +6889,7 @@ test('retains the allocation command ID while a proposal remains open', async ({
   await page.setViewportSize({ width: 1200, height: 760 })
   await page.goto('/')
 
+  await openResources(page)
   await dragToProject(page.locator('.profile-row').first(), page)
   const dialog = page.getByRole('dialog', { name: 'Create worker' })
   await dialog.getByLabel('Objective').fill('Retry the same proposal.')
@@ -8013,7 +8029,7 @@ test('applies all built-in themes to populated status and terminal surfaces', as
   seedActiveAssignment(state)
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   await page
     .locator('.worker-row[data-worker-id="worker-unavailable"]')
     .click()
@@ -11340,7 +11356,7 @@ test('changes a project orchestrator only to an eligible live workspace worker',
   ).toHaveText('terminal-2')
   await expect.poll(() => state.terminalSockets.length).toBe(1)
   await page.getByRole('button', { name: 'Back to Map' }).click()
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   await expect(
     page.locator(
       '.worker-row[data-worker-id="project-1-orchestrator"][data-availability="unassigned_live"]',
@@ -12185,7 +12201,7 @@ test('opens chat and terminal from an assigned worker in the worker rail', async
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   await page
     .locator('.worker-row[data-worker-id="worker-assigned"]')
     .click()
@@ -12217,7 +12233,7 @@ test('reconciles an external assignment into terminal controls without reloading
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   await page
     .locator('.worker-row[data-worker-id="worker-assigned"]')
     .click()
@@ -12257,7 +12273,7 @@ test('opens an existing worker terminal in Ghostty', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   await page
     .locator('.worker-row[data-worker-id="worker-assigned"]')
     .click()
@@ -12303,7 +12319,7 @@ for (const ghosttyError of ghosttyLaunchErrors) {
     await page.setViewportSize({ width: 1280, height: 800 })
     await page.goto('/')
     await page.evaluate(() => navigator.clipboard.writeText('unchanged'))
-    await page.getByRole('tab', { name: 'Workers' }).click()
+    await openResources(page, 'Workers')
     await page
       .locator('.worker-row[data-worker-id="worker-assigned"]')
       .click()
@@ -13073,6 +13089,7 @@ test('records a durable manual completion receipt', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
+  await openResources(page)
   await dragToProject(page.locator('.profile-row').first(), page)
   await page.getByLabel('Objective').fill('Ship the receipt workflow.')
   await page
@@ -13204,7 +13221,7 @@ test('records a durable manual completion receipt', async ({ page }) => {
   await expect(
     page.locator('.assigned-worker-marker'),
   ).toHaveCount(0)
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   const resumableWorker = page.locator(
     '.worker-row[data-worker-id="assignment-1-worker"][data-availability="resumable"]',
   )
@@ -13286,6 +13303,7 @@ test('uploads and safely inspects a typed HTML artifact', async ({
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
+  await openResources(page)
   await dragToProject(page.locator('.profile-row').first(), page)
   await page.getByLabel('Objective').fill('Publish a release report.')
   await page
@@ -13396,7 +13414,7 @@ test('reviews bounded completed runtimes without mutation', async ({ page }) => 
   const state = await mockApi(page)
   await page.goto('/')
 
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   const trigger = page.getByRole('button', {
     name: 'Review completed runtimes, read-only; nothing will be closed',
   })
@@ -13426,7 +13444,7 @@ test('reports queued runtime cleanup after ending a session', async ({
   const state = await mockApi(page, { endSessionCleanupPending: true })
   await page.goto('/')
 
-  await page.getByRole('tab', { name: 'Workers' }).click()
+  await openResources(page, 'Workers')
   await page
     .locator(
       '.worker-row[data-worker-id="worker-resumable"][data-availability="resumable"]',
@@ -13463,6 +13481,7 @@ test('retries completion with the same command ID after a network failure', asyn
   await page.setViewportSize({ width: 1200, height: 760 })
   await page.goto('/')
 
+  await openResources(page)
   await dragToProject(page.locator('.profile-row').first(), page)
   await page.getByLabel('Objective').fill('Verify retry semantics.')
   await page
@@ -13499,6 +13518,7 @@ test('creates and edits a reusable worker profile', async ({ page }) => {
   await page.setViewportSize({ width: 1200, height: 760 })
   await page.goto('/')
 
+  await openResources(page)
   await page.getByRole('button', { name: 'Create worker profile' }).click()
   await page.getByLabel('Profile name').fill('Reviewer')
   await page.getByLabel('Default role').fill('reviewer')
@@ -13522,6 +13542,7 @@ test('traps modal focus and restores the opening control', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
+  await openResources(page)
   const trigger = page.getByRole('button', {
     name: 'Create worker profile',
   })
@@ -13560,6 +13581,7 @@ test('creates a worker profile from a reusable role template', async ({
   await page.setViewportSize({ width: 1200, height: 760 })
   await page.goto('/')
 
+  await openResources(page)
   await page.getByRole('button', { name: 'Create worker profile' }).click()
   await page.getByLabel('Profile template').selectOption('verifier')
   await expect(page.getByLabel('Profile name')).toHaveValue('Verifier')
@@ -13809,6 +13831,7 @@ test('drops an allocation on the visibly projected territory', async ({
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
 
+  await openResources(page)
   const territory = page.locator('.territory-polygon').first()
   const box = await territory.boundingBox()
   expect(box).not.toBeNull()
