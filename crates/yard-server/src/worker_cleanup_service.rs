@@ -676,6 +676,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn summary_retirement_defers_when_owned_lease_is_lost() {
+        let persistence = Arc::new(RecordingPersistence::new());
+        let mut exact = inventory();
+        let mut pane = observed_pane("pane-1");
+        pane.pane_instance_id = Some("captured-instance".to_owned());
+        exact.panes.push(pane);
+        let service = WorkerCleanupService::with_components(
+            Arc::new(StaticInventory(exact)),
+            persistence.clone(),
+            Arc::new(LeaseLostRetirement),
+            Arc::new(UnsupportedCleanupAdvisor),
+        );
+        let mut cleanup_item = item();
+        cleanup_item.is_summary_worker = true;
+        cleanup_item.pane_instance_id = Some("captured-instance".to_owned());
+
+        service.process_item(&cleanup_item).await.unwrap();
+
+        assert_eq!(
+            persistence.finished.lock().unwrap().as_slice(),
+            [(
+                WorkerCleanupItemStatus::Review,
+                "lease:management lease was not found".to_owned()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_retirement_closes_only_the_exact_pane_instance() {
+        let authorized = Arc::new(AtomicBool::new(false));
+        let persistence = Arc::new(RecordingPersistence {
+            authorized: Arc::clone(&authorized),
+            finished: Mutex::new(Vec::new()),
+            reconciled: Mutex::new(Vec::new()),
+            retried: Mutex::new(Vec::new()),
+            recorded_advisors: Mutex::new(Vec::new()),
+        });
+        let retirement = Arc::new(RecordingRetirement {
+            authorized,
+            lease_lookups: Mutex::new(Vec::new()),
+            closes: Mutex::new(Vec::new()),
+        });
+        let mut exact = inventory();
+        let mut pane = observed_pane("pane-1");
+        pane.pane_instance_id = Some("instance-7".to_owned());
+        exact.panes.push(pane);
+        let service = WorkerCleanupService::with_components(
+            Arc::new(StaticInventory(exact)),
+            persistence.clone(),
+            retirement.clone(),
+            Arc::new(UnsupportedCleanupAdvisor),
+        );
+        let mut cleanup_item = item();
+        cleanup_item.is_summary_worker = true;
+        cleanup_item.pane_instance_id = Some("instance-7".to_owned());
+
+        service.process_item(&cleanup_item).await.unwrap();
+
+        let closes = retirement.closes.lock().unwrap();
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].pane_instance_id, "instance-7");
+        assert_eq!(
+            persistence.finished.lock().unwrap().as_slice(),
+            [(
+                WorkerCleanupItemStatus::Retired,
+                "leased_close_succeeded".to_owned()
+            )]
+        );
+    }
+
+    #[tokio::test]
     async fn close_uses_existing_exact_lease_after_store_authorization() {
         let authorized = Arc::new(AtomicBool::new(false));
         let persistence = Arc::new(RecordingPersistence {
@@ -1048,6 +1119,24 @@ mod tests {
         authorized: Arc<AtomicBool>,
         lease_lookups: Mutex<Vec<(String, String)>>,
         closes: Mutex<Vec<CloseManagedPaneRequest>>,
+    }
+
+    struct LeaseLostRetirement;
+
+    #[async_trait]
+    impl CleanupRetirement for LeaseLostRetirement {
+        fn capability(&self) -> CleanupRetirementCapability {
+            CleanupRetirementCapability::PaneManagementLeaseV1
+        }
+
+        async fn owned_management_lease(
+            &self,
+            _session: &str,
+            _pane_id: &str,
+        ) -> Result<crate::cleanup_retirement::OwnedManagementLease, CleanupRetirementError>
+        {
+            Err(CleanupRetirementError::LeaseNotFound)
+        }
     }
 
     #[async_trait]

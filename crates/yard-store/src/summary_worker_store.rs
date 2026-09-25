@@ -56,6 +56,12 @@ pub(super) async fn begin(
                     current_version: project.orchestrator.version,
                 });
             }
+            if project.runtime.adapter != capture.adapter
+                || project.runtime.session != capture.session
+                || project.runtime.workspace_id != capture.workspace_id
+            {
+                return Err(ProjectStoreError::SummaryWorkerAllocationMismatch);
+            }
             let runtime = project
                 .orchestrator
                 .runtime

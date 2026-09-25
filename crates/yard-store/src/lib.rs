@@ -20828,56 +20828,56 @@ mod tests {
         (project_id, assignment, receipt_id)
     }
 
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn summary_worker_handoff_requires_exact_artifact_then_schedules_guarded_cleanup() {
-        let temp = TempDir::new().unwrap();
-        let store = open_store(&temp).await;
-        let (project_draft, orchestrator_runtime) = draft("workspace-summary", "terminal-parent");
+    struct SummaryFixture {
+        project: Project,
+        command: RequestSummaryWorker,
+        assignment: yard_domain::Assignment,
+    }
+
+    async fn create_summary_fixture(store: &SqliteProjectStore, suffix: &str) -> SummaryFixture {
+        let workspace_id = format!("workspace-summary-{suffix}");
+        let (project_draft, orchestrator_runtime) =
+            draft(&workspace_id, &format!("terminal-parent-{suffix}"));
         let project = store
             .create_project(project_draft, orchestrator_runtime)
             .await
             .unwrap();
         let profile = store
             .create_worker_profile(CreateWorkerProfile {
-                spec: profile_spec("Summarizer"),
+                spec: profile_spec(&format!("Summarizer {suffix}")),
             })
             .await
             .unwrap();
-        let artifact_id = Uuid::now_v7().to_string();
         let command = RequestSummaryWorker {
-            command_id: Uuid::now_v7().to_string(),
+            command_id: format!("summary-{suffix}"),
             actor: "local-user".to_owned(),
             parent_worker_id: project.orchestrator.id.clone(),
             expected_parent_worker_version: project.orchestrator.version,
             expected_project_version: project.version,
             profile_id: profile.id.clone(),
             expected_profile_version: profile.version,
-            artifact_id: artifact_id.clone(),
+            artifact_id: Uuid::now_v7().to_string(),
             objective: "Summarize the durable state.".to_owned(),
         };
         let parent_runtime = project.orchestrator.runtime.as_ref().unwrap();
-        assert_eq!(
-            store
-                .begin_summary_worker(
-                    &project.id,
-                    command.clone(),
-                    SummaryParentRuntimeCapture {
-                        adapter: parent_runtime.adapter.clone(),
-                        session: parent_runtime.session.clone(),
-                        workspace_id: parent_runtime.workspace_id.clone(),
-                        terminal_id: parent_runtime.terminal_id.clone(),
-                        tab_id: parent_runtime.tab_id.clone().unwrap(),
-                        pane_id: parent_runtime.pane_id.clone(),
-                        pane_instance_id: Some("parent-instance".to_owned()),
-                        provider_session: parent_runtime.provider_session.clone(),
-                        observed_at_unix_ms: 2,
-                    },
-                )
-                .await
-                .unwrap(),
-            BeginSummaryWorker::Started
-        );
+        store
+            .begin_summary_worker(
+                &project.id,
+                command.clone(),
+                SummaryParentRuntimeCapture {
+                    adapter: parent_runtime.adapter.clone(),
+                    session: parent_runtime.session.clone(),
+                    workspace_id: parent_runtime.workspace_id.clone(),
+                    terminal_id: parent_runtime.terminal_id.clone(),
+                    tab_id: parent_runtime.tab_id.clone().unwrap(),
+                    pane_id: parent_runtime.pane_id.clone(),
+                    pane_instance_id: Some(format!("parent-instance-{suffix}")),
+                    provider_session: parent_runtime.provider_session.clone(),
+                    observed_at_unix_ms: 2,
+                },
+            )
+            .await
+            .unwrap();
         store
             .begin_profile_allocation(
                 &project.id,
@@ -20894,9 +20894,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let (_, mut child_runtime) = draft("workspace-summary", "terminal-child");
-        child_runtime.tab_id = Some("tab-child".to_owned());
-        child_runtime.pane_id = "pane-child".to_owned();
+        let (_, mut child_runtime) = draft(&workspace_id, &format!("terminal-child-{suffix}"));
+        child_runtime.tab_id = Some(format!("tab-child-{suffix}"));
+        child_runtime.pane_id = format!("pane-child-{suffix}");
         child_runtime.owns_tab = true;
         store
             .claim_provisioning_runtime(&command.command_id, child_runtime.clone())
@@ -20910,38 +20910,36 @@ mod tests {
             .activate_profile_allocation(&command.command_id)
             .await
             .unwrap();
-        let summary = store
+        let assignment = store
             .complete_summary_worker(&command.command_id, allocation)
             .await
+            .unwrap()
+            .assignment
             .unwrap();
-        let assignment = summary.assignment.unwrap();
-        assert!(matches!(
-            store
-                .start_summary_worker_handoff(
-                    &project.id,
-                    &project.orchestrator.id,
-                    &assignment.id,
-                    ReceiveSummaryWorker {
-                        command_id: Uuid::now_v7().to_string(),
-                        actor: "local-user".to_owned(),
-                        expected_parent_worker_version: project.orchestrator.version,
-                    },
-                    Some("child-instance".to_owned()),
-                )
-                .await,
-            Err(ProjectStoreError::SummaryWorkerHandoffNotReady)
-        ));
+        SummaryFixture {
+            project,
+            command,
+            assignment,
+        }
+    }
+
+    async fn register_summary_artifact(
+        store: &SqliteProjectStore,
+        fixture: &SummaryFixture,
+        artifact_id: &str,
+        kind: ArtifactKind,
+    ) {
         store
             .register_artifact(
-                &project.id,
-                &assignment.id,
-                &artifact_id,
+                &fixture.project.id,
+                &fixture.assignment.id,
+                artifact_id,
                 ArtifactRegistration {
                     actor: "summary-worker".to_owned(),
-                    attempt_id: assignment.attempt.id.clone(),
-                    expected_assignment_version: assignment.version,
-                    expected_attempt_version: assignment.attempt.version,
-                    kind: ArtifactKind::Markdown,
+                    attempt_id: fixture.assignment.attempt.id.clone(),
+                    expected_assignment_version: fixture.assignment.version,
+                    expected_attempt_version: fixture.assignment.attempt.version,
+                    kind,
                     display_name: "summary.md".to_owned(),
                     byte_size: 7,
                     sha256: "0".repeat(64),
@@ -20949,42 +20947,85 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    fn summary_receipt(
+        fixture: &SummaryFixture,
+        command_id: &str,
+        artifact_ids: Vec<String>,
+    ) -> RecordCompletionReceipt {
+        RecordCompletionReceipt {
+            command_id: command_id.to_owned(),
+            actor: "summary-worker".to_owned(),
+            attempt_id: fixture.assignment.attempt.id.clone(),
+            expected_assignment_version: fixture.assignment.version,
+            expected_attempt_version: fixture.assignment.attempt.version,
+            outcome: CompletionOutcome::Completed,
+            summary: "Summary committed.".to_owned(),
+            artifact_refs: Vec::new(),
+            artifact_ids,
+            evidence_refs: vec!["test://summary".to_owned()],
+            unresolved_blockers: Vec::new(),
+        }
+    }
+
+    fn receive_summary(fixture: &SummaryFixture, command_id: &str) -> ReceiveSummaryWorker {
+        ReceiveSummaryWorker {
+            command_id: command_id.to_owned(),
+            actor: "local-user".to_owned(),
+            expected_parent_worker_version: fixture.project.orchestrator.version,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn summary_worker_handoff_requires_exact_artifact_then_schedules_guarded_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let fixture = create_summary_fixture(&store, "handoff").await;
+        assert!(matches!(
+            store
+                .start_summary_worker_handoff(
+                    &fixture.project.id,
+                    &fixture.project.orchestrator.id,
+                    &fixture.assignment.id,
+                    receive_summary(&fixture, "receive-too-early"),
+                    Some("child-instance".to_owned()),
+                )
+                .await,
+            Err(ProjectStoreError::SummaryWorkerHandoffNotReady)
+        ));
+        register_summary_artifact(
+            &store,
+            &fixture,
+            &fixture.command.artifact_id,
+            ArtifactKind::Markdown,
+        )
+        .await;
         store
             .record_completion_receipt(
-                &project.id,
-                &assignment.id,
-                RecordCompletionReceipt {
-                    command_id: Uuid::now_v7().to_string(),
-                    actor: "summary-worker".to_owned(),
-                    attempt_id: assignment.attempt.id.clone(),
-                    expected_assignment_version: assignment.version,
-                    expected_attempt_version: assignment.attempt.version,
-                    outcome: CompletionOutcome::Completed,
-                    summary: "Summary committed.".to_owned(),
-                    artifact_refs: Vec::new(),
-                    artifact_ids: vec![artifact_id.clone()],
-                    evidence_refs: Vec::new(),
-                    unresolved_blockers: Vec::new(),
-                },
+                &fixture.project.id,
+                &fixture.assignment.id,
+                summary_receipt(
+                    &fixture,
+                    "summary-receipt-handoff",
+                    vec![fixture.command.artifact_id.clone()],
+                ),
             )
             .await
             .unwrap();
-        let handoff_command = ReceiveSummaryWorker {
-            command_id: Uuid::now_v7().to_string(),
-            actor: "local-user".to_owned(),
-            expected_parent_worker_version: project.orchestrator.version,
-        };
+        let handoff_command = receive_summary(&fixture, "receive-handoff");
         let handoff = store
             .start_summary_worker_handoff(
-                &project.id,
-                &project.orchestrator.id,
-                &assignment.id,
+                &fixture.project.id,
+                &fixture.project.orchestrator.id,
+                &fixture.assignment.id,
                 handoff_command.clone(),
                 Some("child-instance".to_owned()),
             )
             .await
             .unwrap();
-        assert_eq!(handoff.artifact_id, artifact_id);
+        assert_eq!(handoff.artifact_id, fixture.command.artifact_id);
         assert_eq!(handoff.summary.state, SummaryWorkerState::RetirementPending);
         let claimed = store
             .claim_worker_cleanup_items(handoff.summary.cleanup_run_id.as_deref(), 1, 10_000)
@@ -21003,9 +21044,9 @@ mod tests {
             .unwrap();
         let replayed = store
             .start_summary_worker_handoff(
-                &project.id,
-                &project.orchestrator.id,
-                &assignment.id,
+                &fixture.project.id,
+                &fixture.project.orchestrator.id,
+                &fixture.assignment.id,
                 handoff_command,
                 Some("child-instance".to_owned()),
             )
@@ -21016,6 +21057,375 @@ mod tests {
             replayed.summary.cleanup_run_id,
             handoff.summary.cleanup_run_id
         );
+        assert_ne!(claimed[0].worker_id, fixture.project.orchestrator.id);
+        let ordinary = create_active_assignment_with_suffix(&store, "ordinary-cleanup").await;
+        let protected_count = store
+            .run({
+                let parent_worker_id = fixture.project.orchestrator.id.clone();
+                let ordinary_worker_id = ordinary.1.worker.id;
+                move |connection| {
+                    Ok(connection.query_row(
+                        "SELECT COUNT(*) FROM worker_cleanup_run_items
+                          WHERE worker_id IN (?1, ?2)",
+                        params![parent_worker_id, ordinary_worker_id],
+                        |row| row.get::<_, i64>(0),
+                    )?)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(protected_count, 0);
+    }
+
+    #[tokio::test]
+    async fn summary_worker_receipt_requires_artifact_first() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let fixture = create_summary_fixture(&store, "artifact-first").await;
+        let receipt = summary_receipt(
+            &fixture,
+            "receipt-before-artifact",
+            vec![fixture.command.artifact_id.clone()],
+        );
+        assert!(matches!(
+            store
+                .record_completion_receipt(
+                    &fixture.project.id,
+                    &fixture.assignment.id,
+                    receipt.clone(),
+                )
+                .await,
+            Err(ProjectStoreError::ArtifactNotFound)
+        ));
+        assert!(matches!(
+            store
+                .start_summary_worker_handoff(
+                    &fixture.project.id,
+                    &fixture.project.orchestrator.id,
+                    &fixture.assignment.id,
+                    receive_summary(&fixture, "receive-without-artifact"),
+                    None,
+                )
+                .await,
+            Err(ProjectStoreError::SummaryWorkerHandoffNotReady)
+        ));
+
+        register_summary_artifact(
+            &store,
+            &fixture,
+            &fixture.command.artifact_id,
+            ArtifactKind::Markdown,
+        )
+        .await;
+        store
+            .record_completion_receipt(&fixture.project.id, &fixture.assignment.id, receipt)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_summary_worker(
+                    &fixture.project.id,
+                    &fixture.project.orchestrator.id,
+                    &fixture.assignment.id,
+                )
+                .await
+                .unwrap()
+                .state,
+            SummaryWorkerState::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_worker_rejects_wrong_artifact_kind_and_id() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+
+        let wrong_kind = create_summary_fixture(&store, "wrong-kind").await;
+        register_summary_artifact(
+            &store,
+            &wrong_kind,
+            &wrong_kind.command.artifact_id,
+            ArtifactKind::Html,
+        )
+        .await;
+        store
+            .record_completion_receipt(
+                &wrong_kind.project.id,
+                &wrong_kind.assignment.id,
+                summary_receipt(
+                    &wrong_kind,
+                    "receipt-wrong-kind",
+                    vec![wrong_kind.command.artifact_id.clone()],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_summary_worker(
+                    &wrong_kind.project.id,
+                    &wrong_kind.project.orchestrator.id,
+                    &wrong_kind.assignment.id,
+                )
+                .await
+                .unwrap()
+                .state,
+            SummaryWorkerState::Failed
+        );
+
+        let wrong_id = create_summary_fixture(&store, "wrong-id").await;
+        let other_id = Uuid::now_v7().to_string();
+        register_summary_artifact(&store, &wrong_id, &other_id, ArtifactKind::Markdown).await;
+        store
+            .record_completion_receipt(
+                &wrong_id.project.id,
+                &wrong_id.assignment.id,
+                summary_receipt(&wrong_id, "receipt-wrong-id", vec![other_id]),
+            )
+            .await
+            .unwrap();
+        let summary = store
+            .get_summary_worker(
+                &wrong_id.project.id,
+                &wrong_id.project.orchestrator.id,
+                &wrong_id.assignment.id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.state, SummaryWorkerState::Failed);
+        assert!(matches!(
+            store
+                .start_summary_worker_handoff(
+                    &wrong_id.project.id,
+                    &wrong_id.project.orchestrator.id,
+                    &wrong_id.assignment.id,
+                    receive_summary(&wrong_id, "receive-wrong-id"),
+                    None,
+                )
+                .await,
+            Err(ProjectStoreError::SummaryWorkerHandoffNotReady)
+        ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn summary_worker_receipt_rejects_wrong_scope_and_worker() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let fixture = create_summary_fixture(&store, "wrong-scope").await;
+        let (other_project_id, other_assignment) =
+            create_active_assignment_with_suffix(&store, "wrong-scope-source").await;
+        let other_artifact_id = Uuid::now_v7().to_string();
+        store
+            .register_artifact(
+                &other_project_id,
+                &other_assignment.id,
+                &other_artifact_id,
+                ArtifactRegistration {
+                    actor: "other-worker".to_owned(),
+                    attempt_id: other_assignment.attempt.id.clone(),
+                    expected_assignment_version: other_assignment.version,
+                    expected_attempt_version: other_assignment.attempt.version,
+                    kind: ArtifactKind::Markdown,
+                    display_name: "other.md".to_owned(),
+                    byte_size: 1,
+                    sha256: "1".repeat(64),
+                },
+            )
+            .await
+            .unwrap();
+        let wrong_project = store
+            .record_completion_receipt(
+                &other_project_id,
+                &fixture.assignment.id,
+                summary_receipt(&fixture, "receipt-wrong-project", Vec::new()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(wrong_project, ProjectStoreError::AssignmentNotFound),
+            "{wrong_project:?}"
+        );
+        assert!(matches!(
+            store
+                .record_completion_receipt(
+                    &fixture.project.id,
+                    &fixture.assignment.id,
+                    summary_receipt(
+                        &fixture,
+                        "receipt-wrong-assignment",
+                        vec![other_artifact_id],
+                    ),
+                )
+                .await,
+            Err(ProjectStoreError::ArtifactScopeMismatch)
+        ));
+        let mut wrong_attempt = summary_receipt(&fixture, "receipt-wrong-attempt", Vec::new());
+        wrong_attempt.attempt_id = other_assignment.attempt.id;
+        assert!(matches!(
+            store
+                .record_completion_receipt(
+                    &fixture.project.id,
+                    &fixture.assignment.id,
+                    wrong_attempt,
+                )
+                .await,
+            Err(ProjectStoreError::AttemptNotCurrent { .. })
+        ));
+
+        register_summary_artifact(
+            &store,
+            &fixture,
+            &fixture.command.artifact_id,
+            ArtifactKind::Markdown,
+        )
+        .await;
+        store
+            .run({
+                let artifact_id = fixture.command.artifact_id.clone();
+                let parent_worker_id = fixture.project.orchestrator.id.clone();
+                move |connection| {
+                    connection.execute(
+                        "UPDATE artifacts SET worker_id = ?1 WHERE id = ?2",
+                        params![parent_worker_id, artifact_id],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+        store
+            .record_completion_receipt(
+                &fixture.project.id,
+                &fixture.assignment.id,
+                summary_receipt(
+                    &fixture,
+                    "receipt-wrong-worker",
+                    vec![fixture.command.artifact_id.clone()],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_summary_worker(
+                    &fixture.project.id,
+                    &fixture.project.orchestrator.id,
+                    &fixture.assignment.id,
+                )
+                .await
+                .unwrap()
+                .state,
+            SummaryWorkerState::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_worker_replay_survives_reopen_without_second_allocation() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let fixture = create_summary_fixture(&store, "reopen").await;
+        drop(store);
+
+        let reopened = SqliteProjectStore::open(path).await.unwrap();
+        let parent_runtime = fixture.project.orchestrator.runtime.as_ref().unwrap();
+        assert!(matches!(
+            reopened
+                .begin_summary_worker(
+                    &fixture.project.id,
+                    fixture.command.clone(),
+                    SummaryParentRuntimeCapture {
+                        adapter: parent_runtime.adapter.clone(),
+                        session: parent_runtime.session.clone(),
+                        workspace_id: parent_runtime.workspace_id.clone(),
+                        terminal_id: parent_runtime.terminal_id.clone(),
+                        tab_id: parent_runtime.tab_id.clone().unwrap(),
+                        pane_id: parent_runtime.pane_id.clone(),
+                        pane_instance_id: Some("parent-instance-reopen".to_owned()),
+                        provider_session: parent_runtime.provider_session.clone(),
+                        observed_at_unix_ms: 3,
+                    },
+                )
+                .await
+                .unwrap(),
+            BeginSummaryWorker::Replayed(_)
+        ));
+        let allocation_count = reopened
+            .run({
+                let command_id = fixture.command.command_id;
+                move |connection| {
+                    Ok(connection.query_row(
+                        "SELECT COUNT(*) FROM profile_allocation_commands WHERE command_id = ?1",
+                        [command_id],
+                        |row| row.get::<_, i64>(0),
+                    )?)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(allocation_count, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_or_cancelled_summary_assignment_never_schedules_retirement() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        for suffix in ["failed", "cancelled"] {
+            let fixture = create_summary_fixture(&store, suffix).await;
+            store
+                .run({
+                    let assignment_id = fixture.assignment.id.clone();
+                    let message = suffix.to_owned();
+                    move |connection| {
+                        connection.execute(
+                            "UPDATE assignments SET lifecycle = 'failed' WHERE id = ?1",
+                            [&assignment_id],
+                        )?;
+                        connection.execute(
+                            "UPDATE assignment_attempts
+                                SET lifecycle = 'failed', error_message = ?1
+                              WHERE assignment_id = ?2",
+                            params![message, assignment_id],
+                        )?;
+                        Ok(())
+                    }
+                })
+                .await
+                .unwrap();
+            let summary = store
+                .get_summary_worker(
+                    &fixture.project.id,
+                    &fixture.project.orchestrator.id,
+                    &fixture.assignment.id,
+                )
+                .await
+                .unwrap();
+            assert_eq!(summary.state, SummaryWorkerState::Failed);
+            assert!(matches!(
+                store
+                    .start_summary_worker_handoff(
+                        &fixture.project.id,
+                        &fixture.project.orchestrator.id,
+                        &fixture.assignment.id,
+                        receive_summary(&fixture, &format!("receive-{suffix}")),
+                        None,
+                    )
+                    .await,
+                Err(ProjectStoreError::SummaryWorkerHandoffNotReady)
+            ));
+        }
+        let cleanup_count = store
+            .run(|connection| {
+                Ok(connection.query_row(
+                    "SELECT COUNT(*) FROM worker_cleanup_run_items",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(cleanup_count, 0);
     }
 
     async fn preview_retained_reasons(

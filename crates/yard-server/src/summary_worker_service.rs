@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use yard_domain::{
-    ConfirmProfileAllocation, IsolationPolicy, ReceiveSummaryWorker, ReceivedSummaryWorker,
-    RequestSummaryWorker, RuntimeObservationState, RuntimeProcessState, SendAssignmentPrompt,
-    SummaryParentRuntimeCapture, SummaryWorker, SummaryWorkers,
+    ConfirmProfileAllocation, IsolationPolicy, Project, ReceiveSummaryWorker,
+    ReceivedSummaryWorker, RequestSummaryWorker, RuntimeInventory, RuntimeObservationState,
+    RuntimeProcessState, SendAssignmentPrompt, SummaryParentRuntimeCapture, SummaryWorker,
+    SummaryWorkers,
 };
 use yard_store::{BeginSummaryWorker, ProjectStoreError, YardStore};
 
@@ -207,42 +208,14 @@ impl SummaryWorkerService {
             .runtime
             .as_ref()
             .ok_or(ProjectStoreError::SummaryParentRuntimeUnverified)?;
-        if runtime.observation_state != RuntimeObservationState::Observed
-            || runtime.process_state != RuntimeProcessState::Running
+        if project.runtime.adapter != runtime.adapter
+            || project.runtime.session != runtime.session
+            || project.runtime.workspace_id != runtime.workspace_id
         {
-            return Err(ProjectStoreError::SummaryParentRuntimeUnverified.into());
+            return Err(ProjectStoreError::SummaryWorkerAllocationMismatch.into());
         }
         let inventory = self.source.inventory(&runtime.session).await?;
-        if inventory.adapter != runtime.adapter
-            || inventory.session != runtime.session
-            || inventory.observed_at_unix_ms < runtime.last_observed_at_unix_ms
-        {
-            return Err(ProjectStoreError::SummaryParentRuntimeUnverified.into());
-        }
-        let pane = inventory
-            .panes
-            .iter()
-            .find(|pane| {
-                pane.runtime_id == runtime.pane_id && pane.terminal_id == runtime.terminal_id
-            })
-            .filter(|pane| {
-                pane.workspace_id == runtime.workspace_id
-                    && Some(pane.tab_id.as_str()) == runtime.tab_id.as_deref()
-                    && pane.provider_session == runtime.provider_session
-                    && pane.revision >= runtime.revision
-            })
-            .ok_or(ProjectStoreError::SummaryParentRuntimeUnverified)?;
-        Ok(SummaryParentRuntimeCapture {
-            adapter: runtime.adapter.clone(),
-            session: runtime.session.clone(),
-            workspace_id: pane.workspace_id.clone(),
-            terminal_id: pane.terminal_id.clone(),
-            tab_id: pane.tab_id.clone(),
-            pane_id: pane.runtime_id.clone(),
-            pane_instance_id: pane.pane_instance_id.clone(),
-            provider_session: pane.provider_session.clone(),
-            observed_at_unix_ms: inventory.observed_at_unix_ms,
-        })
+        capture_parent_runtime(&project, command, &inventory).map_err(Into::into)
     }
 
     async fn observed_child_instance(&self, summary: &SummaryWorker) -> Option<String> {
@@ -260,6 +233,57 @@ impl SummaryWorkerService {
             })
             .and_then(|pane| pane.pane_instance_id.clone())
     }
+}
+
+fn capture_parent_runtime(
+    project: &Project,
+    command: &RequestSummaryWorker,
+    inventory: &RuntimeInventory,
+) -> Result<SummaryParentRuntimeCapture, ProjectStoreError> {
+    if project.orchestrator.id != command.parent_worker_id {
+        return Err(ProjectStoreError::SummaryParentNotCurrent);
+    }
+    let runtime = project
+        .orchestrator
+        .runtime
+        .as_ref()
+        .ok_or(ProjectStoreError::SummaryParentRuntimeUnverified)?;
+    if project.runtime.adapter != runtime.adapter
+        || project.runtime.session != runtime.session
+        || project.runtime.workspace_id != runtime.workspace_id
+    {
+        return Err(ProjectStoreError::SummaryWorkerAllocationMismatch);
+    }
+    if runtime.observation_state != RuntimeObservationState::Observed
+        || runtime.process_state != RuntimeProcessState::Running
+        || inventory.adapter != runtime.adapter
+        || inventory.session != runtime.session
+        || inventory.observed_at_unix_ms < runtime.last_observed_at_unix_ms
+    {
+        return Err(ProjectStoreError::SummaryParentRuntimeUnverified);
+    }
+    let pane = inventory
+        .panes
+        .iter()
+        .find(|pane| pane.runtime_id == runtime.pane_id && pane.terminal_id == runtime.terminal_id)
+        .filter(|pane| {
+            pane.workspace_id == runtime.workspace_id
+                && Some(pane.tab_id.as_str()) == runtime.tab_id.as_deref()
+                && pane.provider_session == runtime.provider_session
+                && pane.revision >= runtime.revision
+        })
+        .ok_or(ProjectStoreError::SummaryParentRuntimeUnverified)?;
+    Ok(SummaryParentRuntimeCapture {
+        adapter: runtime.adapter.clone(),
+        session: runtime.session.clone(),
+        workspace_id: pane.workspace_id.clone(),
+        terminal_id: pane.terminal_id.clone(),
+        tab_id: pane.tab_id.clone(),
+        pane_id: pane.runtime_id.clone(),
+        pane_instance_id: pane.pane_instance_id.clone(),
+        provider_session: pane.provider_session.clone(),
+        observed_at_unix_ms: inventory.observed_at_unix_ms,
+    })
 }
 
 fn contract_prompt(summary: &SummaryWorker) -> String {
@@ -311,4 +335,241 @@ pub enum SummaryWorkerServiceError {
     Intervention(#[from] InterventionServiceError),
     #[error(transparent)]
     Artifact(#[from] ArtifactServiceError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use yard_domain::{
+        CanvasPlacement, FocusObservation, ObservedStatus, PaneObservation, ProjectPlacement,
+        ProjectRuntimeBinding, ProjectWorkflowProfilePin, TabObservation, Worker,
+        WorkerDesiredState, WorkerRuntimeBinding, WorkspaceObservation, WorktreeObservation,
+    };
+
+    use super::*;
+
+    fn project() -> Project {
+        Project {
+            id: "project-1".to_owned(),
+            name: "Project".to_owned(),
+            runtime: ProjectRuntimeBinding {
+                adapter: "herdr".to_owned(),
+                session: "alpha".to_owned(),
+                workspace_id: "workspace-parent".to_owned(),
+            },
+            orchestrator: Worker {
+                id: "parent".to_owned(),
+                profile_id: None,
+                profile_version: None,
+                desired_state: WorkerDesiredState::Running,
+                runtime: Some(WorkerRuntimeBinding {
+                    adapter: "herdr".to_owned(),
+                    session: "alpha".to_owned(),
+                    workspace_id: "workspace-parent".to_owned(),
+                    terminal_id: "terminal-parent".to_owned(),
+                    tab_id: Some("tab-parent".to_owned()),
+                    pane_id: "pane-parent".to_owned(),
+                    provider_session: None,
+                    owns_tab: false,
+                    observation_state: RuntimeObservationState::Observed,
+                    process_state: RuntimeProcessState::Running,
+                    status: ObservedStatus::Working,
+                    state_change_sequence: 1,
+                    revision: 5,
+                    version: 1,
+                    last_observed_at_unix_ms: 50,
+                }),
+                version: 1,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            },
+            placement: ProjectPlacement {
+                geometry: CanvasPlacement {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 400.0,
+                    height: 300.0,
+                },
+                version: 1,
+                updated_at_unix_ms: 1,
+            },
+            workflow_profile: ProjectWorkflowProfilePin {
+                profile_id: "workflow".to_owned(),
+                profile_version: 1,
+                pinned_by: "test".to_owned(),
+                pinned_at_unix_ms: 1,
+            },
+            version: 1,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        }
+    }
+
+    fn command() -> RequestSummaryWorker {
+        RequestSummaryWorker {
+            command_id: "summary-1".to_owned(),
+            actor: "local-user".to_owned(),
+            parent_worker_id: "parent".to_owned(),
+            expected_parent_worker_version: 1,
+            expected_project_version: 1,
+            profile_id: "profile".to_owned(),
+            expected_profile_version: 1,
+            artifact_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            objective: "Summarize.".to_owned(),
+        }
+    }
+
+    fn pane(
+        pane_id: &str,
+        terminal_id: &str,
+        workspace_id: &str,
+        tab_id: &str,
+        revision: u64,
+    ) -> PaneObservation {
+        PaneObservation {
+            runtime_id: pane_id.to_owned(),
+            pane_instance_id: Some(format!("instance-{pane_id}")),
+            terminal_id: terminal_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            tab_id: tab_id.to_owned(),
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+            label: None,
+            provider: None,
+            display_provider: None,
+            status: ObservedStatus::Working,
+            tokens: BTreeMap::new(),
+            provider_session: None,
+            revision,
+        }
+    }
+
+    fn workspace(runtime_id: &str, focused: bool) -> WorkspaceObservation {
+        WorkspaceObservation {
+            runtime_id: runtime_id.to_owned(),
+            order: usize::from(!focused),
+            label: "same-repository".to_owned(),
+            focused,
+            active_tab_id: format!("tab-{runtime_id}"),
+            pane_count: 1,
+            tab_count: 1,
+            status: ObservedStatus::Working,
+            tokens: BTreeMap::new(),
+            worktree: Some(WorktreeObservation {
+                repository_key: format!("key-{runtime_id}"),
+                repository_name: "same-repository".to_owned(),
+                repository_root: format!("/repos/{runtime_id}"),
+                checkout_path: format!("/checkouts/{runtime_id}"),
+                is_linked: true,
+            }),
+        }
+    }
+
+    fn inventory() -> RuntimeInventory {
+        RuntimeInventory {
+            adapter: "herdr".to_owned(),
+            session: "alpha".to_owned(),
+            runtime_version: "test".to_owned(),
+            protocol: 1,
+            observed_at_unix_ms: 60,
+            focus: FocusObservation {
+                workspace_id: Some("workspace-other".to_owned()),
+                tab_id: Some("tab-other".to_owned()),
+                pane_id: Some("pane-other".to_owned()),
+            },
+            workspaces: vec![
+                workspace("workspace-parent", false),
+                workspace("workspace-other", true),
+            ],
+            tabs: vec![
+                TabObservation {
+                    runtime_id: "tab-parent".to_owned(),
+                    workspace_id: "workspace-parent".to_owned(),
+                    order: 0,
+                    label: "Parent".to_owned(),
+                    focused: false,
+                    pane_count: 1,
+                    status: ObservedStatus::Working,
+                },
+                TabObservation {
+                    runtime_id: "tab-other".to_owned(),
+                    workspace_id: "workspace-other".to_owned(),
+                    order: 0,
+                    label: "Other".to_owned(),
+                    focused: true,
+                    pane_count: 1,
+                    status: ObservedStatus::Working,
+                },
+            ],
+            panes: vec![
+                pane(
+                    "pane-parent",
+                    "terminal-parent",
+                    "workspace-parent",
+                    "tab-parent",
+                    5,
+                ),
+                pane(
+                    "pane-other",
+                    "terminal-other",
+                    "workspace-other",
+                    "tab-other",
+                    9,
+                ),
+            ],
+            workers: Vec::new(),
+            child_agents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn capture_rejects_missing_and_stale_parent_pane() {
+        let project = project();
+        let command = command();
+        let mut missing = inventory();
+        missing.panes.remove(0);
+        assert!(matches!(
+            capture_parent_runtime(&project, &command, &missing),
+            Err(ProjectStoreError::SummaryParentRuntimeUnverified)
+        ));
+
+        let mut stale_observation = inventory();
+        stale_observation.observed_at_unix_ms = 49;
+        assert!(matches!(
+            capture_parent_runtime(&project, &command, &stale_observation),
+            Err(ProjectStoreError::SummaryParentRuntimeUnverified)
+        ));
+
+        let mut stale_revision = inventory();
+        stale_revision.panes[0].revision = 4;
+        assert!(matches!(
+            capture_parent_runtime(&project, &command, &stale_revision),
+            Err(ProjectStoreError::SummaryParentRuntimeUnverified)
+        ));
+    }
+
+    #[test]
+    fn capture_uses_identity_not_focus_or_repository_name() {
+        let capture = capture_parent_runtime(&project(), &command(), &inventory()).unwrap();
+
+        assert_eq!(capture.workspace_id, "workspace-parent");
+        assert_eq!(capture.pane_id, "pane-parent");
+        assert_eq!(
+            capture.pane_instance_id.as_deref(),
+            Some("instance-pane-parent")
+        );
+    }
+
+    #[test]
+    fn capture_rejects_allocation_workspace_mismatch_before_provisioning() {
+        let mut project = project();
+        project.runtime.workspace_id = "workspace-allocation-target".to_owned();
+
+        assert!(matches!(
+            capture_parent_runtime(&project, &command(), &inventory()),
+            Err(ProjectStoreError::SummaryWorkerAllocationMismatch)
+        ));
+    }
 }
