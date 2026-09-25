@@ -5,6 +5,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::WorkerProfileSpec;
@@ -22,6 +23,8 @@ const MAX_VALUE_BYTES: usize = 512;
 const MAX_LIST_ITEMS: usize = 128;
 const MAX_ARTIFACTS: usize = 256;
 const MAX_EXTENSIONS: usize = 64;
+const MAX_FILE_BYTES: usize = 256 * 1024;
+const MAX_BUNDLE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -180,6 +183,14 @@ pub struct AgentProfileArtifact {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentProfileFile {
+    pub path: String,
+    pub media_type: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AdapterDescriptor {
     pub adapter_id: String,
     pub adapter_version: String,
@@ -250,11 +261,15 @@ pub struct CapabilityNegotiationReport {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateAgentProfile {
     pub manifest: Value,
+    #[serde(default)]
+    pub files: Vec<AgentProfileFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpdateAgentProfile {
     pub manifest: Value,
+    #[serde(default)]
+    pub files: Vec<AgentProfileFile>,
     #[serde(with = "crate::serde_u64")]
     pub expected_version: u64,
 }
@@ -265,6 +280,8 @@ pub struct AgentProfile {
     #[serde(with = "crate::serde_u64")]
     pub version: u64,
     pub manifest: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<AgentProfileFile>,
     pub validation: CapabilityNegotiationReport,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
@@ -279,6 +296,7 @@ pub struct AgentProfiles {
 pub struct PreparedAgentProfile {
     pub original_manifest: Value,
     pub canonical_manifest: AgentProfileManifest,
+    pub files: Vec<AgentProfileFile>,
     pub worker_profile: WorkerProfileSpec,
     pub validation: CapabilityNegotiationReport,
 }
@@ -302,10 +320,10 @@ impl PreparedAgentProfile {
         current: &AgentProfileManifest,
         spec: &WorkerProfileSpec,
     ) -> Result<Self, AgentProfileValidationError> {
-        let prepared =
-            Self::from_compatible_manifest(current.with_worker_profile(spec), spec.clone());
-        ensure_required_capabilities_supported(&prepared.validation)?;
-        Ok(prepared)
+        Ok(Self::from_compatible_manifest(
+            current.with_worker_profile(spec),
+            spec.clone(),
+        ))
     }
 
     fn from_compatible_manifest(
@@ -319,6 +337,7 @@ impl PreparedAgentProfile {
         Self {
             original_manifest,
             canonical_manifest,
+            files: Vec::new(),
             worker_profile,
             validation,
         }
@@ -334,7 +353,7 @@ impl CreateAgentProfile {
     /// a secret value is present, no `WorkerProfile` projection can be built, or
     /// an adapter cannot satisfy a required capability.
     pub fn prepare(self) -> Result<PreparedAgentProfile, AgentProfileValidationError> {
-        prepare_manifest(self.manifest)
+        prepare_manifest(self.manifest, self.files)
     }
 }
 
@@ -349,7 +368,7 @@ impl UpdateAgentProfile {
         if self.expected_version == 0 {
             return Err(AgentProfileValidationError::InvalidVersion);
         }
-        prepare_manifest(self.manifest)
+        prepare_manifest(self.manifest, self.files)
     }
 }
 
@@ -372,15 +391,15 @@ impl AgentProfileManifest {
                     unknown: BTreeMap::new(),
                 }]
             });
-        let mut optional = Vec::new();
+        let mut required = Vec::new();
         if !spec.skills.is_empty() {
-            optional.push(capability_request("agent.skills"));
+            required.push(capability_request("agent.skills"));
         }
         if !spec.tools.is_empty() {
-            optional.push(capability_request("agent.tools"));
+            required.push(capability_request("agent.tools"));
         }
         if !spec.mcp_servers.is_empty() {
-            optional.push(capability_request("tool.mcp.client"));
+            required.push(capability_request("tool.mcp.client"));
         }
 
         Self {
@@ -402,8 +421,8 @@ impl AgentProfileManifest {
                 },
                 instructions,
                 capabilities: AgentProfileCapabilities {
-                    required: Vec::new(),
-                    optional,
+                    required,
+                    optional: Vec::new(),
                     unknown: BTreeMap::new(),
                 },
                 components: AgentProfileComponents {
@@ -645,17 +664,30 @@ pub enum AgentProfileValidationError {
     UnsafePath(String),
     #[error("artifact sha256 must contain 64 hexadecimal characters")]
     InvalidArtifactDigest,
+    #[error("bundle file {path} uses unsupported media type {media_type}")]
+    UnsupportedMediaType { path: String, media_type: String },
+    #[error("bundle file {path} must contain at most {max} bytes")]
+    FileTooLarge { path: String, max: usize },
+    #[error("agent profile bundle must contain at most {max} bytes")]
+    BundleTooLarge { max: usize },
+    #[error("bundle file {0} is not declared by an artifact")]
+    UndeclaredFile(String),
+    #[error("bundle file {0} media type does not match its artifact")]
+    ArtifactMediaTypeMismatch(String),
+    #[error("bundle file {0} digest does not match its artifact")]
+    ArtifactDigestMismatch(String),
     #[error("resolved secret value is forbidden at {0}")]
     SecretValueForbidden(String),
     #[error("agent profile cannot be represented by the WorkerProfile compatibility API: {0}")]
     InvalidWorkerProjection(String),
-    #[error("required capabilities are unsupported: {0:?}")]
-    UnsupportedRequiredCapabilities(Vec<String>),
     #[error("expected_version must be greater than zero")]
     InvalidVersion,
 }
 
-fn prepare_manifest(manifest: Value) -> Result<PreparedAgentProfile, AgentProfileValidationError> {
+fn prepare_manifest(
+    manifest: Value,
+    files: Vec<AgentProfileFile>,
+) -> Result<PreparedAgentProfile, AgentProfileValidationError> {
     let serialized = serde_json::to_vec(&manifest)
         .map_err(|error| AgentProfileValidationError::InvalidManifest(error.to_string()))?;
     if serialized.len() > MAX_MANIFEST_BYTES {
@@ -667,35 +699,17 @@ fn prepare_manifest(manifest: Value) -> Result<PreparedAgentProfile, AgentProfil
     let canonical_manifest: AgentProfileManifest = serde_json::from_value(manifest.clone())
         .map_err(|error| AgentProfileValidationError::InvalidManifest(error.to_string()))?;
     validate_manifest(&canonical_manifest)?;
+    validate_files(&canonical_manifest.artifacts, &files)?;
     let worker_profile = canonical_manifest.worker_profile_projection()?;
     let descriptor = compatibility_adapter_descriptor(&worker_profile);
     let validation = canonical_manifest.negotiate(&descriptor);
-    ensure_required_capabilities_supported(&validation)?;
     Ok(PreparedAgentProfile {
         original_manifest: manifest,
         canonical_manifest,
+        files,
         worker_profile,
         validation,
     })
-}
-
-fn ensure_required_capabilities_supported(
-    validation: &CapabilityNegotiationReport,
-) -> Result<(), AgentProfileValidationError> {
-    if validation.compatible {
-        return Ok(());
-    }
-    let unsupported = validation
-        .results
-        .iter()
-        .filter(|result| {
-            result.requirement == CapabilityRequirement::Required
-                && !matches!(result.status, CapabilitySupportStatus::Supported)
-                && !(result.status == CapabilitySupportStatus::Degraded && result.allow_degraded)
-        })
-        .map(|result| format!("{} v{} ({})", result.id, result.version, result.reason))
-        .collect();
-    Err(AgentProfileValidationError::UnsupportedRequiredCapabilities(unsupported))
 }
 
 fn validate_manifest(manifest: &AgentProfileManifest) -> Result<(), AgentProfileValidationError> {
@@ -897,6 +911,83 @@ fn validate_artifacts(
         }
     }
     Ok(())
+}
+
+fn validate_files(
+    artifacts: &[AgentProfileArtifact],
+    files: &[AgentProfileFile],
+) -> Result<(), AgentProfileValidationError> {
+    check_count("files", files.len(), MAX_ARTIFACTS)?;
+    let artifacts = artifacts
+        .iter()
+        .map(|artifact| (artifact.path.as_str(), artifact))
+        .collect::<BTreeMap<_, _>>();
+    let mut paths = BTreeSet::new();
+    let mut bundle_bytes = 0usize;
+    for file in files {
+        validate_relative_path(&file.path)?;
+        if !paths.insert(&file.path) {
+            return Err(AgentProfileValidationError::DuplicateId {
+                field: "files",
+                id: file.path.clone(),
+            });
+        }
+        if !matches!(
+            file.media_type.as_str(),
+            "application/json" | "text/markdown" | "text/plain"
+        ) {
+            return Err(AgentProfileValidationError::UnsupportedMediaType {
+                path: file.path.clone(),
+                media_type: file.media_type.clone(),
+            });
+        }
+        let bytes = file.content.as_bytes();
+        if bytes.len() > MAX_FILE_BYTES {
+            return Err(AgentProfileValidationError::FileTooLarge {
+                path: file.path.clone(),
+                max: MAX_FILE_BYTES,
+            });
+        }
+        bundle_bytes = bundle_bytes.saturating_add(bytes.len());
+        if bundle_bytes > MAX_BUNDLE_BYTES {
+            return Err(AgentProfileValidationError::BundleTooLarge {
+                max: MAX_BUNDLE_BYTES,
+            });
+        }
+        if secret_value(&file.content) {
+            return Err(AgentProfileValidationError::SecretValueForbidden(format!(
+                "$.files[{}].content",
+                paths.len() - 1
+            )));
+        }
+        if file.media_type == "application/json" {
+            let value: Value = serde_json::from_str(&file.content).map_err(|error| {
+                AgentProfileValidationError::InvalidManifest(format!(
+                    "bundle file {} is invalid JSON: {error}",
+                    file.path
+                ))
+            })?;
+            reject_secret_values(&value, &format!("$.files.{}", file.path))?;
+        }
+        let artifact = artifacts
+            .get(file.path.as_str())
+            .ok_or_else(|| AgentProfileValidationError::UndeclaredFile(file.path.clone()))?;
+        if artifact.media_type != file.media_type {
+            return Err(AgentProfileValidationError::ArtifactMediaTypeMismatch(
+                file.path.clone(),
+            ));
+        }
+        if !artifact.sha256.eq_ignore_ascii_case(&sha256_hex(bytes)) {
+            return Err(AgentProfileValidationError::ArtifactDigestMismatch(
+                file.path.clone(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sha256_hex(content: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(content))
 }
 
 fn validate_relative_path(value: &str) -> Result<(), AgentProfileValidationError> {
@@ -1307,12 +1398,22 @@ fn legacy_components(values: &[String]) -> Vec<AgentProfileComponent> {
         .map(|value| AgentProfileComponent {
             id: value.clone(),
             source: Some(AgentProfileSource {
-                kind: "legacy".to_owned(),
+                kind: if matches!(value.as_str(), "herdr-orchestration" | "herdr-cli") {
+                    "registry".to_owned()
+                } else {
+                    "legacy".to_owned()
+                },
                 path: None,
-                reference: Some(value.clone()),
+                reference: Some(
+                    if matches!(value.as_str(), "herdr-orchestration" | "herdr-cli") {
+                        format!("yard://skills/{value}/v1")
+                    } else {
+                        value.clone()
+                    },
+                ),
                 unknown: BTreeMap::new(),
             }),
-            required: false,
+            required: true,
             credential_slots: Vec::new(),
             unknown: BTreeMap::new(),
         })
@@ -1425,11 +1526,14 @@ fn support_status_name(status: CapabilitySupportStatus) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use serde_json::{Value, json};
 
     use super::{
-        AgentProfileManifest, AgentProfileValidationError, CapabilitySupportStatus,
-        CreateAgentProfile, PreparedAgentProfile,
+        AdapterCapability, AdapterDescriptor, AgentProfileFile, AgentProfileManifest,
+        AgentProfileValidationError, CapabilityRequirement, CapabilitySupportStatus,
+        CreateAgentProfile, MAX_FILE_BYTES, PreparedAgentProfile, sha256_hex,
     };
 
     fn fixture() -> Value {
@@ -1444,6 +1548,7 @@ mod tests {
         let original = fixture();
         let prepared = CreateAgentProfile {
             manifest: original.clone(),
+            files: Vec::new(),
         }
         .prepare()
         .unwrap();
@@ -1467,34 +1572,187 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_required_capability() {
+    fn verifies_bundle_file_digest_and_media_type() {
+        let content = "---\nname: demo\ndescription: demo\n---\n";
+        let mut manifest = fixture();
+        manifest["artifacts"] = json!([{
+            "path": "skills/demo/SKILL.md",
+            "mediaType": "text/markdown",
+            "sha256": sha256_hex(content.as_bytes()),
+        }]);
+        manifest["spec"]["components"]["skills"] = json!([{
+            "id": "demo",
+            "source": {"kind": "bundle", "path": "skills/demo"},
+            "required": true,
+        }]);
+        let file = AgentProfileFile {
+            path: "skills/demo/SKILL.md".to_owned(),
+            media_type: "text/markdown".to_owned(),
+            content: content.to_owned(),
+        };
+
+        let prepared = CreateAgentProfile {
+            manifest: manifest.clone(),
+            files: vec![file.clone()],
+        }
+        .prepare()
+        .unwrap();
+        assert_eq!(prepared.files, std::slice::from_ref(&file));
+
+        let mut mismatch = file;
+        mismatch.content.push_str("changed");
+        assert!(matches!(
+            CreateAgentProfile {
+                manifest,
+                files: vec![mismatch],
+            }
+            .prepare(),
+            Err(AgentProfileValidationError::ArtifactDigestMismatch(path))
+                if path == "skills/demo/SKILL.md"
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_media_and_oversized_files() {
+        let manifest = fixture();
+        assert!(matches!(
+            CreateAgentProfile {
+                manifest: manifest.clone(),
+                files: vec![AgentProfileFile {
+                    path: "skills/demo/SKILL.md".to_owned(),
+                    media_type: "application/octet-stream".to_owned(),
+                    content: "demo".to_owned(),
+                }],
+            }
+            .prepare(),
+            Err(AgentProfileValidationError::UnsupportedMediaType { .. })
+        ));
+        assert!(matches!(
+            CreateAgentProfile {
+                manifest,
+                files: vec![AgentProfileFile {
+                    path: "skills/demo/SKILL.md".to_owned(),
+                    media_type: "text/markdown".to_owned(),
+                    content: "x".repeat(MAX_FILE_BYTES + 1),
+                }],
+            }
+            .prepare(),
+            Err(AgentProfileValidationError::FileTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn negotiation_reports_all_support_outcomes_deterministically() {
+        let mut manifest: AgentProfileManifest = serde_json::from_value(fixture()).unwrap();
+        manifest.spec.capabilities.required = vec![
+            super::CapabilityRequest {
+                id: "supported".to_owned(),
+                version: 1,
+                allow_degraded: false,
+                unknown: BTreeMap::default(),
+            },
+            super::CapabilityRequest {
+                id: "degraded".to_owned(),
+                version: 1,
+                allow_degraded: true,
+                unknown: BTreeMap::default(),
+            },
+            super::CapabilityRequest {
+                id: "approval".to_owned(),
+                version: 1,
+                allow_degraded: false,
+                unknown: BTreeMap::default(),
+            },
+        ];
+        manifest.spec.capabilities.optional = vec![super::CapabilityRequest {
+            id: "unsupported".to_owned(),
+            version: 1,
+            allow_degraded: false,
+            unknown: BTreeMap::default(),
+        }];
+        let descriptor = AdapterDescriptor {
+            adapter_id: "test".to_owned(),
+            adapter_version: "1".to_owned(),
+            provider_id: "test".to_owned(),
+            provider_version: None,
+            runtime_surface: "test".to_owned(),
+            capabilities: [
+                ("supported", CapabilitySupportStatus::Supported),
+                ("degraded", CapabilitySupportStatus::Degraded),
+                ("approval", CapabilitySupportStatus::ApprovalRequired),
+                ("unsupported", CapabilitySupportStatus::Unsupported),
+            ]
+            .into_iter()
+            .map(|(id, status)| AdapterCapability {
+                id: id.to_owned(),
+                min_version: 1,
+                max_version: 1,
+                status,
+                reason: id.to_owned(),
+                surface: "test".to_owned(),
+            })
+            .collect(),
+        };
+
+        let report = manifest.negotiate(&descriptor);
+
+        assert_eq!(
+            report
+                .results
+                .iter()
+                .map(|result| result.status)
+                .collect::<Vec<_>>(),
+            [
+                CapabilitySupportStatus::Supported,
+                CapabilitySupportStatus::Degraded,
+                CapabilitySupportStatus::ApprovalRequired,
+                CapabilitySupportStatus::Unsupported,
+            ]
+        );
+        assert!(!report.compatible);
+    }
+
+    #[test]
+    fn preserves_unsupported_required_capability_for_launch_negotiation() {
         let mut manifest = fixture();
         manifest["spec"]["capabilities"]["required"]
             .as_array_mut()
             .unwrap()
             .push(json!({"id": "agent.skills", "version": 1}));
 
-        let error = CreateAgentProfile { manifest }.prepare().unwrap_err();
+        let prepared = CreateAgentProfile {
+            manifest,
+            files: Vec::new(),
+        }
+        .prepare()
+        .unwrap();
 
-        assert!(matches!(
-            error,
-            AgentProfileValidationError::UnsupportedRequiredCapabilities(capabilities)
-                if capabilities[0].contains("agent.skills")
-        ));
+        assert!(!prepared.validation.compatible);
+        assert!(prepared.validation.results.iter().any(|result| {
+            result.id == "agent.skills"
+                && result.requirement == CapabilityRequirement::Required
+                && result.status == CapabilitySupportStatus::Unsupported
+        }));
     }
 
     #[test]
-    fn rejects_required_component_without_adapter_support() {
+    fn preserves_required_component_without_adapter_support() {
         let mut manifest = fixture();
         manifest["spec"]["components"]["mcpServers"][0]["required"] = Value::Bool(true);
 
-        let error = CreateAgentProfile { manifest }.prepare().unwrap_err();
+        let prepared = CreateAgentProfile {
+            manifest,
+            files: Vec::new(),
+        }
+        .prepare()
+        .unwrap();
 
-        assert!(matches!(
-            error,
-            AgentProfileValidationError::UnsupportedRequiredCapabilities(capabilities)
-                if capabilities[0].contains("tool.mcp.client")
-        ));
+        assert!(!prepared.validation.compatible);
+        assert!(prepared.validation.results.iter().any(|result| {
+            result.id == "tool.mcp.client"
+                && result.requirement == CapabilityRequirement::Required
+                && result.status == CapabilitySupportStatus::Unsupported
+        }));
     }
 
     #[test]
@@ -1515,7 +1773,11 @@ mod tests {
             manifest["spec"]["extensions"]["io.example.provider"][field] = value;
 
             assert!(matches!(
-                CreateAgentProfile { manifest }.prepare(),
+                CreateAgentProfile {
+                    manifest,
+                    files: Vec::new(),
+                }
+                .prepare(),
                 Err(AgentProfileValidationError::SecretValueForbidden(_))
             ));
         }
@@ -1528,7 +1790,11 @@ mod tests {
             json!("do-not-store");
 
         assert!(matches!(
-            CreateAgentProfile { manifest }.prepare(),
+            CreateAgentProfile {
+                manifest,
+                files: Vec::new(),
+            }
+            .prepare(),
             Err(AgentProfileValidationError::InvalidManifest(_))
         ));
     }
@@ -1537,6 +1803,7 @@ mod tests {
     fn worker_profile_overlay_retains_unknown_extension_content() {
         let prepared = CreateAgentProfile {
             manifest: fixture(),
+            files: Vec::new(),
         }
         .prepare()
         .unwrap();
@@ -1573,25 +1840,25 @@ mod tests {
     }
 
     #[test]
-    fn worker_profile_overlay_fails_closed_after_incompatible_runtime_change() {
+    fn worker_profile_overlay_preserves_incompatible_runtime_for_launch_check() {
         let prepared = CreateAgentProfile {
             manifest: fixture(),
+            files: Vec::new(),
         }
         .prepare()
         .unwrap();
         let mut worker = prepared.worker_profile;
         worker.runtime_adapter = "other-runtime".to_owned();
 
-        let error = PreparedAgentProfile::preserving_unknown(&prepared.canonical_manifest, &worker)
-            .unwrap_err();
+        let updated =
+            PreparedAgentProfile::preserving_unknown(&prepared.canonical_manifest, &worker)
+                .unwrap();
 
-        assert!(matches!(
-            error,
-            AgentProfileValidationError::UnsupportedRequiredCapabilities(capabilities)
-                if capabilities.iter().any(|capability| {
-                    capability.contains("filesystem.workspace.read")
-                })
-        ));
+        assert!(!updated.validation.compatible);
+        assert!(updated.validation.results.iter().any(|result| {
+            result.id == "filesystem.workspace.read"
+                && result.status == CapabilitySupportStatus::Unsupported
+        }));
     }
 
     #[test]

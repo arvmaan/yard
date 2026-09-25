@@ -33,6 +33,7 @@ import type {
   CreateProjectInput,
   CreateProjectFromProfileInput,
   CreateWorkerProfileInput,
+  ProfileLaunchPlan,
   CreateWorkspaceProjectFromProfileInput,
   DeletedProject,
   DeletedProjectRelationship,
@@ -791,6 +792,22 @@ export function updateWorkerProfile(
       body: JSON.stringify(profile),
       headers: { 'Content-Type': 'application/json' },
       method: 'PUT',
+      signal,
+    },
+  )
+}
+
+export function dryRunAgentProfile(
+  profileId: string,
+  profileVersion: string,
+  signal?: AbortSignal,
+): Promise<ProfileLaunchPlan> {
+  return requestJson(
+    `/api/v1/agent-profiles/${encodeURIComponent(profileId)}/dry-run`,
+    {
+      body: JSON.stringify({ profile_version: profileVersion }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
       signal,
     },
   )

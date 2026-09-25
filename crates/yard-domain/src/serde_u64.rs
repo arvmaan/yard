@@ -1,14 +1,24 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
-pub(crate) fn serialize<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+/// Serializes a `u64` as a decimal string.
+///
+/// # Errors
+///
+/// Returns the serializer's error when the string cannot be emitted.
+pub fn serialize<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
     value.to_string().serialize(serializer)
 }
 
-pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+/// Deserializes a decimal string into a `u64`.
+///
+/// # Errors
+///
+/// Returns the deserializer's error when the value is not a valid `u64`.
+pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -16,18 +26,28 @@ where
     value.parse().map_err(serde::de::Error::custom)
 }
 
-pub(crate) mod option {
+pub mod option {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     #[allow(clippy::ref_option)]
-    pub(crate) fn serialize<S>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error>
+    /// Serializes an optional `u64` as an optional decimal string.
+    ///
+    /// # Errors
+    ///
+    /// Returns the serializer's error when the value cannot be emitted.
+    pub fn serialize<S>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         value.map(|value| value.to_string()).serialize(serializer)
     }
 
-    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+    /// Deserializes an optional decimal string into an optional `u64`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the deserializer's error when the value is not a valid `u64`.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
     where
         D: Deserializer<'de>,
     {

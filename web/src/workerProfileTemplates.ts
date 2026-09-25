@@ -57,10 +57,13 @@ export const WORKER_PROFILE_TEMPLATES: readonly WorkerProfileTemplate[] = [
     description: 'Decompose, delegate, monitor, and synthesize work.',
     id: 'orchestrator',
     label: 'Orchestrator',
-    spec: profile({
-      name: 'Orchestrator',
-      default_role: 'orchestrator',
-    }),
+    spec: {
+      ...profile({
+        name: 'Orchestrator',
+        default_role: 'orchestrator',
+      }),
+      skills: ['herdr-orchestration', 'herdr-cli'],
+    },
   },
   {
     description: 'Evidence-first exploration and debugging.',

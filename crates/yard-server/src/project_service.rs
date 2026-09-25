@@ -24,11 +24,11 @@ use yard_store::{
 };
 
 use crate::allocation_service::{
-    AllocationServiceError, RuntimeControl, RuntimeProvisionError, RuntimeProvisionRequest,
-    RuntimeWorkspaceProvisionRequest, agent_name, assignment_prompt, provider_args,
-    validate_supported_profile,
+    RuntimeControl, RuntimeProvisionError, RuntimeProvisionRequest,
+    RuntimeWorkspaceProvisionRequest, agent_name, assignment_prompt,
 };
 use crate::inventory_service::{InventoryServiceError, InventorySource};
+use crate::profile_runtime::{compile_profile_launch, materialize_profile_launch};
 use crate::runtime_cleanup_service::RuntimeCleanupService;
 use crate::status_protocol::{with_orchestrator_status_contract, with_orchestrator_workflow};
 
@@ -350,29 +350,6 @@ impl ProjectService {
                 .await?;
             return Err(error);
         }
-        if let Err(message) = validate_supported_profile(&context.profile) {
-            self.store
-                .fail_profile_project_creation(&command_id, &message, false)
-                .await?;
-            return Err(ProjectServiceError::UnsupportedProfile(message));
-        }
-        let args = match provider_args(&context.profile) {
-            Ok(args) => args,
-            Err(AllocationServiceError::UnsupportedProfile(message)) => {
-                self.store
-                    .fail_profile_project_creation(&command_id, &message, false)
-                    .await?;
-                return Err(ProjectServiceError::UnsupportedProfile(message));
-            }
-            Err(error) => {
-                let message = error.to_string();
-                self.store
-                    .fail_profile_project_creation(&command_id, &message, false)
-                    .await?;
-                return Err(ProjectServiceError::UnsupportedProfile(message));
-            }
-        };
-
         let inventory = match self
             .source
             .inventory(&context.command.runtime.session)
@@ -427,6 +404,18 @@ impl ProjectService {
                 .fail_profile_project_creation(&command_id, &error.to_string(), false)
                 .await?;
             return Err(error);
+        };
+        let args = match self
+            .prepare_profile_launch(&context.profile, &cwd, &command_id)
+            .await
+        {
+            Ok(args) => args,
+            Err(error) => {
+                self.store
+                    .fail_profile_project_creation(&command_id, &error.to_string(), false)
+                    .await?;
+                return Err(error);
+            }
         };
         let objective = assignment_prompt(
             &context.command.orchestrator_objective,
@@ -613,26 +602,16 @@ impl ProjectService {
                 .await?;
             return Err(error);
         }
-        if let Err(message) = validate_supported_profile(&context.profile) {
-            self.store
-                .fail_workspace_project_creation(&command_id, &message, false)
-                .await?;
-            return Err(ProjectServiceError::UnsupportedProfile(message));
-        }
-        let args = match provider_args(&context.profile) {
+        let args = match self
+            .prepare_profile_launch(&context.profile, &context.command.cwd, &command_id)
+            .await
+        {
             Ok(args) => args,
-            Err(AllocationServiceError::UnsupportedProfile(message)) => {
-                self.store
-                    .fail_workspace_project_creation(&command_id, &message, false)
-                    .await?;
-                return Err(ProjectServiceError::UnsupportedProfile(message));
-            }
             Err(error) => {
-                let message = error.to_string();
                 self.store
-                    .fail_workspace_project_creation(&command_id, &message, false)
+                    .fail_workspace_project_creation(&command_id, &error.to_string(), false)
                     .await?;
-                return Err(ProjectServiceError::UnsupportedProfile(message));
+                return Err(error);
             }
         };
         let objective = assignment_prompt(
@@ -881,6 +860,41 @@ impl ProjectService {
             .update_project_placement(project_id, update)
             .await
             .map_err(Into::into)
+    }
+
+    async fn prepare_profile_launch(
+        &self,
+        profile: &yard_domain::WorkerProfile,
+        cwd: &str,
+        command_id: &str,
+    ) -> Result<Vec<String>, ProjectServiceError> {
+        let portable = self
+            .store
+            .get_agent_profile_revision(&profile.id, profile.version)
+            .await?;
+        let compiled = compile_profile_launch(profile, &portable, command_id)
+            .map_err(|error| ProjectServiceError::UnsupportedProfile(error.to_string()))?;
+        self.store
+            .record_profile_launch_audit(
+                command_id,
+                &profile.id,
+                profile.version,
+                serde_json::to_value(&compiled.plan)
+                    .expect("ProfileLaunchPlan serialization is infallible"),
+            )
+            .await?;
+        if !compiled.plan.compatible {
+            return Err(ProjectServiceError::UnsupportedProfile(format!(
+                "launch plan is incompatible; missing: {}; approvals: {}",
+                compiled.plan.missing_capabilities.join(", "),
+                compiled.plan.approvals.join(", ")
+            )));
+        }
+        if !compiled.plan.generated_files.is_empty() {
+            materialize_profile_launch(&compiled, Path::new(cwd), command_id)
+                .map_err(|error| ProjectServiceError::RuntimeProvision(error.to_string()))?;
+        }
+        Ok(compiled.plan.args)
     }
 }
 

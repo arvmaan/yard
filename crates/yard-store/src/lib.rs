@@ -20,12 +20,12 @@ use thiserror::Error;
 use tokio::task;
 use uuid::Uuid;
 use yard_domain::{
-    AgentProfile, AgentProfileManifest, AgentProfiles, AllocationContext, AllocationMode,
-    ArchiveProject, ArchivedProject, Artifact, ArtifactKind, ArtifactRegistration, ArtifactSource,
-    Assignment, AssignmentAttempt, AssignmentLifecycle, Assignments, AttemptLifecycle,
-    AutomaticSummaryRequestKind, Automation, AutomationCommandResult, AutomationRun,
-    AutomationRunCommandResult, AutomationRuns, Automations, CanvasPlacement, CompletionOutcome,
-    CompletionReceipt, ConfigureYardOrchestrator, ConfiguredYardOrchestrator,
+    AgentProfile, AgentProfileFile, AgentProfileManifest, AgentProfiles, AllocationContext,
+    AllocationMode, ArchiveProject, ArchivedProject, Artifact, ArtifactKind, ArtifactRegistration,
+    ArtifactSource, Assignment, AssignmentAttempt, AssignmentLifecycle, Assignments,
+    AttemptLifecycle, AutomaticSummaryRequestKind, Automation, AutomationCommandResult,
+    AutomationRun, AutomationRunCommandResult, AutomationRuns, Automations, CanvasPlacement,
+    CompletionOutcome, CompletionReceipt, ConfigureYardOrchestrator, ConfiguredYardOrchestrator,
     ConfirmProfileAllocation, ConfirmWorkerAllocation, ConfirmWorkerHandoff, ConfirmedAllocation,
     ConfirmedProjectCreation, ConfirmedWorkerHandoff, CoordinationCommandStatus, CoordinationNode,
     CoordinationNodeCommandResult, CoordinationNodePromptAcknowledgement, CoordinationNodeRoute,
@@ -75,7 +75,7 @@ pub use pane_management_store::{
     BeginPaneManagementBatch, ManagedPaneAdoption, StoredLeaseToken, StoredPaneManagementLease,
 };
 
-const SCHEMA_VERSION: i64 = 31;
+const SCHEMA_VERSION: i64 = 32;
 const PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS: u64 = 120_000;
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_projects.sql");
 const PROFILE_ASSIGNMENT_MIGRATION: &str =
@@ -132,6 +132,8 @@ const PANE_MANAGEMENT_MIGRATION: &str =
     include_str!("../migrations/0030_pane_management_leases.sql");
 const BLANK_WORKER_PROFILE_ID: &str = "yard:managed-blank-profile";
 const WORKER_CLEANUP_MIGRATION: &str = include_str!("../migrations/0031_worker_cleanup.sql");
+const PORTABLE_PROFILE_BUNDLES_MIGRATION: &str =
+    include_str!("../migrations/0032_portable_profile_bundles.sql");
 const BLANK_WORKER_PROFILE_NAME: &str = "Blank profile";
 const MAX_ROUTE_LIST_LIMIT: usize = 500;
 pub const MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT: usize = 100;
@@ -546,6 +548,13 @@ pub trait YardStore: Send + Sync {
         profile_id: &str,
         update: UpdateAgentProfile,
     ) -> Result<AgentProfile, ProjectStoreError>;
+    async fn record_profile_launch_audit(
+        &self,
+        command_id: &str,
+        profile_id: &str,
+        profile_version: u64,
+        plan: serde_json::Value,
+    ) -> Result<(), ProjectStoreError>;
     async fn list_worker_candidates(&self) -> Result<WorkerCandidates, ProjectStoreError>;
     async fn preview_completed_runtime_cleanup(
         &self,
@@ -4426,7 +4435,9 @@ impl YardStore for SqliteProjectStore {
                 return Err(ProjectStoreError::ProfileVersionConflict { current_version });
             }
             let current_agent_profile =
-                select_agent_profile_manifest(&transaction, &profile_id, current_version)?;
+                select_agent_profile_revision(&transaction, &profile_id, current_version)?;
+            let current_manifest: AgentProfileManifest =
+                serde_json::from_value(current_agent_profile.manifest)?;
             let next_version = current_version
                 .checked_add(1)
                 .ok_or(ProjectStoreError::VersionOverflow)?;
@@ -4450,8 +4461,9 @@ impl YardStore for SqliteProjectStore {
                 };
             }
             insert_profile_revision(&transaction, &profile_id, next_version, &update.spec, now)?;
-            let agent_profile =
-                PreparedAgentProfile::preserving_unknown(&current_agent_profile, &update.spec)?;
+            let mut agent_profile =
+                PreparedAgentProfile::preserving_unknown(&current_manifest, &update.spec)?;
+            agent_profile.files = current_agent_profile.files;
             insert_agent_profile_revision(
                 &transaction,
                 &profile_id,
@@ -4605,6 +4617,55 @@ impl YardStore for SqliteProjectStore {
             let saved = select_agent_profile_revision(&transaction, &profile_id, next_version)?;
             transaction.commit()?;
             Ok(saved)
+        })
+        .await
+    }
+
+    async fn record_profile_launch_audit(
+        &self,
+        command_id: &str,
+        profile_id: &str,
+        profile_version: u64,
+        plan: serde_json::Value,
+    ) -> Result<(), ProjectStoreError> {
+        let command_id = required_id(command_id)?;
+        let profile_id = required_profile_id(profile_id)?;
+        self.run(move |connection| {
+            let now = unix_time_ms()?;
+            let plan_json = serde_json::to_string(&plan)?;
+            let result = connection.execute(
+                "INSERT INTO profile_launch_audits (
+                    command_id, profile_id, profile_version, plan_json,
+                    created_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(command_id) DO NOTHING",
+                params![
+                    command_id,
+                    profile_id,
+                    to_i64(profile_version)?,
+                    plan_json,
+                    to_i64(now)?,
+                ],
+            )?;
+            if result == 0 {
+                let existing = connection.query_row(
+                    "SELECT profile_id, profile_version, plan_json
+                       FROM profile_launch_audits
+                      WHERE command_id = ?1",
+                    [&command_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row_u64(row, 1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )?;
+                if existing != (profile_id, profile_version, plan_json) {
+                    return Err(ProjectStoreError::IdempotencyConflict);
+                }
+            }
+            Ok(())
         })
         .await
     }
@@ -12326,6 +12387,13 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         transaction.execute_batch(WORKER_CLEANUP_MIGRATION)?;
         ensure_foreign_keys(&transaction)?;
         transaction.commit()?;
+        current = 31;
+    }
+    if current == 31 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(PORTABLE_PROFILE_BUNDLES_MIGRATION)?;
+        ensure_foreign_keys(&transaction)?;
+        transaction.commit()?;
     }
     ensure_foreign_keys(connection)?;
     Ok(())
@@ -14882,6 +14950,7 @@ fn select_agent_profile_revision(
                     id: profile_id.to_owned(),
                     version,
                     manifest: serde_json::from_str(&original_manifest)?,
+                    files: select_agent_profile_files(connection, profile_id, version)?,
                     validation: serde_json::from_str(&validation_report)?,
                     created_at_unix_ms,
                     updated_at_unix_ms,
@@ -14892,22 +14961,30 @@ fn select_agent_profile_revision(
         .ok_or(ProjectStoreError::ProfileNotFound)
 }
 
-fn select_agent_profile_manifest(
+fn select_agent_profile_files(
     connection: &Connection,
     profile_id: &str,
     version: u64,
-) -> Result<AgentProfileManifest, ProjectStoreError> {
-    let manifest = connection
-        .query_row(
-            "SELECT canonical_manifest_json
-               FROM agent_profile_revisions
-              WHERE profile_id = ?1 AND profile_version = ?2",
-            params![profile_id, to_i64(version)?],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-        .ok_or(ProjectStoreError::ProfileNotFound)?;
-    Ok(serde_json::from_str(&manifest)?)
+) -> Result<Vec<AgentProfileFile>, ProjectStoreError> {
+    if !table_exists(connection, "agent_profile_files")? {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection.prepare(
+        "SELECT path, media_type, content
+           FROM agent_profile_files
+          WHERE profile_id = ?1 AND profile_version = ?2
+          ORDER BY path",
+    )?;
+    statement
+        .query_map(params![profile_id, to_i64(version)?], |row| {
+            Ok(AgentProfileFile {
+                path: row.get(0)?,
+                media_type: row.get(1)?,
+                content: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn insert_agent_profile_revision(
@@ -14935,6 +15012,32 @@ fn insert_agent_profile_revision(
             to_i64(now)?,
         ],
     )?;
+    for file in &profile.files {
+        let sha256 = profile
+            .canonical_manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path == file.path)
+            .map(|artifact| artifact.sha256.as_str())
+            .ok_or_else(|| {
+                ProjectStoreError::InvalidAgentProfile(
+                    yard_domain::AgentProfileValidationError::UndeclaredFile(file.path.clone()),
+                )
+            })?;
+        connection.execute(
+            "INSERT INTO agent_profile_files (
+                profile_id, profile_version, path, media_type, content, sha256
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                profile_id,
+                to_i64(version)?,
+                file.path,
+                file.media_type,
+                file.content,
+                sha256,
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -19285,19 +19388,19 @@ mod tests {
     };
 
     use rusqlite::{Connection, TransactionBehavior, params};
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tempfile::TempDir;
     use uuid::Uuid;
     use yard_domain::{
-        AllocationMode, ArchiveProject, ArtifactKind, ArtifactRegistration, AssignmentLifecycle,
-        AttemptLifecycle, AutomationScope, CancelWorkerCleanupRun, CanvasPlacement,
-        CompletedRuntimeRetentionReason, CompletionOutcome, ConfigureYardOrchestrator,
-        ConfirmProfileAllocation, ConfirmWorkerAllocation, ConfirmWorkerHandoff,
-        CoordinationCommandStatus, CoordinationNodeKind, CreateAgentProfile, CreateAutomation,
-        CreateCoordinationNode, CreateProject, CreateProjectFromProfile, CreateProjectRelationship,
-        CreateWorkerProfile, CreateWorkspaceProjectFromProfile, DailySchedule, DeleteProject,
-        DeleteProjectRelationship, DeleteWorker, EndWorkerSession, FocusObservation,
-        HandoffTargetRole, IsolationPolicy, ManagedRuntimeOccupantKind,
+        AgentProfileFile, AllocationMode, ArchiveProject, ArtifactKind, ArtifactRegistration,
+        AssignmentLifecycle, AttemptLifecycle, AutomationScope, CancelWorkerCleanupRun,
+        CanvasPlacement, CompletedRuntimeRetentionReason, CompletionOutcome,
+        ConfigureYardOrchestrator, ConfirmProfileAllocation, ConfirmWorkerAllocation,
+        ConfirmWorkerHandoff, CoordinationCommandStatus, CoordinationNodeKind, CreateAgentProfile,
+        CreateAutomation, CreateCoordinationNode, CreateProject, CreateProjectFromProfile,
+        CreateProjectRelationship, CreateWorkerProfile, CreateWorkspaceProjectFromProfile,
+        DailySchedule, DeleteProject, DeleteProjectRelationship, DeleteWorker, EndWorkerSession,
+        FocusObservation, HandoffTargetRole, IsolationPolicy, ManagedRuntimeOccupantKind,
         ManagedRuntimeWorkspaceKind, ObservedStatus, ObservedWorker, OldSessionDisposition,
         PaneObservation, Project, ProjectRelationshipKind, ProjectRuntimeBinding,
         ProviderSessionRef, ProvisionCoordinationNode, ProvisionYardOrchestrator,
@@ -25639,11 +25742,22 @@ mod tests {
     async fn agent_profile_import_round_trips_unknown_content_and_worker_projection() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
-        let manifest = agent_profile_fixture();
+        let mut manifest = agent_profile_fixture();
+        manifest["artifacts"] = json!([{
+            "path": "skills/demo/SKILL.md",
+            "mediaType": "text/markdown",
+            "sha256": "74daeff849609b74a42500aff45eb6229a086907ab1b2badae4c29ed4fc10e3c",
+        }]);
+        let files = vec![AgentProfileFile {
+            path: "skills/demo/SKILL.md".to_owned(),
+            media_type: "text/markdown".to_owned(),
+            content: "# Skill\n".to_owned(),
+        }];
 
         let created = store
             .create_agent_profile(CreateAgentProfile {
                 manifest: manifest.clone(),
+                files: files.clone(),
             })
             .await
             .unwrap();
@@ -25659,6 +25773,7 @@ mod tests {
         assert_eq!(created.version, 1);
         assert_eq!(created.manifest, manifest);
         assert_eq!(exported.manifest, manifest);
+        assert_eq!(exported.files, files);
         assert_eq!(worker.id, created.id);
         assert_eq!(worker.version, created.version);
         assert_eq!(worker.spec.name, "Portable implementer");
@@ -25669,12 +25784,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_launch_audit_is_durable_and_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let created = store
+            .create_agent_profile(CreateAgentProfile {
+                manifest: agent_profile_fixture(),
+                files: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let plan = json!({"compatible": true, "generatedFiles": []});
+
+        store
+            .record_profile_launch_audit(
+                "launch-command",
+                &created.id,
+                created.version,
+                plan.clone(),
+            )
+            .await
+            .unwrap();
+        store
+            .record_profile_launch_audit("launch-command", &created.id, created.version, plan)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .record_profile_launch_audit(
+                    "launch-command",
+                    &created.id,
+                    created.version,
+                    json!({"compatible": false}),
+                )
+                .await,
+            Err(ProjectStoreError::IdempotencyConflict)
+        ));
+        drop(store);
+
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM profile_launch_audits
+                  WHERE command_id = 'launch-command'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
     async fn worker_profile_update_preserves_imported_opaque_content() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
         let created = store
             .create_agent_profile(CreateAgentProfile {
                 manifest: agent_profile_fixture(),
+                files: Vec::new(),
             })
             .await
             .unwrap();
@@ -25745,19 +25912,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_profile_update_fails_closed_for_preserved_required_capabilities() {
+    async fn worker_profile_update_preserves_required_capabilities_for_launch_check() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
         let created = store
             .create_agent_profile(CreateAgentProfile {
                 manifest: agent_profile_fixture(),
+                files: Vec::new(),
             })
             .await
             .unwrap();
         let mut worker = store.get_worker_profile(&created.id).await.unwrap();
         worker.spec.runtime_adapter = "other-runtime".to_owned();
 
-        let error = store
+        let updated = store
             .update_worker_profile(
                 &worker.id,
                 UpdateWorkerProfile {
@@ -25766,16 +25934,12 @@ mod tests {
                 },
             )
             .await
-            .unwrap_err();
+            .unwrap();
         let current = store.get_agent_profile(&created.id).await.unwrap();
 
-        assert!(matches!(
-            error,
-            ProjectStoreError::InvalidAgentProfile(
-                yard_domain::AgentProfileValidationError::UnsupportedRequiredCapabilities(_)
-            )
-        ));
-        assert_eq!(current.version, 1);
+        assert_eq!(updated.version, 2);
+        assert_eq!(current.version, 2);
+        assert!(!current.validation.compatible);
     }
 
     #[tokio::test]
@@ -25785,6 +25949,7 @@ mod tests {
         let created = store
             .create_agent_profile(CreateAgentProfile {
                 manifest: agent_profile_fixture(),
+                files: Vec::new(),
             })
             .await
             .unwrap();
@@ -25838,6 +26003,7 @@ mod tests {
                 &created.id,
                 UpdateAgentProfile {
                     manifest: replacement,
+                    files: Vec::new(),
                     expected_version: created.version,
                 },
             )

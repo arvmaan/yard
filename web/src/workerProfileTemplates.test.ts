@@ -61,6 +61,18 @@ describe('worker profile template catalog', () => {
       name: '',
     })
   })
+
+  it('packages the built-in orchestration skills only in the orchestrator template', () => {
+    expect(
+      WORKER_PROFILE_TEMPLATES.find(({ id }) => id === 'orchestrator')?.spec
+        .skills,
+    ).toEqual(['herdr-orchestration', 'herdr-cli'])
+    expect(
+      WORKER_PROFILE_TEMPLATES.filter(({ id }) => id !== 'orchestrator').every(
+        ({ spec }) => spec.skills.length === 0,
+      ),
+    ).toBe(true)
+  })
 })
 
 describe('profile editor template state', () => {

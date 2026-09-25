@@ -550,6 +550,10 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             "/api/v1/agent-profiles/{profile_id}/revisions/{profile_version}",
             get(get_agent_profile_revision),
         )
+        .route(
+            "/api/v1/agent-profiles/{profile_id}/dry-run",
+            axum::routing::post(dry_run_agent_profile),
+        )
         .fallback(web::serve)
         .with_state(AppState {
             store,
@@ -1710,6 +1714,25 @@ async fn update_agent_profile(
         .map_err(ApiError::from)
 }
 
+#[derive(serde::Deserialize)]
+struct DryRunAgentProfile {
+    #[serde(with = "yard_domain::serde_u64")]
+    profile_version: u64,
+}
+
+async fn dry_run_agent_profile(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+    Json(request): Json<DryRunAgentProfile>,
+) -> Result<NoStoreJson<crate::profile_runtime::ProfileLaunchPlan>, ApiError> {
+    state
+        .profiles
+        .dry_run(&profile_id, request.profile_version)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
 async fn list_project_assignments(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -2708,6 +2731,11 @@ impl From<AgentProfileServiceError> for ApiError {
                     message: error.to_string(),
                 }
             }
+            AgentProfileServiceError::Runtime(error) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "agent_profile_compile_failed",
+                message: error.to_string(),
+            },
             AgentProfileServiceError::Store(ProjectStoreError::ProfileNotFound) => Self {
                 status: StatusCode::NOT_FOUND,
                 code: "agent_profile_not_found",
@@ -10400,15 +10428,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(
-            response_json(response).await["error"]["code"],
-            "invalid_worker_profile"
-        );
-        assert_eq!(
-            get_json(&app, &format!("/api/v1/agent-profiles/{profile_id}")).await["version"],
-            "2"
-        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = response_json(response).await;
+        assert_eq!(updated["version"], "3");
+        let portable = get_json(&app, &format!("/api/v1/agent-profiles/{profile_id}")).await;
+        assert_eq!(portable["version"], "3");
+        assert_eq!(portable["validation"]["compatible"], false);
     }
 
     #[tokio::test]
@@ -10602,14 +10627,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_profile_import_fails_closed_for_unsupported_required_capability() {
+    async fn agent_profile_import_preserves_but_dry_run_blocks_unsupported_capability() {
         let (app, _temp) = test_router().await;
         let mut manifest = agent_profile_fixture();
+        manifest["spec"]["capabilities"]["optional"] = serde_json::json!([]);
         manifest["spec"]["capabilities"]["required"]
             .as_array_mut()
             .unwrap()
             .push(serde_json::json!({
-                "id": "agent.skills",
+                "id": "tool.mcp.client",
                 "version": 1
             }));
 
@@ -10626,11 +10652,27 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(
-            response_json(response).await["error"]["code"],
-            "invalid_agent_profile"
-        );
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = response_json(response).await;
+        assert_eq!(created["validation"]["compatible"], false);
+        let profile_id = created["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/agent-profiles/{profile_id}/dry-run"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"profile_version":"1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let plan = response_json(response).await;
+        assert_eq!(plan["compatible"], false);
+        assert_eq!(plan["missingCapabilities"][0], "tool.mcp.client v1");
 
         let response = app
             .oneshot(

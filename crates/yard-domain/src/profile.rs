@@ -1,3 +1,5 @@
+use std::path::{Component, Path};
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -69,6 +71,18 @@ impl WorkerProfileSpec {
         self.default_role = required("default_role", &self.default_role, MAX_VALUE_BYTES)?;
         self.instructions_ref =
             optional("instructions_ref", self.instructions_ref, MAX_VALUE_BYTES)?;
+        if let Some(reference) = self.instructions_ref.as_deref() {
+            let path = Path::new(reference);
+            if path.is_absolute()
+                || reference.contains('\\')
+                || reference.as_bytes().get(1) == Some(&b':')
+                || path
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return Err(ProfileValidationError::UnsafePath("instructions_ref"));
+            }
+        }
         self.tools = normalize_list("tools", self.tools)?;
         self.skills = normalize_list("skills", self.skills)?;
         self.mcp_servers = normalize_list("mcp_servers", self.mcp_servers)?;
@@ -156,6 +170,8 @@ pub enum ProfileValidationError {
     TooManyValues { field: &'static str, max: usize },
     #[error("expected_version must be greater than zero")]
     InvalidVersion,
+    #[error("{0} must be a relative contained path")]
+    UnsafePath(&'static str),
 }
 
 fn required(
@@ -241,6 +257,19 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, ProfileValidationError::InvalidVersion);
+    }
+
+    #[test]
+    fn rejects_absolute_or_escaping_instruction_paths() {
+        for reference in ["/home/user/AGENTS.md", "../AGENTS.md", r"folder\AGENTS.md"] {
+            let mut profile = spec();
+            profile.instructions_ref = Some(reference.to_owned());
+
+            assert_eq!(
+                profile.normalize().unwrap_err(),
+                ProfileValidationError::UnsafePath("instructions_ref")
+            );
+        }
     }
 
     #[test]

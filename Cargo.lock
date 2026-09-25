@@ -1495,6 +1495,7 @@ dependencies = [
  "chrono-tz",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "uuid",
 ]

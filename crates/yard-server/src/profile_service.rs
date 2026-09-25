@@ -7,6 +7,8 @@ use yard_domain::{
 };
 use yard_store::{ProjectStoreError, YardStore};
 
+use crate::profile_runtime::{ProfileLaunchPlan, ProfileRuntimeError, compile_profile_launch};
+
 #[derive(Clone)]
 pub struct ProfileService {
     store: Arc<dyn YardStore>,
@@ -137,8 +139,8 @@ impl ProfileService {
     ///
     /// # Errors
     ///
-    /// Returns [`AgentProfileServiceError`] for invalid input, unsupported
-    /// required capabilities, stale revisions, or persistence failures.
+    /// Returns [`AgentProfileServiceError`] for invalid input, stale revisions,
+    /// or persistence failures.
     pub async fn update_agent(
         &self,
         profile_id: &str,
@@ -149,6 +151,26 @@ impl ProfileService {
             .update_agent_profile(profile_id, update)
             .await
             .map_err(Into::into)
+    }
+
+    /// Compile a deterministic, side-effect-free launch plan for one revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentProfileServiceError`] when the revision is missing or
+    /// cannot be lowered by the selected adapter.
+    pub async fn dry_run(
+        &self,
+        profile_id: &str,
+        profile_version: u64,
+    ) -> Result<ProfileLaunchPlan, AgentProfileServiceError> {
+        let (worker, portable) = tokio::try_join!(
+            self.store
+                .get_worker_profile_revision(profile_id, profile_version),
+            self.store
+                .get_agent_profile_revision(profile_id, profile_version),
+        )?;
+        Ok(compile_profile_launch(&worker, &portable, "dry-run")?.plan)
     }
 }
 
@@ -164,6 +186,8 @@ pub enum ProfileServiceError {
 pub enum AgentProfileServiceError {
     #[error(transparent)]
     InvalidProfile(#[from] yard_domain::AgentProfileValidationError),
+    #[error(transparent)]
+    Runtime(#[from] ProfileRuntimeError),
     #[error(transparent)]
     Store(#[from] ProjectStoreError),
 }

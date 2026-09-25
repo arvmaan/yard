@@ -51,6 +51,7 @@ import type {
   TerminalClientMessage,
   Worker,
   WorkerCandidate,
+  WorkerProfile,
   WorkerRuntimeBinding,
   WorkspaceObservation,
   YardOrchestrator,
@@ -163,7 +164,7 @@ const inventory: RuntimeInventory = {
   child_agents: [] as ObservedChildAgent[],
 }
 
-function profile(id = 'profile-1', name = 'Implementer') {
+function profile(id = 'profile-1', name = 'Implementer'): WorkerProfile {
   return {
     id,
     name,
@@ -1782,6 +1783,59 @@ async function mockApi(
       return
     }
     await route.fulfill({ status: 404 })
+  })
+
+  await page.route('**/api/v1/agent-profiles/*/dry-run', async (route) => {
+    const request = route.request()
+    const profileId = decodeURIComponent(
+      new URL(request.url()).pathname.split('/').at(-2) ?? '',
+    )
+    const selected = state.profiles.find(
+      (candidate) => candidate.id === profileId,
+    )
+    if (!selected || request.method() !== 'POST') {
+      await route.fulfill({ status: 404 })
+      return
+    }
+    await route.fulfill({
+      json: {
+        commandId: 'dry-run',
+        profileId,
+        profileVersion: selected.version,
+        bundleApiVersion: 'yard.dev/agent-profile/v1alpha1',
+        adapterId: 'herdr',
+        providerId: selected.provider,
+        runtimeSurface: 'cli',
+        args: ['--no-alt-screen'],
+        negotiation: {
+          adapterId: 'herdr',
+          adapterVersion: 'yard-herdr/v1',
+          providerId: selected.provider,
+          runtimeSurface: 'cli',
+          compatible: true,
+          results: [],
+        },
+        components: selected.skills.map((id) => ({
+          kind: 'skill',
+          id,
+          required: false,
+          status: 'supported',
+          reason: 'project skill directory',
+          surface: '.agents/skills',
+        })),
+        generatedFiles: selected.skills.map((id) => ({
+          path: `.agents/skills/${id}/SKILL.md`,
+          mediaType: 'text/markdown',
+          sha256: 'a'.repeat(64),
+          provenance: 'yard:embedded-orchestrator-kit/v1',
+        })),
+        permissions: [selected.permission_policy],
+        missingCapabilities: [],
+        approvals: [],
+        warnings: [],
+        compatible: true,
+      },
+    })
   })
 
   await page.route('**/api/v1/projects**', async (route) => {
@@ -13108,9 +13162,12 @@ test('creates a worker profile from a reusable role template', async ({
   await expect(page.getByLabel('Instructions reference')).toHaveValue(
     'AGENTS.md',
   )
-  await expect(page.getByLabel('Tools')).toHaveValue('')
-  await expect(page.getByLabel('Skills')).toHaveValue('')
-  await expect(page.getByLabel('MCP servers')).toHaveValue('')
+  await expect(page.getByLabel('Tools')).toHaveCount(0)
+  await expect(page.getByLabel('Skills')).toHaveCount(0)
+  await expect(page.getByLabel('MCP servers')).toHaveCount(0)
+  await expect(page.getByLabel('Portable components')).toContainText(
+    'No packaged skills.',
+  )
   await expect(page.getByLabel('Sandbox')).toHaveValue('runtime_default')
   await expect(page.getByLabel('Worktree')).toHaveValue('project_workspace')
   await expect(page.getByLabel('Permissions')).toHaveValue('runtime_default')
@@ -13131,6 +13188,31 @@ test('creates a worker profile from a reusable role template', async ({
     tools: [],
     worktree_policy: 'project_workspace',
   })
+})
+
+test('previews packaged profile lowering without exposing raw capability fields', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  state.profiles[0].skills = ['herdr-orchestration', 'herdr-cli']
+  await page.setViewportSize({ width: 1200, height: 760 })
+  await page.goto('/')
+
+  await page.getByRole('button', { name: /Implementer/ }).click()
+  await page.getByRole('button', { name: 'Edit profile' }).click()
+  const dialog = page.getByRole('dialog', { name: 'Edit profile' })
+  await expect(dialog.getByLabel('Portable components')).toContainText(
+    'herdr-orchestration, herdr-cli',
+  )
+  await dialog.getByRole('button', { name: 'Preview launch plan' }).click()
+
+  await expect(dialog.getByText('Launch compatible · codex')).toBeVisible()
+  await expect(dialog.getByText('2 managed files')).toBeVisible()
+  await expect(dialog.getByText('herdr-orchestration: supported')).toBeVisible()
+  await expect(dialog.getByText('herdr-cli: supported')).toBeVisible()
+  await expect(dialog.getByLabel('Tools')).toHaveCount(0)
+  await expect(dialog.getByLabel('Skills')).toHaveCount(0)
+  await expect(dialog.getByLabel('MCP servers')).toHaveCount(0)
 })
 
 test('persists project drag placement across reload', async ({ page }) => {

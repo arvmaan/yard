@@ -608,6 +608,42 @@ export interface UpdateWorkerProfileInput extends WorkerProfileSpec {
   expected_version: string
 }
 
+export type CapabilitySupportStatus =
+  | 'supported'
+  | 'degraded'
+  | 'approval_required'
+  | 'unsupported'
+
+export interface ProfileLaunchPlan {
+  commandId: string
+  profileId: string
+  profileVersion: string
+  bundleApiVersion: string
+  adapterId: string
+  providerId: string
+  runtimeSurface: string
+  args: string[]
+  components: Array<{
+    kind: string
+    id: string
+    required: boolean
+    status: CapabilitySupportStatus
+    reason: string
+    surface: string
+  }>
+  generatedFiles: Array<{
+    path: string
+    mediaType: string
+    sha256: string
+    provenance: string
+  }>
+  permissions: string[]
+  missingCapabilities: string[]
+  approvals: string[]
+  warnings: string[]
+  compatible: boolean
+}
+
 export type AssignmentLifecycle =
   | 'allocating'
   | 'active'

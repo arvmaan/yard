@@ -1,7 +1,15 @@
-import { useEffect, useReducer, useRef, type FormEvent } from 'react'
-import { LoaderCircle, Save, X } from 'lucide-react'
+import {
+  useEffect,
+  useReducer,
+  useRef,
+  useState,
+  type FormEvent,
+} from 'react'
+import { LoaderCircle, RefreshCw, Save, X } from 'lucide-react'
+import { dryRunAgentProfile } from './api'
 import type {
   CreateWorkerProfileInput,
+  ProfileLaunchPlan,
   WorkerProfile,
 } from './types'
 import {
@@ -19,17 +27,6 @@ interface ProfileEditorProps {
   onSave: (spec: CreateWorkerProfileInput) => Promise<void>
 }
 
-function listValue(values: string[]) {
-  return values.join(', ')
-}
-
-function parseList(value: string) {
-  return value
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean)
-}
-
 export function ProfileEditor({
   busy,
   profile,
@@ -37,6 +34,9 @@ export function ProfileEditor({
   onSave,
 }: ProfileEditorProps) {
   const dialogRef = useRef<HTMLElement>(null)
+  const [plan, setPlan] = useState<ProfileLaunchPlan | null>(null)
+  const [planError, setPlanError] = useState<string | null>(null)
+  const [planLoading, setPlanLoading] = useState(false)
   const [{ spec, templateId }, dispatch] = useReducer(
     workerProfileEditorReducer,
     profile,
@@ -50,11 +50,28 @@ export function ProfileEditor({
 
   useEffect(() => {
     dispatch({ profile, type: 'reset' })
+    setPlan(null)
+    setPlanError(null)
   }, [profile])
 
   const submit = (event: FormEvent) => {
     event.preventDefault()
     void onSave(spec)
+  }
+
+  const previewLaunch = async () => {
+    if (!profile) return
+    setPlanLoading(true)
+    setPlanError(null)
+    try {
+      setPlan(await dryRunAgentProfile(profile.id, profile.version))
+    } catch (caught) {
+      setPlanError(
+        caught instanceof Error ? caught.message : 'Launch preview failed',
+      )
+    } finally {
+      setPlanLoading(false)
+    }
   }
 
   return (
@@ -185,45 +202,20 @@ export function ProfileEditor({
             />
           </label>
 
-          <div className="form-grid">
-            <label>
-              <span>Tools</span>
-              <input
-                onChange={(event) =>
-                  dispatch({
-                    patch: { tools: parseList(event.target.value) },
-                    type: 'update-spec',
-                  })
-                }
-                value={listValue(spec.tools)}
-              />
-            </label>
-            <label>
-              <span>Skills</span>
-              <input
-                onChange={(event) =>
-                  dispatch({
-                    patch: { skills: parseList(event.target.value) },
-                    type: 'update-spec',
-                  })
-                }
-                value={listValue(spec.skills)}
-              />
-            </label>
-            <label>
-              <span>MCP servers</span>
-              <input
-                onChange={(event) =>
-                  dispatch({
-                    patch: {
-                      mcp_servers: parseList(event.target.value),
-                    },
-                    type: 'update-spec',
-                  })
-                }
-                value={listValue(spec.mcp_servers)}
-              />
-            </label>
+          <div className="profile-components" aria-label="Portable components">
+            <span>Portable components</span>
+            {spec.skills.length > 0 ? (
+              <p>Packaged skills: {spec.skills.join(', ')}</p>
+            ) : (
+              <p>No packaged skills.</p>
+            )}
+            {spec.tools.length > 0 || spec.mcp_servers.length > 0 ? (
+              <p>
+                Legacy tool and MCP requests are preserved but must pass the
+                launch preview; importing them grants no permissions or
+                credentials.
+              </p>
+            ) : null}
           </div>
 
           <div className="form-grid">
@@ -274,6 +266,54 @@ export function ProfileEditor({
               </select>
             </label>
           </div>
+
+          {profile ? (
+            <div className="profile-launch-preview">
+              <button
+                className="secondary-button"
+                disabled={busy || planLoading}
+                onClick={() => void previewLaunch()}
+                type="button"
+              >
+                {planLoading ? (
+                  <LoaderCircle
+                    aria-hidden="true"
+                    className="status-spin"
+                    size={16}
+                  />
+                ) : (
+                  <RefreshCw aria-hidden="true" size={16} />
+                )}
+                Preview launch plan
+              </button>
+              {planError ? <p role="alert">{planError}</p> : null}
+              {plan ? (
+                <div aria-live="polite">
+                  <p>
+                    {plan.compatible
+                      ? 'Launch compatible'
+                      : 'Launch blocked'}
+                    {' · '}
+                    {plan.providerId}
+                  </p>
+                  <p>
+                    {plan.generatedFiles.length} managed file
+                    {plan.generatedFiles.length === 1 ? '' : 's'}
+                    {plan.approvals.length > 0
+                      ? ` · ${plan.approvals.length} approval required`
+                      : ''}
+                  </p>
+                  <ul>
+                    {plan.components.map((component) => (
+                      <li key={`${component.kind}:${component.id}`}>
+                        {component.id}: {component.status}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
 
           <footer className="dialog-actions">
             <button

@@ -17,6 +17,7 @@ use crate::intervention_service::{
     RuntimeIntervention, RuntimeInterventionError, RuntimePromptRequest,
 };
 use crate::inventory_service::{InventoryServiceError, InventorySource};
+use crate::profile_runtime::{compile_profile_launch, materialize_profile_launch};
 use crate::runtime_cleanup_service::RuntimeCleanupService;
 use crate::status_protocol::{with_orchestrator_status_contract, with_orchestrator_workflow};
 
@@ -246,22 +247,6 @@ impl AllocationService {
             BeginProfileAllocation::Replayed(allocation) => return Ok(*allocation),
             BeginProfileAllocation::Started(context) => *context,
         };
-        if let Err(message) = validate_supported_profile(&context.profile) {
-            self.store
-                .fail_profile_allocation(&context.command.command_id, &message, false)
-                .await?;
-            return Err(AllocationServiceError::UnsupportedProfile(message));
-        }
-        let args = match provider_args(&context.profile) {
-            Ok(args) => args,
-            Err(error) => {
-                self.store
-                    .fail_profile_allocation(&context.command.command_id, &error.to_string(), false)
-                    .await?;
-                return Err(error);
-            }
-        };
-
         let inventory = match self
             .source
             .inventory(&context.project.runtime.session)
@@ -308,6 +293,18 @@ impl AllocationService {
                 .fail_profile_allocation(&context.command.command_id, &error.to_string(), false)
                 .await?;
             return Err(error);
+        };
+        let args = match self
+            .prepare_profile_launch(&context.profile, &cwd, &context.command.command_id)
+            .await
+        {
+            Ok(args) => args,
+            Err(error) => {
+                self.store
+                    .fail_profile_allocation(&context.command.command_id, &error.to_string(), false)
+                    .await?;
+                return Err(error);
+            }
         };
         let provision = RuntimeProvisionRequest {
             command_id: context.command.command_id.clone(),
@@ -497,13 +494,6 @@ impl AllocationService {
             BeginWorkerAllocation::Replayed(allocation) => return Ok(*allocation),
             BeginWorkerAllocation::Started(context) => *context,
         };
-        if let Err(message) = validate_supported_profile(&context.profile) {
-            self.store
-                .fail_worker_allocation(&context.command.command_id, &message, false)
-                .await?;
-            return Err(AllocationServiceError::UnsupportedProfile(message));
-        }
-
         if !context.replace_runtime {
             let runtime = match self.verify_live_worker(&context.worker).await {
                 Ok(runtime) => runtime,
@@ -566,15 +556,6 @@ impl AllocationService {
             };
         }
 
-        let args = match provider_args(&context.profile) {
-            Ok(args) => args,
-            Err(error) => {
-                self.store
-                    .fail_worker_allocation(&context.command.command_id, &error.to_string(), false)
-                    .await?;
-                return Err(error);
-            }
-        };
         let inventory = match self
             .source
             .inventory(&context.project.runtime.session)
@@ -621,6 +602,18 @@ impl AllocationService {
                 .fail_worker_allocation(&context.command.command_id, &error.to_string(), false)
                 .await?;
             return Err(error);
+        };
+        let args = match self
+            .prepare_profile_launch(&context.profile, &cwd, &context.command.command_id)
+            .await
+        {
+            Ok(args) => args,
+            Err(error) => {
+                self.store
+                    .fail_worker_allocation(&context.command.command_id, &error.to_string(), false)
+                    .await?;
+                return Err(error);
+            }
         };
         let provision = RuntimeProvisionRequest {
             command_id: context.command.command_id.clone(),
@@ -816,21 +809,6 @@ impl AllocationService {
             }
             BeginWorkerHandoff::Started(context) => *context,
         };
-        if let Err(message) = validate_supported_profile(&context.profile) {
-            self.store
-                .fail_worker_handoff(&context.command.command_id, &message, false)
-                .await?;
-            return Err(AllocationServiceError::UnsupportedProfile(message));
-        }
-        let args = match provider_args(&context.profile) {
-            Ok(args) => args,
-            Err(error) => {
-                self.store
-                    .fail_worker_handoff(&context.command.command_id, &error.to_string(), false)
-                    .await?;
-                return Err(error);
-            }
-        };
         let inventory = match self
             .source
             .inventory(&context.target_project.runtime.session)
@@ -877,6 +855,18 @@ impl AllocationService {
                 .fail_worker_handoff(&context.command.command_id, &error.to_string(), false)
                 .await?;
             return Err(error);
+        };
+        let args = match self
+            .prepare_profile_launch(&context.profile, &cwd, &context.command.command_id)
+            .await
+        {
+            Ok(args) => args,
+            Err(error) => {
+                self.store
+                    .fail_worker_handoff(&context.command.command_id, &error.to_string(), false)
+                    .await?;
+                return Err(error);
+            }
         };
         let prompt = assignment_prompt(
             &context.command.objective,
@@ -1207,6 +1197,41 @@ impl AllocationService {
             .await
             .map_err(Into::into)
     }
+
+    async fn prepare_profile_launch(
+        &self,
+        profile: &WorkerProfile,
+        cwd: &str,
+        command_id: &str,
+    ) -> Result<Vec<String>, AllocationServiceError> {
+        let portable = self
+            .store
+            .get_agent_profile_revision(&profile.id, profile.version)
+            .await?;
+        let compiled = compile_profile_launch(profile, &portable, command_id)
+            .map_err(|error| AllocationServiceError::UnsupportedProfile(error.to_string()))?;
+        self.store
+            .record_profile_launch_audit(
+                command_id,
+                &profile.id,
+                profile.version,
+                serde_json::to_value(&compiled.plan)
+                    .expect("ProfileLaunchPlan serialization is infallible"),
+            )
+            .await?;
+        if !compiled.plan.compatible {
+            return Err(AllocationServiceError::UnsupportedProfile(format!(
+                "launch plan is incompatible; missing: {}; approvals: {}",
+                compiled.plan.missing_capabilities.join(", "),
+                compiled.plan.approvals.join(", ")
+            )));
+        }
+        if !compiled.plan.generated_files.is_empty() {
+            materialize_profile_launch(&compiled, std::path::Path::new(cwd), command_id)
+                .map_err(|error| AllocationServiceError::RuntimeProvision(error.to_string()))?;
+        }
+        Ok(compiled.plan.args)
+    }
 }
 
 pub(crate) fn validate_supported_profile(profile: &WorkerProfile) -> Result<(), String> {
@@ -1242,7 +1267,7 @@ pub(crate) fn validate_supported_profile(profile: &WorkerProfile) -> Result<(), 
         || !profile.spec.skills.is_empty()
         || !profile.spec.mcp_servers.is_empty()
     {
-        return Err("Herdr profile tool, skill, and MCP injection is not available yet".to_owned());
+        return Err("This launch path does not materialize portable profile components".to_owned());
     }
     if profile.spec.completion_contract != "manual_receipt" {
         return Err("Only the manual_receipt completion contract is supported".to_owned());

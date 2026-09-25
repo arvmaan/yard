@@ -12,7 +12,7 @@ mod orchestrator_workflow_profile;
 mod pane_management;
 mod profile;
 mod project;
-mod serde_u64;
+pub mod serde_u64;
 mod status_report;
 mod token_spend;
 mod worker;
@@ -22,12 +22,12 @@ mod yard_orchestrator;
 pub use agent_profile::{
     AGENT_PROFILE_API_VERSION, AGENT_PROFILE_KIND, AdapterCapability, AdapterDescriptor,
     AgentProfile, AgentProfileArtifact, AgentProfileCapabilities, AgentProfileComponent,
-    AgentProfileComponents, AgentProfileInstruction, AgentProfileManifest, AgentProfileMetadata,
-    AgentProfilePolicies, AgentProfileRole, AgentProfileSource, AgentProfileSpec,
-    AgentProfileValidationError, AgentProfiles, CapabilityNegotiation, CapabilityNegotiationReport,
-    CapabilityRequest, CapabilityRequirement, CapabilitySupportStatus, CreateAgentProfile,
-    CredentialSlot, CredentialSlotKind, HERDR_EXTENSION_KEY, PreparedAgentProfile,
-    UpdateAgentProfile, WORKER_PROFILE_EXTENSION_KEY,
+    AgentProfileComponents, AgentProfileFile, AgentProfileInstruction, AgentProfileManifest,
+    AgentProfileMetadata, AgentProfilePolicies, AgentProfileRole, AgentProfileSource,
+    AgentProfileSpec, AgentProfileValidationError, AgentProfiles, CapabilityNegotiation,
+    CapabilityNegotiationReport, CapabilityRequest, CapabilityRequirement, CapabilitySupportStatus,
+    CreateAgentProfile, CredentialSlot, CredentialSlotKind, HERDR_EXTENSION_KEY,
+    PreparedAgentProfile, UpdateAgentProfile, WORKER_PROFILE_EXTENSION_KEY,
 };
 pub use artifact::{
     Artifact, ArtifactContent, ArtifactKind, ArtifactRegistration, ArtifactSource,
