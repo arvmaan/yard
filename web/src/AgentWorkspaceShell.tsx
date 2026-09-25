@@ -12,6 +12,7 @@ import {
   Bot,
   Boxes,
   BriefcaseBusiness,
+  ChevronRight,
   Folder,
   GitBranch,
   Info,
@@ -56,6 +57,36 @@ import type {
   RuntimeSession,
   YardOrchestratorRoute,
 } from './types'
+
+const COLLAPSED_WORKSPACES_STORAGE_KEY =
+  'yard:terminal-collapsed-workspaces:v1'
+
+function readCollapsedWorkspaceKeys() {
+  try {
+    const stored = window.localStorage.getItem(
+      COLLAPSED_WORKSPACES_STORAGE_KEY,
+    )
+    if (!stored) return new Set<string>()
+    const parsed: unknown = JSON.parse(stored)
+    if (!Array.isArray(parsed)) return new Set<string>()
+    return new Set(
+      parsed.filter((key): key is string => typeof key === 'string'),
+    )
+  } catch {
+    return new Set<string>()
+  }
+}
+
+function persistCollapsedWorkspaceKeys(keys: Set<string>) {
+  try {
+    window.localStorage.setItem(
+      COLLAPSED_WORKSPACES_STORAGE_KEY,
+      JSON.stringify([...keys].sort()),
+    )
+  } catch {
+    return
+  }
+}
 
 const TerminalSession = lazy(() =>
   import('./TerminalSession').then((module) => ({
@@ -351,6 +382,9 @@ export function AgentWorkspaceShell({
   const [unassignedOpen, setUnassignedOpen] = useState(false)
   const [windowSort, setWindowSort] =
     useState<AgentWindowSort>('activity')
+  const [collapsedWorkspaceKeys, setCollapsedWorkspaceKeys] = useState(
+    readCollapsedWorkspaceKeys,
+  )
   useEffect(() => {
     if (mode !== 'chat') setMobileNavigatorOpen(false)
   }, [mode])
@@ -442,6 +476,36 @@ export function AgentWorkspaceShell({
     0,
   )
   const otherSessionCount = sessionTargets.elsewhereCount
+  const activeTargetKey = activeTarget?.key ?? null
+  const activeWorkspaceGroupKey = useMemo(
+    () =>
+      [...groupedTargets.pinned, ...groupedTargets.linked].find((group) =>
+        group.targets.some((target) => target.key === activeTargetKey),
+      )?.key ?? null,
+    [activeTargetKey, groupedTargets],
+  )
+  useEffect(() => {
+    if (!activeWorkspaceGroupKey) return
+    setCollapsedWorkspaceKeys((current) => {
+      if (!current.has(activeWorkspaceGroupKey)) return current
+      const next = new Set(current)
+      next.delete(activeWorkspaceGroupKey)
+      persistCollapsedWorkspaceKeys(next)
+      return next
+    })
+  }, [activeWorkspaceGroupKey])
+  const toggleWorkspaceGroup = (groupKey: string) => {
+    setCollapsedWorkspaceKeys((current) => {
+      const next = new Set(current)
+      if (next.has(groupKey)) {
+        next.delete(groupKey)
+      } else {
+        next.add(groupKey)
+      }
+      persistCollapsedWorkspaceKeys(next)
+      return next
+    })
+  }
   return (
     <section
       aria-label={activeTarget?.label ?? `${mode} workspace`}
@@ -590,10 +654,24 @@ export function AgentWorkspaceShell({
           ) : null}
           {visibleWorkspaceGroups.map((group, groupIndex) => {
             const workspace = group.observation
-            const label = workspace?.label ?? 'Unobserved workspace'
+            const primaryTarget =
+              group.targets.find((target) => target.role !== 'worker') ??
+              group.targets[0]
+            const label =
+              (primaryTarget?.role === 'workstream'
+                ? primaryTarget.label
+                : primaryTarget?.contextLabel) ??
+              workspace?.label ??
+              'Unobserved workspace'
+            const runtimeLabel =
+              workspace?.label && workspace.label !== label
+                ? workspace.label
+                : null
             const offline = group.sessionRunning === false
+            const expanded = !collapsedWorkspaceKeys.has(group.key)
+            const targetsId = `agent-window-workspace-${groupIndex}-targets`
             const workspaceTitle = [
-              `${label} · ${group.workspaceId}`,
+              `${label} · ${runtimeLabel ?? 'Runtime workspace'} · ${group.workspaceId}`,
               `${group.runtimeAdapter} session ${group.session}`,
               workspace
                 ? `Observed workspace runtime: ${workspace.status}`
@@ -616,6 +694,7 @@ export function AgentWorkspaceShell({
                 aria-label={`${label} workspace ${group.workspaceId}`}
                 className="agent-window-workspace"
                 data-focused={workspace?.focused || undefined}
+                data-expanded={expanded}
                 data-observed={Boolean(workspace)}
                 data-offline={offline || undefined}
                 data-session={group.session}
@@ -625,15 +704,28 @@ export function AgentWorkspaceShell({
                 data-workspace-id={group.workspaceId}
                 key={`${group.targets.some((target) => target.role === 'superintendent') ? 'superintendent' : 'linked'}:${group.key}`}
               >
-                <header
+                <button
+                  aria-controls={targetsId}
+                  aria-expanded={expanded}
+                  aria-label={`${expanded ? 'Collapse' : 'Expand'} ${label} terminals, ${group.targets.length} ${group.targets.length === 1 ? 'target' : 'targets'}`}
                   className="agent-window-workspace__heading"
+                  onClick={() => toggleWorkspaceGroup(group.key)}
                   title={workspaceTitle}
+                  type="button"
                 >
                   <div className="agent-window-workspace__identity">
+                    <ChevronRight
+                      aria-hidden="true"
+                      className="agent-window-workspace__chevron"
+                      size={12}
+                    />
                     <Boxes aria-hidden="true" size={14} />
                     <span>
                       <strong>{label}</strong>
-                      <code>{group.workspaceId}</code>
+                      <code>
+                        {runtimeLabel ? `${runtimeLabel} · ` : ''}
+                        {group.workspaceId}
+                      </code>
                     </span>
                     <small>
                       {group.targets.length}{' '}
@@ -679,120 +771,126 @@ export function AgentWorkspaceShell({
                       <code>{workspace.worktree.checkout_path}</code>
                     </div>
                   ) : null}
-                </header>
-                {group.targets.map((target, targetIndex) => {
-                  const descriptionId = `agent-window-target-${groupIndex}-${targetIndex}-description`
-                  const detailsOpen = detailsTarget?.target.key === target.key
-                  const detailsControlLabel =
-                    targetDetailsControlLabel(target)
-                  return (
-                    <div
-                      className="agent-window-row-frame"
-                      key={target.key}
-                    >
-                      <button
-                        aria-describedby={descriptionId}
-                        aria-label={`${target.label}, ${target.roleLabel}, ${target.contextLabel}`}
-                        aria-current={
-                          target.key === activeTarget?.key
-                            ? 'page'
-                            : undefined
-                        }
-                        className="agent-window-row"
-                        data-observation={target.observation}
-                        data-status={target.status}
-                        data-target-key={target.key}
-                        onClick={() => {
-                          onTargetChange(target)
-                          setMobileNavigatorOpen(false)
-                        }}
-                        title={targetTitle(target)}
-                        type="button"
+                </button>
+                <div
+                  className="agent-window-workspace__targets"
+                  hidden={!expanded}
+                  id={targetsId}
+                >
+                  {group.targets.map((target, targetIndex) => {
+                    const descriptionId = `agent-window-target-${groupIndex}-${targetIndex}-description`
+                    const detailsOpen = detailsTarget?.target.key === target.key
+                    const detailsControlLabel =
+                      targetDetailsControlLabel(target)
+                    return (
+                      <div
+                        className="agent-window-row-frame"
+                        key={target.key}
                       >
-                        <span
-                          className="visually-hidden"
-                          id={descriptionId}
-                        >
-                          {targetTitle(target)}
-                        </span>
-                        <span className="agent-window-row__icon">
-                          <TargetIcon target={target} />
-                          <i aria-hidden="true" />
-                        </span>
-                          <span className="agent-window-row__body">
-                            <span className="agent-window-row__identity">
-                              <strong>{target.label}</strong>
-                            </span>
-                            <small className="agent-window-row__connection">
-                              {!target.interactive
-                                ? target.capabilityDetail ??
-                                  runtimeCapabilityLabel(
-                                    targetCapabilities(target),
-                                  )
-                                : target.observation === 'stale'
-                                  ? 'Connection status stale'
-                                  : target.observation === 'observed'
-                                    ? target.chatAvailable
-                                      ? `Runtime ${target.status}`
-                                      : 'Observed · terminal only'
-                                    : 'Connection status unknown'}
-                            </small>
-                          <small className="agent-window-row__context">
-                            {target.roleLabel} · {target.contextLabel}
-                          </small>
-                          <span className="agent-window-row__runtime">
-                            <small>
-                              {target.harness} · {target.session}
-                            </small>
-                            <code>{target.terminalId}</code>
-                          </span>
-                          <code className="agent-window-row__topology">
-                            {target.tabId
-                              ? `tab ${target.tabId} · `
-                              : ''}
-                            pane {target.paneId}
-                          </code>
-                          {target.cwd ? (
-                            <span className="agent-window-row__path">
-                              <Folder aria-hidden="true" size={9} />
-                              <code>{target.cwd}</code>
-                            </span>
-                          ) : null}
-                        </span>
-                      </button>
-                      <button
-                        aria-controls="agent-window-details-dialog"
-                        aria-expanded={detailsOpen}
-                        aria-haspopup="dialog"
-                        aria-label={detailsControlLabel}
-                        className="icon-button agent-window-row__details"
-                        onClick={(event) => {
-                          const nextDetailsTarget = {
-                            returnFocus:
-                              mobileNavigatorOpen &&
-                              mobileNavigatorTriggerRef.current
-                                ? mobileNavigatorTriggerRef.current
-                                : event.currentTarget,
-                            target,
+                        <button
+                          aria-describedby={descriptionId}
+                          aria-label={`${target.label}, ${target.roleLabel}, ${target.contextLabel}`}
+                          aria-current={
+                            target.key === activeTarget?.key
+                              ? 'page'
+                              : undefined
                           }
-                          if (mobileNavigatorOpen) {
+                          className="agent-window-row"
+                          data-observation={target.observation}
+                          data-status={target.status}
+                          data-target-key={target.key}
+                          onClick={() => {
+                            onTargetChange(target)
                             setMobileNavigatorOpen(false)
-                            window.setTimeout(
-                              () => setDetailsTarget(nextDetailsTarget),
-                              0,
-                            )
-                            return
-                          }
-                          setDetailsTarget(nextDetailsTarget)
-                        }}
-                        title={detailsControlLabel}
-                        type="button"
-                      >
-                        <Info aria-hidden="true" size={14} />
-                      </button>
-                    </div>
-                  )
-                })}
+                          }}
+                          title={targetTitle(target)}
+                          type="button"
+                        >
+                          <span
+                            className="visually-hidden"
+                            id={descriptionId}
+                          >
+                            {targetTitle(target)}
+                          </span>
+                          <span className="agent-window-row__icon">
+                            <TargetIcon target={target} />
+                            <i aria-hidden="true" />
+                          </span>
+                            <span className="agent-window-row__body">
+                              <span className="agent-window-row__identity">
+                                <strong>{target.label}</strong>
+                              </span>
+                              <small className="agent-window-row__connection">
+                                {!target.interactive
+                                  ? target.capabilityDetail ??
+                                    runtimeCapabilityLabel(
+                                      targetCapabilities(target),
+                                    )
+                                  : target.observation === 'stale'
+                                    ? 'Connection status stale'
+                                    : target.observation === 'observed'
+                                      ? target.chatAvailable
+                                        ? `Runtime ${target.status}`
+                                        : 'Observed · terminal only'
+                                      : 'Connection status unknown'}
+                              </small>
+                            <small className="agent-window-row__context">
+                              {target.roleLabel} · {target.contextLabel}
+                            </small>
+                            <span className="agent-window-row__runtime">
+                              <small>
+                                {target.harness} · {target.session}
+                              </small>
+                              <code>{target.terminalId}</code>
+                            </span>
+                            <code className="agent-window-row__topology">
+                              {target.tabId
+                                ? `tab ${target.tabId} · `
+                                : ''}
+                              pane {target.paneId}
+                            </code>
+                            {target.cwd ? (
+                              <span className="agent-window-row__path">
+                                <Folder aria-hidden="true" size={9} />
+                                <code>{target.cwd}</code>
+                              </span>
+                            ) : null}
+                          </span>
+                        </button>
+                        <button
+                          aria-controls="agent-window-details-dialog"
+                          aria-expanded={detailsOpen}
+                          aria-haspopup="dialog"
+                          aria-label={detailsControlLabel}
+                          className="icon-button agent-window-row__details"
+                          onClick={(event) => {
+                            const nextDetailsTarget = {
+                              returnFocus:
+                                mobileNavigatorOpen &&
+                                mobileNavigatorTriggerRef.current
+                                  ? mobileNavigatorTriggerRef.current
+                                  : event.currentTarget,
+                              target,
+                            }
+                            if (mobileNavigatorOpen) {
+                              setMobileNavigatorOpen(false)
+                              window.setTimeout(
+                                () => setDetailsTarget(nextDetailsTarget),
+                                0,
+                              )
+                              return
+                            }
+                            setDetailsTarget(nextDetailsTarget)
+                          }}
+                          title={detailsControlLabel}
+                          type="button"
+                        >
+                          <Info aria-hidden="true" size={14} />
+                        </button>
+                      </div>
+                    )
+                  })}
+                </div>
               </section>
             )
           })}

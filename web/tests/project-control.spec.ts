@@ -673,6 +673,14 @@ function reconcileTransferRuntimeTimestamps(
   )
 }
 
+// Moving the only alpha project would make its new session the automatic
+// Herdr session choice; pin alpha as the user's explicit choice instead.
+async function pinHerdrSession(page: Page, session: string) {
+  await page.addInitScript((name) => {
+    window.localStorage.setItem('yard:herdr-session:v1', name)
+  }, session)
+}
+
 function moveProjectTransferFixtureToSession(
   state: MockState,
   session: string,
@@ -7137,6 +7145,7 @@ test('keeps exactly one durable orchestrator visible across selected sessions', 
     fullPage: true,
   })
 
+  await selectRuntimeSession(page, 'alpha')
   await page.setViewportSize({ width: 390, height: 844 })
   await page.reload()
   await expect(orchestrators).toHaveCount(2)
@@ -9584,6 +9593,50 @@ test('renders central cleanup and Superintendent despite a project workspace col
   await expect(page.locator('.workspace-row')).toHaveCount(4)
 })
 
+test('hides an empty central territory while keeping the Superintendent', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  state.yardOrchestrator = {
+    worker: durableWorker(
+      'yard-central-worker',
+      'yard-central-terminal',
+      null,
+      'yard-central-workspace',
+      'alpha',
+      false,
+    ),
+    version: '2',
+    workflow_profile_version: '1',
+    created_at_unix_ms: 1_786_400_000_000,
+    updated_at_unix_ms: 1_786_400_000_000,
+  }
+  state.runtimeTopology = {
+    adapter: 'herdr',
+    session: 'alpha',
+    managed_workspaces: [
+      {
+        workspace_id: 'yard-central-workspace',
+        kind: 'yard_central',
+        label: 'Yard central',
+        occupants: [],
+      },
+    ],
+  }
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await expect(
+    page.locator(
+      '.runtime-workspace-region[data-managed-kind="yard_central"]',
+    ),
+  ).toHaveCount(0)
+  await expect(page.locator('[data-id="yard-orchestrator"]')).toHaveCount(1)
+  await expect(
+    page.locator('[data-id="workspace:yard-central-workspace"]'),
+  ).toHaveCount(0)
+})
+
 test('adopts an observed workspace and keeps it after reload', async ({ page }) => {
   const state = await mockApi(page)
   await page.setViewportSize({ width: 1280, height: 800 })
@@ -10390,6 +10443,65 @@ test('renders only classified answers as structured Markdown', async ({
   })
   expect(bubbleWidth).toBeLessThanOrEqual(1)
   expect(state.terminalOutputRequests).toHaveLength(1)
+})
+
+test('copies a Markdown code block to the clipboard', async ({ page }) => {
+  const state = await mockApi(page, {
+    terminalOutputText: [
+      '› Summarize the focused checks.',
+      '• ## Ready for review',
+      '',
+      'The focused checks passed.',
+      '',
+      '```text',
+      'first result',
+      '',
+      'second result',
+      '```',
+    ].join('\n'),
+  })
+  seedActiveAssignment(state)
+  await page.addInitScript(() => {
+    const copied: string[] = []
+    Object.defineProperty(window, '__copiedText', { value: copied })
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        writeText: async (text: string) => {
+          copied.push(text)
+        },
+      },
+    })
+  })
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page
+    .getByRole('button', { name: 'Open chat', exact: true })
+    .click()
+
+  const answer = page
+    .getByLabel('Agent conversation')
+    .locator('.agent-output__primary[aria-label="Latest answer"]')
+  const codeBlock = answer.locator('.agent-output__code-block')
+  await expect(codeBlock).toHaveCount(1)
+  const copyButton = codeBlock.getByRole('button', {
+    name: 'Copy code to clipboard',
+  })
+  await expect(copyButton).toBeEnabled()
+  await copyButton.click()
+  await expect(
+    codeBlock.getByRole('button', { name: 'Copied to clipboard' }),
+  ).toHaveAttribute('data-state', 'copied')
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { __copiedText: string[] }).__copiedText,
+    ),
+  ).toEqual(['first result\n\nsecond result'])
+  await expect(
+    codeBlock.getByRole('button', { name: 'Copy code to clipboard' }),
+  ).toBeVisible({ timeout: 4_000 })
 })
 
 test('preserves raw terminal output as exact preformatted text', async ({ page }) => {
@@ -13801,6 +13913,9 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
 
   await page.addInitScript(() => {
     window.localStorage.setItem('yard:theme', 'light')
+    window.localStorage.removeItem(
+      'yard:terminal-collapsed-workspaces:v1',
+    )
   })
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
@@ -13869,6 +13984,33 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   await expect(workspaceGroups.nth(1)).toContainText(
     '/tmp/sample/yard-worktrees/api-migration',
   )
+  const releaseWorkspaceToggle = workspaceGroups
+    .nth(0)
+    .locator('.agent-window-workspace__heading')
+  const releaseWorkspaceTargets = workspaceGroups
+    .nth(0)
+    .locator('.agent-window-workspace__targets')
+  await expect(releaseWorkspaceToggle).toHaveAttribute(
+    'aria-expanded',
+    'true',
+  )
+  await releaseWorkspaceToggle.click()
+  await expect(releaseWorkspaceToggle).toHaveAttribute(
+    'aria-expanded',
+    'false',
+  )
+  await expect(releaseWorkspaceTargets).toBeHidden()
+  expect(
+    await page.evaluate(() =>
+      JSON.parse(
+        window.localStorage.getItem(
+          'yard:terminal-collapsed-workspaces:v1',
+        ) ?? '[]',
+      ),
+    ),
+  ).toContain('["herdr","alpha","workspace-2"]')
+  await releaseWorkspaceToggle.click()
+  await expect(releaseWorkspaceTargets).toBeVisible()
   const targetRows = navigator.locator('.agent-window-row')
   await expect(targetRows).toHaveCount(3)
   const targetKeys = await targetRows.evaluateAll((rows) =>
@@ -13977,7 +14119,14 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   const keyboardFocusRow = navigator.locator(
     '[data-target-key="orchestrator:project-1"]',
   )
+  const keyboardFocusWorkspaceToggle = workspaceGroups
+    .filter({
+      has: page.locator('[data-target-key="orchestrator:project-1"]'),
+    })
+    .locator('.agent-window-workspace__heading')
   await reviewerRow.focus()
+  await page.keyboard.press('Tab')
+  await expect(keyboardFocusWorkspaceToggle).toBeFocused()
   await page.keyboard.press('Tab')
   await page.keyboard.press('Tab')
   await expect(keyboardFocusRow).toBeFocused()
@@ -14020,6 +14169,8 @@ test('uses full-screen chat and terminal modes with a Herdr window navigator', a
   })
   await setAppTheme(page, 'Dark')
   await reviewerRow.focus()
+  await page.keyboard.press('Tab')
+  await expect(keyboardFocusWorkspaceToggle).toBeFocused()
   await page.keyboard.press('Tab')
   await page.keyboard.press('Tab')
   await expect(keyboardFocusRow).toBeFocused()
@@ -16430,6 +16581,7 @@ test('loads transfer inventory from the project session without changing the glo
 }) => {
   const state = await mockApi(page)
   moveProjectTransferFixtureToSession(state, 'beta')
+  await pinHerdrSession(page, 'alpha')
 
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
@@ -16537,6 +16689,7 @@ test('submits full runtimes from a timestamp-reconciled transfer snapshot', asyn
 }) => {
   const state = await mockApi(page)
   moveProjectTransferFixtureToSession(state, 'beta')
+  await pinHerdrSession(page, 'alpha')
   const initialObservedAt =
     state.runtimeInventory.observed_at_unix_ms + 1_000
   const initialGate = deferred()
@@ -16685,6 +16838,7 @@ test('keeps transfer dialog focus contained during initial and polling refreshes
 }) => {
   const state = await mockApi(page)
   moveProjectTransferFixtureToSession(state, 'beta')
+  await pinHerdrSession(page, 'alpha')
 
   await page.goto('/')
   await page
@@ -16769,6 +16923,7 @@ test('keeps transfer disabled across abort, reopen, and out-of-order inventory c
 }) => {
   const state = await mockApi(page)
   moveProjectTransferFixtureToSession(state, 'beta')
+  await pinHerdrSession(page, 'alpha')
   const olderObservedAt =
     state.runtimeInventory.observed_at_unix_ms + 1_000
   const newerObservedAt = olderObservedAt + 1_000
@@ -16843,6 +16998,7 @@ test('delivers and ignores an older transfer response after a newer generation',
 }) => {
   const state = await mockApi(page)
   moveProjectTransferFixtureToSession(state, 'beta')
+  await pinHerdrSession(page, 'alpha')
 
   await page.goto('/')
   await page
@@ -16959,6 +17115,7 @@ test('rejects a lower transfer timestamp until an equal observation completes', 
 }) => {
   const state = await mockApi(page)
   moveProjectTransferFixtureToSession(state, 'beta')
+  await pinHerdrSession(page, 'alpha')
   const currentObservedAt =
     state.runtimeInventory.observed_at_unix_ms + 2_000
   state.inventoryResponsePlans.set('beta', [
@@ -20466,4 +20623,116 @@ test('reports sanitized partial and total Herdr fleet failures', async ({ page }
   await expect(failedInventory).toContainText(
     '2 of 2 Herdr session snapshots failed.',
   )
+})
+
+test('defaults the Herdr session to the one holding Yard projects and remembers an explicit choice', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  state.runtimeSessions = [
+    { name: 'default', is_default: true, running: true },
+    { name: 'yard-orchestrator', is_default: false, running: true },
+  ]
+  state.projects = state.projects.map((candidate) => ({
+    ...candidate,
+    runtime: { ...candidate.runtime, session: 'yard-orchestrator' },
+  }))
+  await page.goto('/')
+
+  const trigger = page.getByRole('button', { name: /^Runtime health:/ })
+  await expect(trigger).toHaveAccessibleName(
+    /^Runtime health: yard-orchestrator,/,
+  )
+  expect(state.inventoryRequestSessions).not.toContain('default')
+
+  const popover = await openRuntimeHealth(page)
+  const select = popover.getByLabel('Herdr session')
+  await expect(select.locator('option')).toHaveText([
+    'default — Herdr default',
+    'yard-orchestrator — 2 projects',
+  ])
+  await expect(popover).toContainText('where new projects are created')
+  await select.selectOption('default')
+  await page.keyboard.press('Escape')
+  await expect(trigger).toHaveAccessibleName(/^Runtime health: default,/)
+  await expect
+    .poll(() =>
+      page.evaluate(() => window.localStorage.getItem('yard:herdr-session:v1')),
+    )
+    .toBe('default')
+
+  await page.reload()
+  await expect(trigger).toHaveAccessibleName(/^Runtime health: default,/)
+})
+
+test('ignores a stored Herdr session that is no longer running', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  state.runtimeSessions = [
+    { name: 'default', is_default: true, running: true },
+    { name: 'yard-orchestrator', is_default: false, running: true },
+  ]
+  state.projects = state.projects.map((candidate) => ({
+    ...candidate,
+    runtime: { ...candidate.runtime, session: 'yard-orchestrator' },
+  }))
+  await page.addInitScript(() => {
+    window.localStorage.setItem('yard:herdr-session:v1', 'old-session')
+  })
+  // Let sessions arrive well before projects so a premature automatic
+  // choice would land on Herdr's default session.
+  await page.route('**/api/v1/projects', async (route) => {
+    if (route.request().method() === 'GET') {
+      await new Promise((resolve) => setTimeout(resolve, 400))
+    }
+    await route.fallback()
+  })
+  await page.goto('/')
+
+  const trigger = page.getByRole('button', { name: /^Runtime health:/ })
+  await expect(trigger).toHaveAccessibleName(
+    /^Runtime health: yard-orchestrator,/,
+  )
+  expect(state.inventoryRequestSessions).not.toContain('default')
+  expect(
+    await page.evaluate(() =>
+      window.localStorage.getItem('yard:herdr-session:v1'),
+    ),
+  ).toBe('old-session')
+})
+
+test('shows workstream archive and delete actions at the top of the inspector', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const node = seedWorkstream(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await page
+    .locator(`[data-id="coordination-node:${node.id}"]`)
+    .dispatchEvent('click')
+
+  const inspector = page.locator('.inspector')
+  const archive = inspector.getByRole('button', {
+    name: 'Archive workstream',
+    exact: true,
+  })
+  const remove = inspector.getByRole('button', {
+    name: 'Delete workstream…',
+    exact: true,
+  })
+  await expect(archive).toBeInViewport()
+  await expect(remove).toBeInViewport()
+  const precedesSettings = await inspector.evaluate((element) => {
+    const actions = element.querySelector('.disposition-actions')
+    const settings = element.querySelector('.coordination-node-settings')
+    return Boolean(
+      actions &&
+        settings &&
+        actions.compareDocumentPosition(settings) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+    )
+  })
+  expect(precedesSettings).toBe(true)
 })
