@@ -50,6 +50,8 @@ pub struct OrchestratorReplacementRecoveryReport {
 }
 
 const RECOVERY_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const REPLACEMENT_VERIFICATION_ATTEMPTS: usize = 20;
+const REPLACEMENT_VERIFICATION_INTERVAL: Duration = Duration::from_millis(250);
 const RECOVERY_RETRY_BASE_MS: u64 = 60_000;
 const RECOVERY_RETRY_CAP_MS: u64 = 3_600_000;
 const STRANDED_PENDING_MESSAGE: &str = "Yard lost the final persistence acknowledgement for an orchestrator replacement; \
@@ -804,8 +806,20 @@ impl OrchestratorReplacementService {
         &self,
         runtime: WorkerRuntimeBinding,
     ) -> Result<WorkerRuntimeBinding, OrchestratorReplacementServiceError> {
-        let inventory = self.source.inventory(&runtime.session).await?;
-        verified_replacement_runtime(runtime, &inventory)
+        let mut last_error = OrchestratorReplacementServiceError::ReplacementUnverified;
+        for attempt in 0..REPLACEMENT_VERIFICATION_ATTEMPTS {
+            match self.source.inventory(&runtime.session).await {
+                Ok(inventory) => match verified_replacement_runtime(runtime.clone(), &inventory) {
+                    Ok(verified) => return Ok(verified),
+                    Err(error) => last_error = error,
+                },
+                Err(error) => last_error = error.into(),
+            }
+            if attempt + 1 < REPLACEMENT_VERIFICATION_ATTEMPTS {
+                tokio::time::sleep(REPLACEMENT_VERIFICATION_INTERVAL).await;
+            }
+        }
+        Err(last_error)
     }
 
     async fn reconcile_after_ambiguous_failure(
