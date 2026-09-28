@@ -13,21 +13,26 @@ use tokio::{
 };
 use tracing::warn;
 use yard_domain::{
-    ArchiveProject, ArchivedProject, ConfirmedProjectCreation, CreateProject,
+    ArchiveProject, ArchivedProject, ArchivedProjects, ConfirmedProjectCreation, CreateProject,
     CreateProjectFromProfile, CreateWorkspaceProjectFromProfile, DeleteProject, DeletedProject,
-    Project, ProjectRepositories, ProjectRepository, Projects, RuntimeObservationState,
-    RuntimeProcessState, SetProjectRepository, UpdateProjectPlacement,
-    UpdateProjectWorkflowProfile, WorkerRuntimeBinding,
+    ObservedWorker, Project, ProjectDispositionPreview, ProjectRepositories, ProjectRepository,
+    ProjectRestoreUnavailableReason, Projects, RequestOrigin, RestoreProject, RestoredProject,
+    RuntimeInventory, RuntimeObservationState, RuntimeProcessState, SetProjectRepository,
+    UpdateProjectPlacement, UpdateProjectWorkflowProfile, WorkerRuntimeBinding,
 };
 use yard_store::{
-    BeginProfileProjectCreation, BeginWorkspaceProjectCreation, ProjectStoreError, YardStore,
+    BeginProfileProjectCreation, BeginWorkspaceProjectCreation, ProjectRestorePlan,
+    ProjectRestoreRuntime, ProjectStoreError, RetiredOrchestratorRuntime, YardStore,
 };
 
 use crate::allocation_service::{
-    RuntimeControl, RuntimeProvisionError, RuntimeProvisionRequest,
+    RuntimeControl, RuntimeProvisionError, RuntimeProvisionRequest, RuntimeRetirementRequest,
     RuntimeWorkspaceProvisionRequest, agent_name, assignment_prompt,
 };
-use crate::inventory_service::{InventoryServiceError, InventorySource};
+use crate::inventory_service::{
+    InventoryServiceError, InventorySource, RetirementResolution, retirement_resolution,
+    runtime_binding_from_observed_worker,
+};
 use crate::profile_runtime::{compile_profile_launch, materialize_profile_launch};
 use crate::runtime_cleanup_service::RuntimeCleanupService;
 use crate::status_protocol::{with_orchestrator_status_contract, with_orchestrator_workflow};
@@ -183,33 +188,203 @@ impl ProjectService {
             .map_err(Into::into)
     }
 
+    /// What archiving or deleting an active project would end: its current
+    /// versions and every allocating, active, or handing-off assignment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectServiceError`] when the project is not active or the
+    /// store cannot be read.
+    pub async fn disposition_preview(
+        &self,
+        project_id: &str,
+    ) -> Result<ProjectDispositionPreview, ProjectServiceError> {
+        self.store
+            .project_disposition_preview(project_id)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Archive a durable project and immediately attempt cleanup of its
-    /// orchestrator runtime.
+    /// orchestrator runtime and of every worker the archive ended.
     ///
     /// The project and its historical work remain in storage, while active
-    /// project queries stop returning it. Runtime cleanup failures remain
-    /// durably queued for the background retry loop.
+    /// project queries stop returning it. With `active_work = cancel`, the
+    /// previewed active assignments are recorded as cancelled and their
+    /// workers ended in the same transaction; their transcript captures run
+    /// in the background. Runtime cleanup failures remain durably queued for
+    /// the background retry loop.
     ///
     /// # Errors
     ///
     /// Returns [`ProjectServiceError`] for stale input, active project work,
-    /// pending orchestrator interventions, or persistence failure.
+    /// a stale preview, pending orchestrator interventions, or persistence
+    /// failure.
     pub async fn archive(
         &self,
         project_id: &str,
         command: ArchiveProject,
+        request_origin: RequestOrigin,
     ) -> Result<ArchivedProject, ProjectServiceError> {
         let command_id = command.command_id.clone();
-        let mut archived = self.store.archive_project(project_id, command).await?;
-        if !archived.cleanup_pending {
-            return Ok(archived);
+        let mut archived = self
+            .store
+            .archive_project_from(project_id, command, request_origin)
+            .await?;
+        if archived.cleanup_pending
+            && let Some(pending) = self.attempt_cleanup(&command_id, project_id).await
+        {
+            archived.cleanup_pending = pending;
         }
+        Ok(archived)
+    }
 
-        match self.cleanup.process_command(&command_id).await {
-            Ok(report) if report.attempted > 0 => {
-                archived.cleanup_pending = report.failed > 0;
+    /// Permanently remove a project and its orchestrator from normal Yard UI
+    /// queries while retaining durable audit and cleanup records. An active
+    /// project is archived in the same transaction first; cleanup it queues is
+    /// attempted once after commit and never fails the deletion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectServiceError`] for stale archive preconditions, active
+    /// project work, an unknown or already deleted project, or persistence
+    /// failure.
+    pub async fn delete(
+        &self,
+        project_id: &str,
+        command: DeleteProject,
+        request_origin: RequestOrigin,
+    ) -> Result<DeletedProject, ProjectServiceError> {
+        let command_id = command.command_id.clone();
+        let mut deleted = self
+            .store
+            .delete_project_from(project_id, command, request_origin)
+            .await?;
+        if deleted.cleanup_pending
+            && let Some(pending) = self.attempt_cleanup(&command_id, project_id).await
+        {
+            deleted.cleanup_pending = pending;
+        }
+        Ok(deleted)
+    }
+
+    /// Archived projects that are not deleted, each with whether Restore can
+    /// undo its archive now.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectServiceError`] when the store cannot be read.
+    pub async fn list_archived(&self) -> Result<ArchivedProjects, ProjectServiceError> {
+        self.store
+            .list_archived_projects()
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Undo a project archive (design D7).
+    ///
+    /// Before the transaction the orchestrator's retired runtime is resolved
+    /// against a fresh Herdr inventory: the same pane is re-bound, a closed
+    /// pane (or none at archive time), a Herdr session that no longer exists,
+    /// or a reused identity restores the orchestrator unbound. When Herdr
+    /// cannot be inventoried (including a stopped session) Restore refuses
+    /// with `herdr_unreachable` instead of possibly orphaning a running
+    /// orchestrator. Cancelled assignments stay cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectServiceError`] when the project is unknown, not
+    /// archived, not restorable now (with a reason), the command conflicts,
+    /// or persistence fails.
+    pub async fn restore(
+        &self,
+        project_id: &str,
+        command: RestoreProject,
+    ) -> Result<RestoredProject, ProjectServiceError> {
+        let command = command.normalize()?;
+        let retired = match self
+            .store
+            .project_restore_plan(project_id, command.clone())
+            .await?
+        {
+            ProjectRestorePlan::Replayed(restored) => return Ok(*restored),
+            ProjectRestorePlan::Ready {
+                retired_orchestrator,
+            } => retired_orchestrator,
+        };
+        let runtime = match retired {
+            None => ProjectRestoreRuntime::Absent,
+            Some(retired) => {
+                self.resolve_retired_orchestrator(project_id, &retired)
+                    .await?
             }
-            Ok(_) => {}
+        };
+        self.store
+            .restore_project(project_id, command, runtime)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn resolve_retired_orchestrator(
+        &self,
+        project_id: &str,
+        retired: &RetiredOrchestratorRuntime,
+    ) -> Result<ProjectRestoreRuntime, ProjectServiceError> {
+        let inventory = match tokio::time::timeout(
+            RUNTIME_IDENTITY_TIMEOUT,
+            self.source.inventory(&retired.session),
+        )
+        .await
+        {
+            Ok(Ok(inventory)) => inventory,
+            // Herdr answered and the session no longer exists, so the retired
+            // pane cannot be running. A stopped session still counts as
+            // unreachable: restarting it may bring its panes back.
+            Ok(Err(InventoryServiceError::Herdr(yard_herdr::HerdrError::SessionNotFound(_)))) => {
+                return Ok(ProjectRestoreRuntime::Absent);
+            }
+            Ok(Err(error)) => {
+                warn!(project_id, error = %error, "Restore could not inventory Herdr");
+                return Err(restore_unavailable(
+                    ProjectRestoreUnavailableReason::HerdrUnreachable,
+                ));
+            }
+            Err(_) => {
+                warn!(project_id, "Restore timed out inventorying Herdr");
+                return Err(restore_unavailable(
+                    ProjectRestoreUnavailableReason::HerdrUnreachable,
+                ));
+            }
+        };
+        let request = RuntimeRetirementRequest {
+            cleanup_id: String::new(),
+            adapter: retired.adapter.clone(),
+            session: retired.session.clone(),
+            workspace_id: retired.workspace_id.clone(),
+            terminal_id: retired.terminal_id.clone(),
+            tab_id: retired.tab_id.clone(),
+            pane_id: retired.pane_id.clone(),
+            provider_session: retired.provider_session.clone(),
+            owns_tab: retired.owns_tab,
+        };
+        Ok(match retirement_resolution(&inventory, &request) {
+            RetirementResolution::Target => match coherent_retired_worker(&inventory, retired) {
+                Some(observed) => ProjectRestoreRuntime::Rebind(Box::new(
+                    runtime_binding_from_observed_worker(&inventory, observed, retired.owns_tab),
+                )),
+                None => ProjectRestoreRuntime::Conflict,
+            },
+            RetirementResolution::Absent => ProjectRestoreRuntime::Absent,
+            RetirementResolution::Conflict => ProjectRestoreRuntime::Conflict,
+        })
+    }
+
+    /// Run the cleanup jobs one committed command queued. Returns whether any
+    /// remain pending, or `None` when nothing was attempted.
+    async fn attempt_cleanup(&self, command_id: &str, project_id: &str) -> Option<bool> {
+        match self.cleanup.process_command(command_id).await {
+            Ok(report) if report.attempted > 0 => Some(report.failed > 0),
+            Ok(_) => None,
             Err(error) => {
                 warn!(
                     command_id,
@@ -217,27 +392,9 @@ impl ProjectService {
                     error = %error,
                     "Immediate archived-project runtime cleanup failed; durable retry remains pending"
                 );
+                None
             }
         }
-        Ok(archived)
-    }
-
-    /// Permanently remove an archived project and its orchestrator from normal
-    /// Yard UI queries while retaining durable audit and cleanup records.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProjectServiceError`] when the project is not archived, was
-    /// already deleted, or persistence fails.
-    pub async fn delete(
-        &self,
-        project_id: &str,
-        command: DeleteProject,
-    ) -> Result<DeletedProject, ProjectServiceError> {
-        self.store
-            .delete_project(project_id, command)
-            .await
-            .map_err(Into::into)
     }
 
     /// Pin a project to one immutable workflow-profile revision.
@@ -1036,6 +1193,65 @@ fn path_string(path: PathBuf) -> Result<String, ProjectServiceError> {
     })
 }
 
+/// The one live agent that still is the retired orchestrator, by mainline's
+/// pane identity rules: its terminal, pane, tab, workspace and provider
+/// session equal the retired identity; when Herdr reports the pane, exactly
+/// one pane observation carries that pane id and terminal and its
+/// `pane_instance_id` agrees with the agent's; and when Yard's
+/// pane-management lease recorded an instance, the observed instance is that
+/// one. A recycled pane id (another instance behind the same ids) or a
+/// doubled observation returns `None`, so Restore leaves the orchestrator
+/// unbound and keeps the retirement instead of binding it.
+fn coherent_retired_worker<'a>(
+    inventory: &'a RuntimeInventory,
+    retired: &RetiredOrchestratorRuntime,
+) -> Option<&'a ObservedWorker> {
+    if inventory.adapter != retired.adapter || inventory.session != retired.session {
+        return None;
+    }
+    let mut workers = inventory.workers.iter().filter(|worker| {
+        worker.terminal_id == retired.terminal_id || worker.pane_id == retired.pane_id
+    });
+    let worker = workers.next()?;
+    if workers.next().is_some()
+        || worker.terminal_id != retired.terminal_id
+        || worker.pane_id != retired.pane_id
+        || Some(worker.tab_id.as_str()) != retired.tab_id.as_deref()
+        || worker.workspace_id != retired.workspace_id
+        || worker.provider_session != retired.provider_session
+    {
+        return None;
+    }
+    let mut panes = inventory.panes.iter().filter(|pane| {
+        pane.runtime_id == retired.pane_id || pane.terminal_id == retired.terminal_id
+    });
+    // An adapter that reports the agent without its pane leaves only the
+    // agent's own instance to compare.
+    let mut instance = worker.pane_instance_id.as_deref();
+    if let Some(pane) = panes.next() {
+        if panes.next().is_some()
+            || pane.runtime_id != retired.pane_id
+            || pane.terminal_id != retired.terminal_id
+            || pane.workspace_id != retired.workspace_id
+            || Some(pane.tab_id.as_str()) != retired.tab_id.as_deref()
+            || pane.pane_instance_id != worker.pane_instance_id
+        {
+            return None;
+        }
+        instance = pane.pane_instance_id.as_deref();
+    }
+    if let Some(expected) = retired.pane_instance_id.as_deref()
+        && instance != Some(expected)
+    {
+        return None;
+    }
+    Some(worker)
+}
+
+const fn restore_unavailable(reason: ProjectRestoreUnavailableReason) -> ProjectServiceError {
+    ProjectServiceError::Store(ProjectStoreError::ProjectRestoreUnavailable(reason))
+}
+
 #[derive(Debug, Error)]
 pub enum ProjectServiceError {
     #[error(transparent)]
@@ -1380,5 +1596,140 @@ mod tests {
                 .await,
             Err(ProjectServiceError::RepositoryNotGitWorktree(_)),
         ));
+    }
+
+    fn retired_orchestrator(instance: Option<&str>) -> RetiredOrchestratorRuntime {
+        RetiredOrchestratorRuntime {
+            adapter: "herdr".to_owned(),
+            session: "yard".to_owned(),
+            workspace_id: "workspace-1".to_owned(),
+            terminal_id: "terminal-1".to_owned(),
+            tab_id: Some("tab-1".to_owned()),
+            pane_id: "pane-1".to_owned(),
+            provider_session: None,
+            owns_tab: true,
+            pane_instance_id: instance.map(str::to_owned),
+        }
+    }
+
+    fn restore_inventory(
+        worker_instance: Option<&str>,
+        pane_instance: Option<&str>,
+    ) -> RuntimeInventory {
+        RuntimeInventory {
+            adapter: "herdr".to_owned(),
+            session: "yard".to_owned(),
+            runtime_version: "test".to_owned(),
+            protocol: 1,
+            observed_at_unix_ms: 1_000,
+            focus: yard_domain::FocusObservation {
+                workspace_id: None,
+                tab_id: None,
+                pane_id: None,
+            },
+            workspaces: Vec::new(),
+            tabs: Vec::new(),
+            panes: vec![yard_domain::PaneObservation {
+                runtime_id: "pane-1".to_owned(),
+                pane_instance_id: pane_instance.map(str::to_owned),
+                terminal_id: "terminal-1".to_owned(),
+                workspace_id: "workspace-1".to_owned(),
+                tab_id: "tab-1".to_owned(),
+                focused: false,
+                cwd: None,
+                foreground_cwd: None,
+                label: None,
+                provider: Some("codex".to_owned()),
+                display_provider: None,
+                status: ObservedStatus::Working,
+                tokens: std::collections::BTreeMap::new(),
+                provider_session: None,
+                revision: 4,
+            }],
+            workers: vec![ObservedWorker {
+                runtime_id: "pane-1".to_owned(),
+                pane_instance_id: worker_instance.map(str::to_owned),
+                terminal_id: "terminal-1".to_owned(),
+                workspace_id: "workspace-1".to_owned(),
+                tab_id: "tab-1".to_owned(),
+                pane_id: "pane-1".to_owned(),
+                name: None,
+                provider: Some("codex".to_owned()),
+                display_provider: None,
+                status: ObservedStatus::Working,
+                focused: false,
+                launch_pending: false,
+                interactive_ready: true,
+                state_change_sequence: 3,
+                cwd: None,
+                foreground_cwd: None,
+                tokens: std::collections::BTreeMap::new(),
+                provider_session: None,
+                revision: 4,
+            }],
+            child_agents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn restore_rebinds_only_the_same_pane_instance() {
+        // Herdr without instance ids (0.9) and an exact identity: re-bind,
+        // built from the observation by mainline's helper.
+        let inventory = restore_inventory(None, None);
+        let observed = coherent_retired_worker(&inventory, &retired_orchestrator(None)).unwrap();
+        let binding = runtime_binding_from_observed_worker(&inventory, observed, true);
+        assert_eq!(binding.terminal_id, "terminal-1");
+        assert_eq!(binding.pane_id, "pane-1");
+        assert_eq!(binding.status, ObservedStatus::Working);
+        assert_eq!(binding.last_observed_at_unix_ms, 1_000);
+
+        // The lease recorded the same instance the pane still has: re-bind.
+        let inventory = restore_inventory(Some("instance-a"), Some("instance-a"));
+        assert!(
+            coherent_retired_worker(&inventory, &retired_orchestrator(Some("instance-a")))
+                .is_some()
+        );
+
+        // A recycled pane id: same pane, terminal and tab ids, but another
+        // pane instance than the one Yard leased. Never bound.
+        let inventory = restore_inventory(Some("instance-b"), Some("instance-b"));
+        assert!(
+            coherent_retired_worker(&inventory, &retired_orchestrator(Some("instance-a")))
+                .is_none()
+        );
+
+        // The agent record and the pane disagree on the instance: the agent
+        // observation belongs to an earlier pane behind the same id.
+        let inventory = restore_inventory(Some("instance-a"), Some("instance-b"));
+        assert!(coherent_retired_worker(&inventory, &retired_orchestrator(None)).is_none());
+    }
+
+    #[test]
+    fn restore_refuses_a_reused_terminal_or_a_doubled_pane() {
+        let retired = retired_orchestrator(None);
+        // The pane id now hosts another terminal.
+        let mut inventory = restore_inventory(None, None);
+        inventory.workers[0].terminal_id = "terminal-9".to_owned();
+        inventory.panes[0].terminal_id = "terminal-9".to_owned();
+        assert!(coherent_retired_worker(&inventory, &retired).is_none());
+        // Two panes claim the pane id.
+        let mut inventory = restore_inventory(None, None);
+        let mut twin = inventory.panes[0].clone();
+        twin.terminal_id = "terminal-2".to_owned();
+        inventory.panes.push(twin);
+        assert!(coherent_retired_worker(&inventory, &retired).is_none());
+        // Moved to another tab.
+        let mut inventory = restore_inventory(None, None);
+        inventory.workers[0].tab_id = "tab-2".to_owned();
+        inventory.panes[0].tab_id = "tab-2".to_owned();
+        assert!(coherent_retired_worker(&inventory, &retired).is_none());
+        // Only the agent is reported: its own instance must still match.
+        let mut inventory = restore_inventory(Some("instance-b"), None);
+        inventory.panes.clear();
+        assert!(coherent_retired_worker(&inventory, &retired).is_some());
+        assert!(
+            coherent_retired_worker(&inventory, &retired_orchestrator(Some("instance-a")))
+                .is_none()
+        );
     }
 }

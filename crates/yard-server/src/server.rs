@@ -25,6 +25,7 @@ use yard_server::{
     reconciliation_service::ReconciliationService,
     runtime_cleanup_service::RuntimeCleanupService,
     terminal_service::RuntimeTerminal,
+    transcript_capture_service::TranscriptCaptureService,
     worker_cleanup_service::WorkerCleanupService,
 };
 use yard_store::{ProjectStoreError, SqliteProjectStore, YardStore};
@@ -190,6 +191,8 @@ where
     let cleanup = RuntimeCleanupService::new(control.clone(), store.clone());
     let pane_management = PaneManagementService::new(source.clone(), store.clone());
     let worker_cleanup = WorkerCleanupService::new(source.clone(), store.clone());
+    let transcripts =
+        TranscriptCaptureService::new(source.clone(), intervention.clone(), store.clone());
     let (shutdown, shutdown_receiver) = watch::channel(false);
     let (app, automations, connections) =
         app_with_reconciliation_and_paths_and_automation_and_shutdown(
@@ -240,6 +243,10 @@ where
     background_tasks.spawn(async move {
         worker_cleanup.run().await;
         "worker cleanup"
+    });
+    background_tasks.spawn(async move {
+        transcripts.run().await;
+        "transcript capture"
     });
     background_tasks.spawn(async move {
         replacement_recovery.run().await;

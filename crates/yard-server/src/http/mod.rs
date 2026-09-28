@@ -3,46 +3,49 @@ use std::{env, ffi::OsString, io, path::PathBuf, process::Stdio, sync::Arc};
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::{HeaderName, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, put},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use yard_domain::{
-    AgentProfile, AgentProfiles, ArchiveProject, ArchivedProject, Artifact, ArtifactContent,
-    Assignments, Automation, AutomationCommandResult, AutomationRun, AutomationRunCommandResult,
-    AutomationRuns, Automations, CancelWorkerCleanupRun, CompletedRuntimeCleanupPreview,
-    ConfigureYardOrchestrator, ConfiguredYardOrchestrator, ConfirmProfileAllocation,
-    ConfirmWorkerAllocation, ConfirmWorkerHandoff, ConfirmedAllocation, ConfirmedProjectCreation,
-    ConfirmedWorkerHandoff, CoordinationNode, CoordinationNodeCommandResult,
+    AgentProfile, AgentProfiles, ArchiveCoordinationNode, ArchiveProject, ArchivedCoordinationNode,
+    ArchivedProjects, Artifact, ArtifactContent, Assignments, Automation, AutomationCommandResult,
+    AutomationRun, AutomationRunCommandResult, AutomationRuns, Automations, CancelWorkerCleanupRun,
+    CompletedRuntimeCleanupPreview, ConfigureYardOrchestrator, ConfiguredYardOrchestrator,
+    ConfirmProfileAllocation, ConfirmWorkerAllocation, ConfirmWorkerHandoff, ConfirmedAllocation,
+    ConfirmedProjectCreation, ConfirmedWorkerHandoff, CoordinationNode,
+    CoordinationNodeCommandResult, CoordinationNodeDispositionPreview,
     CoordinationNodePromptAcknowledgement, CoordinationNodeRoute, CoordinationNodeRoutes,
     CoordinationNodeTerminalOutput, CoordinationNodes, CoordinationSnapshot, CoordinationSnapshots,
     CreateAgentProfile, CreateAutomation, CreateCoordinationNode, CreateProject,
     CreateProjectFromProfile, CreateProjectRelationship, CreateWorkerProfile,
-    CreateWorkspaceProjectFromProfile, CreatedProjectRelationship, DeleteProject,
-    DeleteProjectRelationship, DeleteWorker, DeletedProject, DeletedProjectRelationship,
-    DeletedWorker, EndWorkerSession, EndedWorkerSession, ManageAllAgents,
-    OrchestratorPromptAcknowledgement, OrchestratorTerminalOutput, OrchestratorWorkflowProfile,
-    OrchestratorWorkflowProfiles, PaneManagementBatchResult, PaneManagementPreview, Project,
-    ProjectRelationships, ProjectRepositories, ProjectRepository, Projects, PromptAcknowledgement,
-    ProvisionCoordinationNode, ProvisionYardOrchestrator, ReceiveSummaryWorker,
-    RecordCompletionReceipt, RecordedCompletionReceipt, RecoverYardOrchestrator,
-    RecoveredYardOrchestrator, ReplaceProjectOrchestrator, ReplacedProjectOrchestrator,
-    RepositoryDiff, RepositoryFileContent, RepositoryFileMode, RepositoryFiles,
-    RequestCoordinationSnapshot, RequestSummaryWorker, ResetOrchestratorWorkflowProfile,
-    RunAutomationNow, RuntimeInventory, RuntimeSessions, RuntimeTopology, SendAssignmentPrompt,
-    SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
-    SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SetAutomationPaused,
-    SetProjectRepository, StartWorkerCleanupRun, SummaryWorker, SummaryWorkers, TerminalOutput,
-    TokenSpendSettings, TransferProjectOrchestrator, TransferredProjectOrchestrator,
-    UpdateAgentProfile, UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
-    UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
-    UpdateProjectWorkflowProfile, UpdateTokenSpendSettings, UpdateWorkerCleanupPolicy,
-    UpdateWorkerProfile, UploadArtifact, WorkerCandidates, WorkerCleanupDashboard,
-    WorkerCleanupPolicy, WorkerCleanupRun, WorkerCleanupRunTrigger, WorkerProfile, WorkerProfiles,
-    YardOrchestrator, YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute,
-    YardOrchestratorRoutes, YardOrchestratorTerminalOutput,
+    CreateWorkspaceProjectFromProfile, CreatedProjectRelationship, DeleteCoordinationNode,
+    DeleteProject, DeleteProjectRelationship, DeleteWorker, DeletedCoordinationNode,
+    DeletedProjectRelationship, DeletedWorker, DisposeAssignment, DisposedAssignment,
+    EndWorkerSession, EndedWorkerSession, ManageAllAgents, OrchestratorPromptAcknowledgement,
+    OrchestratorTerminalOutput, OrchestratorWorkflowProfile, OrchestratorWorkflowProfiles,
+    PaneManagementBatchResult, PaneManagementPreview, Project, ProjectDispositionPreview,
+    ProjectRelationships, ProjectRepositories, ProjectRepository, ProjectRestoreUnavailableReason,
+    Projects, PromptAcknowledgement, ProvisionCoordinationNode, ProvisionYardOrchestrator,
+    ReceiveSummaryWorker, RecordCompletionReceipt, RecordedCompletionReceipt,
+    RecoverYardOrchestrator, RecoveredYardOrchestrator, ReplaceProjectOrchestrator,
+    ReplacedProjectOrchestrator, RepositoryDiff, RepositoryFileContent, RepositoryFileMode,
+    RepositoryFiles, RequestCoordinationSnapshot, RequestOrigin, RequestSummaryWorker,
+    ResetOrchestratorWorkflowProfile, RestoreProject, RunAutomationNow, RuntimeInventory,
+    RuntimeSessions, RuntimeTopology, SendAssignmentPrompt, SendCoordinationNodePrompt,
+    SendCoordinationNodeRoute, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
+    SendYardOrchestratorRoute, SetAutomationPaused, SetProjectRepository, StartWorkerCleanupRun,
+    SummaryWorker, SummaryWorkers, TerminalOutput, TokenSpendSettings, TransferProjectOrchestrator,
+    TransferredProjectOrchestrator, UpdateAgentProfile, UpdateAutomation,
+    UpdateAutomationPlacement, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
+    UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
+    UpdateTokenSpendSettings, UpdateWorkerCleanupPolicy, UpdateWorkerProfile, UploadArtifact,
+    WorkerCandidates, WorkerCleanupDashboard, WorkerCleanupPolicy, WorkerCleanupRun,
+    WorkerCleanupRunTrigger, WorkerProfile, WorkerProfiles, WorkerTranscript, YardOrchestrator,
+    YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute, YardOrchestratorRoutes,
+    YardOrchestratorTerminalOutput,
 };
 use yard_herdr::HerdrError;
 use yard_store::{MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT, ProjectStoreError, YardStore};
@@ -50,6 +53,9 @@ use yard_store::{MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT, ProjectStoreError,
 use crate::ConnectionTracker;
 use crate::allocation_service::{AllocationService, AllocationServiceError, RuntimeControl};
 use crate::artifact_service::{ArtifactService, ArtifactServiceError, StoredArtifact};
+use crate::assignment_disposition_service::{
+    AssignmentDispositionService, AssignmentDispositionServiceError,
+};
 use crate::automation_service::{AutomationService, AutomationServiceError};
 use crate::coordination_node_service::{CoordinationNodeService, CoordinationNodeServiceError};
 use crate::intervention_service::{
@@ -92,6 +98,7 @@ struct AppState {
     profiles: ProfileService,
     orchestrator_workflow_profiles: OrchestratorWorkflowProfileService,
     allocations: AllocationService,
+    dispositions: AssignmentDispositionService,
     orchestrator_replacements: OrchestratorReplacementService,
     orchestrator_transfers: ProjectOrchestratorTransferService,
     worker_sessions: WorkerSessionService,
@@ -247,6 +254,12 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         Arc::clone(&intervention),
         Arc::clone(&store),
     );
+    let dispositions = AssignmentDispositionService::new(
+        Arc::clone(&source),
+        Arc::clone(&runtime),
+        Arc::clone(&intervention),
+        Arc::clone(&store),
+    );
     let orchestrator_replacements = OrchestratorReplacementService::new(
         Arc::clone(&source),
         Arc::clone(&runtime),
@@ -345,6 +358,18 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         .route(
             "/api/v1/coordination-nodes/{node_id}/placement",
             put(update_coordination_node_placement),
+        )
+        .route(
+            "/api/v1/coordination-nodes/{node_id}/disposition-preview",
+            get(preview_coordination_node_disposition),
+        )
+        .route(
+            "/api/v1/coordination-nodes/{node_id}/archive",
+            axum::routing::post(archive_coordination_node),
+        )
+        .route(
+            "/api/v1/coordination-nodes/{node_id}/delete",
+            axum::routing::post(delete_coordination_node),
         )
         .route(
             "/api/v1/coordination-nodes/{node_id}/provision",
@@ -498,6 +523,10 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             get(get_repository_diff),
         )
         .route(
+            "/api/v1/projects/{project_id}/disposition-preview",
+            get(preview_project_disposition),
+        )
+        .route(
             "/api/v1/projects/{project_id}/archive",
             axum::routing::post(archive_project),
         )
@@ -505,6 +534,11 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             "/api/v1/projects/{project_id}/delete",
             axum::routing::post(delete_project),
         )
+        .route(
+            "/api/v1/projects/{project_id}/restore",
+            axum::routing::post(restore_project),
+        )
+        .route("/api/v1/archived", get(list_archived))
         .route(
             "/api/v1/projects/{project_id}/orchestrator",
             put(transfer_project_orchestrator),
@@ -548,6 +582,14 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         .route(
             "/api/v1/projects/{project_id}/assignments/{assignment_id}/completion-receipts",
             axum::routing::post(record_completion_receipt),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/assignments/{assignment_id}/disposition",
+            axum::routing::post(dispose_assignment),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/assignments/{assignment_id}/transcript",
+            get(get_assignment_transcript),
         )
         .route(
             "/api/v1/projects/{project_id}/assignments/{assignment_id}/handoffs",
@@ -607,6 +649,7 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             profiles,
             orchestrator_workflow_profiles,
             allocations,
+            dispositions,
             orchestrator_replacements,
             orchestrator_transfers,
             worker_sessions,
@@ -906,6 +949,44 @@ async fn update_coordination_node_placement(
         .await
         .map(NoStoreJson)
         .map_err(ApiError::from)
+}
+
+async fn preview_coordination_node_disposition(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+) -> Result<NoStoreJson<CoordinationNodeDispositionPreview>, ApiError> {
+    state
+        .coordination_nodes
+        .disposition_preview(&node_id)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn archive_coordination_node(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    Json(command): Json<ArchiveCoordinationNode>,
+) -> Result<NoStoreJson<ArchivedCoordinationNode>, ApiError> {
+    state
+        .coordination_nodes
+        .archive(&node_id, command)
+        .await
+        .map(NoStoreJson)
+        .map_err(coordination_node_disposition_error)
+}
+
+async fn delete_coordination_node(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    Json(command): Json<DeleteCoordinationNode>,
+) -> Result<NoStoreJson<DeletedCoordinationNode>, ApiError> {
+    state
+        .coordination_nodes
+        .delete(&node_id, command)
+        .await
+        .map(NoStoreJson)
+        .map_err(coordination_node_disposition_error)
 }
 
 async fn provision_coordination_node(
@@ -1531,30 +1612,186 @@ async fn get_repository_diff(
         .map_err(ApiError::from)
 }
 
-async fn archive_project(
+async fn preview_project_disposition(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
-    Json(command): Json<ArchiveProject>,
-) -> Result<NoStoreJson<ArchivedProject>, ApiError> {
+) -> Result<NoStoreJson<ProjectDispositionPreview>, ApiError> {
     state
         .projects
-        .archive(&project_id, command)
+        .disposition_preview(&project_id)
         .await
         .map(NoStoreJson)
         .map_err(ApiError::from)
 }
 
+async fn archive_project(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+    Json(command): Json<ArchiveProject>,
+) -> Response {
+    let request_origin = match lifecycle_request_origin(&headers) {
+        Ok(origin) => origin,
+        Err(error) => return error.into_response(),
+    };
+    match state
+        .projects
+        .archive(&project_id, command, request_origin)
+        .await
+    {
+        Ok(archived) => NoStoreJson(archived).into_response(),
+        Err(error) => project_disposition_error(error),
+    }
+}
+
 async fn delete_project(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    headers: HeaderMap,
     Json(command): Json<DeleteProject>,
-) -> Result<NoStoreJson<DeletedProject>, ApiError> {
+) -> Response {
+    let request_origin = match lifecycle_request_origin(&headers) {
+        Ok(origin) => origin,
+        Err(error) => return error.into_response(),
+    };
+    match state
+        .projects
+        .delete(&project_id, command, request_origin)
+        .await
+    {
+        Ok(deleted) => NoStoreJson(deleted).into_response(),
+        Err(error) => project_disposition_error(error),
+    }
+}
+
+/// Undo a project archive. Every refusal that Restore can recover from is
+/// 409 `project_restore_unavailable` with a machine-readable `reason`.
+async fn restore_project(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+    Json(command): Json<RestoreProject>,
+) -> Response {
+    if let Err(error) = lifecycle_request_origin(&headers) {
+        return error.into_response();
+    }
+    match state.projects.restore(&project_id, command).await {
+        Ok(restored) => NoStoreJson(restored).into_response(),
+        Err(ProjectServiceError::Store(ProjectStoreError::ProjectRestoreUnavailable(reason))) => {
+            let mut response = (
+                StatusCode::CONFLICT,
+                Json(RestoreErrorEnvelope {
+                    error: RestoreErrorBody {
+                        code: "project_restore_unavailable",
+                        message: project_restore_unavailable_message(reason).to_owned(),
+                        reason,
+                    },
+                }),
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Err(error) => ApiError::from(error).into_response(),
+    }
+}
+
+const fn project_restore_unavailable_message(
+    reason: ProjectRestoreUnavailableReason,
+) -> &'static str {
+    match reason {
+        ProjectRestoreUnavailableReason::HerdrUnreachable => {
+            "Herdr is unreachable, so Yard cannot tell whether the orchestrator is still running. \
+             Retry when Herdr is back"
+        }
+        ProjectRestoreUnavailableReason::WorkspaceReserved => {
+            "Another project or pending Herdr work now holds this project's workspace"
+        }
+        ProjectRestoreUnavailableReason::RuntimeReserved => {
+            "The orchestrator's Herdr tab is now bound to or reserved by another worker"
+        }
+        ProjectRestoreUnavailableReason::ArchiveChanged => {
+            "The project was restored or archived again since this view loaded"
+        }
+        ProjectRestoreUnavailableReason::ProjectDeleted => {
+            "The project was deleted, and deletion cannot be undone"
+        }
+        ProjectRestoreUnavailableReason::OrchestratorUnavailable => {
+            "The project's orchestrator worker is no longer available to restore"
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RestoreErrorEnvelope {
+    error: RestoreErrorBody,
+}
+
+#[derive(Serialize)]
+struct RestoreErrorBody {
+    code: &'static str,
+    message: String,
+    reason: ProjectRestoreUnavailableReason,
+}
+
+async fn list_archived(
+    State(state): State<AppState>,
+) -> Result<NoStoreJson<ArchivedProjects>, ApiError> {
     state
         .projects
-        .delete(&project_id, command)
+        .list_archived()
         .await
         .map(NoStoreJson)
         .map_err(ApiError::from)
+}
+
+/// Archive and delete refusals about active work carry a fresh disposition
+/// preview, so the client can show exactly what changed and ask again.
+fn project_disposition_error(error: ProjectServiceError) -> Response {
+    let (code, message, preview) = match error {
+        ProjectServiceError::Store(ProjectStoreError::ProjectHasActiveWork(preview)) => (
+            "project_has_active_work",
+            "The project has active assignments. Confirm archiving them as cancelled, or \
+             finish them first",
+            preview,
+        ),
+        ProjectServiceError::Store(ProjectStoreError::ProjectArchivePreviewStale(preview)) => (
+            "project_archive_preview_stale",
+            "The project's active assignments changed since the preview. Review the updated \
+             list and confirm again",
+            preview,
+        ),
+        error => return ApiError::from(error).into_response(),
+    };
+    let mut response = (
+        StatusCode::CONFLICT,
+        Json(PreviewErrorEnvelope {
+            error: PreviewErrorBody {
+                code,
+                message: message.to_owned(),
+                preview: *preview,
+            },
+        }),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+#[derive(Serialize)]
+struct PreviewErrorEnvelope {
+    error: PreviewErrorBody,
+}
+
+#[derive(Serialize)]
+struct PreviewErrorBody {
+    code: &'static str,
+    message: String,
+    preview: ProjectDispositionPreview,
 }
 
 async fn update_project_placement(
@@ -1991,6 +2228,69 @@ async fn record_completion_receipt(
         .await
         .map(CreatedCompletionReceipt)
         .map_err(ApiError::from)
+}
+
+async fn dispose_assignment(
+    State(state): State<AppState>,
+    Path((project_id, assignment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(command): Json<DisposeAssignment>,
+) -> Result<NoStoreJson<DisposedAssignment>, ApiError> {
+    let request_origin = lifecycle_request_origin(&headers)?;
+    state
+        .dispositions
+        .dispose(&project_id, &assignment_id, command, request_origin)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn get_assignment_transcript(
+    State(state): State<AppState>,
+    Path((project_id, assignment_id)): Path<(String, String)>,
+) -> Result<NoStoreJson<WorkerTranscript>, ApiError> {
+    state
+        .store
+        .get_assignment_transcript(&project_id, &assignment_id)
+        .await
+        .map(NoStoreJson)
+        .map_err(allocation_store_error)
+}
+
+/// Request guard for lifecycle commands.
+///
+/// A present `Host` must be a loopback name, which stops DNS-rebinding pages,
+/// and a present `Origin` must be a loopback web origin, which stops
+/// cross-site pages. A request without `Origin` (a CLI or agent) is accepted
+/// and recorded as `none`. This is provenance, not authentication: any local
+/// process can forge these headers.
+fn lifecycle_request_origin(headers: &HeaderMap) -> Result<RequestOrigin, ApiError> {
+    if let Some(host) = headers.get(header::HOST) {
+        let loopback = host
+            .to_str()
+            .ok()
+            .and_then(|host| host.parse::<axum::http::uri::Authority>().ok())
+            .is_some_and(|authority| terminal::is_loopback_host_name(authority.host()));
+        if !loopback {
+            return Err(ApiError {
+                status: StatusCode::FORBIDDEN,
+                code: "request_host_forbidden",
+                message: "Yard accepts lifecycle commands only on a loopback host name".to_owned(),
+            });
+        }
+    }
+    match headers.get(header::ORIGIN) {
+        None => Ok(RequestOrigin::None),
+        Some(origin) if origin.to_str().is_ok_and(terminal::is_loopback_origin) => {
+            Ok(RequestOrigin::Browser)
+        }
+        Some(_) => Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            code: "request_origin_forbidden",
+            message: "Lifecycle commands from a web page require the loopback Yard origin"
+                .to_owned(),
+        }),
+    }
 }
 
 async fn put_artifact(
@@ -2603,34 +2903,58 @@ impl From<ProjectServiceError> for ApiError {
             ProjectServiceError::Store(ProjectStoreError::ProjectNotArchived) => Self {
                 status: StatusCode::CONFLICT,
                 code: "project_not_archived",
-                message: "Archive the project before deleting it".to_owned(),
+                message: "Include the project's archive preconditions to delete an active project"
+                    .to_owned(),
             },
             ProjectServiceError::Store(ProjectStoreError::ProjectAlreadyDeleted) => Self {
                 status: StatusCode::CONFLICT,
                 code: "project_already_deleted",
                 message: "Yard project has already been deleted from the UI".to_owned(),
             },
+            ProjectServiceError::Store(ProjectStoreError::ProjectRestoreNotArchived) => Self {
+                status: StatusCode::CONFLICT,
+                code: "project_not_archived",
+                message: "Yard project is not archived".to_owned(),
+            },
+            ProjectServiceError::Store(ProjectStoreError::ProjectRestoreUnavailable(reason)) => {
+                Self {
+                    status: StatusCode::CONFLICT,
+                    code: "project_restore_unavailable",
+                    message: project_restore_unavailable_message(reason).to_owned(),
+                }
+            }
             ProjectServiceError::Store(ProjectStoreError::ProjectHasArchiveDependencies) => Self {
                 status: StatusCode::CONFLICT,
                 code: "project_has_archive_dependencies",
-                message: "Complete or hand off active assignments and remove or retarget project \
+                message: "Wait for unresolved worker allocations and remove or retarget project \
                           automations before archiving"
                     .to_owned(),
+            },
+            ProjectServiceError::Store(ProjectStoreError::ProjectHasActiveWork(_)) => Self {
+                status: StatusCode::CONFLICT,
+                code: "project_has_active_work",
+                message: "The project has active assignments".to_owned(),
+            },
+            ProjectServiceError::Store(ProjectStoreError::ProjectArchivePreviewStale(_)) => Self {
+                status: StatusCode::CONFLICT,
+                code: "project_archive_preview_stale",
+                message: "The project's active assignments changed since the preview".to_owned(),
             },
             ProjectServiceError::Store(ProjectStoreError::ProjectArchiveHandoffInProgress) => {
                 Self {
                     status: StatusCode::CONFLICT,
                     code: "project_archive_handoff_in_progress",
-                    message: "A worker handoff targeting this project is still in progress"
+                    message: "A worker handoff into or out of this project is still in progress"
                         .to_owned(),
                 }
             }
             ProjectServiceError::Store(
-                ProjectStoreError::ProjectArchiveSnapshotCollectionPending,
+                ProjectStoreError::ProjectArchiveSummaryWorkerAllocating,
             ) => Self {
                 status: StatusCode::CONFLICT,
-                code: "project_archive_snapshot_collection_pending",
-                message: "A coordination snapshot has not finished collecting this project"
+                code: "project_summary_worker_allocating",
+                message: "A summary worker for this project is still starting. Wait until it \
+                              is running or has failed, then archive again"
                     .to_owned(),
             },
             ProjectServiceError::Store(ProjectStoreError::OrchestratorWorkflowProfileNotFound) => {
@@ -2709,6 +3033,33 @@ impl From<ProjectServiceError> for ApiError {
                 code: "project_archive_conflict",
                 message: error.to_string(),
             },
+            ProjectServiceError::Store(ProjectStoreError::AssignmentInterventionInProgress) => {
+                Self {
+                    status: StatusCode::CONFLICT,
+                    code: "assignment_intervention_in_progress",
+                    message: "Wait for the pending prompt to an active assignment before \
+                              archiving"
+                        .to_owned(),
+                }
+            }
+            ProjectServiceError::Store(
+                error @ (ProjectStoreError::AssignmentNotActive
+                | ProjectStoreError::AttemptNotActive
+                | ProjectStoreError::AssignmentVersionConflict { .. }),
+            ) => Self {
+                status: StatusCode::CONFLICT,
+                code: "assignment_not_active",
+                message: error.to_string(),
+            },
+            ProjectServiceError::Store(
+                error @ (ProjectStoreError::OrchestratorSessionEndForbidden
+                | ProjectStoreError::YardOrchestratorSessionEndForbidden
+                | ProjectStoreError::CoordinationNodeSessionEndForbidden),
+            ) => Self {
+                status: StatusCode::CONFLICT,
+                code: "archive_worker_protected",
+                message: error.to_string(),
+            },
             ProjectServiceError::Store(ProjectStoreError::RuntimeWorkspaceMismatch) => Self {
                 status: StatusCode::CONFLICT,
                 code: "runtime_workspace_mismatch",
@@ -2720,11 +3071,16 @@ impl From<ProjectServiceError> for ApiError {
                 code: "database_busy",
                 message: "Yard storage is busy; retry the request".to_owned(),
             },
-            ProjectServiceError::Store(_) => Self {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                code: "storage_error",
-                message: "Yard storage is unavailable".to_owned(),
-            },
+            ProjectServiceError::Store(error) => {
+                // The response stays opaque; the log keeps the cause, such as
+                // a constraint failure, distinguishable from a disk failure.
+                tracing::error!(target: "yard_server", %error, "project store operation failed");
+                Self {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    code: "storage_error",
+                    message: "Yard storage is unavailable".to_owned(),
+                }
+            }
         }
     }
 }
@@ -3338,6 +3694,19 @@ impl From<WorkerSessionServiceError> for ApiError {
                 code: "idempotency_conflict",
                 message: "Command ID is already associated with different input".to_owned(),
             },
+            WorkerSessionServiceError::Store(ProjectStoreError::CommandInProgress) => Self {
+                status: StatusCode::CONFLICT,
+                code: "command_in_progress",
+                message: "This worker command is still in progress; retry with the same command ID"
+                    .to_owned(),
+            },
+            WorkerSessionServiceError::Store(ProjectStoreError::CommandPreviouslyFailed(
+                message,
+            )) => Self {
+                status: StatusCode::CONFLICT,
+                code: "command_previously_failed",
+                message,
+            },
             WorkerSessionServiceError::Store(ProjectStoreError::DatabaseBusy) => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "database_busy",
@@ -3348,6 +3717,73 @@ impl From<WorkerSessionServiceError> for ApiError {
                 code: "storage_error",
                 message: "Yard could not end the worker session".to_owned(),
             },
+        }
+    }
+}
+
+impl From<AssignmentDispositionServiceError> for ApiError {
+    fn from(error: AssignmentDispositionServiceError) -> Self {
+        let AssignmentDispositionServiceError::Store(error) = error;
+        match error {
+            ProjectStoreError::InvalidDisposition(error) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid_assignment_disposition",
+                message: error.to_string(),
+            },
+            ProjectStoreError::AssignmentNotActive | ProjectStoreError::AttemptNotActive => Self {
+                status: StatusCode::CONFLICT,
+                code: "assignment_not_active",
+                message: "This assignment is no longer active".to_owned(),
+            },
+            error @ ProjectStoreError::AssignmentHandoffUnresolved => Self {
+                status: StatusCode::CONFLICT,
+                code: "assignment_handoff_unresolved",
+                message: error.to_string(),
+            },
+            ProjectStoreError::AssignmentInterventionInProgress => Self {
+                status: StatusCode::CONFLICT,
+                code: "assignment_intervention_in_progress",
+                message:
+                    "Wait for the pending worker prompt before completing or ending this worker"
+                        .to_owned(),
+            },
+            ProjectStoreError::CommandInProgress => Self {
+                status: StatusCode::CONFLICT,
+                code: "command_in_progress",
+                // A pending handoff ack is not recovered after a restart
+                // (deferred, as in PR2a), so this copy must not promise
+                // that a retry will succeed.
+                message: "A worker handoff or another command for this assignment has not \
+                          finished, so it cannot be completed or ended yet"
+                    .to_owned(),
+            },
+            error @ ProjectStoreError::OrchestratorSessionEndForbidden => Self {
+                status: StatusCode::CONFLICT,
+                code: "orchestrator_replacement_required",
+                message: error.to_string(),
+            },
+            error @ ProjectStoreError::YardOrchestratorSessionEndForbidden => Self {
+                status: StatusCode::CONFLICT,
+                code: "yard_orchestrator_replacement_required",
+                message: error.to_string(),
+            },
+            error @ ProjectStoreError::CoordinationNodeSessionEndForbidden => Self {
+                status: StatusCode::CONFLICT,
+                code: "coordination_node_worker_protected",
+                message: error.to_string(),
+            },
+            error @ ProjectStoreError::SystemEphemeralWorker => Self {
+                status: StatusCode::CONFLICT,
+                code: "system_ephemeral_worker",
+                message: error.to_string(),
+            },
+            error @ (ProjectStoreError::WorkerVersionConflict { .. }
+            | ProjectStoreError::WorkerRuntimeVersionConflict { .. }) => Self {
+                status: StatusCode::CONFLICT,
+                code: "worker_version_conflict",
+                message: error.to_string(),
+            },
+            error => allocation_store_error(error),
         }
     }
 }
@@ -3600,7 +4036,102 @@ fn coordination_store_error(error: ProjectStoreError) -> ApiError {
     }
 }
 
+/// Archive and delete answer with the project disposition codes' shape:
+/// replay conflicts and stale versions get their own codes instead of the
+/// generic `coordination_node_conflict`.
+fn coordination_node_disposition_error(error: CoordinationNodeServiceError) -> ApiError {
+    match error {
+        CoordinationNodeServiceError::Store(ProjectStoreError::IdempotencyConflict) => ApiError {
+            status: StatusCode::CONFLICT,
+            code: "idempotency_conflict",
+            message: "Command ID is already associated with different input".to_owned(),
+        },
+        CoordinationNodeServiceError::Store(
+            ProjectStoreError::CoordinationNodeVersionConflict { current_version },
+        ) => ApiError {
+            status: StatusCode::CONFLICT,
+            code: "coordination_node_version_conflict",
+            message: format!(
+                "Workstream changed concurrently; current version is {current_version}"
+            ),
+        },
+        CoordinationNodeServiceError::Store(
+            error @ (ProjectStoreError::WorkerVersionConflict { .. }
+            | ProjectStoreError::WorkerRuntimeVersionConflict { .. }
+            | ProjectStoreError::CoordinationNodeNotProvisioned),
+        ) => ApiError {
+            status: StatusCode::CONFLICT,
+            code: "coordination_node_archive_conflict",
+            message: error.to_string(),
+        },
+        error => ApiError::from(error),
+    }
+}
+
+fn pending_node_work_message(pending_prompts: usize, pending_routes: usize) -> String {
+    let plural = |count: usize, noun: &str| {
+        format!(
+            "{count} pending {noun}{}",
+            if count == 1 { "" } else { "s" }
+        )
+    };
+    let work = match (pending_prompts, pending_routes) {
+        (prompts, 0) => plural(prompts, "workstream prompt"),
+        (0, routes) => plural(routes, "workstream route"),
+        (prompts, routes) => format!(
+            "{} and {}",
+            plural(prompts, "workstream prompt"),
+            plural(routes, "workstream route")
+        ),
+    };
+    format!("Wait for {work} to finish before archiving or deleting this workstream")
+}
+
+/// Codes for a node's archive and delete lifecycle, shared by every node
+/// endpoint because each one rejects an archived node.
+fn coordination_node_lifecycle_error(error: &ProjectStoreError) -> Option<ApiError> {
+    let (code, message) = match error {
+        ProjectStoreError::CoordinationNodeArchived => (
+            "coordination_node_archived",
+            "This workstream is archived and can no longer change".to_owned(),
+        ),
+        ProjectStoreError::CoordinationNodeAlreadyArchived => (
+            "coordination_node_already_archived",
+            "Workstream is already archived".to_owned(),
+        ),
+        ProjectStoreError::CoordinationNodeNotArchived => (
+            "coordination_node_not_archived",
+            "Include the workstream's archive preconditions to delete an active workstream"
+                .to_owned(),
+        ),
+        ProjectStoreError::CoordinationNodeAlreadyDeleted => (
+            "coordination_node_already_deleted",
+            "Workstream has already been deleted from the UI".to_owned(),
+        ),
+        ProjectStoreError::CoordinationNodeKindNotSupported => (
+            "coordination_node_kind_not_supported",
+            "Only workstreams can be archived or deleted".to_owned(),
+        ),
+        ProjectStoreError::CoordinationNodeDispositionBlocked {
+            pending_prompts,
+            pending_routes,
+        } => (
+            "coordination_node_archive_blocked",
+            pending_node_work_message(*pending_prompts, *pending_routes),
+        ),
+        _ => return None,
+    };
+    Some(ApiError {
+        status: StatusCode::CONFLICT,
+        code,
+        message,
+    })
+}
+
 fn coordination_node_store_error(error: ProjectStoreError) -> ApiError {
+    if let Some(error) = coordination_node_lifecycle_error(&error) {
+        return error;
+    }
     match error {
         ProjectStoreError::InvalidOrchestratorWorkflowProfile(error) => ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -3661,11 +4192,20 @@ fn coordination_node_store_error(error: ProjectStoreError) -> ApiError {
             code: "coordination_node_conflict",
             message: error.to_string(),
         },
-        _ => ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "coordination_storage_error",
-            message: "Yard coordination storage is unavailable".to_owned(),
-        },
+        error => {
+            // The response stays opaque; the log keeps the cause, such as a
+            // constraint failure, distinguishable from a disk failure.
+            tracing::error!(
+                target: "yard_server",
+                %error,
+                "coordination node store operation failed"
+            );
+            ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "coordination_storage_error",
+                message: "Yard coordination storage is unavailable".to_owned(),
+            }
+        }
     }
 }
 
@@ -3732,6 +4272,11 @@ fn automation_store_error(error: ProjectStoreError) -> ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "invalid_automation_request",
             message: error.to_string(),
+        },
+        ProjectStoreError::CoordinationNodeArchived => ApiError {
+            status: StatusCode::CONFLICT,
+            code: "coordination_node_archived",
+            message: "The automation's workstream is archived".to_owned(),
         },
         _ => ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -9042,6 +9587,7 @@ mod tests {
         assert_eq!(closed["reason"], "assignment_changed");
 
         let output_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!(
@@ -9055,6 +9601,15 @@ mod tests {
         assert_eq!(output_response.status(), StatusCode::CONFLICT);
         let output_error = response_json(output_response).await;
         assert_eq!(output_error["error"]["code"], "assignment_not_active");
+        // The detailed path captured the transcript inline, before replying.
+        let transcript = get_json(
+            &app,
+            &format!("/api/v1/projects/{project_id}/assignments/{assignment_id}/transcript"),
+        )
+        .await;
+        assert_eq!(transcript["status"], "captured");
+        assert_eq!(transcript["text"], "Focused tests are passing.");
+        assert_eq!(transcript["attempts"], 1);
 
         server.abort();
     }
@@ -9262,6 +9817,8 @@ mod tests {
                         .runtime
                         .as_ref()
                         .map(|runtime| runtime.version),
+                    active_work: yard_domain::ProjectArchiveActiveWork::Reject,
+                    expected_active_assignments: None,
                 },
             )
             .await
@@ -9763,6 +10320,8 @@ mod tests {
                         .runtime
                         .as_ref()
                         .map(|runtime| runtime.version),
+                    active_work: yard_domain::ProjectArchiveActiveWork::Reject,
+                    expected_active_assignments: None,
                 },
             )
             .await
@@ -9785,6 +10344,7 @@ mod tests {
                 DeleteProject {
                     command_id: "delete-repository-files-route".to_owned(),
                     actor: "local-user".to_owned(),
+                    archive: None,
                 },
             )
             .await
@@ -9891,6 +10451,673 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn post_project_command(
+        app: &Router,
+        project_id: &str,
+        verb: &str,
+        body: &serde_json::Value,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/projects/{project_id}/{verb}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn create_http_project(app: &Router) -> serde_json::Value {
+        response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/projects")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(create_body("terminal-1")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await
+    }
+
+    fn http_archive_preconditions(created: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "expected_project_version": created["version"],
+            "expected_orchestrator_worker_id": created["orchestrator"]["id"],
+            "expected_orchestrator_worker_version": created["orchestrator"]["version"],
+            "expected_orchestrator_runtime_version":
+                created["orchestrator"]["runtime"]["version"]
+        })
+    }
+
+    async fn post_project_command_with_headers(
+        app: &Router,
+        project_id: &str,
+        verb: &str,
+        body: &serde_json::Value,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{project_id}/{verb}"))
+            .header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        app.clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// An archive body that ends exactly the workers a preview listed.
+    fn http_cancel_archive(command_id: &str, preview: &serde_json::Value) -> serde_json::Value {
+        let expected = preview["active_assignments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|assignment| {
+                serde_json::json!({
+                    "assignment_id": assignment["assignment_id"],
+                    "expected_assignment_version": assignment["assignment_version"],
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "command_id": command_id,
+            "actor": "local-user",
+            "expected_project_version": preview["project_version"],
+            "expected_orchestrator_worker_id": preview["orchestrator_worker_id"],
+            "expected_orchestrator_worker_version": preview["orchestrator_worker_version"],
+            "expected_orchestrator_runtime_version": preview["orchestrator_runtime_version"],
+            "active_work": "cancel",
+            "expected_active_assignments": expected,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn archives_a_project_with_active_workers_through_its_preview() {
+        let (app, temp) = test_router().await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/{project_id}/disposition-preview"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let preview = response_json(response).await;
+        assert_eq!(preview["project_id"], project_id);
+        let listed = preview["active_assignments"].as_array().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["assignment_id"], assignment_id);
+        assert_eq!(listed[0]["lifecycle"], "active");
+        assert_eq!(
+            listed[0]["objective"],
+            "Exercise the interactive terminal bridge."
+        );
+        assert_eq!(listed[0]["runtime_present"], true);
+
+        // An old client that cannot cancel gets the preview with its refusal.
+        let mut legacy = http_cancel_archive("http-archive-legacy", &preview);
+        legacy.as_object_mut().unwrap().remove("active_work");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_active_assignments");
+        let refused = post_project_command(&app, &project_id, "archive", &legacy).await;
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        let refused = response_json(refused).await;
+        assert_eq!(refused["error"]["code"], "project_has_active_work");
+        assert_eq!(refused["error"]["preview"], preview);
+
+        // A stale list is refused with a fresh preview, and a cancel without
+        // any list is invalid input.
+        let mut stale = http_cancel_archive("http-archive-stale", &preview);
+        stale["expected_active_assignments"] = serde_json::json!([]);
+        let response = post_project_command(&app, &project_id, "archive", &stale).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let stale = response_json(response).await;
+        assert_eq!(stale["error"]["code"], "project_archive_preview_stale");
+        assert_eq!(stale["error"]["preview"], preview);
+        let mut unlisted = http_cancel_archive("http-archive-unlisted", &preview);
+        unlisted
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_active_assignments");
+        let response = post_project_command(&app, &project_id, "archive", &unlisted).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Archive is a lifecycle command: a cross-site page cannot send it.
+        let body = http_cancel_archive("http-archive-and-end", &preview);
+        let forbidden = post_project_command_with_headers(
+            &app,
+            &project_id,
+            "archive",
+            &body,
+            &[("origin", "https://example.com")],
+        )
+        .await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response_json(forbidden).await["error"]["code"],
+            "request_origin_forbidden"
+        );
+
+        let response =
+            post_project_command_with_headers(&app, &project_id, "archive", &body, BROWSER_HEADERS)
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let archived = response_json(response).await;
+        assert_eq!(archived["replayed"], false);
+        assert_eq!(
+            archived["cancelled_assignment_ids"],
+            serde_json::json!([assignment_id])
+        );
+
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let (reason, origin, lifecycle): (String, String, String) = connection
+            .query_row(
+                "SELECT cancellation.reason, cancellation.request_origin, assignment.lifecycle
+                   FROM assignment_cancellations cancellation
+                   JOIN assignments assignment ON assignment.id = cancellation.assignment_id
+                  WHERE cancellation.assignment_id = ?1",
+                [&assignment_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (reason.as_str(), origin.as_str(), lifecycle.as_str()),
+            ("project_archived", "browser", "cancelled")
+        );
+        drop(connection);
+
+        let replay = post_project_command(&app, &project_id, "archive", &body).await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay = response_json(replay).await;
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(
+            replay["cancelled_assignment_ids"],
+            archived["cancelled_assignment_ids"]
+        );
+        let gone = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/{project_id}/disposition-preview"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn deletes_a_project_with_active_workers_and_reports_a_stale_preview() {
+        let (app, _temp) = test_router().await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let preview = get_json(
+            &app,
+            &format!("/api/v1/projects/{project_id}/disposition-preview"),
+        )
+        .await;
+        let mut archive = http_cancel_archive("unused", &preview);
+        let archive_object = archive.as_object_mut().unwrap();
+        archive_object.remove("command_id");
+        archive_object.remove("actor");
+
+        let mut stale_archive = archive.clone();
+        stale_archive["expected_active_assignments"] = serde_json::json!([]);
+        let stale = post_project_command(
+            &app,
+            &project_id,
+            "delete",
+            &serde_json::json!({
+                "command_id": "http-delete-stale",
+                "actor": "local-user",
+                "archive": stale_archive,
+            }),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let stale = response_json(stale).await;
+        assert_eq!(stale["error"]["code"], "project_archive_preview_stale");
+        assert_eq!(stale["error"]["preview"], preview);
+
+        let body = serde_json::json!({
+            "command_id": "http-delete-and-end",
+            "actor": "local-user",
+            "archive": archive,
+        });
+        let deleted = post_project_command(&app, &project_id, "delete", &body).await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted = response_json(deleted).await;
+        assert_eq!(
+            deleted["cancelled_assignment_ids"],
+            serde_json::json!([assignment_id])
+        );
+        let replay =
+            response_json(post_project_command(&app, &project_id, "delete", &body).await).await;
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(
+            replay["cancelled_assignment_ids"],
+            deleted["cancelled_assignment_ids"]
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn deletes_active_project_in_one_call_and_replays() {
+        let (app, _temp) = test_router().await;
+        let created = create_http_project(&app).await;
+        let project_id = created["id"].as_str().unwrap().to_owned();
+
+        let without_preconditions = post_project_command(
+            &app,
+            &project_id,
+            "delete",
+            &serde_json::json!({
+                "command_id": "delete-without-preconditions",
+                "actor": "local-user"
+            }),
+        )
+        .await;
+        assert_eq!(without_preconditions.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(without_preconditions).await["error"]["code"],
+            "project_not_archived"
+        );
+
+        let delete = serde_json::json!({
+            "command_id": "delete-active-project-http",
+            "actor": "local-user",
+            "archive": http_archive_preconditions(&created)
+        });
+        let response = post_project_command(&app, &project_id, "delete", &delete).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let deleted = response_json(response).await;
+        assert_eq!(deleted["project_id"], project_id);
+        assert_eq!(
+            deleted["orchestrator_worker_id"],
+            created["orchestrator"]["id"]
+        );
+        assert_eq!(deleted["cleanup_pending"], false);
+        assert_eq!(deleted["replayed"], false);
+        assert_eq!(
+            deleted["background"],
+            serde_json::json!({ "snapshots_pending": 0, "snapshots_abandoned": 0 })
+        );
+        let projects = get_json(&app, "/api/v1/projects").await;
+        assert!(projects["projects"].as_array().unwrap().is_empty());
+        let workers = get_json(&app, "/api/v1/workers").await;
+        assert!(
+            workers["workers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|candidate| candidate["worker"]["id"] != created["orchestrator"]["id"])
+        );
+
+        let replayed = post_project_command(&app, &project_id, "delete", &delete).await;
+        assert_eq!(replayed.status(), StatusCode::OK);
+        assert_eq!(response_json(replayed).await["replayed"], true);
+        let mut conflicting = delete.clone();
+        conflicting["actor"] = serde_json::json!("another-user");
+        let conflict = post_project_command(&app, &project_id, "delete", &conflicting).await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(conflict).await["error"]["code"],
+            "idempotency_conflict"
+        );
+        let again = post_project_command(
+            &app,
+            &project_id,
+            "delete",
+            &serde_json::json!({
+                "command_id": "delete-active-project-again",
+                "actor": "local-user"
+            }),
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(again).await["error"]["code"],
+            "project_already_deleted"
+        );
+
+        let unknown = post_project_command(
+            &app,
+            "missing-project",
+            "delete",
+            &serde_json::json!({
+                "command_id": "delete-unknown-project",
+                "actor": "local-user",
+                "archive": http_archive_preconditions(&created)
+            }),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response_json(unknown).await["error"]["code"],
+            "project_not_found"
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn restores_an_archived_project_and_refuses_while_herdr_is_down() {
+        let source = Arc::new(SwitchableInventory {
+            down: AtomicBool::new(false),
+        });
+        let (app, _temp) = test_router_with_source(source.clone()).await;
+        let created = create_http_project(&app).await;
+        let project_id = created["id"].as_str().unwrap().to_owned();
+        let mut archive = http_archive_preconditions(&created);
+        archive["command_id"] = serde_json::json!("http-restore-archive");
+        archive["actor"] = serde_json::json!("local-user");
+        let response = post_project_command(&app, &project_id, "archive", &archive).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let archived = response_json(response).await;
+        assert_eq!(archived["restorable"], true);
+        assert_eq!(archived["visibility"], "archived");
+        let listed = get_json(&app, "/api/v1/archived").await;
+        assert_eq!(listed["projects"][0]["project_id"], project_id);
+        assert_eq!(
+            listed["projects"][0]["archive_command_id"],
+            "http-restore-archive"
+        );
+        assert_eq!(listed["projects"][0]["restorable"], true);
+
+        let restore = serde_json::json!({
+            "command_id": "http-restore",
+            "actor": "local-user",
+            "expected_archive_command_id": "http-restore-archive",
+        });
+        let forbidden = post_project_command_with_headers(
+            &app,
+            &project_id,
+            "restore",
+            &restore,
+            &[("origin", "https://example.com")],
+        )
+        .await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        // Herdr down: restoring unbound could orphan a running orchestrator.
+        source.down.store(true, Ordering::SeqCst);
+        let unavailable = post_project_command(&app, &project_id, "restore", &restore).await;
+        assert_eq!(unavailable.status(), StatusCode::CONFLICT);
+        assert_eq!(unavailable.headers()[header::CACHE_CONTROL], "no-store");
+        let unavailable = response_json(unavailable).await;
+        assert_eq!(unavailable["error"]["code"], "project_restore_unavailable");
+        assert_eq!(unavailable["error"]["reason"], "herdr_unreachable");
+        let projects = get_json(&app, "/api/v1/projects").await;
+        assert!(projects["projects"].as_array().unwrap().is_empty());
+
+        // The same command succeeds once Herdr is back and re-binds the tab.
+        source.down.store(false, Ordering::SeqCst);
+        let response = post_project_command_with_headers(
+            &app,
+            &project_id,
+            "restore",
+            &restore,
+            BROWSER_HEADERS,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let restored = response_json(response).await;
+        assert_eq!(restored["orchestrator_runtime"], "rebound");
+        assert_eq!(restored["visibility"], "active");
+        assert_eq!(restored["replayed"], false);
+        let project = get_json(&app, &format!("/api/v1/projects/{project_id}")).await;
+        assert_eq!(project["orchestrator"]["desired_state"], "running");
+        assert_eq!(
+            project["orchestrator"]["runtime"]["terminal_id"],
+            created["orchestrator"]["runtime"]["terminal_id"]
+        );
+        let listed = get_json(&app, "/api/v1/archived").await;
+        assert!(listed["projects"].as_array().unwrap().is_empty());
+
+        let replayed = post_project_command(&app, &project_id, "restore", &restore).await;
+        assert_eq!(replayed.status(), StatusCode::OK);
+        assert_eq!(response_json(replayed).await["replayed"], true);
+        let mut conflicting = restore.clone();
+        conflicting["actor"] = serde_json::json!("another-user");
+        let conflict = post_project_command(&app, &project_id, "restore", &conflicting).await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(conflict).await["error"]["code"],
+            "idempotency_conflict"
+        );
+        let mut again = restore.clone();
+        again["command_id"] = serde_json::json!("http-restore-again");
+        let again = post_project_command(&app, &project_id, "restore", &again).await;
+        assert_eq!(again.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(again).await["error"]["code"],
+            "project_not_archived"
+        );
+        let mut unknown = restore.clone();
+        unknown["command_id"] = serde_json::json!("http-restore-unknown");
+        let unknown = post_project_command(&app, "missing-project", "restore", &unknown).await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response_json(unknown).await["error"]["code"],
+            "project_not_found"
+        );
+    }
+
+    /// D1: archive keeps repository links, so a restored project lists them
+    /// again (repository CRUD stays blocked only while it is archived).
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn restored_project_keeps_its_linked_repositories() {
+        let (app, temp) = test_router_with_source(Arc::new(FakeInventory)).await;
+        let created = create_http_project(&app).await;
+        let project_id = created["id"].as_str().unwrap().to_owned();
+        let repository = temp.path().join("restore-repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let linked = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/projects/{project_id}/repositories"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "root_path": repository.to_string_lossy() })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(linked.status(), StatusCode::CREATED);
+        let repository_id = response_json(linked).await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let mut archive = http_archive_preconditions(&created);
+        archive["command_id"] = serde_json::json!("repository-restore-archive");
+        archive["actor"] = serde_json::json!("local-user");
+        let response = post_project_command(&app, &project_id, "archive", &archive).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let while_archived = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/{project_id}/repositories"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(while_archived.status(), StatusCode::OK);
+
+        let restore = serde_json::json!({
+            "command_id": "repository-restore",
+            "actor": "local-user",
+            "expected_archive_command_id": "repository-restore-archive",
+        });
+        let response = post_project_command(&app, &project_id, "restore", &restore).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed = get_json(&app, &format!("/api/v1/projects/{project_id}/repositories")).await;
+        let repositories = listed["repositories"].as_array().unwrap();
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories[0]["id"], repository_id.as_str());
+    }
+
+    /// 0 = normal, 1 = session stopped, 2 = session gone.
+    struct VanishingSessionInventory {
+        mode: std::sync::atomic::AtomicU8,
+    }
+
+    #[async_trait]
+    impl InventorySource for VanishingSessionInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            FakeInventory.sessions().await
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            match self.mode.load(Ordering::SeqCst) {
+                1 => Err(InventoryServiceError::Herdr(HerdrError::SessionNotRunning(
+                    session_name.to_owned(),
+                ))),
+                2 => Err(InventoryServiceError::Herdr(HerdrError::SessionNotFound(
+                    session_name.to_owned(),
+                ))),
+                _ => FakeInventory.inventory(session_name).await,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restores_unbound_when_the_herdr_session_no_longer_exists() {
+        let source = Arc::new(VanishingSessionInventory {
+            mode: std::sync::atomic::AtomicU8::new(0),
+        });
+        let (app, _temp) = test_router_with_source(source.clone()).await;
+        let created = create_http_project(&app).await;
+        let project_id = created["id"].as_str().unwrap().to_owned();
+        let mut archive = http_archive_preconditions(&created);
+        archive["command_id"] = serde_json::json!("http-vanished-archive");
+        archive["actor"] = serde_json::json!("local-user");
+        let response = post_project_command(&app, &project_id, "archive", &archive).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let restore = serde_json::json!({
+            "command_id": "http-vanished-restore",
+            "actor": "local-user",
+            "expected_archive_command_id": "http-vanished-archive",
+        });
+
+        // A stopped session may bring its panes back when restarted.
+        source.mode.store(1, Ordering::SeqCst);
+        let stopped = post_project_command(&app, &project_id, "restore", &restore).await;
+        assert_eq!(stopped.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(stopped).await["error"]["reason"],
+            "herdr_unreachable"
+        );
+
+        // A session that no longer exists cannot be running the pane.
+        source.mode.store(2, Ordering::SeqCst);
+        let response = post_project_command(&app, &project_id, "restore", &restore).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let restored = response_json(response).await;
+        assert_eq!(restored["orchestrator_runtime"], "unbound");
+        let project = get_json(&app, &format!("/api/v1/projects/{project_id}")).await;
+        assert!(project["orchestrator"]["runtime"].is_null());
+    }
+
+    #[tokio::test]
+    async fn archive_succeeds_when_runtime_cleanup_fails_and_retries_later() {
+        let (app, temp, runtime) =
+            handoff_test_router_with_source(1, Arc::new(FakeInventory)).await;
+        let created = create_http_project(&app).await;
+        let project_id = created["id"].as_str().unwrap().to_owned();
+        let mut archive = http_archive_preconditions(&created);
+        archive["command_id"] = serde_json::json!("archive-with-herdr-down");
+        archive["actor"] = serde_json::json!("local-user");
+
+        let response = post_project_command(&app, &project_id, "archive", &archive).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let archived = response_json(response).await;
+        assert_eq!(archived["cleanup_pending"], true);
+        assert_eq!(runtime.retirement_calls.lock().unwrap().len(), 1);
+        let projects = get_json(&app, "/api/v1/projects").await;
+        assert!(projects["projects"].as_array().unwrap().is_empty());
+
+        let database_path = temp.path().join("yard.sqlite3");
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        let (status, attempts, error): (String, i64, Option<String>) = connection
+            .query_row(
+                "SELECT status, attempts, last_error
+                   FROM runtime_cleanup_jobs
+                  WHERE command_id = 'archive-with-herdr-down'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!(attempts, 1);
+        assert_eq!(error.as_deref(), Some("simulated Herdr close failure"));
+        connection
+            .execute(
+                "UPDATE runtime_cleanup_jobs SET next_attempt_at_unix_ms = 0",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        drop(app);
+
+        let reopened = Arc::new(SqliteProjectStore::open(&database_path).await.unwrap());
+        let report = RuntimeCleanupService::new(runtime.clone(), reopened)
+            .process_pending()
+            .await
+            .unwrap();
+        assert_eq!(report.succeeded, 1);
+        assert_eq!(report.failed, 0);
+        let status: String = rusqlite::Connection::open(database_path)
+            .unwrap()
+            .query_row(
+                "SELECT status FROM runtime_cleanup_jobs
+                  WHERE command_id = 'archive-with-herdr-down'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "succeeded");
     }
 
     #[tokio::test]
@@ -14661,6 +15888,1565 @@ mod tests {
         assert_eq!(
             response_json(response).await["error"]["code"],
             "automatic_summary_isolation_required"
+        );
+    }
+
+    async fn send_node_request(
+        app: &Router,
+        method: Method,
+        uri: &str,
+        body: Option<&serde_json::Value>,
+    ) -> axum::response::Response {
+        let request = Request::builder().method(method).uri(uri);
+        let request = match body {
+            Some(body) => request
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string())),
+            None => request.body(Body::empty()),
+        };
+        app.clone().oneshot(request.unwrap()).await.unwrap()
+    }
+
+    async fn assert_error_code(response: axum::response::Response, status: StatusCode, code: &str) {
+        assert_eq!(response.status(), status);
+        assert_eq!(response_json(response).await["error"]["code"], code);
+    }
+
+    /// Provision a workstream in `yard-coordination` straight through the
+    /// store, as the terminal test does, so no Herdr launch is needed.
+    async fn provisioned_http_workstream(
+        store: &Arc<SqliteProjectStore>,
+        temp: &TempDir,
+        source: &FakeInventory,
+        attached_project_ids: Vec<String>,
+    ) -> yard_domain::CoordinationNode {
+        let node_id = uuid::Uuid::now_v7().to_string();
+        let cwd = temp.path().join("coordination").join(&node_id);
+        std::fs::create_dir_all(&cwd).unwrap();
+        let node = store
+            .create_coordination_node(
+                &node_id,
+                Some(cwd.to_string_lossy().into_owned()),
+                None,
+                CreateCoordinationNode {
+                    command_id: format!("create-{node_id}"),
+                    actor: "local-user".to_owned(),
+                    name: "Release readiness".to_owned(),
+                    kind: CoordinationNodeKind::Workstream,
+                    placement: CanvasPlacement {
+                        x: 80.0,
+                        y: 70.0,
+                        width: 116.0,
+                        height: 116.0,
+                    },
+                    attached_project_ids,
+                },
+            )
+            .await
+            .unwrap()
+            .node;
+        let inventory = source.inventory("yard-coordination").await.unwrap();
+        seed_inventory_workers(
+            &temp.path().join("yard.sqlite3"),
+            &inventory,
+            &["terminal-1"],
+        );
+        store.reconcile_runtime_inventory(inventory).await.unwrap();
+        let candidate = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| {
+                candidate.worker.runtime.as_ref().is_some_and(|runtime| {
+                    runtime.session == "yard-coordination" && runtime.terminal_id == "terminal-1"
+                })
+            })
+            .unwrap();
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: WorkerProfileSpec {
+                    name: "Release coordinator".to_owned(),
+                    runtime_adapter: "herdr".to_owned(),
+                    provider: "codex".to_owned(),
+                    model: Some("gpt-5.4".to_owned()),
+                    default_role: "coordinator".to_owned(),
+                    instructions_ref: None,
+                    tools: Vec::new(),
+                    skills: Vec::new(),
+                    mcp_servers: Vec::new(),
+                    sandbox_policy: "runtime_default".to_owned(),
+                    worktree_policy: "project_workspace".to_owned(),
+                    permission_policy: "runtime_default".to_owned(),
+                    completion_contract: "manual_receipt".to_owned(),
+                },
+            })
+            .await
+            .unwrap();
+        let worker = store
+            .pin_worker_profile(&candidate.worker.id, &profile.id, profile.version)
+            .await
+            .unwrap();
+        store
+            .configure_coordination_node(
+                &node_id,
+                ProvisionCoordinationNode {
+                    command_id: format!("provision-{node_id}"),
+                    actor: "local-user".to_owned(),
+                    profile_id: profile.id,
+                    expected_profile_version: profile.version,
+                    expected_node_version: node.version,
+                },
+                &worker.id,
+                worker.version,
+            )
+            .await
+            .unwrap()
+            .node
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn archives_and_deletes_a_workstream_through_http_without_touching_projects() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(FakeRuntime);
+        let app = router(
+            Arc::new(FakeInventory),
+            runtime.clone(),
+            runtime.clone(),
+            runtime,
+            store.clone(),
+            ArtifactService::new(temp.path().join("artifacts"), store.clone()),
+        );
+        let project = create_http_project(&app).await;
+        let project_id = project["id"].as_str().unwrap().to_owned();
+        let node =
+            provisioned_http_workstream(&store, &temp, &FakeInventory, vec![project_id.clone()])
+                .await;
+        let worker_id = node.worker.as_ref().unwrap().id.clone();
+        let node_uri = format!("/api/v1/coordination-nodes/{}", node.id);
+
+        let preview = send_node_request(
+            &app,
+            Method::GET,
+            &format!("{node_uri}/disposition-preview"),
+            None,
+        )
+        .await;
+        assert_eq!(preview.status(), StatusCode::OK);
+        assert_eq!(preview.headers()[header::CACHE_CONTROL], "no-store");
+        let preview = response_json(preview).await;
+        assert_eq!(preview["kind"], "workstream");
+        assert_eq!(preview["supported"], true);
+        assert_eq!(preview["node_version"], node.version.to_string());
+        assert_eq!(preview["worker"]["worker_id"], worker_id);
+        assert_eq!(preview["worker"]["profile_name"], "Release coordinator");
+        assert_eq!(preview["worker"]["will_end"], true);
+        assert_eq!(
+            preview["attached_projects"],
+            serde_json::json!([{ "project_id": project_id, "name": "Runtime API" }])
+        );
+        assert_eq!(preview["automations"], serde_json::json!([]));
+        assert_eq!(preview["blockers"], serde_json::json!([]));
+
+        let workstream_automation = |command_id: &str| {
+            serde_json::json!({
+                "command_id": command_id,
+                "actor": "local-user",
+                "name": "Workstream status",
+                "scope": { "kind": "workstream_coordination_node", "node_id": node.id },
+                "placement": { "x": 220.0, "y": 180.0, "width": 168.0, "height": 58.0 },
+                "schedule": { "hour": 9, "minute": 0, "timezone": "UTC" },
+                "selected_project_ids": [],
+                "prompt_template": "Summarize workstream status."
+            })
+        };
+        let automation = send_node_request(
+            &app,
+            Method::POST,
+            "/api/v1/automations",
+            Some(&workstream_automation("create-http-workstream-automation")),
+        )
+        .await;
+        assert_eq!(automation.status(), StatusCode::CREATED);
+        let automation = response_json(automation).await["automation"].clone();
+        let automation_id = automation["id"].as_str().unwrap().to_owned();
+
+        // A stale dedicated-worker version is refused before anything changes.
+        let stale_worker = serde_json::json!({
+            "command_id": "archive-http-workstream-stale-worker",
+            "actor": "local-user",
+            "expected_node_version": preview["node_version"],
+            "expected_worker_version": (node.worker.as_ref().unwrap().version + 5).to_string()
+        });
+        assert_error_code(
+            send_node_request(
+                &app,
+                Method::POST,
+                &format!("{node_uri}/archive"),
+                Some(&stale_worker),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "coordination_node_archive_conflict",
+        )
+        .await;
+
+        let mut stale = serde_json::json!({
+            "command_id": "archive-http-workstream",
+            "actor": "local-user",
+            "expected_node_version": (node.version + 1).to_string()
+        });
+        assert_error_code(
+            send_node_request(
+                &app,
+                Method::POST,
+                &format!("{node_uri}/archive"),
+                Some(&stale),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "coordination_node_version_conflict",
+        )
+        .await;
+        stale["expected_node_version"] = preview["node_version"].clone();
+        let archive = stale;
+        let archived = send_node_request(
+            &app,
+            Method::POST,
+            &format!("{node_uri}/archive"),
+            Some(&archive),
+        )
+        .await;
+        assert_eq!(archived.status(), StatusCode::OK);
+        assert_eq!(archived.headers()[header::CACHE_CONTROL], "no-store");
+        let archived = response_json(archived).await;
+        assert_eq!(archived["node_id"], node.id);
+        assert_eq!(archived["worker_id"], worker_id);
+        assert_eq!(
+            archived["paused_automation_ids"],
+            serde_json::json!([automation_id])
+        );
+        assert_eq!(archived["cleanup_pending"], false);
+        assert_eq!(archived["replayed"], false);
+
+        let nodes = get_json(&app, "/api/v1/coordination-nodes").await;
+        assert!(nodes["nodes"].as_array().unwrap().is_empty());
+        // Its paused automation leaves the listing (the map) with it, stays
+        // readable, and cannot be recreated on, resumed, or run.
+        let automations = get_json(&app, "/api/v1/automations").await;
+        assert!(automations["automations"].as_array().unwrap().is_empty());
+        let automation_uri = format!("/api/v1/automations/{automation_id}");
+        let paused = get_json(&app, &automation_uri).await;
+        assert_eq!(paused["state"], "paused");
+        assert_error_code(
+            send_node_request(
+                &app,
+                Method::POST,
+                "/api/v1/automations",
+                Some(&workstream_automation(
+                    "create-archived-workstream-automation",
+                )),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "coordination_node_archived",
+        )
+        .await;
+        assert_error_code(
+            send_node_request(
+                &app,
+                Method::PUT,
+                &format!("{automation_uri}/state"),
+                Some(&serde_json::json!({
+                    "command_id": "resume-archived-workstream-automation",
+                    "actor": "local-user",
+                    "expected_version": paused["version"],
+                    "paused": false
+                })),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "coordination_node_archived",
+        )
+        .await;
+        assert_error_code(
+            send_node_request(
+                &app,
+                Method::POST,
+                &format!("{automation_uri}/runs"),
+                Some(&serde_json::json!({
+                    "command_id": "run-archived-workstream-automation",
+                    "actor": "local-user",
+                    "expected_version": paused["version"]
+                })),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "coordination_node_archived",
+        )
+        .await;
+        assert_error_code(
+            send_node_request(&app, Method::GET, &node_uri, None).await,
+            StatusCode::CONFLICT,
+            "coordination_node_archived",
+        )
+        .await;
+        // The dedicated node-runtime bootstrap refuses an archived node
+        // before it touches Herdr.
+        let node_worker = node.worker.as_ref().unwrap();
+        assert_error_code(
+            send_node_request(
+                &app,
+                Method::POST,
+                &format!("{node_uri}/provision"),
+                Some(&serde_json::json!({
+                    "command_id": "reprovision-archived-workstream",
+                    "actor": "local-user",
+                    "profile_id": node_worker.profile_id.clone().unwrap(),
+                    "expected_profile_version":
+                        node_worker.profile_version.unwrap().to_string(),
+                    "expected_node_version": (node.version + 1).to_string()
+                })),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "coordination_node_archived",
+        )
+        .await;
+        assert_error_code(
+            send_node_request(
+                &app,
+                Method::PUT,
+                &node_uri,
+                Some(&serde_json::json!({
+                    "command_id": "detach-archived-workstream",
+                    "actor": "local-user",
+                    "expected_version": (node.version + 1).to_string(),
+                    "name": "Release readiness",
+                    "attached_project_ids": []
+                })),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "coordination_node_archived",
+        )
+        .await;
+        let replayed = send_node_request(
+            &app,
+            Method::POST,
+            &format!("{node_uri}/archive"),
+            Some(&archive),
+        )
+        .await;
+        assert_eq!(replayed.status(), StatusCode::OK);
+        assert_eq!(response_json(replayed).await["replayed"], true);
+        let mut conflicting = archive.clone();
+        conflicting["actor"] = serde_json::json!("another-user");
+        assert_error_code(
+            send_node_request(
+                &app,
+                Method::POST,
+                &format!("{node_uri}/archive"),
+                Some(&conflicting),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "idempotency_conflict",
+        )
+        .await;
+        let mut again = archive.clone();
+        again["command_id"] = serde_json::json!("archive-http-workstream-again");
+        assert_error_code(
+            send_node_request(
+                &app,
+                Method::POST,
+                &format!("{node_uri}/archive"),
+                Some(&again),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "coordination_node_already_archived",
+        )
+        .await;
+
+        // Delete from archived ignores the (now stale) archive preconditions.
+        let delete = serde_json::json!({
+            "command_id": "delete-http-workstream",
+            "actor": "local-user",
+            "archive": { "expected_node_version": preview["node_version"] }
+        });
+        let deleted = send_node_request(
+            &app,
+            Method::POST,
+            &format!("{node_uri}/delete"),
+            Some(&delete),
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted = response_json(deleted).await;
+        assert_eq!(deleted["worker_id"], worker_id);
+        assert_eq!(deleted["replayed"], false);
+        let replayed = send_node_request(
+            &app,
+            Method::POST,
+            &format!("{node_uri}/delete"),
+            Some(&delete),
+        )
+        .await;
+        assert_eq!(response_json(replayed).await["replayed"], true);
+        let mut again = delete.clone();
+        again["command_id"] = serde_json::json!("delete-http-workstream-again");
+        assert_error_code(
+            send_node_request(
+                &app,
+                Method::POST,
+                &format!("{node_uri}/delete"),
+                Some(&again),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "coordination_node_already_deleted",
+        )
+        .await;
+        assert_error_code(
+            send_node_request(&app, Method::GET, &node_uri, None).await,
+            StatusCode::NOT_FOUND,
+            "coordination_node_not_found",
+        )
+        .await;
+        let unknown = format!("/api/v1/coordination-nodes/{}/delete", uuid::Uuid::now_v7());
+        let mut unknown_delete = delete.clone();
+        unknown_delete["command_id"] = serde_json::json!("delete-unknown-workstream");
+        assert_error_code(
+            send_node_request(&app, Method::POST, &unknown, Some(&unknown_delete)).await,
+            StatusCode::NOT_FOUND,
+            "coordination_node_not_found",
+        )
+        .await;
+
+        // The member project, its orchestrator, and the ended worker's
+        // audit trail are untouched; only the dedicated worker leaves views.
+        let projects = get_json(&app, "/api/v1/projects").await;
+        assert_eq!(projects["projects"][0]["id"], project_id);
+        assert_eq!(projects["projects"][0]["version"], project["version"]);
+        let workers = get_json(&app, "/api/v1/workers").await;
+        assert!(
+            workers["workers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|candidate| candidate["worker"]["id"] != worker_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn deletes_an_unprovisioned_workstream_and_refuses_knowledge_stores() {
+        let (app, _temp) = test_router().await;
+        let create = |kind: &str, command_id: &str| {
+            serde_json::json!({
+                "command_id": command_id,
+                "actor": "local-user",
+                "name": "Coordination",
+                "kind": kind,
+                "placement": { "x": 10.0, "y": 20.0, "width": 116.0, "height": 116.0 },
+                "attached_project_ids": []
+            })
+        };
+        let workstream = response_json(
+            send_node_request(
+                &app,
+                Method::POST,
+                "/api/v1/coordination-nodes",
+                Some(&create("workstream", "create-unprovisioned-workstream")),
+            )
+            .await,
+        )
+        .await;
+        let node_uri = format!(
+            "/api/v1/coordination-nodes/{}",
+            workstream["node"]["id"].as_str().unwrap()
+        );
+        assert_error_code(
+            send_node_request(
+                &app,
+                Method::POST,
+                &format!("{node_uri}/delete"),
+                Some(&serde_json::json!({
+                    "command_id": "delete-without-preconditions",
+                    "actor": "local-user"
+                })),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "coordination_node_not_archived",
+        )
+        .await;
+        let deleted = send_node_request(
+            &app,
+            Method::POST,
+            &format!("{node_uri}/delete"),
+            Some(&serde_json::json!({
+                "command_id": "delete-unprovisioned-workstream",
+                "actor": "local-user",
+                "archive": { "expected_node_version": workstream["node"]["version"] }
+            })),
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted = response_json(deleted).await;
+        assert!(deleted["worker_id"].is_null());
+        assert_eq!(deleted["cleanup_pending"], false);
+
+        let knowledge = response_json(
+            send_node_request(
+                &app,
+                Method::POST,
+                "/api/v1/coordination-nodes",
+                Some(&create("knowledge_store", "create-knowledge-store")),
+            )
+            .await,
+        )
+        .await;
+        let knowledge_uri = format!(
+            "/api/v1/coordination-nodes/{}",
+            knowledge["node"]["id"].as_str().unwrap()
+        );
+        assert_error_code(
+            send_node_request(
+                &app,
+                Method::POST,
+                &format!("{knowledge_uri}/archive"),
+                Some(&serde_json::json!({
+                    "command_id": "archive-knowledge-store",
+                    "actor": "local-user",
+                    "expected_node_version": knowledge["node"]["version"]
+                })),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "coordination_node_kind_not_supported",
+        )
+        .await;
+        let nodes = get_json(&app, "/api/v1/coordination-nodes").await;
+        assert_eq!(nodes["nodes"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn workstream_archive_succeeds_when_worker_cleanup_fails_and_retries_later() {
+        let temp = TempDir::new().unwrap();
+        let database_path = temp.path().join("yard.sqlite3");
+        let store = Arc::new(SqliteProjectStore::open(&database_path).await.unwrap());
+        let node = provisioned_http_workstream(&store, &temp, &FakeInventory, Vec::new()).await;
+        let runtime = Arc::new(ClaimCheckingRuntime {
+            database_path: database_path.clone(),
+            claim_seen_before_start: AtomicBool::new(false),
+            start_calls: AtomicUsize::new(0),
+            replacement_prompt_failure: AtomicBool::new(false),
+            replacement_start_ambiguity: AtomicBool::new(false),
+            retirement_identity_conflict: AtomicBool::new(false),
+            retirement_failures: AtomicUsize::new(1),
+            retirement_calls: Mutex::new(Vec::new()),
+            start_requests: Mutex::new(Vec::new()),
+        });
+        let interactive = Arc::new(FakeRuntime);
+        let app = router(
+            Arc::new(FakeInventory),
+            runtime.clone(),
+            interactive.clone(),
+            interactive,
+            store.clone(),
+            ArtifactService::new(temp.path().join("artifacts"), store.clone()),
+        );
+
+        let archived = send_node_request(
+            &app,
+            Method::POST,
+            &format!("/api/v1/coordination-nodes/{}/archive", node.id),
+            Some(&serde_json::json!({
+                "command_id": "archive-workstream-herdr-down",
+                "actor": "local-user",
+                "expected_node_version": node.version.to_string()
+            })),
+        )
+        .await;
+        assert_eq!(archived.status(), StatusCode::OK);
+        let archived = response_json(archived).await;
+        assert_eq!(archived["cleanup_pending"], true);
+        let calls = runtime.retirement_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].session, "yard-coordination");
+        let nodes = get_json(&app, "/api/v1/coordination-nodes").await;
+        assert!(nodes["nodes"].as_array().unwrap().is_empty());
+
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute(
+                "UPDATE runtime_cleanup_jobs SET next_attempt_at_unix_ms = 0",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let report = RuntimeCleanupService::new(runtime, store)
+            .process_pending()
+            .await
+            .unwrap();
+        assert_eq!((report.succeeded, report.failed), (1, 0));
+        let status: String = rusqlite::Connection::open(database_path)
+            .unwrap()
+            .query_row(
+                "SELECT status FROM runtime_cleanup_jobs
+                  WHERE command_id = 'archive-workstream-herdr-down'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "succeeded");
+    }
+
+    #[tokio::test]
+    async fn maps_blocked_workstream_disposition_to_itemized_conflict() {
+        let error = ApiError::from(CoordinationNodeServiceError::Store(
+            ProjectStoreError::CoordinationNodeDispositionBlocked {
+                pending_prompts: 1,
+                pending_routes: 2,
+            },
+        ));
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "coordination_node_archive_blocked");
+        assert_eq!(
+            error.message,
+            "Wait for 1 pending workstream prompt and 2 pending workstream routes to finish \
+             before archiving or deleting this workstream"
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn workstream_terminal_is_revoked_when_the_workstream_is_archived() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let node = provisioned_http_workstream(&store, &temp, &FakeInventory, Vec::new()).await;
+        let runtime = Arc::new(FakeRuntime);
+        let app = router(
+            Arc::new(FakeInventory),
+            runtime.clone(),
+            runtime.clone(),
+            runtime,
+            store.clone(),
+            ArtifactService::new(temp.path().join("artifacts"), store),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, app.clone()).into_future());
+        let mut terminal_request = format!(
+            "ws://{address}/api/v1/coordination-nodes/{}/terminal?cols=80&rows=24",
+            node.id
+        )
+        .into_client_request()
+        .unwrap();
+        terminal_request.headers_mut().insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://127.0.0.1:5173"),
+        );
+        let (mut socket, _) = connect_async(terminal_request).await.unwrap();
+        assert!(matches!(
+            socket.next().await.unwrap().unwrap(),
+            TungsteniteMessage::Text(_)
+        ));
+
+        let archived = send_node_request(
+            &app,
+            Method::POST,
+            &format!("/api/v1/coordination-nodes/{}/archive", node.id),
+            Some(&serde_json::json!({
+                "command_id": "archive-terminal-workstream",
+                "actor": "local-user",
+                "expected_node_version": node.version.to_string()
+            })),
+        )
+        .await;
+        assert_eq!(archived.status(), StatusCode::OK);
+        let closed = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("workstream terminal lease was not revoked")
+            .unwrap()
+            .unwrap();
+        let TungsteniteMessage::Text(closed) = closed else {
+            panic!("expected terminal.closed");
+        };
+        let closed: serde_json::Value = serde_json::from_str(&closed).unwrap();
+        assert_eq!(closed["type"], "terminal.closed");
+        assert_eq!(closed["reason"], "coordination_node_changed");
+
+        // Reopening it (e.g. from a stale tab) is refused before the upgrade:
+        // 409 while archived, 404 once deleted.
+        let reopen = |expected: StatusCode, code: &'static str| {
+            let mut request = format!(
+                "ws://{address}/api/v1/coordination-nodes/{}/terminal?cols=80&rows=24",
+                node.id
+            )
+            .into_client_request()
+            .unwrap();
+            request.headers_mut().insert(
+                header::ORIGIN,
+                axum::http::HeaderValue::from_static("http://127.0.0.1:5173"),
+            );
+            async move {
+                let Err(tokio_tungstenite::tungstenite::Error::Http(response)) =
+                    connect_async(request).await
+                else {
+                    panic!("terminal of an inactive workstream opened");
+                };
+                assert_eq!(response.status(), expected);
+                let body: serde_json::Value =
+                    serde_json::from_slice(response.body().as_deref().unwrap()).unwrap();
+                assert_eq!(body["error"]["code"], code);
+            }
+        };
+        reopen(StatusCode::CONFLICT, "coordination_node_archived").await;
+        let deleted = send_node_request(
+            &app,
+            Method::POST,
+            &format!("/api/v1/coordination-nodes/{}/delete", node.id),
+            Some(&serde_json::json!({
+                "command_id": "delete-terminal-workstream",
+                "actor": "local-user"
+            })),
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        reopen(StatusCode::NOT_FOUND, "coordination_node_not_found").await;
+        server.abort();
+    }
+
+    // ---- Assignment disposition and retained transcripts ----
+
+    async fn assignment_json(
+        app: &Router,
+        project_id: &str,
+        assignment_id: &str,
+    ) -> serde_json::Value {
+        get_json(app, &format!("/api/v1/projects/{project_id}/assignments")).await["assignments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|assignment| assignment["id"] == assignment_id)
+            .unwrap()
+            .clone()
+    }
+
+    fn disposition_body(
+        command_id: &str,
+        assignment: &serde_json::Value,
+        outcome: &str,
+        end_session: bool,
+    ) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "command_id": command_id,
+            "actor": "local-user",
+            "attempt_id": assignment["attempt"]["id"],
+            "expected_assignment_version": assignment["version"],
+            "expected_attempt_version": assignment["attempt"]["version"],
+            "outcome": outcome,
+            "end_session": end_session,
+        });
+        if end_session {
+            body["expected_worker_version"] = assignment["worker"]["version"].clone();
+            if !assignment["worker"]["runtime"].is_null() {
+                body["expected_runtime_version"] =
+                    assignment["worker"]["runtime"]["version"].clone();
+            }
+        }
+        body
+    }
+
+    async fn post_disposition(
+        app: &Router,
+        project_id: &str,
+        assignment_id: &str,
+        body: &serde_json::Value,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/api/v1/projects/{project_id}/assignments/{assignment_id}/disposition"
+            ))
+            .header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        app.clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+    }
+
+    const BROWSER_HEADERS: &[(&str, &str)] = &[
+        ("origin", "http://127.0.0.1:4317"),
+        ("host", "127.0.0.1:4317"),
+    ];
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn completes_and_ends_a_worker_in_one_disposition_request_and_keeps_its_transcript() {
+        let (app, temp) = test_router().await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let assignment = assignment_json(&app, &project_id, &assignment_id).await;
+        let body = disposition_body("http-quick-complete", &assignment, "completed", true);
+
+        let response =
+            post_disposition(&app, &project_id, &assignment_id, &body, BROWSER_HEADERS).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let disposed = response_json(response).await;
+        assert_eq!(disposed["replayed"], false);
+        assert_eq!(disposed["assignment"]["lifecycle"], "completed");
+        assert_eq!(disposed["receipt"]["detail_level"], "minimal");
+        assert_eq!(
+            disposed["receipt"]["objective_snapshot"],
+            "Exercise the interactive terminal bridge."
+        );
+        assert_eq!(
+            disposed["receipt"]["summary"],
+            "Completed without a detailed handoff."
+        );
+        assert_eq!(disposed["receipt"]["evidence_refs"], serde_json::json!([]));
+        assert_eq!(disposed["receipt"]["artifact_refs"], serde_json::json!([]));
+        assert!(disposed["cancellation"].is_null());
+        assert_eq!(disposed["worker"]["desired_state"], "ended");
+        assert!(disposed["worker"]["runtime"].is_null());
+        assert_eq!(disposed["cleanup_pending"], false);
+        assert_eq!(disposed["transcript_pending"], false);
+
+        // Live terminal access is revoked, but the transcript was retained.
+        let output = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal-output"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(output).await["error"]["code"],
+            "assignment_not_active"
+        );
+        let transcript = get_json(
+            &app,
+            &format!("/api/v1/projects/{project_id}/assignments/{assignment_id}/transcript"),
+        )
+        .await;
+        assert_eq!(transcript["status"], "captured");
+        assert_eq!(transcript["text"], "Focused tests are passing.");
+        assert_eq!(transcript["line_count"], 1);
+        assert_eq!(transcript["truncated"], false);
+        assert_eq!(
+            transcript["terminal_id"],
+            assignment["worker"]["runtime"]["terminal_id"]
+        );
+
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let origin: String = connection
+            .query_row(
+                "SELECT request_origin FROM completion_receipts WHERE assignment_id = ?1",
+                [&assignment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(origin, "browser");
+        drop(connection);
+
+        let replay = post_disposition(&app, &project_id, &assignment_id, &body, &[]).await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay = response_json(replay).await;
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["receipt"]["id"], disposed["receipt"]["id"]);
+
+        let mut conflicting = body.clone();
+        conflicting["outcome"] = serde_json::json!("cancelled");
+        let conflict = post_disposition(&app, &project_id, &assignment_id, &conflicting, &[]).await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(conflict).await["error"]["code"],
+            "idempotency_conflict"
+        );
+        let again = disposition_body("http-quick-complete-2", &assignment, "completed", false);
+        let again = post_disposition(&app, &project_id, &assignment_id, &again, &[]).await;
+        assert_eq!(again.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(again).await["error"]["code"],
+            "assignment_not_active"
+        );
+
+        // The detailed endpoint still rejects an empty receipt, even with a
+        // stray detail marker.
+        let empty = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/projects/{project_id}/assignments/{assignment_id}/completion-receipts"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command_id": "empty-detailed-receipt",
+                            "actor": "local-user",
+                            "attempt_id": assignment["attempt"]["id"],
+                            "expected_assignment_version": assignment["version"],
+                            "expected_attempt_version": assignment["attempt"]["version"],
+                            "outcome": "completed",
+                            "detail_level": "minimal",
+                            "summary": "Done.",
+                            "artifact_refs": [],
+                            "evidence_refs": [],
+                            "unresolved_blockers": []
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(empty).await["error"]["code"],
+            "invalid_completion_receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn ends_a_worker_without_completion_and_records_a_cancellation_not_a_receipt() {
+        let (app, _temp) = test_router().await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let assignment = assignment_json(&app, &project_id, &assignment_id).await;
+        let body = disposition_body(
+            "http-end-without-completion",
+            &assignment,
+            "cancelled",
+            true,
+        );
+
+        let response =
+            post_disposition(&app, &project_id, &assignment_id, &body, BROWSER_HEADERS).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let disposed = response_json(response).await;
+        assert_eq!(disposed["assignment"]["lifecycle"], "cancelled");
+        assert_eq!(disposed["assignment"]["attempt"]["lifecycle"], "cancelled");
+        assert!(disposed["receipt"].is_null());
+        assert!(disposed["assignment"]["completion_receipt"].is_null());
+        assert_eq!(
+            disposed["cancellation"]["reason"],
+            "ended_without_completion"
+        );
+        assert_eq!(disposed["cancellation"]["request_origin"], "browser");
+        assert_eq!(
+            disposed["cancellation"]["objective_snapshot"],
+            "Exercise the interactive terminal bridge."
+        );
+        assert_eq!(disposed["worker"]["desired_state"], "ended");
+
+        let listed = assignment_json(&app, &project_id, &assignment_id).await;
+        assert_eq!(listed["lifecycle"], "cancelled");
+        assert_eq!(listed["cancellation"], disposed["cancellation"]);
+        let transcript = get_json(
+            &app,
+            &format!("/api/v1/projects/{project_id}/assignments/{assignment_id}/transcript"),
+        )
+        .await;
+        assert_eq!(transcript["status"], "captured");
+
+        let end = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/workers/{}/end-session",
+                        disposed["worker"]["id"].as_str().unwrap()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command_id": "end-after-cancel",
+                            "actor": "local-user",
+                            "expected_worker_version": disposed["worker"]["version"],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(end.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(end).await["error"]["code"],
+            "worker_session_already_ended"
+        );
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/projects/{project_id}/assignments/unknown-assignment/transcript"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rejects_cross_site_lifecycle_requests_before_writing_anything() {
+        let (app, temp) = test_router().await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let assignment = assignment_json(&app, &project_id, &assignment_id).await;
+        let body = disposition_body("guarded-disposition", &assignment, "completed", false);
+
+        for (headers, code) in [
+            (
+                &[
+                    ("origin", "https://evil.example"),
+                    ("host", "127.0.0.1:4317"),
+                ][..],
+                "request_origin_forbidden",
+            ),
+            (&[("origin", "null")][..], "request_origin_forbidden"),
+            (
+                &[
+                    ("origin", "http://127.0.0.1:4317"),
+                    ("host", "evil.example:4317"),
+                ][..],
+                "request_host_forbidden",
+            ),
+            (
+                &[("host", "yard.attacker.test")][..],
+                "request_host_forbidden",
+            ),
+        ] {
+            let response =
+                post_disposition(&app, &project_id, &assignment_id, &body, headers).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{headers:?}");
+            assert_eq!(response_json(response).await["error"]["code"], code);
+        }
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let written: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM command_acknowledgements WHERE id = 'guarded-disposition'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(written, 0);
+
+        // A CLI request without Origin is accepted and recorded as such.
+        let response = post_disposition(
+            &app,
+            &project_id,
+            &assignment_id,
+            &body,
+            &[("host", "localhost:4317")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let origin: String = connection
+            .query_row(
+                "SELECT request_origin FROM assignment_disposition_commands
+                  WHERE command_id = 'guarded-disposition'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(origin, "none");
+    }
+
+    struct SwitchableInventory {
+        down: AtomicBool,
+    }
+
+    #[async_trait]
+    impl InventorySource for SwitchableInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            FakeInventory.sessions().await
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            if self.down.load(Ordering::SeqCst) {
+                return Err(InventoryServiceError::Herdr(HerdrError::SocketTimeout));
+            }
+            FakeInventory.inventory(session_name).await
+        }
+    }
+
+    #[tokio::test]
+    async fn disposition_succeeds_while_herdr_is_down_and_the_capture_retries_later() {
+        let source = Arc::new(SwitchableInventory {
+            down: AtomicBool::new(false),
+        });
+        let (app, temp) = test_router_with_source(source.clone()).await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let assignment = assignment_json(&app, &project_id, &assignment_id).await;
+        source.down.store(true, Ordering::SeqCst);
+
+        let body = disposition_body("herdr-down-complete", &assignment, "completed", true);
+        let response =
+            post_disposition(&app, &project_id, &assignment_id, &body, BROWSER_HEADERS).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let disposed = response_json(response).await;
+        assert_eq!(disposed["assignment"]["lifecycle"], "completed");
+        assert_eq!(disposed["transcript_pending"], true);
+        let pending = get_json(
+            &app,
+            &format!("/api/v1/projects/{project_id}/assignments/{assignment_id}/transcript"),
+        )
+        .await;
+        assert_eq!(pending["status"], "pending");
+        assert_eq!(pending["attempts"], 1);
+        assert!(pending["last_error"].as_str().is_some());
+        drop(app);
+
+        let path = temp.path().join("yard.sqlite3");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE transcript_capture_jobs SET next_attempt_at_unix_ms = 0
+                  WHERE command_id = 'herdr-down-complete'",
+                [],
+            )
+            .unwrap();
+        source.down.store(false, Ordering::SeqCst);
+        let store: Arc<dyn YardStore> = Arc::new(SqliteProjectStore::open(&path).await.unwrap());
+        let report = crate::transcript_capture_service::TranscriptCaptureService::new(
+            source,
+            Arc::new(FakeRuntime),
+            Arc::clone(&store),
+        )
+        .process_pending()
+        .await
+        .unwrap();
+        assert_eq!(report.stored, 1);
+        let transcript = store
+            .get_assignment_transcript(&project_id, &assignment_id)
+            .await
+            .unwrap();
+        assert_eq!(transcript.status, yard_domain::TranscriptStatus::Captured);
+        assert_eq!(
+            transcript.text.as_deref(),
+            Some("Focused tests are passing.")
+        );
+        assert_eq!(transcript.attempts, 2);
+    }
+
+    /// Live for the first `live_reads` inventories counted in `reads`, then
+    /// without any workers (the tab closed).
+    struct ClosingInventory {
+        down: AtomicBool,
+        live_reads: AtomicUsize,
+        reads: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl InventorySource for ClosingInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            FakeInventory.sessions().await
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            if self.down.load(Ordering::SeqCst) {
+                return Err(InventoryServiceError::Herdr(HerdrError::SocketTimeout));
+            }
+            let mut inventory = FakeInventory.inventory(session_name).await?;
+            if self.reads.fetch_add(1, Ordering::SeqCst) >= self.live_reads.load(Ordering::SeqCst) {
+                inventory.workers.clear();
+            }
+            Ok(inventory)
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingOutput {
+        reads: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RuntimeIntervention for CountingOutput {
+        async fn prompt(
+            &self,
+            request: RuntimePromptRequest,
+        ) -> Result<RuntimePromptResult, RuntimeInterventionError> {
+            FakeRuntime.prompt(request).await
+        }
+
+        async fn read_output(
+            &self,
+            request: RuntimeOutputRequest,
+        ) -> Result<RuntimeOutputResult, RuntimeInterventionError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            FakeRuntime.read_output(request).await
+        }
+    }
+
+    /// End a worker's session while Herdr is down, so its capture job waits
+    /// for the background pass; returns the store and the job's terminal.
+    async fn queue_capture_while_herdr_is_down(
+        source: Arc<ClosingInventory>,
+        command_id: &str,
+    ) -> (Arc<dyn YardStore>, TempDir, String, String, String) {
+        let (app, temp) = test_router_with_source(source.clone()).await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let assignment = assignment_json(&app, &project_id, &assignment_id).await;
+        source.down.store(true, Ordering::SeqCst);
+        let body = disposition_body(command_id, &assignment, "completed", true);
+        let response =
+            post_disposition(&app, &project_id, &assignment_id, &body, BROWSER_HEADERS).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["transcript_pending"], true);
+        drop(app);
+        let path = temp.path().join("yard.sqlite3");
+        let terminal_id: String = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "UPDATE transcript_capture_jobs SET next_attempt_at_unix_ms = 0
+                  WHERE command_id = ?1 RETURNING terminal_id",
+                [command_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        source.down.store(false, Ordering::SeqCst);
+        let store: Arc<dyn YardStore> = Arc::new(SqliteProjectStore::open(&path).await.unwrap());
+        (store, temp, project_id, assignment_id, terminal_id)
+    }
+
+    #[tokio::test]
+    async fn a_capture_expires_when_the_tab_closes_during_the_read() {
+        // Live for the check before the read, gone for the check after it.
+        let source = Arc::new(ClosingInventory {
+            down: AtomicBool::new(false),
+            live_reads: AtomicUsize::new(usize::MAX),
+            reads: AtomicUsize::new(0),
+        });
+        let (store, temp, project_id, assignment_id, _) =
+            queue_capture_while_herdr_is_down(source.clone(), "closes-during-read").await;
+        source.reads.store(0, Ordering::SeqCst);
+        source.live_reads.store(1, Ordering::SeqCst);
+        let output = Arc::new(CountingOutput::default());
+        let report = crate::transcript_capture_service::TranscriptCaptureService::new(
+            source.clone(),
+            output.clone(),
+            Arc::clone(&store),
+        )
+        .process_pending()
+        .await
+        .unwrap();
+        assert_eq!(report.expired, 1);
+        assert_eq!(report.stored, 0);
+        assert_eq!(output.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(source.reads.load(Ordering::SeqCst), 2);
+        let transcript = store
+            .get_assignment_transcript(&project_id, &assignment_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            transcript.unavailable_reason,
+            Some(yard_domain::TranscriptUnavailableReason::RuntimeClosed)
+        );
+        assert!(transcript.text.is_none());
+        let stored: i64 = rusqlite::Connection::open(temp.path().join("yard.sqlite3"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM worker_transcripts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, 0);
+    }
+
+    #[tokio::test]
+    async fn a_capture_never_reads_a_runtime_bound_to_another_worker() {
+        let source = Arc::new(ClosingInventory {
+            down: AtomicBool::new(false),
+            live_reads: AtomicUsize::new(usize::MAX),
+            reads: AtomicUsize::new(0),
+        });
+        let (store, temp, project_id, assignment_id, terminal_id) =
+            queue_capture_while_herdr_is_down(source.clone(), "rebound-before-read").await;
+        // Reconciliation adopted the ended worker's pane into another worker.
+        let moved = rusqlite::Connection::open(temp.path().join("yard.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE worker_runtime_bindings SET terminal_id = ?1
+                  WHERE terminal_id = 'terminal-1'",
+                [&terminal_id],
+            )
+            .unwrap();
+        assert_eq!(moved, 1);
+        let output = Arc::new(CountingOutput::default());
+        let report = crate::transcript_capture_service::TranscriptCaptureService::new(
+            source,
+            output.clone(),
+            Arc::clone(&store),
+        )
+        .process_pending()
+        .await
+        .unwrap();
+        assert_eq!(report.expired, 1);
+        assert_eq!(output.reads.load(Ordering::SeqCst), 0);
+        let transcript = store
+            .get_assignment_transcript(&project_id, &assignment_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            transcript.unavailable_reason,
+            Some(yard_domain::TranscriptUnavailableReason::RuntimeReused)
+        );
+        assert!(transcript.text.is_none());
+    }
+
+    #[test]
+    fn maps_disposition_and_worker_session_command_conflicts() {
+        use crate::assignment_disposition_service::AssignmentDispositionServiceError;
+        use crate::worker_session_service::WorkerSessionServiceError;
+
+        let in_progress = ApiError::from(WorkerSessionServiceError::Store(
+            ProjectStoreError::CommandInProgress,
+        ));
+        assert_eq!(in_progress.status, StatusCode::CONFLICT);
+        assert_eq!(in_progress.code, "command_in_progress");
+        let failed = ApiError::from(WorkerSessionServiceError::Store(
+            ProjectStoreError::CommandPreviouslyFailed("delete failed".to_owned()),
+        ));
+        assert_eq!(failed.code, "command_previously_failed");
+
+        for (error, status, code) in [
+            (
+                ProjectStoreError::InvalidDisposition(
+                    yard_domain::DispositionValidationError::WorkerVersionRequired,
+                ),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_assignment_disposition",
+            ),
+            (
+                ProjectStoreError::AssignmentHandoffUnresolved,
+                StatusCode::CONFLICT,
+                "assignment_handoff_unresolved",
+            ),
+            (
+                ProjectStoreError::CommandInProgress,
+                StatusCode::CONFLICT,
+                "command_in_progress",
+            ),
+            (
+                ProjectStoreError::AssignmentInterventionInProgress,
+                StatusCode::CONFLICT,
+                "assignment_intervention_in_progress",
+            ),
+            (
+                ProjectStoreError::AssignmentNotActive,
+                StatusCode::CONFLICT,
+                "assignment_not_active",
+            ),
+            (
+                ProjectStoreError::OrchestratorSessionEndForbidden,
+                StatusCode::CONFLICT,
+                "orchestrator_replacement_required",
+            ),
+            (
+                ProjectStoreError::YardOrchestratorSessionEndForbidden,
+                StatusCode::CONFLICT,
+                "yard_orchestrator_replacement_required",
+            ),
+            (
+                ProjectStoreError::CoordinationNodeSessionEndForbidden,
+                StatusCode::CONFLICT,
+                "coordination_node_worker_protected",
+            ),
+            (
+                ProjectStoreError::WorkerRuntimeVersionConflict {
+                    current_version: Some(2),
+                },
+                StatusCode::CONFLICT,
+                "worker_version_conflict",
+            ),
+            (
+                ProjectStoreError::AssignmentVersionConflict { current_version: 4 },
+                StatusCode::CONFLICT,
+                "assignment_version_conflict",
+            ),
+            (
+                ProjectStoreError::IdempotencyConflict,
+                StatusCode::CONFLICT,
+                "idempotency_conflict",
+            ),
+            (
+                ProjectStoreError::AssignmentNotFound,
+                StatusCode::NOT_FOUND,
+                "assignment_not_found",
+            ),
+            (
+                ProjectStoreError::SystemEphemeralWorker,
+                StatusCode::CONFLICT,
+                "system_ephemeral_worker",
+            ),
+        ] {
+            let mapped = ApiError::from(AssignmentDispositionServiceError::Store(error));
+            assert_eq!(mapped.status, status, "{code}");
+            assert_eq!(mapped.code, code);
+        }
+        // A crash-stranded pending handoff also maps here and never clears
+        // on its own, so the copy must not promise that a retry will work.
+        let handoff_pending = ApiError::from(AssignmentDispositionServiceError::Store(
+            ProjectStoreError::CommandInProgress,
+        ));
+        assert!(
+            !handoff_pending.message.to_lowercase().contains("retry"),
+            "{}",
+            handoff_pending.message
+        );
+    }
+
+    #[test]
+    fn archive_waits_for_an_allocating_summary_worker_with_a_conflict() {
+        let mapped = ApiError::from(ProjectServiceError::Store(
+            ProjectStoreError::ProjectArchiveSummaryWorkerAllocating,
+        ));
+        assert_eq!(mapped.status, StatusCode::CONFLICT);
+        assert_eq!(mapped.code, "project_summary_worker_allocating");
+        let response = super::project_disposition_error(ProjectServiceError::Store(
+            ProjectStoreError::ProjectArchiveSummaryWorkerAllocating,
+        ));
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn lifecycle_guard_accepts_only_loopback_hosts_and_origins() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(
+            super::lifecycle_request_origin(&headers).ok(),
+            Some(yard_domain::RequestOrigin::None)
+        );
+        for host in [
+            "127.0.0.1:4317",
+            "localhost:5173",
+            "[::1]:4317",
+            "localhost",
+        ] {
+            headers.insert(header::HOST, host.parse().unwrap());
+            assert!(super::lifecycle_request_origin(&headers).is_ok(), "{host}");
+        }
+        headers.insert(header::ORIGIN, "http://localhost:5173".parse().unwrap());
+        assert_eq!(
+            super::lifecycle_request_origin(&headers).ok(),
+            Some(yard_domain::RequestOrigin::Browser)
+        );
+        for origin in ["https://evil.example", "null", "http://127.0.0.1.evil:80"] {
+            headers.insert(header::ORIGIN, origin.parse().unwrap());
+            assert_eq!(
+                super::lifecycle_request_origin(&headers)
+                    .err()
+                    .map(|error| error.code),
+                Some("request_origin_forbidden"),
+                "{origin}"
+            );
+        }
+        headers.remove(header::ORIGIN);
+        headers.insert(header::HOST, "192.168.1.5:4317".parse().unwrap());
+        assert_eq!(
+            super::lifecycle_request_origin(&headers)
+                .err()
+                .map(|error| error.code),
+            Some("request_host_forbidden")
+        );
+    }
+
+    /// Provisions like `FakeRuntime` but cannot retire runtimes (the trait's
+    /// default), like Herdr refusing to close a live pane.
+    struct RetirementRefusingRuntime;
+
+    #[async_trait]
+    impl RuntimeControl for RetirementRefusingRuntime {
+        async fn provision_worker(
+            &self,
+            request: RuntimeProvisionRequest,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            FakeRuntime.provision_worker(request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn disposition_keeps_the_ended_state_when_runtime_cleanup_fails() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let interactive = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            Arc::new(FakeInventory),
+            Arc::new(RetirementRefusingRuntime),
+            interactive.clone(),
+            interactive,
+            store,
+            artifacts,
+        );
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let assignment = assignment_json(&app, &project_id, &assignment_id).await;
+        let body = disposition_body("cleanup-refused", &assignment, "cancelled", true);
+
+        let response =
+            post_disposition(&app, &project_id, &assignment_id, &body, BROWSER_HEADERS).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let disposed = response_json(response).await;
+        assert_eq!(disposed["assignment"]["lifecycle"], "cancelled");
+        assert_eq!(disposed["worker"]["desired_state"], "ended");
+        assert_eq!(disposed["cleanup_pending"], true);
+        assert_eq!(disposed["transcript_pending"], false);
+
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let (status, attempts, last_error): (String, i64, Option<String>) = connection
+            .query_row(
+                "SELECT status, attempts, last_error FROM runtime_cleanup_jobs
+                  WHERE command_id = 'cleanup-refused'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!(attempts, 1);
+        assert!(last_error.is_some());
+        let replay = post_disposition(&app, &project_id, &assignment_id, &body, &[]).await;
+        let replay = response_json(replay).await;
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["cleanup_pending"], true);
+        assert_eq!(
+            assignment_json(&app, &project_id, &assignment_id).await["lifecycle"],
+            "cancelled"
         );
     }
 }

@@ -14,6 +14,7 @@ import {
   CircleAlert,
   FileCode2,
   Files,
+  FolderArchive,
   FolderPlus,
   LoaderCircle,
   Map as MapIcon,
@@ -36,7 +37,7 @@ import type {
 import { THEME_OPTIONS, type ThemeId } from './theme'
 import { useModalDialog } from './useModalDialog'
 
-export type ResourceView = 'profiles' | 'workspaces' | 'workers'
+export type ResourceView = 'archived' | 'profiles' | 'workspaces' | 'workers'
 
 type RuntimeHealth = 'degraded' | 'loading' | 'observed' | 'unavailable'
 
@@ -257,9 +258,17 @@ interface GlobalCommandBarProps extends RuntimeHealthPopoverProps {
 }
 
 const RESOURCE_ICONS = {
+  archived: FolderArchive,
   profiles: FileCode2,
   workers: Bot,
   workspaces: Boxes,
+}
+
+const RESOURCE_LABELS: Record<ResourceView, string> = {
+  archived: 'Archived',
+  profiles: 'Profiles',
+  workers: 'Workers',
+  workspaces: 'Workspaces',
 }
 
 export function GlobalCommandBar({
@@ -459,7 +468,10 @@ export function ResourceShelfTabs({
   onChange,
   value,
 }: {
-  counts: Record<ResourceView, number>
+  // The Archived count is unknown until the shelf has read the list once.
+  counts: Record<Exclude<ResourceView, 'archived'>, number> & {
+    archived: number | null
+  }
   onChange: (view: ResourceView) => void
   value: ResourceView
 }) {
@@ -491,14 +503,10 @@ export function ResourceShelfTabs({
       }}
       role="tablist"
     >
-      {(['profiles', 'workers', 'workspaces'] as const).map((view) => {
+      {(['profiles', 'workers', 'workspaces', 'archived'] as const).map((view) => {
         const Icon = RESOURCE_ICONS[view]
-        const label =
-          view === 'profiles'
-            ? 'Profiles'
-            : view === 'workers'
-              ? 'Workers'
-              : 'Workspaces'
+        const label = RESOURCE_LABELS[view]
+        const count = counts[view]
         return (
           <button
             aria-selected={value === view}
@@ -510,7 +518,7 @@ export function ResourceShelfTabs({
           >
             <Icon aria-hidden="true" size={13} />
             <span>{label}</span>
-            <small>{counts[view]}</small>
+            {count === null ? null : <small>{count}</small>}
           </button>
         )
       })}
@@ -528,9 +536,11 @@ interface SettingsDialogProps {
   automaticCoordinationBusy: boolean
   automaticCoordinationError: string | null
   automaticCoordinationSettings: TokenSpendSettings | null
+  completeAndEndSession: boolean
   initialFocus: 'appearance' | 'automatic'
   mapVisualMode: MapVisualMode
   onClose: () => void
+  onCompleteAndEndSessionChange: (enabled: boolean) => void
   onSaveAutomaticCoordination: (
     selection: AutomaticCoordinationSelection,
   ) => void
@@ -546,9 +556,11 @@ export function SettingsDialog({
   automaticCoordinationBusy,
   automaticCoordinationError,
   automaticCoordinationSettings,
+  completeAndEndSession,
   initialFocus,
   mapVisualMode,
   onClose,
+  onCompleteAndEndSessionChange,
   onSaveAutomaticCoordination,
   onOpenOrchestratorWorkflow,
   onMapVisualModeChange,
@@ -647,6 +659,38 @@ export function SettingsDialog({
                 >
                   <Box aria-hidden="true" size={14} />
                   2.5D
+                </button>
+              </div>
+            </div>
+          </section>
+          <section aria-labelledby={`${titleId}-workers`}>
+            <h3 id={`${titleId}-workers`}>Workers</h3>
+            <div className="settings-row">
+              <div>
+                <strong>Complete and end session</strong>
+                <small>
+                  Complete also ends Yard's session; the agent keeps running
+                  until its Herdr tab is closed. Stored in this browser
+                </small>
+              </div>
+              <div
+                aria-label="Complete and end session"
+                className="segmented-control settings-segmented-control"
+                role="group"
+              >
+                <button
+                  aria-pressed={completeAndEndSession}
+                  onClick={() => onCompleteAndEndSessionChange(true)}
+                  type="button"
+                >
+                  On
+                </button>
+                <button
+                  aria-pressed={!completeAndEndSession}
+                  onClick={() => onCompleteAndEndSessionChange(false)}
+                  type="button"
+                >
+                  Off
                 </button>
               </div>
             </div>

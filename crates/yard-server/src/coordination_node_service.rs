@@ -13,13 +13,15 @@ use tokio::{
 };
 use uuid::Uuid;
 use yard_domain::{
-    CoordinationNode, CoordinationNodeCommandResult, CoordinationNodeKind,
+    ArchiveCoordinationNode, ArchivedCoordinationNode, CoordinationNode,
+    CoordinationNodeCommandResult, CoordinationNodeDispositionPreview, CoordinationNodeKind,
     CoordinationNodePromptAcknowledgement, CoordinationNodeRoute, CoordinationNodeRoutes,
     CoordinationNodeTerminalOutput, CoordinationNodes, CoordinationSnapshot, CoordinationSnapshots,
-    CreateCoordinationNode, OrchestratorStatusReport, ProvisionCoordinationNode,
-    RequestCoordinationSnapshot, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
-    SnapshotCollectionStatus, UpdateCoordinationNode, UpdateCoordinationNodePlacement, Worker,
-    WorkerAvailability, WorkerRuntimeBinding,
+    CreateCoordinationNode, DeleteCoordinationNode, DeletedCoordinationNode,
+    OrchestratorStatusReport, ProvisionCoordinationNode, RequestCoordinationSnapshot,
+    SendCoordinationNodePrompt, SendCoordinationNodeRoute, SnapshotCollectionStatus,
+    UpdateCoordinationNode, UpdateCoordinationNodePlacement, Worker, WorkerAvailability,
+    WorkerRuntimeBinding,
 };
 use yard_store::{
     BeginCoordinationNodePrompt, BeginCoordinationNodeRoute, ProjectStoreError,
@@ -40,6 +42,7 @@ use crate::{
         InventoryServiceError, InventorySource, runtime_binding_from_observed_worker,
     },
     reconciliation_service::{ReconciliationService, ReconciliationServiceError},
+    runtime_cleanup_service::RuntimeCleanupService,
     status_protocol::{
         validate_executable_orchestrator_workflow, with_orchestrator_status_contract,
         with_orchestrator_workflow,
@@ -70,6 +73,7 @@ pub struct CoordinationNodeService {
     coordination_root: PathBuf,
     knowledge_root: PathBuf,
     operation: Arc<Mutex<()>>,
+    cleanup: RuntimeCleanupService,
 }
 
 impl CoordinationNodeService {
@@ -83,6 +87,7 @@ impl CoordinationNodeService {
         coordination_root: PathBuf,
         knowledge_root: PathBuf,
     ) -> Self {
+        let cleanup = RuntimeCleanupService::new(Arc::clone(&runtime), Arc::clone(&store));
         Self {
             source,
             runtime,
@@ -92,6 +97,7 @@ impl CoordinationNodeService {
             coordination_root,
             knowledge_root,
             operation: Arc::default(),
+            cleanup,
         }
     }
 
@@ -171,6 +177,83 @@ impl CoordinationNodeService {
             .update_coordination_node_placement(node_id, command)
             .await
             .map_err(Into::into)
+    }
+
+    pub(crate) async fn disposition_preview(
+        &self,
+        node_id: &str,
+    ) -> Result<CoordinationNodeDispositionPreview, CoordinationNodeServiceError> {
+        self.store
+            .coordination_node_disposition_preview(node_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Archive a workstream and end its dedicated worker, then attempt that
+    /// worker's runtime cleanup once.
+    ///
+    /// Cleanup never closes a live Herdr tab: the job stays pending until the
+    /// runtime is gone, and a cleanup error never fails the archive.
+    pub(crate) async fn archive(
+        &self,
+        node_id: &str,
+        command: ArchiveCoordinationNode,
+    ) -> Result<ArchivedCoordinationNode, CoordinationNodeServiceError> {
+        let command_id = command.command_id.clone();
+        // Provisioning holds this lock across its Herdr steps, so an archive
+        // never lands between a runtime launch and its node binding.
+        let operation = self.operation.lock().await;
+        let mut archived = self
+            .store
+            .archive_coordination_node(node_id, command)
+            .await?;
+        drop(operation);
+        if archived.cleanup_pending
+            && let Some(pending) = self.attempt_cleanup(&command_id, node_id).await
+        {
+            archived.cleanup_pending = pending;
+        }
+        Ok(archived)
+    }
+
+    /// Remove a workstream from Yard views, archiving it first in the same
+    /// transaction when it is still active. Member projects are untouched.
+    pub(crate) async fn delete(
+        &self,
+        node_id: &str,
+        command: DeleteCoordinationNode,
+    ) -> Result<DeletedCoordinationNode, CoordinationNodeServiceError> {
+        let command_id = command.command_id.clone();
+        let operation = self.operation.lock().await;
+        let mut deleted = self
+            .store
+            .delete_coordination_node(node_id, command)
+            .await?;
+        drop(operation);
+        if deleted.cleanup_pending
+            && let Some(pending) = self.attempt_cleanup(&command_id, node_id).await
+        {
+            deleted.cleanup_pending = pending;
+        }
+        Ok(deleted)
+    }
+
+    /// Run the cleanup jobs one committed command queued. Returns whether any
+    /// remain pending, or `None` when nothing was attempted.
+    async fn attempt_cleanup(&self, command_id: &str, node_id: &str) -> Option<bool> {
+        match self.cleanup.process_command(command_id).await {
+            Ok(report) if report.attempted > 0 => Some(report.failed > 0),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(
+                    command_id,
+                    node_id,
+                    error = %error,
+                    "Immediate workstream worker cleanup failed; durable retry remains pending"
+                );
+                None
+            }
+        }
     }
 
     /// Provision one profile-backed worker in the shared coordination session.
@@ -273,6 +356,9 @@ impl CoordinationNodeService {
                 self.store
                     .fail_dedicated_runtime_provision(&command.command_id, &error.to_string(), true)
                     .await?;
+                if matches!(error, ProjectStoreError::CoordinationNodeArchived) {
+                    return Err(error.into());
+                }
                 return Err(CoordinationNodeServiceError::RuntimeProvisionAmbiguous(
                     error.to_string(),
                 ));
@@ -298,6 +384,9 @@ impl CoordinationNodeService {
                 self.store
                     .fail_dedicated_runtime_provision(&command.command_id, &error.to_string(), true)
                     .await?;
+                if matches!(error, ProjectStoreError::CoordinationNodeArchived) {
+                    return Err(error.into());
+                }
                 return Err(CoordinationNodeServiceError::RuntimeProvisionAmbiguous(
                     error.to_string(),
                 ));
@@ -974,7 +1063,7 @@ impl CoordinationNodeService {
         snapshot: CoordinationSnapshot,
     ) -> Result<CoordinationSnapshot, CoordinationNodeServiceError> {
         for project in &snapshot.projects {
-            if project.collection_status == SnapshotCollectionStatus::Pending
+            if project.collection_status != SnapshotCollectionStatus::Collected
                 && snapshot_project_is_collected(Path::new(&project.folder_path))?
             {
                 self.store
@@ -1095,7 +1184,13 @@ fn snapshot_prompt(
 }
 
 fn snapshot_project_is_collected(path: &Path) -> Result<bool, CoordinationNodeServiceError> {
-    let metadata = fs::symlink_metadata(path)?;
+    // A missing folder holds no files yet, so the row stays pending or
+    // abandoned instead of failing the whole snapshot read.
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(CoordinationNodeServiceError::UnsafeManagedPath);
     }
@@ -1322,13 +1417,13 @@ mod tests {
     use async_trait::async_trait;
     use tempfile::TempDir;
     use yard_domain::{
-        CanvasPlacement, CoordinationDeliveryStatus, CoordinationNodeKind, CreateCoordinationNode,
-        CreateProject, CreateWorkerProfile, FocusObservation, ObservedStatus, ObservedWorker,
-        ProjectRuntimeBinding, ProviderSessionRef, ProvisionCoordinationNode,
-        RequestCoordinationSnapshot, RuntimeInventory, RuntimeObservationState,
-        RuntimeProcessState, RuntimeSession, RuntimeSessions, SendCoordinationNodePrompt,
-        SnapshotCollectionStatus, TransferProjectOrchestrator, WorkerProfileSpec,
-        WorkerRuntimeBinding, WorkspaceObservation,
+        ArchiveProject, CanvasPlacement, CoordinationDeliveryStatus, CoordinationNodeKind,
+        CreateCoordinationNode, CreateProject, CreateWorkerProfile, FocusObservation,
+        ObservedStatus, ObservedWorker, ProjectRuntimeBinding, ProviderSessionRef,
+        ProvisionCoordinationNode, RequestCoordinationSnapshot, RuntimeInventory,
+        RuntimeObservationState, RuntimeProcessState, RuntimeSession, RuntimeSessions,
+        SendCoordinationNodePrompt, SnapshotCollectionStatus, TransferProjectOrchestrator,
+        WorkerProfileSpec, WorkerRuntimeBinding, WorkspaceObservation,
     };
     use yard_store::{SqliteProjectStore, YardStore};
 
@@ -1855,6 +1950,122 @@ mod tests {
             })
             .unwrap();
         assert_eq!(receipt_count, 0);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn snapshot_files_collect_after_archive_and_after_expiry() {
+        let (service, store, _runtime, temp) = setup().await;
+        let project = store
+            .create_project(
+                CreateProject {
+                    name: "Project".to_owned(),
+                    runtime: ProjectRuntimeBinding {
+                        adapter: "herdr".to_owned(),
+                        session: "default".to_owned(),
+                        workspace_id: "project-workspace".to_owned(),
+                    },
+                    orchestrator_observed_worker_id: "project-terminal".to_owned(),
+                    placement: placement(),
+                },
+                binding(
+                    "default",
+                    "project-workspace",
+                    "project-terminal",
+                    "project-tab",
+                    "project-pane",
+                    "project-provider-session",
+                ),
+            )
+            .await
+            .unwrap();
+        let node = service
+            .create(create_command(
+                CoordinationNodeKind::KnowledgeStore,
+                vec![project.id.clone()],
+                "create-archived-knowledge",
+            ))
+            .await
+            .unwrap()
+            .node;
+        let request = |command_id: &str, expected_node_version| RequestCoordinationSnapshot {
+            command_id: command_id.to_owned(),
+            actor: "local-user".to_owned(),
+            expected_node_version,
+        };
+        let late = service
+            .request_snapshot(&node.id, request("request-late-snapshot", node.version))
+            .await
+            .unwrap();
+        let expired = service
+            .request_snapshot(&node.id, request("request-expired-snapshot", node.version))
+            .await
+            .unwrap();
+        let archived = store
+            .archive_project(
+                &project.id,
+                ArchiveProject {
+                    command_id: "archive-before-snapshot-files".to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_project_version: project.version,
+                    expected_orchestrator_worker_id: project.orchestrator.id.clone(),
+                    expected_orchestrator_worker_version: project.orchestrator.version,
+                    expected_orchestrator_runtime_version: project
+                        .orchestrator
+                        .runtime
+                        .as_ref()
+                        .map(|runtime| runtime.version),
+                    active_work: yard_domain::ProjectArchiveActiveWork::Reject,
+                    expected_active_assignments: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(archived.background.snapshots_pending, 2);
+
+        rusqlite::Connection::open(temp.path().join("yard.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE coordination_snapshot_projects
+                    SET submitted_at_unix_ms = 1
+                  WHERE snapshot_id = ?1",
+                [&expired.id],
+            )
+            .unwrap();
+        // A missing folder never fails the read; the row just stays abandoned.
+        fs::remove_dir_all(&expired.projects[0].folder_path).unwrap();
+        let abandoned = service.get_snapshot(&node.id, &expired.id).await.unwrap();
+        assert_eq!(
+            abandoned.projects[0].collection_status,
+            SnapshotCollectionStatus::Abandoned
+        );
+        assert_eq!(abandoned.progress.abandoned, 1);
+        assert_eq!(
+            service
+                .list_snapshots(&node.id)
+                .await
+                .unwrap()
+                .snapshots
+                .len(),
+            2
+        );
+
+        for snapshot in [&late, &expired] {
+            let folder = PathBuf::from(&snapshot.projects[0].folder_path);
+            fs::create_dir_all(&folder).unwrap();
+            for file in REQUIRED_SNAPSHOT_FILES {
+                fs::write(folder.join(file), format!("# {file}\n")).unwrap();
+            }
+        }
+        let snapshots = service.list_snapshots(&node.id).await.unwrap().snapshots;
+        assert_eq!(snapshots.len(), 2);
+        for snapshot in snapshots {
+            assert_eq!(
+                snapshot.projects[0].collection_status,
+                SnapshotCollectionStatus::Collected
+            );
+            assert_eq!(snapshot.progress.abandoned, 0);
+        }
     }
 
     #[allow(clippy::too_many_lines)]

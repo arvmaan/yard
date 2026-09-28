@@ -21,42 +21,49 @@ use tokio::task;
 use uuid::Uuid;
 use yard_domain::{
     AgentProfile, AgentProfileFile, AgentProfileManifest, AgentProfiles, AllocationContext,
-    AllocationMode, ArchiveProject, ArchivedProject, Artifact, ArtifactKind, ArtifactRegistration,
-    ArtifactSource, Assignment, AssignmentAttempt, AssignmentLifecycle, Assignments,
-    AttemptLifecycle, AutomaticSummaryRequestKind, Automation, AutomationCommandResult,
-    AutomationRun, AutomationRunCommandResult, AutomationRuns, Automations, CanvasPlacement,
-    CompletionOutcome, CompletionReceipt, ConfigureYardOrchestrator, ConfiguredYardOrchestrator,
-    ConfirmProfileAllocation, ConfirmWorkerAllocation, ConfirmWorkerHandoff, ConfirmedAllocation,
-    ConfirmedProjectCreation, ConfirmedWorkerHandoff, CoordinationCommandStatus, CoordinationNode,
-    CoordinationNodeCommandResult, CoordinationNodePromptAcknowledgement, CoordinationNodeRoute,
-    CoordinationNodeRoutes, CoordinationNodes, CoordinationSnapshot, CoordinationSnapshots,
-    CreateAgentProfile, CreateAutomation, CreateCoordinationNode, CreateProject,
-    CreateProjectFromProfile, CreateProjectRelationship, CreateWorkerProfile,
-    CreateWorkspaceProjectFromProfile, CreatedProjectRelationship, DeleteProject,
-    DeleteProjectRelationship, DeleteWorker, DeletedProject, DeletedProjectRelationship,
-    DeletedWorker, EndWorkerSession, EndedWorkerSession, HandoffTargetRole, IsolationPolicy,
-    ManagedRuntimeOccupant, ManagedRuntimeOccupantKind, ManagedRuntimeWorkspace,
-    ManagedRuntimeWorkspaceKind, ObservedStatus, ObservedWorker, OldSessionDisposition,
-    OrchestratorPromptAcknowledgement, OrchestratorWorkflowProfile, OrchestratorWorkflowProfiles,
-    PaneManagementBatchResult, PaneObservation, PreparedAgentProfile, Project, ProjectPlacement,
-    ProjectRelationship, ProjectRelationshipKind, ProjectRelationships, ProjectRepositories,
-    ProjectRepository, ProjectRuntimeBinding, ProjectWorkflowProfilePin, Projects,
-    ProviderSessionRef, ProvisionCoordinationNode, ProvisionYardOrchestrator, ReceiveSummaryWorker,
-    RecordCompletionReceipt, RecordedCompletionReceipt, ReplaceProjectOrchestrator,
-    ReplacedProjectOrchestrator, RequestCoordinationSnapshot, RequestSummaryWorker,
-    ResetOrchestratorWorkflowProfile, RunAutomationNow, RuntimeInventory, RuntimeObservationState,
-    RuntimeProcessState, RuntimeReconciliation, RuntimeTopology, SendAssignmentPrompt,
-    SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
-    SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SetAutomationPaused,
-    SummaryParentRuntimeCapture, SummaryWorker, SummaryWorkers, TokenSpendSettings,
-    TransferProjectOrchestrator, TransferredProjectOrchestrator, UpdateAgentProfile,
-    UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
+    AllocationMode, ArchiveCoordinationNode, ArchiveProject, ArchivedCoordinationNode,
+    ArchivedProject, ArchivedProjects, Artifact, ArtifactKind, ArtifactRegistration,
+    ArtifactSource, Assignment, AssignmentAttempt, AssignmentCancellation, AssignmentLifecycle,
+    Assignments, AttemptLifecycle, AutomaticSummaryRequestKind, Automation,
+    AutomationCommandResult, AutomationRun, AutomationRunCommandResult, AutomationRuns,
+    Automations, CancellationReason, CanvasPlacement, CompletionOutcome, CompletionReceipt,
+    ConfigureYardOrchestrator, ConfiguredYardOrchestrator, ConfirmProfileAllocation,
+    ConfirmWorkerAllocation, ConfirmWorkerHandoff, ConfirmedAllocation, ConfirmedProjectCreation,
+    ConfirmedWorkerHandoff, CoordinationCommandStatus, CoordinationNode,
+    CoordinationNodeCommandResult, CoordinationNodeDispositionPreview,
+    CoordinationNodePromptAcknowledgement, CoordinationNodeRoute, CoordinationNodeRoutes,
+    CoordinationNodes, CoordinationSnapshot, CoordinationSnapshots, CreateAgentProfile,
+    CreateAutomation, CreateCoordinationNode, CreateProject, CreateProjectFromProfile,
+    CreateProjectRelationship, CreateWorkerProfile, CreateWorkspaceProjectFromProfile,
+    CreatedProjectRelationship, DeleteCoordinationNode, DeleteProject, DeleteProjectRelationship,
+    DeleteWorker, DeletedCoordinationNode, DeletedProject, DeletedProjectRelationship,
+    DeletedWorker, DisposeAssignment, DisposedAssignment, EndWorkerSession, EndedWorkerSession,
+    ExpectedActiveAssignment, HandoffTargetRole, IsolationPolicy, ManagedRuntimeOccupant,
+    ManagedRuntimeOccupantKind, ManagedRuntimeWorkspace, ManagedRuntimeWorkspaceKind,
+    ObservedStatus, ObservedWorker, OldSessionDisposition, OrchestratorPromptAcknowledgement,
+    OrchestratorWorkflowProfile, OrchestratorWorkflowProfiles, PaneManagementBatchResult,
+    PaneObservation, PreparedAgentProfile, Project, ProjectArchivePreconditions,
+    ProjectBackgroundStatus, ProjectDispositionPreview, ProjectPlacement, ProjectRelationship,
+    ProjectRelationshipKind, ProjectRelationships, ProjectRepositories, ProjectRepository,
+    ProjectRestoreUnavailableReason, ProjectRuntimeBinding, ProjectVisibility,
+    ProjectWorkflowProfilePin, Projects, ProviderSessionRef, ProvisionCoordinationNode,
+    ProvisionYardOrchestrator, ReceiptDetailLevel, ReceiveSummaryWorker, RecordCompletionReceipt,
+    RecordedCompletionReceipt, ReplaceProjectOrchestrator, ReplacedProjectOrchestrator,
+    RequestCoordinationSnapshot, RequestOrigin, RequestSummaryWorker,
+    ResetOrchestratorWorkflowProfile, RestoreProject, RestoredProject, RunAutomationNow,
+    RuntimeInventory, RuntimeObservationState, RuntimeProcessState, RuntimeReconciliation,
+    RuntimeTopology, SendAssignmentPrompt, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
+    SendOrchestratorPrompt, SendYardOrchestratorPrompt, SendYardOrchestratorRoute,
+    SetAutomationPaused, SummaryParentRuntimeCapture, SummaryWorker, SummaryWorkers,
+    TokenSpendSettings, TransferProjectOrchestrator, TransferredProjectOrchestrator,
+    UpdateAgentProfile, UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
     UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
     UpdateProjectWorkflowProfile, UpdateTokenSpendSettings, UpdateWorkerProfile, Worker,
     WorkerAllocation, WorkerAvailability, WorkerCandidate, WorkerCandidates, WorkerDesiredState,
     WorkerOwnershipKind, WorkerProfile, WorkerProfileSpec, WorkerProfiles, WorkerRuntimeBinding,
-    YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator, YardOrchestratorPromptAcknowledgement,
-    YardOrchestratorRoute, YardOrchestratorRoutes, herdr_agent_name,
+    WorkerTranscript, YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator,
+    YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute, YardOrchestratorRoutes,
+    herdr_agent_name,
 };
 use yard_domain::{
     CancelWorkerCleanupRun, CleanupAdvisorArtifact, CompletedRuntimeCleanupCandidate,
@@ -65,19 +72,30 @@ use yard_domain::{
     WorkerCleanupRunTrigger, WorkerCleanupRuns,
 };
 
+mod assignment_disposition_store;
 mod automation_store;
 mod coordination_node_store;
 mod orchestrator_workflow_profile_store;
 mod pane_management_store;
+mod project_archive_store;
+mod project_restore_store;
 mod summary_worker_store;
 mod token_spend_store;
+mod transcript_capture_store;
 mod worker_cleanup_store;
 
 pub use pane_management_store::{
     BeginPaneManagementBatch, ManagedPaneAdoption, StoredLeaseToken, StoredPaneManagementLease,
 };
+pub use project_restore_store::{
+    ProjectRestorePlan, ProjectRestoreRuntime, RetiredOrchestratorRuntime,
+};
+pub use transcript_capture_store::{
+    CapturedTranscriptText, PendingTranscriptCapture, TranscriptCaptureExpiry,
+    TranscriptCaptureGuard, TranscriptCaptureOutcome,
+};
 
-const SCHEMA_VERSION: i64 = 33;
+const SCHEMA_VERSION: i64 = 38;
 const PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS: u64 = 120_000;
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_projects.sql");
 const PROFILE_ASSIGNMENT_MIGRATION: &str =
@@ -132,6 +150,17 @@ const PROJECT_REPOSITORIES_MIGRATION: &str =
     include_str!("../migrations/0029_project_repositories.sql");
 const PANE_MANAGEMENT_MIGRATION: &str =
     include_str!("../migrations/0030_pane_management_leases.sql");
+const VISIBILITY_DELETIONS_REPAIR_MIGRATION: &str =
+    include_str!("../migrations/0028_visibility_deletions_repair.sql");
+const SNAPSHOT_EXPIRY_AND_DELETE_COMMANDS_MIGRATION: &str =
+    include_str!("../migrations/0034_snapshot_expiry_and_delete_commands.sql");
+const COORDINATION_NODE_DISPOSITIONS_MIGRATION: &str =
+    include_str!("../migrations/0035_coordination_node_dispositions.sql");
+const ASSIGNMENT_DISPOSITION_MIGRATION: &str =
+    include_str!("../migrations/0036_assignment_disposition.sql");
+const ARCHIVE_ACTIVE_WORK_MIGRATION: &str =
+    include_str!("../migrations/0037_archive_active_work.sql");
+const PROJECT_RESTORE_MIGRATION: &str = include_str!("../migrations/0038_project_restore.sql");
 const BLANK_WORKER_PROFILE_ID: &str = "yard:managed-blank-profile";
 const WORKER_CLEANUP_MIGRATION: &str = include_str!("../migrations/0031_worker_cleanup.sql");
 const PORTABLE_PROFILE_BUNDLES_MIGRATION: &str =
@@ -274,6 +303,20 @@ pub trait YardStore: Send + Sync {
         node_id: &str,
         command: UpdateCoordinationNodePlacement,
     ) -> Result<CoordinationNodeCommandResult, ProjectStoreError>;
+    async fn coordination_node_disposition_preview(
+        &self,
+        node_id: &str,
+    ) -> Result<CoordinationNodeDispositionPreview, ProjectStoreError>;
+    async fn archive_coordination_node(
+        &self,
+        node_id: &str,
+        command: ArchiveCoordinationNode,
+    ) -> Result<ArchivedCoordinationNode, ProjectStoreError>;
+    async fn delete_coordination_node(
+        &self,
+        node_id: &str,
+        command: DeleteCoordinationNode,
+    ) -> Result<DeletedCoordinationNode, ProjectStoreError>;
     async fn begin_coordination_node_runtime_provision(
         &self,
         node_id: &str,
@@ -446,16 +489,63 @@ pub trait YardStore: Send + Sync {
         project_id: &str,
         repository_id: &str,
     ) -> Result<ProjectRepository, ProjectStoreError>;
+    /// What archiving or deleting an active project would end, including
+    /// every assignment an archive with `active_work = cancel` must list.
+    async fn project_disposition_preview(
+        &self,
+        project_id: &str,
+    ) -> Result<ProjectDispositionPreview, ProjectStoreError>;
+    /// Archive with no recorded request origin (a CLI or agent client).
     async fn archive_project(
         &self,
         project_id: &str,
         command: ArchiveProject,
+    ) -> Result<ArchivedProject, ProjectStoreError> {
+        self.archive_project_from(project_id, command, RequestOrigin::None)
+            .await
+    }
+    /// Archive a project. `request_origin` is recorded on the cancellation of
+    /// every active assignment the archive ends.
+    async fn archive_project_from(
+        &self,
+        project_id: &str,
+        command: ArchiveProject,
+        request_origin: RequestOrigin,
     ) -> Result<ArchivedProject, ProjectStoreError>;
+    /// Delete with no recorded request origin (a CLI or agent client).
     async fn delete_project(
         &self,
         project_id: &str,
         command: DeleteProject,
+    ) -> Result<DeletedProject, ProjectStoreError> {
+        self.delete_project_from(project_id, command, RequestOrigin::None)
+            .await
+    }
+    /// Delete a project, archiving it first when it is still active.
+    async fn delete_project_from(
+        &self,
+        project_id: &str,
+        command: DeleteProject,
+        request_origin: RequestOrigin,
     ) -> Result<DeletedProject, ProjectStoreError>;
+    /// Archived projects that are not deleted, with whether each archive is
+    /// restorable now.
+    async fn list_archived_projects(&self) -> Result<ArchivedProjects, ProjectStoreError>;
+    /// Replay a restore, or check it can run and return the retired
+    /// orchestrator runtime the caller must resolve in Herdr first.
+    async fn project_restore_plan(
+        &self,
+        project_id: &str,
+        command: RestoreProject,
+    ) -> Result<ProjectRestorePlan, ProjectStoreError>;
+    /// Restore an archived project; `runtime` is how the retired
+    /// orchestrator runtime resolved in a fresh Herdr inventory.
+    async fn restore_project(
+        &self,
+        project_id: &str,
+        command: RestoreProject,
+        runtime: ProjectRestoreRuntime,
+    ) -> Result<RestoredProject, ProjectStoreError>;
     async fn update_project_workflow_profile(
         &self,
         project_id: &str,
@@ -876,6 +966,50 @@ pub trait YardStore: Send + Sync {
         assignment_id: &str,
         command: RecordCompletionReceipt,
     ) -> Result<RecordedCompletionReceipt, ProjectStoreError>;
+    /// Complete (minimal receipt) or cancel an assignment in one command,
+    /// optionally ending the worker's session in the same transaction.
+    async fn dispose_assignment(
+        &self,
+        project_id: &str,
+        assignment_id: &str,
+        command: DisposeAssignment,
+        request_origin: RequestOrigin,
+    ) -> Result<DisposedAssignment, ProjectStoreError>;
+    async fn claim_pending_transcript_captures(
+        &self,
+        command_id: Option<&str>,
+        limit: usize,
+        claim_ttl_ms: u64,
+    ) -> Result<Vec<PendingTranscriptCapture>, ProjectStoreError>;
+    async fn transcript_capture_guard(
+        &self,
+        job_id: &str,
+        claim_token: &str,
+    ) -> Result<TranscriptCaptureGuard, ProjectStoreError>;
+    async fn succeed_transcript_capture(
+        &self,
+        job_id: &str,
+        claim_token: &str,
+        captured: CapturedTranscriptText,
+    ) -> Result<TranscriptCaptureOutcome, ProjectStoreError>;
+    async fn expire_transcript_capture(
+        &self,
+        job_id: &str,
+        claim_token: &str,
+        expiry: TranscriptCaptureExpiry,
+    ) -> Result<(), ProjectStoreError>;
+    async fn fail_transcript_capture(
+        &self,
+        job_id: &str,
+        claim_token: &str,
+        message: &str,
+        retry_after_ms: u64,
+    ) -> Result<(), ProjectStoreError>;
+    async fn get_assignment_transcript(
+        &self,
+        project_id: &str,
+        assignment_id: &str,
+    ) -> Result<WorkerTranscript, ProjectStoreError>;
     async fn begin_assignment_prompt(
         &self,
         project_id: &str,
@@ -1260,7 +1394,8 @@ fn validate_dedicated_runtime_provision_target(
             }
         }
         "coordination_node" => {
-            let current = coordination_node_store::select_node(transaction, &intent.target_id)?;
+            let current =
+                coordination_node_store::select_active_node(transaction, &intent.target_id)?;
             if current.kind != yard_domain::CoordinationNodeKind::Workstream {
                 return Err(ProjectStoreError::CoordinationNodeKindMismatch);
             }
@@ -1429,6 +1564,12 @@ impl SqliteProjectStore {
             validate_locked_database_path(&path, &lock.database)?;
             migrate(&mut connection)?;
             recover_interrupted_commands(&mut connection)?;
+            coordination_node_store::abandon_expired_snapshot_collections(
+                &connection,
+                unix_time_ms()?,
+                None,
+                None,
+            )?;
             Ok::<_, ProjectStoreError>((lock, connection))
         })
         .await??;
@@ -1549,6 +1690,9 @@ impl SqliteProjectStore {
                 .ok_or(ProjectStoreError::CommandNotFound)?;
             if intent.status != "pending" {
                 return Err(ProjectStoreError::CommandNotPending);
+            }
+            if intent.kind == "coordination_node" {
+                coordination_node_store::reject_inactive_node(&transaction, &intent.target_id)?;
             }
             let claim = select_provisioning_runtime_claim(&transaction, &command_id)?
                 .ok_or(ProjectStoreError::ProvisioningRuntimeClaimMissing)?;
@@ -1876,6 +2020,29 @@ impl YardStore for SqliteProjectStore {
         command: UpdateCoordinationNodePlacement,
     ) -> Result<CoordinationNodeCommandResult, ProjectStoreError> {
         coordination_node_store::update_placement(self, node_id, command).await
+    }
+
+    async fn coordination_node_disposition_preview(
+        &self,
+        node_id: &str,
+    ) -> Result<CoordinationNodeDispositionPreview, ProjectStoreError> {
+        coordination_node_store::disposition_preview(self, node_id).await
+    }
+
+    async fn archive_coordination_node(
+        &self,
+        node_id: &str,
+        command: ArchiveCoordinationNode,
+    ) -> Result<ArchivedCoordinationNode, ProjectStoreError> {
+        coordination_node_store::archive_node(self, node_id, command).await
+    }
+
+    async fn delete_coordination_node(
+        &self,
+        node_id: &str,
+        command: DeleteCoordinationNode,
+    ) -> Result<DeletedCoordinationNode, ProjectStoreError> {
+        coordination_node_store::delete_node(self, node_id, command).await
     }
 
     async fn begin_coordination_node_runtime_provision(
@@ -2786,6 +2953,17 @@ impl YardStore for SqliteProjectStore {
         .await
     }
 
+    async fn project_disposition_preview(
+        &self,
+        project_id: &str,
+    ) -> Result<ProjectDispositionPreview, ProjectStoreError> {
+        let project_id = required_id(project_id)?;
+        self.run(move |connection| {
+            project_archive_store::disposition_preview(connection, &project_id)
+        })
+        .await
+    }
+
     async fn get_project_repository(
         &self,
         project_id: &str,
@@ -2904,26 +3082,51 @@ impl YardStore for SqliteProjectStore {
         .await
     }
 
-    async fn archive_project(
+    async fn archive_project_from(
         &self,
         project_id: &str,
         command: ArchiveProject,
+        request_origin: RequestOrigin,
     ) -> Result<ArchivedProject, ProjectStoreError> {
         let project_id = required_id(project_id)?;
         let command = command.normalize()?;
         self.run(move |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = unix_time_ms()?;
             if let Some(existing) =
                 select_archived_project_command(&transaction, &command.command_id)?
             {
                 if !existing.matches(&project_id, &command) {
                     return Err(ProjectStoreError::IdempotencyConflict);
                 }
-                purge_project_repositories(&transaction, &project_id)?;
                 let cleanup_pending = runtime_cleanup_pending(&transaction, &command.command_id)?;
+                let background = coordination_node_store::project_background_status(
+                    &transaction,
+                    &project_id,
+                    now,
+                )?;
+                let cancelled = project_archive_store::cancelled_assignment_ids(
+                    &transaction,
+                    &command.command_id,
+                )?;
+                let visibility =
+                    project_restore_store::project_visibility(&transaction, &project_id)?;
+                let restorable = project_restore_store::archive_restorable(
+                    &transaction,
+                    &project_id,
+                    &command.command_id,
+                )?;
                 transaction.commit()?;
-                return Ok(existing.archived(cleanup_pending, true));
+                return Ok(existing.archived(
+                    cleanup_pending,
+                    background,
+                    cancelled,
+                    ArchiveStatus {
+                        restorable,
+                        visibility,
+                    },
+                ));
             }
             if command_id_exists(&transaction, &command.command_id)? {
                 return Err(ProjectStoreError::IdempotencyConflict);
@@ -2932,47 +3135,6 @@ impl YardStore for SqliteProjectStore {
                 return Err(ProjectStoreError::ProjectAlreadyArchived);
             }
 
-            let project = select_project(&transaction, &project_id)?;
-            if project.version != command.expected_project_version {
-                return Err(ProjectStoreError::ProjectVersionConflict {
-                    current_version: project.version,
-                });
-            }
-            if project.orchestrator.id != command.expected_orchestrator_worker_id {
-                return Err(ProjectStoreError::OrchestratorNotCurrent {
-                    current_worker_id: project.orchestrator.id,
-                });
-            }
-            if project.orchestrator.version != command.expected_orchestrator_worker_version {
-                return Err(ProjectStoreError::WorkerVersionConflict {
-                    current_version: project.orchestrator.version,
-                });
-            }
-            let current_runtime_version = project
-                .orchestrator
-                .runtime
-                .as_ref()
-                .map(|runtime| runtime.version);
-            if current_runtime_version != command.expected_orchestrator_runtime_version {
-                return Err(ProjectStoreError::WorkerRuntimeVersionConflict {
-                    current_version: current_runtime_version,
-                });
-            }
-            reject_project_archive_dependencies(&transaction, &project_id)?;
-            if project_has_active_work(&transaction, &project_id)? {
-                return Err(ProjectStoreError::ProjectHasArchiveDependencies);
-            }
-
-            let next_project_version = project
-                .version
-                .checked_add(1)
-                .ok_or(ProjectStoreError::VersionOverflow)?;
-            let next_worker_version = project
-                .orchestrator
-                .version
-                .checked_add(1)
-                .ok_or(ProjectStoreError::VersionOverflow)?;
-            let now = unix_time_ms()?;
             transaction.execute(
                 "INSERT INTO command_acknowledgements (
                     id, command_type, actor, status, error_message,
@@ -2982,198 +3144,80 @@ impl YardStore for SqliteProjectStore {
                  )",
                 params![command.command_id, command.actor, to_i64(now)?],
             )?;
-            transaction.execute(
-                "INSERT INTO archived_projects (
-                    project_id, command_id, expected_project_version,
-                    expected_orchestrator_worker_id,
-                    expected_orchestrator_worker_version,
-                    expected_orchestrator_runtime_version,
-                    result_project_version,
-                    result_orchestrator_worker_version, runtime_adapter,
-                    runtime_session, runtime_workspace_id,
-                    archived_at_unix_ms
-                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
-                 )",
-                params![
-                    project_id,
-                    command.command_id,
-                    to_i64(command.expected_project_version)?,
-                    command.expected_orchestrator_worker_id,
-                    to_i64(command.expected_orchestrator_worker_version)?,
-                    command
-                        .expected_orchestrator_runtime_version
-                        .map(to_i64)
-                        .transpose()?,
-                    to_i64(next_project_version)?,
-                    to_i64(next_worker_version)?,
-                    project.runtime.adapter,
-                    project.runtime.session,
-                    project.runtime.workspace_id,
-                    to_i64(now)?,
-                ],
-            )?;
-
-            let project_rows = transaction.execute(
-                "UPDATE projects
-                    SET version = ?1, updated_at_unix_ms = ?2
-                  WHERE id = ?3 AND version = ?4
-                    AND orchestrator_worker_id = ?5",
-                params![
-                    to_i64(next_project_version)?,
-                    to_i64(now)?,
-                    project_id,
-                    to_i64(project.version)?,
-                    command.expected_orchestrator_worker_id,
-                ],
-            )?;
-            if project_rows != 1 {
-                return Err(ProjectStoreError::ProjectVersionConflict {
-                    current_version: project.version,
-                });
-            }
-            transaction.execute(
-                "UPDATE worker_allocations
-                    SET ended_at_unix_ms = ?1
-                  WHERE project_id = ?2 AND ended_at_unix_ms IS NULL",
-                params![to_i64(now)?, project_id],
-            )?;
-
-            let cleanup_pending = if let Some(runtime) = project.orchestrator.runtime.as_ref() {
-                insert_retired_runtime_binding(
-                    &transaction,
-                    &command.command_id,
-                    &project.orchestrator.id,
-                    "project_archive",
-                    runtime,
-                    now,
-                )?;
-                insert_runtime_cleanup_job(
-                    &transaction,
-                    &command.command_id,
-                    &project.orchestrator.id,
-                    "project_archive",
-                    runtime,
-                    RuntimeCleanupExpectation {
-                        worker_version: Some(next_worker_version),
-                        binding_state: "detached",
-                    },
-                    now,
-                )?;
-                let runtime_rows = transaction.execute(
-                    "DELETE FROM worker_runtime_bindings
-                          WHERE worker_id = ?1 AND version = ?2",
-                    params![project.orchestrator.id, to_i64(runtime.version)?,],
-                )?;
-                if runtime_rows != 1 {
-                    return Err(ProjectStoreError::WorkerRuntimeVersionConflict {
-                        current_version: None,
-                    });
-                }
-                true
-            } else {
-                false
-            };
-
-            let worker_rows = transaction.execute(
-                "UPDATE workers
-                    SET ended_at_unix_ms = ?1, version = ?2,
-                        updated_at_unix_ms = ?1
-                  WHERE id = ?3 AND version = ?4
-                    AND ended_at_unix_ms IS NULL",
-                params![
-                    to_i64(now)?,
-                    to_i64(next_worker_version)?,
-                    project.orchestrator.id,
-                    to_i64(project.orchestrator.version)?,
-                ],
-            )?;
-            if worker_rows != 1 {
-                return Err(ProjectStoreError::WorkerVersionConflict {
-                    current_version: project.orchestrator.version,
-                });
-            }
-            purge_project_repositories(&transaction, &project_id)?;
-            coordination_node_store::archive_project_attachments(
+            let archived = archive_project_tx(
                 &transaction,
                 &project_id,
-                &command.actor,
+                &ArchiveCommandContext {
+                    command_id: &command.command_id,
+                    actor: &command.actor,
+                    request_origin,
+                },
+                &command.preconditions(),
                 now,
             )?;
-            let workspace_rows = transaction.execute(
-                "DELETE FROM project_workspace_bindings
-                  WHERE project_id = ?1
-                    AND adapter = ?2
-                    AND runtime_session = ?3
-                    AND runtime_workspace_id = ?4",
-                params![
-                    project_id,
-                    project.runtime.adapter,
-                    project.runtime.session,
-                    project.runtime.workspace_id,
-                ],
-            )?;
-            if workspace_rows != 1 {
-                return Err(ProjectStoreError::ProjectNotFound);
-            }
             transaction.execute(
                 "UPDATE command_acknowledgements
                     SET status = 'succeeded', updated_at_unix_ms = ?1
                   WHERE id = ?2 AND status = 'pending'",
                 params![to_i64(now)?, command.command_id],
             )?;
-            insert_lifecycle_event(
+            let background =
+                coordination_node_store::project_background_status(&transaction, &project_id, now)?;
+            let restorable = project_restore_store::archive_restorable(
                 &transaction,
-                "project",
                 &project_id,
-                next_project_version,
-                "project_archived",
-                &command.actor,
-                now,
-            )?;
-            insert_lifecycle_event(
-                &transaction,
-                "worker",
-                &project.orchestrator.id,
-                next_worker_version,
-                "project_archive_orchestrator_ended",
-                &command.actor,
-                now,
+                &command.command_id,
             )?;
             transaction.commit()?;
             Ok(ArchivedProject {
                 command_id: command.command_id,
                 project_id,
-                orchestrator_worker_id: project.orchestrator.id,
+                orchestrator_worker_id: archived.orchestrator_worker_id,
                 archived_at_unix_ms: now,
-                cleanup_pending,
+                cleanup_pending: archived.cleanup_pending,
+                background,
+                cancelled_assignment_ids: archived.cancelled_assignment_ids,
+                restorable,
+                visibility: ProjectVisibility::Archived,
                 replayed: false,
             })
         })
         .await
     }
 
-    async fn delete_project(
+    async fn delete_project_from(
         &self,
         project_id: &str,
         command: DeleteProject,
+        request_origin: RequestOrigin,
     ) -> Result<DeletedProject, ProjectStoreError> {
         let project_id = required_id(project_id)?;
         let command = command.normalize()?;
         self.run(move |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = unix_time_ms()?;
             if let Some(existing) =
                 select_deleted_project_command(&transaction, &command.command_id)?
             {
-                if existing.project_id != project_id || existing.actor != command.actor {
+                if !existing.matches(&project_id, &command) {
                     return Err(ProjectStoreError::IdempotencyConflict);
                 }
                 purge_project_repositories(&transaction, &project_id)?;
                 let cleanup_pending =
-                    worker_runtime_cleanup_pending(&transaction, &existing.orchestrator_worker_id)?;
+                    worker_runtime_cleanup_pending(&transaction, &existing.orchestrator_worker_id)?
+                        || runtime_cleanup_pending(&transaction, &command.command_id)?;
+                let background = coordination_node_store::project_background_status(
+                    &transaction,
+                    &project_id,
+                    now,
+                )?;
+                let cancelled = project_archive_store::cancelled_assignment_ids(
+                    &transaction,
+                    &command.command_id,
+                )?;
                 transaction.commit()?;
-                return Ok(existing.deleted(cleanup_pending, true));
+                return Ok(existing.deleted(cleanup_pending, background, cancelled, true));
             }
             if command_id_exists(&transaction, &command.command_id)? {
                 return Err(ProjectStoreError::IdempotencyConflict);
@@ -3182,17 +3226,17 @@ impl YardStore for SqliteProjectStore {
                 return Err(ProjectStoreError::ProjectAlreadyDeleted);
             }
 
-            let archived = select_archived_project_target(&transaction, &project_id)?
-                .ok_or(ProjectStoreError::ProjectNotArchived)?;
-            let worker_version = transaction
-                .query_row(
-                    "SELECT version FROM workers WHERE id = ?1",
-                    [&archived.orchestrator_worker_id],
-                    |row| row_u64(row, 0),
-                )
-                .optional()?
-                .ok_or(ProjectStoreError::WorkerNotFound)?;
-            let now = unix_time_ms()?;
+            // An archive by any command, including another tab's, wins over
+            // this command's archive preconditions.
+            let archived_orchestrator = select_archived_project_target(&transaction, &project_id)?
+                .map(|target| target.orchestrator_worker_id);
+            if archived_orchestrator.is_none() {
+                // Unknown IDs are rejected before anything is written.
+                select_project(&transaction, &project_id)?;
+                if command.archive.is_none() {
+                    return Err(ProjectStoreError::ProjectNotArchived);
+                }
+            }
             transaction.execute(
                 "INSERT INTO command_acknowledgements (
                     id, command_type, actor, status, error_message,
@@ -3202,6 +3246,39 @@ impl YardStore for SqliteProjectStore {
                  )",
                 params![command.command_id, command.actor, to_i64(now)?],
             )?;
+            let archive_applied = archived_orchestrator.is_none();
+            let (orchestrator_worker_id, cancelled_assignment_ids) =
+                if let Some(worker_id) = archived_orchestrator {
+                    (worker_id, Vec::new())
+                } else {
+                    let archive = command
+                        .archive
+                        .as_ref()
+                        .ok_or(ProjectStoreError::ProjectNotArchived)?;
+                    let archived = archive_project_tx(
+                        &transaction,
+                        &project_id,
+                        &ArchiveCommandContext {
+                            command_id: &command.command_id,
+                            actor: &command.actor,
+                            request_origin,
+                        },
+                        archive,
+                        now,
+                    )?;
+                    (
+                        archived.orchestrator_worker_id,
+                        archived.cancelled_assignment_ids,
+                    )
+                };
+            let worker_version = transaction
+                .query_row(
+                    "SELECT version FROM workers WHERE id = ?1",
+                    [&orchestrator_worker_id],
+                    |row| row_u64(row, 0),
+                )
+                .optional()?
+                .ok_or(ProjectStoreError::WorkerNotFound)?;
             transaction.execute(
                 "INSERT INTO deleted_projects (
                     project_id, command_id, orchestrator_worker_id,
@@ -3210,18 +3287,34 @@ impl YardStore for SqliteProjectStore {
                 params![
                     project_id,
                     command.command_id,
-                    archived.orchestrator_worker_id,
+                    orchestrator_worker_id,
                     to_i64(now)?,
                 ],
             )?;
-            if !deleted_worker_exists(&transaction, &archived.orchestrator_worker_id)? {
+            transaction.execute(
+                "INSERT INTO project_delete_commands (
+                    command_id, project_id, archive_json, archive_applied
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    command.command_id,
+                    project_id,
+                    command
+                        .archive
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .map_err(ProjectStoreError::StoredResultJson)?,
+                    archive_applied,
+                ],
+            )?;
+            if !deleted_worker_exists(&transaction, &orchestrator_worker_id)? {
                 transaction.execute(
                     "INSERT INTO deleted_workers (
                         worker_id, command_id, expected_worker_version,
                         deleted_at_unix_ms
                      ) VALUES (?1, ?2, ?3, ?4)",
                     params![
-                        archived.orchestrator_worker_id,
+                        orchestrator_worker_id,
                         command.command_id,
                         to_i64(worker_version)?,
                         to_i64(now)?,
@@ -3230,16 +3323,72 @@ impl YardStore for SqliteProjectStore {
             }
             purge_project_repositories(&transaction, &project_id)?;
             let cleanup_pending =
-                worker_runtime_cleanup_pending(&transaction, &archived.orchestrator_worker_id)?;
+                worker_runtime_cleanup_pending(&transaction, &orchestrator_worker_id)?
+                    || runtime_cleanup_pending(&transaction, &command.command_id)?;
+            let background =
+                coordination_node_store::project_background_status(&transaction, &project_id, now)?;
             transaction.commit()?;
             Ok(DeletedProject {
                 command_id: command.command_id,
                 project_id,
-                orchestrator_worker_id: archived.orchestrator_worker_id,
+                orchestrator_worker_id,
                 deleted_at_unix_ms: now,
                 cleanup_pending,
+                background,
+                cancelled_assignment_ids,
                 replayed: false,
             })
+        })
+        .await
+    }
+
+    async fn list_archived_projects(&self) -> Result<ArchivedProjects, ProjectStoreError> {
+        self.run(|connection| {
+            let transaction = connection.transaction()?;
+            let archived = project_restore_store::list_archived_projects(&transaction)?;
+            transaction.commit()?;
+            Ok(archived)
+        })
+        .await
+    }
+
+    async fn project_restore_plan(
+        &self,
+        project_id: &str,
+        command: RestoreProject,
+    ) -> Result<ProjectRestorePlan, ProjectStoreError> {
+        let project_id = required_id(project_id)?;
+        let command = command.normalize()?;
+        self.run(move |connection| {
+            let transaction = connection.transaction()?;
+            let plan = project_restore_store::restore_plan(&transaction, &project_id, &command)?;
+            transaction.commit()?;
+            Ok(plan)
+        })
+        .await
+    }
+
+    async fn restore_project(
+        &self,
+        project_id: &str,
+        command: RestoreProject,
+        runtime: ProjectRestoreRuntime,
+    ) -> Result<RestoredProject, ProjectStoreError> {
+        let project_id = required_id(project_id)?;
+        let command = command.normalize()?;
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = unix_time_ms()?;
+            let restored = project_restore_store::restore_project_tx(
+                &transaction,
+                &project_id,
+                &command,
+                runtime,
+                now,
+            )?;
+            transaction.commit()?;
+            Ok(restored)
         })
         .await
     }
@@ -5842,6 +5991,7 @@ impl YardStore for SqliteProjectStore {
             if status != "pending" {
                 return Err(ProjectStoreError::CommandNotPending);
             }
+            reject_inactive_provisioning_target(&transaction, &command_id)?;
             if runtime_identity_has_authoritative_binding(&transaction, &runtime)?
                 || runtime_identity_is_provisioning_claimed(
                     &transaction,
@@ -6159,8 +6309,7 @@ impl YardStore for SqliteProjectStore {
 
             let mut source_record = select_assignment_record(&transaction, &source_assignment_id)?
                 .ok_or(ProjectStoreError::AssignmentNotFound)?;
-            source_record.assignment.completion_receipt =
-                select_completion_receipt(&transaction, &source_assignment_id)?;
+            attach_assignment_outcome(&transaction, &mut source_record.assignment)?;
             let source_assignment = &source_record.assignment;
             if source_assignment.project_id != source_project_id
                 || source_assignment.worker.id != command.worker_id
@@ -8771,8 +8920,7 @@ impl YardStore for SqliteProjectStore {
                 .collect::<Result<Vec<_>, _>>()?;
             drop(statement);
             for assignment in &mut assignments {
-                assignment.completion_receipt =
-                    select_completion_receipt(connection, &assignment.id)?;
+                attach_assignment_outcome(connection, assignment)?;
             }
             Ok(Assignments { assignments })
         })
@@ -8998,8 +9146,8 @@ impl YardStore for SqliteProjectStore {
             transaction.execute(
                 "INSERT INTO completion_receipts (
                     id, command_id, assignment_id, attempt_id, outcome,
-                    summary, actor, created_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, 'completed', ?5, ?6, ?7)",
+                    summary, actor, created_at_unix_ms, detail_level
+                 ) VALUES (?1, ?2, ?3, ?4, 'completed', ?5, ?6, ?7, 'detailed')",
                 params![
                     receipt_id,
                     command.command_id,
@@ -9074,6 +9222,19 @@ impl YardStore for SqliteProjectStore {
                   WHERE id = ?2 AND ended_at_unix_ms IS NULL",
                 params![to_i64(now)?, record.allocation.id],
             )?;
+            // Completion revokes live terminal access, so queue a capture of
+            // the still-bound runtime to keep its transcript readable.
+            if let Some(runtime) = record.assignment.worker.runtime.as_ref() {
+                transcript_capture_store::enqueue_transcript_capture(
+                    &transaction,
+                    &command.command_id,
+                    &record.assignment.worker.id,
+                    Some(&assignment_id),
+                    Some(&record.allocation.id),
+                    runtime,
+                    now,
+                )?;
+            }
             transaction.execute(
                 "UPDATE command_acknowledgements
                     SET status = 'succeeded', updated_at_unix_ms = ?1
@@ -9095,6 +9256,76 @@ impl YardStore for SqliteProjectStore {
             Ok(recorded)
         })
         .await
+    }
+
+    async fn dispose_assignment(
+        &self,
+        project_id: &str,
+        assignment_id: &str,
+        command: DisposeAssignment,
+        request_origin: RequestOrigin,
+    ) -> Result<DisposedAssignment, ProjectStoreError> {
+        assignment_disposition_store::dispose_assignment(
+            self,
+            project_id,
+            assignment_id,
+            command,
+            request_origin,
+        )
+        .await
+    }
+
+    async fn claim_pending_transcript_captures(
+        &self,
+        command_id: Option<&str>,
+        limit: usize,
+        claim_ttl_ms: u64,
+    ) -> Result<Vec<PendingTranscriptCapture>, ProjectStoreError> {
+        transcript_capture_store::claim_pending(self, command_id, limit, claim_ttl_ms).await
+    }
+
+    async fn transcript_capture_guard(
+        &self,
+        job_id: &str,
+        claim_token: &str,
+    ) -> Result<TranscriptCaptureGuard, ProjectStoreError> {
+        transcript_capture_store::guard(self, job_id, claim_token).await
+    }
+
+    async fn succeed_transcript_capture(
+        &self,
+        job_id: &str,
+        claim_token: &str,
+        captured: CapturedTranscriptText,
+    ) -> Result<TranscriptCaptureOutcome, ProjectStoreError> {
+        transcript_capture_store::succeed(self, job_id, claim_token, captured).await
+    }
+
+    async fn expire_transcript_capture(
+        &self,
+        job_id: &str,
+        claim_token: &str,
+        expiry: TranscriptCaptureExpiry,
+    ) -> Result<(), ProjectStoreError> {
+        transcript_capture_store::expire(self, job_id, claim_token, expiry).await
+    }
+
+    async fn fail_transcript_capture(
+        &self,
+        job_id: &str,
+        claim_token: &str,
+        message: &str,
+        retry_after_ms: u64,
+    ) -> Result<(), ProjectStoreError> {
+        transcript_capture_store::fail(self, job_id, claim_token, message, retry_after_ms).await
+    }
+
+    async fn get_assignment_transcript(
+        &self,
+        project_id: &str,
+        assignment_id: &str,
+    ) -> Result<WorkerTranscript, ProjectStoreError> {
+        transcript_capture_store::assignment_transcript(self, project_id, assignment_id).await
     }
 
     async fn begin_assignment_prompt(
@@ -9983,6 +10214,9 @@ fn select_runtime_topology(
 ) -> Result<RuntimeTopology, ProjectStoreError> {
     let mut managed_workspaces = BTreeMap::<String, ManagedRuntimeWorkspace>::new();
     add_central_runtime_workspace(connection, adapter, session, &mut managed_workspaces)?;
+    // The archived-node filter below is defensive, not reachable today:
+    // archive deletes the node's worker binding in the same transaction, so
+    // it only matters if a later change (e.g. a restore) keeps the binding.
     add_managed_workspace_rows(
         connection,
         "SELECT DISTINCT binding.runtime_workspace_id
@@ -9991,6 +10225,10 @@ fn select_runtime_topology(
              ON binding.worker_id = node.worker_id
           WHERE binding.adapter = ?1
             AND binding.runtime_session = ?2
+            AND NOT EXISTS (
+                SELECT 1 FROM archived_coordination_nodes archived
+                 WHERE archived.node_id = node.id
+            )
           ORDER BY binding.runtime_workspace_id",
         adapter,
         session,
@@ -10217,15 +10455,24 @@ fn add_cleanup_runtime_occupants(
     session: &str,
     managed_workspaces: &mut BTreeMap<String, ManagedRuntimeWorkspace>,
 ) -> Result<(), ProjectStoreError> {
+    // An archived or deleted workstream's dedicated worker leaves its Herdr
+    // tab open (Yard never closes it), so its cleanup territory names the
+    // workstream the user has to close the tab for.
     let mut statement = connection.prepare(
         "SELECT cleanup.runtime_workspace_id, cleanup.terminal_id,
                 cleanup.tab_id, cleanup.pane_id, cleanup.reason,
-                project.name
+                project.name, node.name, deleted_node.command_id IS NOT NULL
            FROM runtime_cleanup_jobs cleanup
            LEFT JOIN archived_projects archived
              ON archived.command_id = cleanup.command_id
            LEFT JOIN projects project
              ON project.id = archived.project_id
+           LEFT JOIN archived_coordination_nodes archived_node
+             ON archived_node.command_id = cleanup.command_id
+           LEFT JOIN coordination_nodes node
+             ON node.id = archived_node.node_id
+           LEFT JOIN deleted_coordination_nodes deleted_node
+             ON deleted_node.node_id = archived_node.node_id
           WHERE cleanup.status = 'pending'
             AND cleanup.adapter = ?1
             AND cleanup.runtime_session = ?2
@@ -10234,32 +10481,50 @@ fn add_cleanup_runtime_occupants(
     let occupants = statement
         .query_map(params![adapter, session], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
+                (
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ),
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, bool>(7)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    for (workspace_id, terminal_id, tab_id, pane_id, reason, project_name) in occupants {
-        let label = if reason == "project_archive" {
-            "Archived runtime—cleanup pending"
-        } else {
-            "Managed runtime—cleanup pending"
+    for ((workspace_id, terminal_id, tab_id, pane_id), reason, project_name, workstream, deleted) in
+        occupants
+    {
+        let (workspace_label, label) = match workstream {
+            Some(name) => {
+                let state = if deleted { "Deleted" } else { "Archived" };
+                (
+                    format!("{state} workstream {name}—cleanup pending"),
+                    format!("{state} workstream {name}—close its Herdr tab"),
+                )
+            }
+            None if reason == "project_archive" => (
+                "Runtime cleanup pending".to_owned(),
+                "Archived runtime—cleanup pending".to_owned(),
+            ),
+            None => (
+                "Runtime cleanup pending".to_owned(),
+                "Managed runtime—cleanup pending".to_owned(),
+            ),
         };
         add_managed_runtime_occupant(
             managed_workspaces,
             workspace_id,
             ManagedRuntimeWorkspaceKind::CleanupPending,
-            "Runtime cleanup pending",
+            &workspace_label,
             ManagedRuntimeOccupant {
                 kind: ManagedRuntimeOccupantKind::CleanupPending,
                 terminal_id,
                 tab_id,
                 pane_id,
-                label: label.to_owned(),
+                label,
                 reason,
                 project_name,
             },
@@ -11774,6 +12039,9 @@ const ASSIGNMENT_SELECT: &str = "
             WHERE latest.assignment_id = a.id
        )";
 
+// The coordination-node reservation's archived-node filter is defensive, not
+// reachable today: archive ends the node's worker (and deletes its binding) in
+// the same transaction, so an archived node never holds a live candidate.
 const WORKER_CANDIDATE_SELECT: &str = "
     SELECT w.id, w.profile_id, w.profile_version,
            CASE WHEN w.ended_at_unix_ms IS NULL
@@ -11820,6 +12088,10 @@ const WORKER_CANDIDATE_SELECT: &str = "
                SELECT cn.id
                  FROM coordination_nodes cn
                 WHERE cn.worker_id = w.id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM archived_coordination_nodes archived
+                       WHERE archived.node_id = cn.id
+                  )
                 LIMIT 1
            ),
            EXISTS (
@@ -12122,6 +12394,7 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
             supported: SCHEMA_VERSION,
         });
     }
+    ensure_migratable_schema_lineage(connection, current)?;
     if current == 0 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(INITIAL_MIGRATION)?;
@@ -12487,10 +12760,21 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         current = 28;
     }
     if current == 28 {
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute_batch(PROJECT_REPOSITORIES_MIGRATION)?;
-        ensure_foreign_keys(&transaction)?;
-        transaction.commit()?;
+        connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let migration = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if visibility_deletions_schema_is_3fdcf5e(&transaction)? {
+                transaction.execute_batch(VISIBILITY_DELETIONS_REPAIR_MIGRATION)?;
+            }
+            transaction.execute_batch(PROJECT_REPOSITORIES_MIGRATION)?;
+            ensure_foreign_keys(&transaction)?;
+            transaction.commit()?;
+            Ok::<(), ProjectStoreError>(())
+        })();
+        let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
+        migration?;
+        foreign_keys?;
         current = 29;
     }
     if current == 29 {
@@ -12519,8 +12803,324 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         transaction.execute_batch(SUMMARY_WORKER_MIGRATION)?;
         ensure_foreign_keys(&transaction)?;
         transaction.commit()?;
+        current = 33;
+    }
+    if current == 33 {
+        connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let migration = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(SNAPSHOT_EXPIRY_AND_DELETE_COMMANDS_MIGRATION)?;
+            ensure_foreign_keys(&transaction)?;
+            transaction.commit()?;
+            Ok::<(), ProjectStoreError>(())
+        })();
+        let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
+        migration?;
+        foreign_keys?;
+        current = 34;
+    }
+    if current == 34 {
+        connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let migration = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(COORDINATION_NODE_DISPOSITIONS_MIGRATION)?;
+            ensure_foreign_keys(&transaction)?;
+            transaction.commit()?;
+            Ok::<(), ProjectStoreError>(())
+        })();
+        let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
+        migration?;
+        foreign_keys?;
+        current = 35;
+    }
+    if current == 35 {
+        connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let migration = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(ASSIGNMENT_DISPOSITION_MIGRATION)?;
+            ensure_foreign_keys(&transaction)?;
+            transaction.commit()?;
+            Ok::<(), ProjectStoreError>(())
+        })();
+        let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
+        migration?;
+        foreign_keys?;
+        current = 36;
+    }
+    if current == 36 {
+        connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let migration = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(ARCHIVE_ACTIVE_WORK_MIGRATION)?;
+            ensure_foreign_keys(&transaction)?;
+            transaction.commit()?;
+            Ok::<(), ProjectStoreError>(())
+        })();
+        let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
+        migration?;
+        foreign_keys?;
+        current = 37;
+    }
+    if current == 37 {
+        connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let migration = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(PROJECT_RESTORE_MIGRATION)?;
+            ensure_foreign_keys(&transaction)?;
+            transaction.commit()?;
+            Ok::<(), ProjectStoreError>(())
+        })();
+        let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
+        migration?;
+        foreign_keys?;
     }
     ensure_foreign_keys(connection)?;
+    Ok(())
+}
+
+/// One migration's schema markers: `(level, tables, indexes, (table, column))`.
+/// A group counts as present only when every marker exists.
+type MarkerGroup = (
+    i64,
+    &'static [&'static str],
+    &'static [&'static str],
+    &'static [(&'static str, &'static str)],
+);
+
+/// Objects created by mainline migrations 0029..0033 (levels are mainline
+/// `user_version`s).
+const MAINLINE_LINEAGE_MARKERS: &[MarkerGroup] = &[
+    (
+        29,
+        &["project_repositories"],
+        &["project_repositories_project"],
+        &[],
+    ),
+    (
+        30,
+        &[
+            "yard_installation",
+            "pane_management_batches",
+            "pane_management_leases",
+        ],
+        &["pane_management_leases_renewal"],
+        &[],
+    ),
+    (
+        31,
+        &[
+            "worker_cleanup_policy",
+            "worker_cleanup_runs",
+            "worker_cleanup_run_items",
+            "worker_cleanup_pins",
+            "cleanup_advisor_artifacts",
+        ],
+        &[
+            "pending_worker_cleanup_items",
+            "one_pending_cleanup_per_worker",
+        ],
+        &[
+            ("workers", "ownership_kind"),
+            ("workers", "parent_worker_id"),
+        ],
+    ),
+    (
+        32,
+        &["agent_profile_files", "profile_launch_audits"],
+        &[],
+        &[],
+    ),
+    (
+        33,
+        &["summary_worker_commands"],
+        &["summary_workers_by_parent"],
+        &[("worker_cleanup_run_items", "pane_instance_id")],
+    ),
+];
+
+/// Objects created by the pre-rebase fork's migrations 0029..0034
+/// (`feature/worker-names` @ d897fd1). Levels are FORK `user_version`s; the
+/// rebased chain carries the same objects at level + `FORK_BRIDGE_OFFSET`.
+const FORK_LINEAGE_MARKERS: &[MarkerGroup] = &[
+    (
+        29,
+        &["project_delete_commands"],
+        &[],
+        &[
+            ("coordination_snapshot_projects", "abandoned_reason"),
+            ("coordination_snapshot_projects", "abandoned_at_unix_ms"),
+        ],
+    ),
+    (
+        30,
+        &[
+            "archived_coordination_nodes",
+            "archived_coordination_node_automations",
+            "deleted_coordination_nodes",
+        ],
+        &[],
+        &[],
+    ),
+    (
+        31,
+        &[
+            "assignment_cancellations",
+            "assignment_disposition_commands",
+            "transcript_capture_jobs",
+            "worker_transcripts",
+        ],
+        &[
+            "pending_transcript_capture_jobs",
+            "worker_transcripts_by_runtime",
+        ],
+        &[("completion_receipts", "detail_level")],
+    ),
+    (
+        32,
+        &[],
+        &[],
+        &[
+            ("archived_projects", "active_work"),
+            ("archived_projects", "expected_active_assignments_json"),
+        ],
+    ),
+    (
+        33,
+        &["project_restore_commands"],
+        &[
+            "current_archived_projects",
+            "unreleased_retired_runtime_identities",
+        ],
+        &[
+            ("archived_projects", "restore_command_id"),
+            ("retired_runtime_bindings", "released_by_command_id"),
+        ],
+    ),
+    (
+        34,
+        &["worker_rename_commands"],
+        &["worker_rename_commands_by_worker"],
+        &[("workers", "display_name")],
+    ),
+];
+
+/// Fork level N carries the same objects as rebased level N + 5, because the
+/// rebased chain runs mainline 0029..0033 before our renumbered migrations.
+const FORK_BRIDGE_OFFSET: i64 = 5;
+/// Last mainline `user_version`; rebased levels start right after it.
+const MAINLINE_LAST_SCHEMA_VERSION: i64 = 33;
+
+/// Which migration chain produced a database, decided by schema markers
+/// because `user_version` 29..34 means different schemas on the mainline,
+/// pre-rebase fork and rebased chains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaLineage {
+    /// Version 28 or older: identical on every chain.
+    Shared,
+    /// Mainline 0029..0033 only.
+    Mainline(i64),
+    /// Pre-rebase fork 0029..0034 only (no mainline objects).
+    Fork(i64),
+    /// Mainline 0029..0033 followed by our renumbered migrations.
+    Rebased(i64),
+}
+
+/// The highest level whose groups (and all groups below it) are fully
+/// present, or 28 when no marker exists. Partial groups and gaps are invalid.
+fn marker_level(
+    connection: &Connection,
+    lineage: &str,
+    groups: &[MarkerGroup],
+) -> Result<i64, ProjectStoreError> {
+    let mut level = 28;
+    let mut absent_from: Option<i64> = None;
+    for (group_level, tables, indexes, columns) in groups {
+        let mut present = 0;
+        for table in *tables {
+            present += usize::from(table_exists(connection, table)?);
+        }
+        for index in *indexes {
+            present += usize::from(index_exists(connection, index)?);
+        }
+        for (table, column) in *columns {
+            present += usize::from(table_has_column(connection, table, column)?);
+        }
+        let total = tables.len() + indexes.len() + columns.len();
+        if present == 0 {
+            absent_from.get_or_insert(*group_level);
+            continue;
+        }
+        if present != total {
+            return invalid_schema_lineage(&format!(
+                "{lineage} level {group_level} markers are partially present ({present}/{total})"
+            ));
+        }
+        if let Some(missing) = absent_from {
+            return invalid_schema_lineage(&format!(
+                "{lineage} level {group_level} markers exist but level {missing} markers are missing"
+            ));
+        }
+        level = *group_level;
+    }
+    Ok(level)
+}
+
+fn classify_schema_lineage(
+    connection: &Connection,
+    version: i64,
+) -> Result<SchemaLineage, ProjectStoreError> {
+    let mainline = marker_level(connection, "mainline", MAINLINE_LINEAGE_MARKERS)?;
+    let fork = marker_level(connection, "fork", FORK_LINEAGE_MARKERS)?;
+    let rebased = MAINLINE_LAST_SCHEMA_VERSION + 1..=SCHEMA_VERSION;
+    match (version, mainline, fork) {
+        (version, 28, 28) if version <= 28 => Ok(SchemaLineage::Shared),
+        (version, mainline, 28) if (29..=33).contains(&version) && mainline == version => {
+            Ok(SchemaLineage::Mainline(version))
+        }
+        (version, 28, fork) if (29..=34).contains(&version) && fork == version => {
+            Ok(SchemaLineage::Fork(version))
+        }
+        (version, MAINLINE_LAST_SCHEMA_VERSION, fork)
+            if rebased.contains(&version) && fork == version - FORK_BRIDGE_OFFSET =>
+        {
+            Ok(SchemaLineage::Rebased(version))
+        }
+        (version, mainline, fork) => invalid_schema_lineage(&format!(
+            "user_version {version} with mainline markers through {mainline} and fork \
+             markers through {fork}"
+        )),
+    }
+}
+
+fn invalid_schema_lineage<T>(detail: &str) -> Result<T, ProjectStoreError> {
+    Err(ProjectStoreError::InvalidSchemaLineage {
+        detail: detail.to_owned(),
+    })
+}
+
+/// Refuses databases this build cannot migrate safely: pre-rebase fork
+/// databases (their `user_version` 29..34 names other schemas than ours) and
+/// any mix of markers that no chain produces. Runs before any step writes.
+fn ensure_migratable_schema_lineage(
+    connection: &Connection,
+    current: i64,
+) -> Result<(), ProjectStoreError> {
+    let level = match classify_schema_lineage(connection, current)? {
+        SchemaLineage::Shared => current,
+        SchemaLineage::Mainline(level) | SchemaLineage::Rebased(level) => level,
+        SchemaLineage::Fork(level) => {
+            return invalid_schema_lineage(&format!(
+                "user_version {level} is a pre-rebase fork schema (fork migrations through \
+                 {level}); this build cannot migrate it yet"
+            ));
+        }
+    };
+    debug_assert_eq!(level, current);
     Ok(())
 }
 
@@ -13824,6 +14424,18 @@ fn command_acknowledgements_support_worker_session_end(
     Ok(command_schema.is_some_and(|schema| schema.contains("'worker_session_end'")))
 }
 
+/// Commit 3fdcf5e shipped a first 0028 that f2cf35e rewrote in place, so a
+/// database that reached version 28 on 3fdcf5e keeps that shape: tombstones
+/// with an `actor` column, no command FK, and acknowledgement types without
+/// `project_delete` or `worker_delete`. The rewritten 0028 widens those types
+/// and creates both tombstone tables in one transaction, so the column alone
+/// identifies the 3fdcf5e shape.
+fn visibility_deletions_schema_is_3fdcf5e(
+    connection: &Connection,
+) -> Result<bool, ProjectStoreError> {
+    table_has_column(connection, "deleted_projects", "actor")
+}
+
 fn table_exists(connection: &Connection, table: &str) -> Result<bool, ProjectStoreError> {
     connection
         .query_row(
@@ -13872,8 +14484,27 @@ fn ensure_project_workspace_available_for(
     project_runtime: &ProjectRuntimeBinding,
     excluded_command_id: Option<&str>,
 ) -> Result<(), ProjectStoreError> {
-    ensure_project_workspace_unbound(transaction, project_runtime)?;
-    let reserved = transaction.query_row(
+    ensure_project_workspace_available(transaction, project_runtime, excluded_command_id, None)
+}
+
+/// Whether nothing else holds a project workspace. `own_project_id` (used by
+/// Restore) ignores runtime cleanup jobs of workers that were allocated to
+/// that project: they are the project's own ended workers, whose Herdr tabs
+/// may stay open in its workspace, not another owner. It also ignores
+/// quarantined runtimes left by that project's own allocations or by handoffs
+/// into it: nothing ever deletes those rows, and they did not stop the
+/// project using its workspace before the archive.
+fn ensure_project_workspace_available(
+    connection: &Connection,
+    project_runtime: &ProjectRuntimeBinding,
+    excluded_command_id: Option<&str>,
+    own_project_id: Option<&str>,
+) -> Result<(), ProjectStoreError> {
+    ensure_project_workspace_unbound(connection, project_runtime)?;
+    // The coordination-node arm's archived-node filter is defensive, not
+    // reachable today: archive deletes the node's worker binding, so an
+    // archived node never occupies a workspace through it.
+    let reserved = connection.query_row(
         "SELECT EXISTS (
             SELECT 1
               FROM profile_project_creation_commands command
@@ -13898,6 +14529,10 @@ fn ensure_project_workspace_available_for(
              WHERE binding.adapter = ?1
                AND binding.runtime_session = ?2
                AND binding.runtime_workspace_id = ?3
+               AND NOT EXISTS (
+                   SELECT 1 FROM archived_coordination_nodes archived
+                    WHERE archived.node_id = node.id
+               )
             UNION ALL
             SELECT 1
               FROM provisioning_runtime_claims claim
@@ -13911,6 +14546,23 @@ fn ensure_project_workspace_available_for(
              WHERE quarantine.adapter = ?1
                AND quarantine.runtime_session = ?2
                AND quarantine.runtime_workspace_id = ?3
+               AND NOT (?5 IS NOT NULL AND (
+                   EXISTS (
+                       SELECT 1 FROM worker_handoff_commands handoff
+                        WHERE handoff.command_id = quarantine.command_id
+                          AND handoff.target_project_id = ?5
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM worker_allocation_commands allocation
+                        WHERE allocation.command_id = quarantine.command_id
+                          AND allocation.project_id = ?5
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM profile_allocation_commands allocation
+                        WHERE allocation.command_id = quarantine.command_id
+                          AND allocation.project_id = ?5
+                   )
+               ))
             UNION ALL
             SELECT 1
               FROM runtime_cleanup_jobs cleanup
@@ -13918,12 +14570,19 @@ fn ensure_project_workspace_available_for(
                AND cleanup.adapter = ?1
                AND cleanup.runtime_session = ?2
                AND cleanup.runtime_workspace_id = ?3
+               AND NOT EXISTS (
+                   SELECT 1 FROM worker_allocations allocation
+                    WHERE ?5 IS NOT NULL
+                      AND allocation.project_id = ?5
+                      AND allocation.worker_id = cleanup.worker_id
+               )
          )",
         params![
             project_runtime.adapter,
             project_runtime.session,
             project_runtime.workspace_id,
             excluded_command_id,
+            own_project_id,
         ],
         |row| row.get::<_, bool>(0),
     )?;
@@ -13959,10 +14618,10 @@ fn ensure_workspace_project_creation_available(
 }
 
 fn ensure_project_workspace_unbound(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     project_runtime: &ProjectRuntimeBinding,
 ) -> Result<(), ProjectStoreError> {
-    let workspace_exists = transaction.query_row(
+    let workspace_exists = connection.query_row(
         "SELECT EXISTS (
             SELECT 1 FROM project_workspace_bindings
              WHERE adapter = ?1
@@ -14267,37 +14926,333 @@ fn reject_project_orchestrator_intervention(
     }
 }
 
-fn reject_project_archive_dependencies(
+/// Archive-only gate for work that is still in flight. Unlike
+/// [`reject_project_orchestrator_intervention`], kept for its other callers,
+/// it ignores snapshot state, which archive reports as background status, and
+/// terminal records: an ambiguous handoff never sets `finished_at_unix_ms`.
+/// A pending snapshot delivery is skipped too. It is not strictly in-process
+/// (a dropped request leaves it pending until restart), and delivery re-reads
+/// the project, so it records a failed or ambiguous outcome once archived.
+fn reject_project_archive_in_flight_work(
     connection: &Connection,
     project_id: &str,
 ) -> Result<(), ProjectStoreError> {
-    let snapshot_collection_pending = connection.query_row(
-        "SELECT EXISTS (
-            SELECT 1
-              FROM coordination_snapshot_projects snapshot
-             WHERE snapshot.project_id = ?1
-               AND snapshot.collection_status <> 'collected'
-         )",
-        [project_id],
-        |row| row.get::<_, bool>(0),
-    )?;
-    if snapshot_collection_pending {
-        return Err(ProjectStoreError::ProjectArchiveSnapshotCollectionPending);
-    }
-    let incoming_handoff = connection.query_row(
+    let handoff_in_flight = connection.query_row(
         "SELECT EXISTS (
             SELECT 1
               FROM worker_handoff_commands handoff
-             WHERE handoff.target_project_id = ?1
-               AND handoff.finished_at_unix_ms IS NULL
+              JOIN command_acknowledgements command
+                ON command.id = handoff.command_id
+             WHERE (handoff.target_project_id = ?1
+                    OR handoff.source_project_id = ?1)
+               AND command.status = 'pending'
          )",
         [project_id],
         |row| row.get::<_, bool>(0),
     )?;
-    if incoming_handoff {
+    if handoff_in_flight {
         return Err(ProjectStoreError::ProjectArchiveHandoffInProgress);
     }
-    reject_project_orchestrator_intervention(connection, project_id, None)
+    // A summary worker that is still being allocated has no assignment yet,
+    // so the archive cannot cancel it; it waits until the summary worker is
+    // active (then it is ended with the archive) or has failed.
+    let summary_allocating = connection.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM summary_worker_commands
+             WHERE project_id = ?1 AND status = 'allocating'
+         )",
+        [project_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if summary_allocating {
+        return Err(ProjectStoreError::ProjectArchiveSummaryWorkerAllocating);
+    }
+    let intervention_in_flight = connection.query_row(
+        "SELECT EXISTS (
+            SELECT 1
+              FROM orchestrator_prompt_commands prompt
+              JOIN command_acknowledgements command
+                ON command.id = prompt.command_id
+             WHERE prompt.project_id = ?1
+               AND command.status = 'pending'
+            UNION ALL
+            SELECT 1
+              FROM yard_orchestrator_route_commands route
+              JOIN command_acknowledgements command
+                ON command.id = route.command_id
+             WHERE route.target_project_id = ?1
+               AND command.status = 'pending'
+            UNION ALL
+            SELECT 1
+              FROM coordination_node_route_commands route
+              JOIN command_acknowledgements command
+                ON command.id = route.command_id
+             WHERE route.target_project_id = ?1
+               AND command.status = 'pending'
+            UNION ALL
+            SELECT 1
+              FROM project_orchestrator_replacement_commands replacement
+             WHERE replacement.project_id = ?1
+               AND replacement.finished_at_unix_ms IS NULL
+         )",
+        [project_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if intervention_in_flight {
+        Err(ProjectStoreError::OrchestratorInterventionInProgress)
+    } else {
+        Ok(())
+    }
+}
+
+struct ArchivedProjectTransition {
+    orchestrator_worker_id: String,
+    cleanup_pending: bool,
+    cancelled_assignment_ids: Vec<String>,
+}
+
+/// The command an archive transaction runs under: a project archive, or a
+/// delete that archives an active project first.
+struct ArchiveCommandContext<'a> {
+    command_id: &'a str,
+    actor: &'a str,
+    request_origin: RequestOrigin,
+}
+
+/// Archive an active project inside the caller's transaction.
+///
+/// The caller owns the command: `command_id` must already be in
+/// `command_acknowledgements`, and the archive row, the cancellations of any
+/// active assignments, and every retired runtime and cleanup job are all
+/// recorded under it.
+#[allow(clippy::too_many_lines)]
+fn archive_project_tx(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    context: &ArchiveCommandContext<'_>,
+    preconditions: &ProjectArchivePreconditions,
+    now: u64,
+) -> Result<ArchivedProjectTransition, ProjectStoreError> {
+    let ArchiveCommandContext {
+        command_id,
+        actor,
+        request_origin,
+    } = *context;
+    let project = select_project(transaction, project_id)?;
+    if project.version != preconditions.expected_project_version {
+        return Err(ProjectStoreError::ProjectVersionConflict {
+            current_version: project.version,
+        });
+    }
+    if project.orchestrator.id != preconditions.expected_orchestrator_worker_id {
+        return Err(ProjectStoreError::OrchestratorNotCurrent {
+            current_worker_id: project.orchestrator.id,
+        });
+    }
+    if project.orchestrator.version != preconditions.expected_orchestrator_worker_version {
+        return Err(ProjectStoreError::WorkerVersionConflict {
+            current_version: project.orchestrator.version,
+        });
+    }
+    let current_runtime_version = project
+        .orchestrator
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.version);
+    if current_runtime_version != preconditions.expected_orchestrator_runtime_version {
+        return Err(ProjectStoreError::WorkerRuntimeVersionConflict {
+            current_version: current_runtime_version,
+        });
+    }
+    reject_project_archive_in_flight_work(transaction, project_id)?;
+    let cancelled =
+        project_archive_store::gate_active_work(transaction, project_id, preconditions)?;
+    if project_has_active_work(transaction, project_id)? {
+        return Err(ProjectStoreError::ProjectHasArchiveDependencies);
+    }
+
+    let next_project_version = project
+        .version
+        .checked_add(1)
+        .ok_or(ProjectStoreError::VersionOverflow)?;
+    let next_worker_version = project
+        .orchestrator
+        .version
+        .checked_add(1)
+        .ok_or(ProjectStoreError::VersionOverflow)?;
+    transaction.execute(
+        "INSERT INTO archived_projects (
+            project_id, command_id, expected_project_version,
+            expected_orchestrator_worker_id,
+            expected_orchestrator_worker_version,
+            expected_orchestrator_runtime_version,
+            result_project_version,
+            result_orchestrator_worker_version, runtime_adapter,
+            runtime_session, runtime_workspace_id,
+            archived_at_unix_ms, active_work,
+            expected_active_assignments_json
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+         )",
+        params![
+            project_id,
+            command_id,
+            to_i64(preconditions.expected_project_version)?,
+            preconditions.expected_orchestrator_worker_id,
+            to_i64(preconditions.expected_orchestrator_worker_version)?,
+            preconditions
+                .expected_orchestrator_runtime_version
+                .map(to_i64)
+                .transpose()?,
+            to_i64(next_project_version)?,
+            to_i64(next_worker_version)?,
+            project.runtime.adapter,
+            project.runtime.session,
+            project.runtime.workspace_id,
+            to_i64(now)?,
+            preconditions.active_work.as_str(),
+            preconditions
+                .expected_active_assignments
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(ProjectStoreError::StoredResultJson)?,
+        ],
+    )?;
+    // Members first: each cancellation, retirement, and capture is keyed
+    // by the member worker, and ends only that worker's own allocation.
+    project_archive_store::cancel_active_assignments(
+        transaction,
+        command_id,
+        actor,
+        request_origin,
+        &cancelled,
+        now,
+    )?;
+
+    let project_rows = transaction.execute(
+        "UPDATE projects
+            SET version = ?1, updated_at_unix_ms = ?2
+          WHERE id = ?3 AND version = ?4
+            AND orchestrator_worker_id = ?5",
+        params![
+            to_i64(next_project_version)?,
+            to_i64(now)?,
+            project_id,
+            to_i64(project.version)?,
+            preconditions.expected_orchestrator_worker_id,
+        ],
+    )?;
+    if project_rows != 1 {
+        return Err(ProjectStoreError::ProjectVersionConflict {
+            current_version: project.version,
+        });
+    }
+    transaction.execute(
+        "UPDATE worker_allocations
+            SET ended_at_unix_ms = ?1
+          WHERE project_id = ?2 AND ended_at_unix_ms IS NULL",
+        params![to_i64(now)?, project_id],
+    )?;
+
+    let cleanup_pending = if let Some(runtime) = project.orchestrator.runtime.as_ref() {
+        insert_retired_runtime_binding(
+            transaction,
+            command_id,
+            &project.orchestrator.id,
+            "project_archive",
+            runtime,
+            now,
+        )?;
+        insert_runtime_cleanup_job(
+            transaction,
+            command_id,
+            &project.orchestrator.id,
+            "project_archive",
+            runtime,
+            RuntimeCleanupExpectation {
+                worker_version: Some(next_worker_version),
+                binding_state: "detached",
+            },
+            now,
+        )?;
+        let runtime_rows = transaction.execute(
+            "DELETE FROM worker_runtime_bindings
+                  WHERE worker_id = ?1 AND version = ?2",
+            params![project.orchestrator.id, to_i64(runtime.version)?,],
+        )?;
+        if runtime_rows != 1 {
+            return Err(ProjectStoreError::WorkerRuntimeVersionConflict {
+                current_version: None,
+            });
+        }
+        true
+    } else {
+        false
+    };
+
+    let worker_rows = transaction.execute(
+        "UPDATE workers
+            SET ended_at_unix_ms = ?1, version = ?2,
+                updated_at_unix_ms = ?1
+          WHERE id = ?3 AND version = ?4
+            AND ended_at_unix_ms IS NULL",
+        params![
+            to_i64(now)?,
+            to_i64(next_worker_version)?,
+            project.orchestrator.id,
+            to_i64(project.orchestrator.version)?,
+        ],
+    )?;
+    if worker_rows != 1 {
+        return Err(ProjectStoreError::WorkerVersionConflict {
+            current_version: project.orchestrator.version,
+        });
+    }
+    coordination_node_store::archive_project_attachments(transaction, project_id, actor, now)?;
+    let workspace_rows = transaction.execute(
+        "DELETE FROM project_workspace_bindings
+          WHERE project_id = ?1
+            AND adapter = ?2
+            AND runtime_session = ?3
+            AND runtime_workspace_id = ?4",
+        params![
+            project_id,
+            project.runtime.adapter,
+            project.runtime.session,
+            project.runtime.workspace_id,
+        ],
+    )?;
+    if workspace_rows != 1 {
+        return Err(ProjectStoreError::ProjectNotFound);
+    }
+    insert_lifecycle_event(
+        transaction,
+        "project",
+        project_id,
+        next_project_version,
+        "project_archived",
+        actor,
+        now,
+    )?;
+    insert_lifecycle_event(
+        transaction,
+        "worker",
+        &project.orchestrator.id,
+        next_worker_version,
+        "project_archive_orchestrator_ended",
+        actor,
+        now,
+    )?;
+    let cleanup_pending = cleanup_pending || runtime_cleanup_pending(transaction, command_id)?;
+    Ok(ArchivedProjectTransition {
+        orchestrator_worker_id: project.orchestrator.id,
+        cleanup_pending,
+        cancelled_assignment_ids: cancelled
+            .into_iter()
+            .map(|assignment| assignment.assignment_id)
+            .collect(),
+    })
 }
 
 fn select_project(connection: &Connection, project_id: &str) -> Result<Project, ProjectStoreError> {
@@ -14321,6 +15276,8 @@ struct StoredArchivedProject {
     expected_orchestrator_worker_version: u64,
     expected_orchestrator_runtime_version: Option<u64>,
     archived_at_unix_ms: u64,
+    active_work: String,
+    expected_active_assignments: Option<Vec<ExpectedActiveAssignment>>,
 }
 
 impl StoredArchivedProject {
@@ -14333,52 +15290,88 @@ impl StoredArchivedProject {
                 == command.expected_orchestrator_worker_version
             && self.expected_orchestrator_runtime_version
                 == command.expected_orchestrator_runtime_version
+            && self.active_work == command.active_work.as_str()
+            && self.expected_active_assignments == command.expected_active_assignments
     }
 
-    fn archived(self, cleanup_pending: bool, replayed: bool) -> ArchivedProject {
+    /// The replay of this archive, with its live status.
+    fn archived(
+        self,
+        cleanup_pending: bool,
+        background: ProjectBackgroundStatus,
+        cancelled_assignment_ids: Vec<String>,
+        status: ArchiveStatus,
+    ) -> ArchivedProject {
         ArchivedProject {
             command_id: self.command_id,
             project_id: self.project_id,
             orchestrator_worker_id: self.expected_orchestrator_worker_id,
             archived_at_unix_ms: self.archived_at_unix_ms,
             cleanup_pending,
-            replayed,
+            background,
+            cancelled_assignment_ids,
+            restorable: status.restorable,
+            visibility: status.visibility,
+            replayed: true,
         }
     }
+}
+
+/// An archive's live Restore status, reported on every replay.
+#[derive(Clone, Copy)]
+struct ArchiveStatus {
+    restorable: bool,
+    visibility: ProjectVisibility,
 }
 
 fn select_archived_project_command(
     connection: &Connection,
     command_id: &str,
 ) -> Result<Option<StoredArchivedProject>, ProjectStoreError> {
-    connection
+    let stored = connection
         .query_row(
             "SELECT archived.project_id, archived.command_id, command.actor,
                     archived.expected_project_version,
                     archived.expected_orchestrator_worker_id,
                     archived.expected_orchestrator_worker_version,
                     archived.expected_orchestrator_runtime_version,
-                    archived.archived_at_unix_ms
+                    archived.archived_at_unix_ms, archived.active_work,
+                    archived.expected_active_assignments_json
                FROM archived_projects archived
                JOIN command_acknowledgements command
                  ON command.id = archived.command_id
-              WHERE archived.command_id = ?1",
+              WHERE archived.command_id = ?1
+                AND command.command_type = 'project_archive'",
             [command_id],
             |row| {
-                Ok(StoredArchivedProject {
-                    project_id: row.get(0)?,
-                    command_id: row.get(1)?,
-                    actor: row.get(2)?,
-                    expected_project_version: row_u64(row, 3)?,
-                    expected_orchestrator_worker_id: row.get(4)?,
-                    expected_orchestrator_worker_version: row_u64(row, 5)?,
-                    expected_orchestrator_runtime_version: row_optional_u64(row, 6)?,
-                    archived_at_unix_ms: row_u64(row, 7)?,
-                })
+                Ok((
+                    StoredArchivedProject {
+                        project_id: row.get(0)?,
+                        command_id: row.get(1)?,
+                        actor: row.get(2)?,
+                        expected_project_version: row_u64(row, 3)?,
+                        expected_orchestrator_worker_id: row.get(4)?,
+                        expected_orchestrator_worker_version: row_u64(row, 5)?,
+                        expected_orchestrator_runtime_version: row_optional_u64(row, 6)?,
+                        archived_at_unix_ms: row_u64(row, 7)?,
+                        active_work: row.get(8)?,
+                        expected_active_assignments: None,
+                    },
+                    row.get::<_, Option<String>>(9)?,
+                ))
             },
         )
-        .optional()
-        .map_err(Into::into)
+        .optional()?;
+    stored
+        .map(|(mut stored, expected_json)| {
+            stored.expected_active_assignments = expected_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(ProjectStoreError::StoredResultJson)?;
+            Ok(stored)
+        })
+        .transpose()
 }
 
 fn archived_project_exists(
@@ -14388,7 +15381,8 @@ fn archived_project_exists(
     connection
         .query_row(
             "SELECT EXISTS (
-                SELECT 1 FROM archived_projects WHERE project_id = ?1
+                SELECT 1 FROM archived_projects
+                 WHERE project_id = ?1 AND restored_at_unix_ms IS NULL
              )",
             [project_id],
             |row| row.get(0),
@@ -14408,7 +15402,7 @@ fn select_archived_project_target(
         .query_row(
             "SELECT expected_orchestrator_worker_id
                FROM archived_projects
-              WHERE project_id = ?1",
+              WHERE project_id = ?1 AND restored_at_unix_ms IS NULL",
             [project_id],
             |row| {
                 Ok(ArchivedProjectDeletionTarget {
@@ -14424,18 +15418,33 @@ struct StoredDeletedProject {
     project_id: String,
     command_id: String,
     actor: String,
+    archive: Option<ProjectArchivePreconditions>,
     orchestrator_worker_id: String,
     deleted_at_unix_ms: u64,
 }
 
 impl StoredDeletedProject {
-    fn deleted(self, cleanup_pending: bool, replayed: bool) -> DeletedProject {
+    fn matches(&self, project_id: &str, command: &DeleteProject) -> bool {
+        self.project_id == project_id
+            && self.actor == command.actor
+            && self.archive == command.archive
+    }
+
+    fn deleted(
+        self,
+        cleanup_pending: bool,
+        background: ProjectBackgroundStatus,
+        cancelled_assignment_ids: Vec<String>,
+        replayed: bool,
+    ) -> DeletedProject {
         DeletedProject {
             command_id: self.command_id,
             project_id: self.project_id,
             orchestrator_worker_id: self.orchestrator_worker_id,
             deleted_at_unix_ms: self.deleted_at_unix_ms,
             cleanup_pending,
+            background,
+            cancelled_assignment_ids,
             replayed,
         }
     }
@@ -14445,28 +15454,44 @@ fn select_deleted_project_command(
     connection: &Connection,
     command_id: &str,
 ) -> Result<Option<StoredDeletedProject>, ProjectStoreError> {
-    connection
+    let stored = connection
         .query_row(
             "SELECT deleted.project_id, deleted.command_id, command.actor,
+                    delete_command.archive_json,
                     deleted.orchestrator_worker_id, deleted.deleted_at_unix_ms
                FROM deleted_projects deleted
                JOIN command_acknowledgements command
                  ON command.id = deleted.command_id
+               LEFT JOIN project_delete_commands delete_command
+                 ON delete_command.command_id = deleted.command_id
               WHERE deleted.command_id = ?1
                 AND command.command_type = 'project_delete'",
             [command_id],
             |row| {
-                Ok(StoredDeletedProject {
-                    project_id: row.get(0)?,
-                    command_id: row.get(1)?,
-                    actor: row.get(2)?,
-                    orchestrator_worker_id: row.get(3)?,
-                    deleted_at_unix_ms: row_u64(row, 4)?,
-                })
+                Ok((
+                    StoredDeletedProject {
+                        project_id: row.get(0)?,
+                        command_id: row.get(1)?,
+                        actor: row.get(2)?,
+                        archive: None,
+                        orchestrator_worker_id: row.get(4)?,
+                        deleted_at_unix_ms: row_u64(row, 5)?,
+                    },
+                    row.get::<_, Option<String>>(3)?,
+                ))
             },
         )
-        .optional()
-        .map_err(Into::into)
+        .optional()?;
+    stored
+        .map(|(mut stored, archive_json)| {
+            stored.archive = archive_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(ProjectStoreError::StoredResultJson)?;
+            Ok(stored)
+        })
+        .transpose()
 }
 
 fn deleted_project_exists(
@@ -14553,6 +15578,13 @@ fn deleted_worker_exists(
         .map_err(Into::into)
 }
 
+/// Work that archive (and delete from active) refuses to strand, beyond the
+/// active assignments that `project_archive_store::gate_active_work` either
+/// refuses or cancels. Automation runs block only while `pending`:
+/// `ambiguous` is terminal (nothing resolves it later), so it would otherwise
+/// block archive forever. A selection held by an automation of an archived
+/// workstream is not a dependency: archive paused it, and while it targets
+/// that workstream it cannot be resumed, run, or edited.
 fn project_has_active_work(
     connection: &Connection,
     project_id: &str,
@@ -14560,11 +15592,6 @@ fn project_has_active_work(
     connection
         .query_row(
             "SELECT EXISTS (
-                SELECT 1
-                  FROM assignments
-                 WHERE project_id = ?1
-                   AND lifecycle IN ('allocating', 'active', 'handing_off')
-                UNION ALL
                 SELECT 1
                   FROM profile_allocation_commands allocation
                   JOIN command_acknowledgements command
@@ -14584,20 +15611,26 @@ fn project_has_active_work(
                  WHERE scope_project_id = ?1
                 UNION ALL
                 SELECT 1
-                  FROM automation_selected_projects
-                 WHERE project_id = ?1
+                  FROM automation_selected_projects selected
+                  JOIN automations automation
+                    ON automation.id = selected.automation_id
+                 WHERE selected.project_id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM archived_coordination_nodes archived
+                        WHERE archived.node_id = automation.scope_node_id
+                   )
                 UNION ALL
                 SELECT 1
                   FROM automation_runs
                  WHERE scope_project_id = ?1
-                   AND status IN ('pending', 'ambiguous')
+                   AND status = 'pending'
                 UNION ALL
                 SELECT 1
                   FROM automation_run_projects run_project
                   JOIN automation_runs run
                     ON run.id = run_project.run_id
                  WHERE run_project.project_id = ?1
-                   AND run.status IN ('pending', 'ambiguous')
+                   AND run.status = 'pending'
              )",
             [project_id],
             |row| row.get(0),
@@ -16192,6 +17225,21 @@ impl StoredDedicatedRuntimeProvisionIntent {
     }
 }
 
+/// A dedicated node runtime is never claimed for a workstream that was
+/// archived (or deleted) after its provisioning began: the claim answers
+/// `CoordinationNodeArchived` (or not found) instead.
+fn reject_inactive_provisioning_target(
+    connection: &Connection,
+    command_id: &str,
+) -> Result<(), ProjectStoreError> {
+    if let Some(intent) = select_dedicated_runtime_provision_intent(connection, command_id)?
+        && intent.kind == "coordination_node"
+    {
+        coordination_node_store::reject_inactive_node(connection, &intent.target_id)?;
+    }
+    Ok(())
+}
+
 fn select_dedicated_runtime_provision_intent(
     connection: &Connection,
     command_id: &str,
@@ -17090,8 +18138,12 @@ fn validate_detached_runtime_cleanup(
                      WHERE worker_id = ?1
                 )
                 OR EXISTS (
-                    SELECT 1 FROM coordination_nodes
-                     WHERE worker_id = ?1
+                    SELECT 1 FROM coordination_nodes node
+                     WHERE node.worker_id = ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM archived_coordination_nodes archived
+                            WHERE archived.node_id = node.id
+                       )
                 )",
             [&cleanup.worker_id],
             |row| row.get::<_, bool>(0),
@@ -17788,6 +18840,7 @@ fn assignment_record_from_row(row: &Row<'_>) -> rusqlite::Result<AssignmentRecor
         "handed_off" => AssignmentLifecycle::HandedOff,
         "completed" => AssignmentLifecycle::Completed,
         "failed" => AssignmentLifecycle::Failed,
+        "cancelled" => AssignmentLifecycle::Cancelled,
         value => return Err(enum_conversion_error(9, "assignment lifecycle", value)),
     };
     let attempt_lifecycle = match row.get::<_, String>(40)?.as_str() {
@@ -17797,6 +18850,7 @@ fn assignment_record_from_row(row: &Row<'_>) -> rusqlite::Result<AssignmentRecor
         "handed_off" => AttemptLifecycle::HandedOff,
         "completed" => AttemptLifecycle::Completed,
         "failed" => AttemptLifecycle::Failed,
+        "cancelled" => AttemptLifecycle::Cancelled,
         value => return Err(enum_conversion_error(40, "attempt lifecycle", value)),
     };
     let allocation_mode = match row.get::<_, String>(45)?.as_str() {
@@ -17854,6 +18908,7 @@ fn assignment_record_from_row(row: &Row<'_>) -> rusqlite::Result<AssignmentRecor
                 updated_at_unix_ms: row_u64(row, 44)?,
             },
             completion_receipt: None,
+            cancellation: None,
             version: row_u64(row, 10)?,
             created_at_unix_ms: row_u64(row, 11)?,
             updated_at_unix_ms: row_u64(row, 12)?,
@@ -17959,7 +19014,7 @@ fn select_confirmed_allocation(
         .ok_or(ProjectStoreError::RuntimeAllocationMissing)?;
     let mut record = select_assignment_record(connection, &assignment_id)?
         .ok_or(ProjectStoreError::RuntimeAllocationMissing)?;
-    record.assignment.completion_receipt = select_completion_receipt(connection, &assignment_id)?;
+    attach_assignment_outcome(connection, &mut record.assignment)?;
     Ok(ConfirmedAllocation {
         command_id: command_id.to_owned(),
         allocation: record.allocation,
@@ -17986,7 +19041,7 @@ fn select_confirmed_worker_allocation(
         .ok_or(ProjectStoreError::RuntimeAllocationMissing)?;
     let mut record = select_assignment_record(connection, &assignment_id)?
         .ok_or(ProjectStoreError::RuntimeAllocationMissing)?;
-    record.assignment.completion_receipt = select_completion_receipt(connection, &assignment_id)?;
+    attach_assignment_outcome(connection, &mut record.assignment)?;
     Ok(ConfirmedAllocation {
         command_id: command_id.to_owned(),
         allocation: record.allocation,
@@ -18018,8 +19073,7 @@ fn select_confirmed_worker_handoff(
     {
         return Err(ProjectStoreError::RuntimeAllocationMissing);
     }
-    target_record.assignment.completion_receipt =
-        select_completion_receipt(connection, assignment_id)?;
+    attach_assignment_outcome(connection, &mut target_record.assignment)?;
     let mut source_record = select_assignment_record(connection, &command.source_assignment_id)?
         .ok_or(ProjectStoreError::AssignmentNotFound)?;
     if source_record.assignment.project_id != command.source_project_id
@@ -18027,8 +19081,7 @@ fn select_confirmed_worker_handoff(
     {
         return Err(ProjectStoreError::AssignmentNotFound);
     }
-    source_record.assignment.completion_receipt =
-        select_completion_receipt(connection, &command.source_assignment_id)?;
+    attach_assignment_outcome(connection, &mut source_record.assignment)?;
     Ok(ConfirmedWorkerHandoff {
         command_id: command_id.to_owned(),
         source_assignment: source_record.assignment,
@@ -18059,7 +19112,7 @@ fn select_replaced_project_orchestrator(
     }
     let mut record = select_assignment_record(connection, &assignment_id)?
         .ok_or(ProjectStoreError::AssignmentNotFound)?;
-    record.assignment.completion_receipt = select_completion_receipt(connection, &assignment_id)?;
+    attach_assignment_outcome(connection, &mut record.assignment)?;
     Ok(ReplacedProjectOrchestrator {
         command_id: command_id.to_owned(),
         project,
@@ -18548,7 +19601,7 @@ fn select_completion_receipt(
     let receipt = connection
         .query_row(
             "SELECT id, assignment_id, attempt_id, outcome, summary, actor,
-                    created_at_unix_ms
+                    created_at_unix_ms, detail_level, objective_snapshot
                FROM completion_receipts
               WHERE assignment_id = ?1",
             [assignment_id],
@@ -18559,11 +19612,20 @@ fn select_completion_receipt(
                         return Err(enum_conversion_error(3, "completion outcome", value));
                     }
                 };
+                let detail_level = match row.get::<_, String>(7)?.as_str() {
+                    "detailed" => ReceiptDetailLevel::Detailed,
+                    "minimal" => ReceiptDetailLevel::Minimal,
+                    value => {
+                        return Err(enum_conversion_error(7, "receipt detail level", value));
+                    }
+                };
                 Ok(CompletionReceipt {
                     id: row.get(0)?,
                     assignment_id: row.get(1)?,
                     attempt_id: row.get(2)?,
                     outcome,
+                    detail_level,
+                    objective_snapshot: row.get(8)?,
                     summary: row.get(4)?,
                     artifact_refs: Vec::new(),
                     artifacts: Vec::new(),
@@ -18586,6 +19648,64 @@ fn select_completion_receipt(
     receipt.unresolved_blockers =
         select_receipt_values(connection, "completion_receipt_blockers", &receipt.id)?;
     Ok(Some(receipt))
+}
+
+fn select_assignment_cancellation(
+    connection: &Connection,
+    assignment_id: &str,
+) -> Result<Option<AssignmentCancellation>, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT assignment_id, attempt_id, command_id, reason, actor,
+                    request_origin, objective_snapshot, cancelled_at_unix_ms
+               FROM assignment_cancellations
+              WHERE assignment_id = ?1",
+            [assignment_id],
+            |row| {
+                let reason = match row.get::<_, String>(3)?.as_str() {
+                    "ended_without_completion" => CancellationReason::EndedWithoutCompletion,
+                    "project_archived" => CancellationReason::ProjectArchived,
+                    value => return Err(enum_conversion_error(3, "cancellation reason", value)),
+                };
+                Ok(AssignmentCancellation {
+                    assignment_id: row.get(0)?,
+                    attempt_id: row.get(1)?,
+                    command_id: row.get(2)?,
+                    reason,
+                    actor: row.get(4)?,
+                    request_origin: request_origin_from_row(row, 5)?,
+                    objective_snapshot: row.get(6)?,
+                    cancelled_at_unix_ms: row_u64(row, 7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// Fill the receipt and cancellation of one loaded assignment.
+fn attach_assignment_outcome(
+    connection: &Connection,
+    assignment: &mut Assignment,
+) -> Result<(), ProjectStoreError> {
+    assignment.completion_receipt = select_completion_receipt(connection, &assignment.id)?;
+    assignment.cancellation = select_assignment_cancellation(connection, &assignment.id)?;
+    Ok(())
+}
+
+const fn request_origin_value(origin: RequestOrigin) -> &'static str {
+    match origin {
+        RequestOrigin::Browser => "browser",
+        RequestOrigin::None => "none",
+    }
+}
+
+fn request_origin_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<RequestOrigin> {
+    match row.get::<_, String>(index)?.as_str() {
+        "browser" => Ok(RequestOrigin::Browser),
+        "none" => Ok(RequestOrigin::None),
+        value => Err(enum_conversion_error(index, "request origin", value)),
+    }
 }
 
 fn select_recorded_completion(
@@ -19175,6 +20295,8 @@ pub enum ProjectStoreError {
     #[error(transparent)]
     InvalidCompletionReceipt(#[from] yard_domain::CompletionValidationError),
     #[error(transparent)]
+    InvalidDisposition(#[from] yard_domain::DispositionValidationError),
+    #[error(transparent)]
     InvalidIntervention(#[from] yard_domain::InterventionValidationError),
     #[error(transparent)]
     InvalidWorkerSession(#[from] yard_domain::WorkerSessionValidationError),
@@ -19302,6 +20424,28 @@ pub enum ProjectStoreError {
     WorkerProfileRevisionMismatch,
     #[error("the coordination node worker session cannot end")]
     CoordinationNodeSessionEndForbidden,
+    #[error(
+        "system ephemeral summary work is finished by its summary command, not by a worker disposition"
+    )]
+    SystemEphemeralWorker,
+    #[error("coordination node is archived")]
+    CoordinationNodeArchived,
+    #[error("coordination node is already archived")]
+    CoordinationNodeAlreadyArchived,
+    #[error("an active coordination node needs archive preconditions before it can be deleted")]
+    CoordinationNodeNotArchived,
+    #[error("coordination node has already been deleted from the Yard UI")]
+    CoordinationNodeAlreadyDeleted,
+    #[error("only workstreams can be archived or deleted")]
+    CoordinationNodeKindNotSupported,
+    #[error(
+        "wait for {pending_prompts} pending workstream prompt(s) and {pending_routes} pending \
+         route(s) to finish"
+    )]
+    CoordinationNodeDispositionBlocked {
+        pending_prompts: usize,
+        pending_routes: usize,
+    },
     #[error("coordination snapshot was not found")]
     CoordinationSnapshotNotFound,
     #[error("a coordination snapshot with this ID already exists")]
@@ -19318,16 +20462,24 @@ pub enum ProjectStoreError {
     ProjectRepositoryAlreadyLinked,
     #[error("project is already archived")]
     ProjectAlreadyArchived,
-    #[error("project must be archived before it can be deleted")]
+    #[error("an active project needs archive preconditions before it can be deleted")]
     ProjectNotArchived,
     #[error("project has already been deleted from the Yard UI")]
     ProjectAlreadyDeleted,
+    #[error("project is not archived, so there is nothing to restore")]
+    ProjectRestoreNotArchived,
+    #[error("project cannot be restored right now: {}", .0.as_str())]
+    ProjectRestoreUnavailable(ProjectRestoreUnavailableReason),
     #[error("project has active work or automation dependencies")]
     ProjectHasArchiveDependencies,
-    #[error("a worker handoff targeting this project is still in progress")]
+    #[error("project has active assignments; archive them as cancelled or finish them first")]
+    ProjectHasActiveWork(Box<ProjectDispositionPreview>),
+    #[error("the project's active assignments changed since the archive preview")]
+    ProjectArchivePreviewStale(Box<ProjectDispositionPreview>),
+    #[error("a worker handoff into or out of this project is still in progress")]
     ProjectArchiveHandoffInProgress,
-    #[error("a coordination snapshot has not finished collecting this project")]
-    ProjectArchiveSnapshotCollectionPending,
+    #[error("a summary worker for this project is still being allocated")]
+    ProjectArchiveSummaryWorkerAllocating,
     #[error("the relationship source project was not found")]
     RelationshipSourceProjectNotFound,
     #[error("the relationship target project was not found")]
@@ -19420,6 +20572,12 @@ pub enum ProjectStoreError {
     RuntimeHandoffClaimConflict,
     #[error("an assignment intervention is still in progress")]
     AssignmentInterventionInProgress,
+    #[error(
+        "this worker's handoff outcome is unknown, so its assignment can only be ended without completion"
+    )]
+    AssignmentHandoffUnresolved,
+    #[error("transcript capture claim expired or belongs to another processor")]
+    TranscriptCaptureClaimLost,
     #[error("a worker profile allocation is still pending or ambiguous")]
     ProfileAllocationInProgress,
     #[error("completion receipt was not found")]
@@ -19508,6 +20666,8 @@ pub enum ProjectStoreError {
     ForeignKeyCheckFailed,
     #[error("database schema version 25 lineage is invalid: {detail}")]
     InvalidSchemaV25Lineage { detail: String },
+    #[error("database schema lineage is invalid: {detail}")]
+    InvalidSchemaLineage { detail: String },
     #[error("database schema version {found} is newer than supported version {supported}")]
     UnsupportedSchema { found: i64, supported: i64 },
 }
@@ -19541,28 +20701,30 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
     use yard_domain::{
-        AgentProfileFile, AllocationMode, ArchiveProject, ArtifactKind, ArtifactRegistration,
-        AssignmentLifecycle, AttemptLifecycle, AutomationScope, CancelWorkerCleanupRun,
-        CanvasPlacement, CompletedRuntimeRetentionReason, CompletionOutcome,
-        ConfigureYardOrchestrator, ConfirmProfileAllocation, ConfirmWorkerAllocation,
-        ConfirmWorkerHandoff, CoordinationCommandStatus, CoordinationNodeKind, CreateAgentProfile,
+        AgentProfileFile, AllocationMode, ArchiveCoordinationNode, ArchiveProject, ArtifactKind,
+        ArtifactRegistration, AssignmentLifecycle, AttemptLifecycle, AutomationScope,
+        AutomationState, CancelWorkerCleanupRun, CanvasPlacement, CompletedRuntimeRetentionReason,
+        CompletionOutcome, ConfigureYardOrchestrator, ConfirmProfileAllocation,
+        ConfirmWorkerAllocation, ConfirmWorkerHandoff, CoordinationCommandStatus, CoordinationNode,
+        CoordinationNodeDispositionBlockerKind, CoordinationNodeKind, CreateAgentProfile,
         CreateAutomation, CreateCoordinationNode, CreateProject, CreateProjectFromProfile,
         CreateProjectRelationship, CreateWorkerProfile, CreateWorkspaceProjectFromProfile,
-        DailySchedule, DeleteProject, DeleteProjectRelationship, DeleteWorker, EndWorkerSession,
-        FocusObservation, HandoffTargetRole, IsolationPolicy, ManagedRuntimeOccupantKind,
-        ManagedRuntimeWorkspaceKind, ObservedStatus, ObservedWorker, OldSessionDisposition,
-        PaneObservation, Project, ProjectRelationshipKind, ProjectRuntimeBinding,
-        ProviderSessionRef, ProvisionCoordinationNode, ProvisionYardOrchestrator,
-        ReceiveSummaryWorker, RecordCompletionReceipt, ReplaceProjectOrchestrator,
-        RequestCoordinationSnapshot, RequestSummaryWorker, RunAutomationNow, RuntimeInventory,
-        RuntimeObservationState, RuntimeProcessState, SendAssignmentPrompt,
-        SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
-        SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SnapshotCollectionStatus,
-        StartWorkerCleanupRun, SummaryParentRuntimeCapture, SummaryWorkerState,
-        TransferProjectOrchestrator, UpdateAgentProfile, UpdateAutomation, UpdateCoordinationNode,
-        UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
-        UpdateProjectWorkflowProfile, UpdateTokenSpendSettings, UpdateWorkerProfile,
-        WorkerAvailability, WorkerCleanupItemStatus, WorkerCleanupRunStatus,
+        DailySchedule, DeleteCoordinationNode, DeleteProject, DeleteProjectRelationship,
+        DeleteWorker, EndWorkerSession, FocusObservation, HandoffTargetRole, IsolationPolicy,
+        ManagedRuntimeOccupantKind, ManagedRuntimeWorkspaceKind, ObservedStatus, ObservedWorker,
+        OldSessionDisposition, PaneObservation, Project, ProjectBackgroundStatus,
+        ProjectRelationshipKind, ProjectRuntimeBinding, ProviderSessionRef,
+        ProvisionCoordinationNode, ProvisionYardOrchestrator, ReceiveSummaryWorker,
+        RecordCompletionReceipt, ReplaceProjectOrchestrator, RequestCoordinationSnapshot,
+        RequestSummaryWorker, RunAutomationNow, RuntimeInventory, RuntimeObservationState,
+        RuntimeProcessState, SendAssignmentPrompt, SendCoordinationNodePrompt,
+        SendCoordinationNodeRoute, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
+        SendYardOrchestratorRoute, SetAutomationPaused, SnapshotAbandonmentReason,
+        SnapshotCollectionStatus, StartWorkerCleanupRun, SummaryParentRuntimeCapture,
+        SummaryWorkerState, TransferProjectOrchestrator, UpdateAgentProfile, UpdateAutomation,
+        UpdateCoordinationNode, UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile,
+        UpdateProjectPlacement, UpdateProjectWorkflowProfile, UpdateTokenSpendSettings,
+        UpdateWorkerProfile, WorkerAvailability, WorkerCleanupItemStatus, WorkerCleanupRunStatus,
         WorkerCleanupRunTrigger, WorkerOwnershipKind, WorkerProfile, WorkerProfileSpec,
         WorkerRuntimeBinding, YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator,
     };
@@ -19573,17 +20735,27 @@ mod tests {
         BeginOrchestratorPrompt, BeginProfileAllocation, BeginProfileProjectCreation,
         BeginProjectOrchestratorReplacement, BeginSummaryWorker, BeginWorkerAllocation,
         BeginWorkerHandoff, BeginWorkspaceProjectCreation, BeginYardOrchestratorPrompt,
-        BeginYardOrchestratorRoute, COMPLETION_RECEIPT_MIGRATION, FINAL_BACKEND_SAFETY_MIGRATION,
+        BeginYardOrchestratorRoute, COMPLETION_RECEIPT_MIGRATION,
+        COORDINATION_NODE_DISPOSITIONS_MIGRATION, FINAL_BACKEND_SAFETY_MIGRATION,
         INITIAL_MIGRATION, OrchestratorReplacementRecoveryOutcome,
         OrchestratorReplacementRecoveryTarget, OrchestratorReplacementRuntimeRole,
         OrchestratorReplacementStartEvidence, PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS,
-        PROFILE_ASSIGNMENT_MIGRATION, ProjectStoreError, SCHEMA_VERSION, SnapshotDeliveryResult,
-        SnapshotProjectFolder, SqliteProjectStore, TokenSpendCommandSource, YardStore,
-        insert_worker_runtime_binding, insert_worker_runtime_binding_unchecked,
+        PROFILE_ASSIGNMENT_MIGRATION, PROJECT_ARCHIVING_MIGRATION, ProjectStoreError,
+        SCHEMA_VERSION, SnapshotDeliveryResult, SnapshotProjectFolder, SqliteProjectStore,
+        TokenSpendCommandSource, VISIBILITY_DELETIONS_MIGRATION, WORKER_HANDOFF_MIGRATION,
+        YardStore, coordination_node_store, insert_worker_runtime_binding,
+        insert_worker_runtime_binding_unchecked, to_i64,
     };
 
     const HISTORICAL_PROVIDER_NEUTRAL_WORKFLOW_V25_MIGRATION: &str =
         include_str!("../tests/fixtures/0025_provider_neutral_workflow_profiles.sql");
+    /// The first 0028, shipped in commit 3fdcf5e and later rewritten in place.
+    const HISTORICAL_VISIBILITY_DELETIONS_3FDCF5E_MIGRATION: &str =
+        include_str!("../tests/fixtures/0028_visibility_deletions_3fdcf5e.sql");
+    /// Verbatim `crates/yard-store/migrations/0029_*.sql` from the pre-rebase
+    /// fork (d897fd1), which numbered our first migration 29.
+    const FORK_D897FD1_SNAPSHOT_EXPIRY_V29_MIGRATION: &str =
+        include_str!("../tests/fixtures/fork_d897fd1/0029_snapshot_expiry_and_delete_commands.sql");
 
     fn draft(workspace_id: &str, terminal_id: &str) -> (CreateProject, WorkerRuntimeBinding) {
         (
@@ -19886,6 +21058,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     fn downgrade_provider_neutral_workflow_schema_to_v25(connection: &Connection) {
+        downgrade_snapshot_expiry_schema_to_v33(connection);
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = OFF;
@@ -21454,6 +22627,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cleanup_count, 0);
+    }
+
+    #[tokio::test]
+    async fn disposition_refuses_system_ephemeral_summary_work() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let fixture = create_summary_fixture(&store, "disposition").await;
+        let assignment =
+            listed_assignment(&store, &fixture.project.id, &fixture.assignment.id).await;
+        for (index, (outcome, end_session)) in [
+            (yard_domain::DispositionOutcome::Completed, false),
+            (yard_domain::DispositionOutcome::Cancelled, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(matches!(
+                store
+                    .dispose_assignment(
+                        &fixture.project.id,
+                        &assignment.id,
+                        disposition_command(
+                            &format!("summary-disposition-{index}"),
+                            &assignment,
+                            outcome,
+                            end_session,
+                        ),
+                        yard_domain::RequestOrigin::Browser,
+                    )
+                    .await,
+                Err(ProjectStoreError::SystemEphemeralWorker)
+            ));
+        }
+
+        // The summary command's assignment stays protected even if the
+        // worker's ownership kind no longer says so.
+        store
+            .run({
+                let worker_id = assignment.worker.id.clone();
+                move |connection| {
+                    connection.execute(
+                        "UPDATE workers SET ownership_kind = 'external' WHERE id = ?1",
+                        [&worker_id],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+        let assignment = listed_assignment(&store, &fixture.project.id, &assignment.id).await;
+        assert!(matches!(
+            store
+                .dispose_assignment(
+                    &fixture.project.id,
+                    &assignment.id,
+                    disposition_command(
+                        "summary-disposition-external",
+                        &assignment,
+                        yard_domain::DispositionOutcome::Completed,
+                        false,
+                    ),
+                    yard_domain::RequestOrigin::Browser,
+                )
+                .await,
+            Err(ProjectStoreError::SystemEphemeralWorker)
+        ));
+        let unchanged = listed_assignment(&store, &fixture.project.id, &assignment.id).await;
+        assert_eq!(unchanged.lifecycle, AssignmentLifecycle::Active);
+        assert!(unchanged.completion_receipt.is_none());
+        assert!(unchanged.cancellation.is_none());
+        let summary = store
+            .get_summary_worker(
+                &fixture.project.id,
+                &fixture.project.orchestrator.id,
+                &assignment.id,
+            )
+            .await
+            .unwrap();
+        assert_ne!(summary.state, SummaryWorkerState::Failed);
+        let dispositions: i64 = store
+            .run(|connection| {
+                Ok(connection.query_row(
+                    "SELECT COUNT(*) FROM assignment_disposition_commands",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(dispositions, 0);
     }
 
     async fn preview_retained_reasons(
@@ -24271,8 +25534,10 @@ mod tests {
         ));
     }
 
+    /// Decision D1 (rebase onto mainline): archive keeps the repository links,
+    /// so a restored project comes back with them; delete purges them.
     #[tokio::test]
-    async fn project_archive_and_delete_purge_repository_paths() {
+    async fn project_archive_keeps_and_delete_purges_repository_paths() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
         let (draft, runtime) = draft("workspace-repo-lifecycle", "terminal-repo-lifecycle");
@@ -24292,6 +25557,7 @@ mod tests {
             .archive_project(&project.id, archive.clone())
             .await
             .unwrap();
+        // Repository editing stays blocked while the project is archived.
         assert_project_repositories_unavailable(&store, &project.id, &repository.id).await;
 
         let database = temp.path().join("yard.sqlite3");
@@ -24305,7 +25571,16 @@ mod tests {
                 )
                 .unwrap()
         };
-        assert_eq!(repository_rows(), 0);
+        assert_eq!(repository_rows(), 1);
+        let kept_root: String = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT root_path FROM project_repositories WHERE id = ?1",
+                [&repository.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept_root, "/sensitive/checkout");
 
         let insert_stale_repository = |repository_id: &str| {
             Connection::open(&database)
@@ -24314,9 +25589,12 @@ mod tests {
                     "INSERT INTO project_repositories (
                         id, project_id, root_path, git_common_dir,
                         created_at_unix_ms, updated_at_unix_ms
-                     ) VALUES (?1, ?2, '/sensitive/stale',
-                               '/sensitive/stale/.git', 1, 1)",
-                    params![repository_id, project.id],
+                     ) VALUES (?1, ?2, ?3, '/sensitive/stale/.git', 1, 1)",
+                    params![
+                        repository_id,
+                        project.id,
+                        format!("/sensitive/{repository_id}")
+                    ],
                 )
                 .unwrap();
         };
@@ -24329,12 +25607,12 @@ mod tests {
                 .unwrap()
                 .replayed
         );
-        assert_eq!(repository_rows(), 0);
+        assert_eq!(repository_rows(), 2);
 
-        insert_stale_repository("repository-before-delete");
         let delete = DeleteProject {
             command_id: "delete-repository-project".to_owned(),
             actor: "local-user".to_owned(),
+            archive: None,
         };
         store
             .delete_project(&project.id, delete.clone())
@@ -24351,6 +25629,46 @@ mod tests {
                 .replayed
         );
         assert_eq!(repository_rows(), 0);
+        assert_project_repositories_unavailable(&store, &project.id, &repository.id).await;
+    }
+
+    /// Delete from an active project archives and purges in one transaction.
+    #[tokio::test]
+    async fn project_delete_from_active_purges_repository_paths() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (draft, runtime) = draft("workspace-repo-delete", "terminal-repo-delete");
+        let project = store.create_project(draft, runtime).await.unwrap();
+        let repository = store
+            .create_project_repository(
+                &project.id,
+                "repository-delete-active",
+                "/sensitive/delete-active",
+                "/sensitive/delete-active/.git",
+            )
+            .await
+            .unwrap();
+        let archive = archive_command(&project, "unused-archive-command");
+        store
+            .delete_project(
+                &project.id,
+                DeleteProject {
+                    command_id: "delete-active-repository-project".to_owned(),
+                    actor: "local-user".to_owned(),
+                    archive: Some(archive.preconditions()),
+                },
+            )
+            .await
+            .unwrap();
+        let rows: i64 = Connection::open(temp.path().join("yard.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM project_repositories WHERE project_id = ?1",
+                [&project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
         assert_project_repositories_unavailable(&store, &project.id, &repository.id).await;
     }
 
@@ -34028,6 +35346,8 @@ mod tests {
                 .runtime
                 .as_ref()
                 .map(|runtime| runtime.version),
+            active_work: yard_domain::ProjectArchiveActiveWork::Reject,
+            expected_active_assignments: None,
         }
     }
 
@@ -34304,6 +35624,7 @@ mod tests {
         let command = DeleteProject {
             command_id: "delete-project-command".to_owned(),
             actor: "local-user".to_owned(),
+            archive: None,
         };
 
         let deleted = store
@@ -34333,6 +35654,7 @@ mod tests {
                     DeleteProject {
                         command_id: "different-project-delete".to_owned(),
                         actor: "local-user".to_owned(),
+                        archive: None,
                     },
                 )
                 .await
@@ -34462,6 +35784,7 @@ mod tests {
                     DeleteProject {
                         command_id: "occupied-project-delete-command".to_owned(),
                         actor: "local-user".to_owned(),
+                        archive: None,
                     },
                 )
                 .await
@@ -34506,6 +35829,7 @@ mod tests {
         let project_delete = DeleteProject {
             command_id: "ledger-project-delete-command".to_owned(),
             actor: "local-user".to_owned(),
+            archive: None,
         };
         store
             .delete_project(&deleted_project.id, project_delete.clone())
@@ -34570,6 +35894,7 @@ mod tests {
                     DeleteProject {
                         command_id: worker_delete.command_id,
                         actor: worker_delete.actor,
+                        archive: None,
                     },
                 )
                 .await
@@ -34660,15 +35985,17 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
-            error,
-            ProjectStoreError::ProjectHasArchiveDependencies
-        ));
+        // Old clients (no active_work) still get a refusal, now with the
+        // preview that lists what an archive would cancel.
+        let ProjectStoreError::ProjectHasActiveWork(preview) = error else {
+            panic!("expected ProjectHasActiveWork, got {error:?}");
+        };
+        assert_eq!(preview.active_assignments.len(), 1);
         assert_eq!(store.get_project(&project.id).await.unwrap().id, project.id);
     }
 
     #[tokio::test]
-    async fn archiving_rejects_unfinished_member_handoffs_targeting_project() {
+    async fn archiving_waits_only_for_pending_handoffs() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
         let (source_project, source_assignment, target_project) =
@@ -34702,14 +36029,43 @@ mod tests {
             store.get_project(&target_project.id).await.unwrap().id,
             target_project.id
         );
+        let source_project = store.get_project(&source_project.id).await.unwrap();
+        assert!(matches!(
+            store
+                .archive_project(
+                    &source_project.id,
+                    archive_command(&source_project, "archive-handoff-source"),
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::ProjectArchiveHandoffInProgress
+        ));
+
+        // An ambiguous handoff never finishes, so it no longer blocks the
+        // target; claim and finalize already refuse an archived target.
+        store
+            .fail_worker_handoff(
+                "member-handoff-blocks-archive",
+                "handoff outcome is unknown",
+                true,
+            )
+            .await
+            .unwrap();
+        store
+            .archive_project(
+                &target_project.id,
+                archive_command(&target_project, "archive-after-ambiguous-handoff"),
+            )
+            .await
+            .unwrap();
     }
 
-    #[tokio::test]
-    async fn archiving_waits_for_snapshot_collection_after_delivery() {
-        let temp = TempDir::new().unwrap();
-        let store = open_store(&temp).await;
-        let (project_draft, runtime) = draft("snapshot-archive", "snapshot-archive-terminal");
-        let project = store.create_project(project_draft, runtime).await.unwrap();
+    async fn create_submitted_snapshot(
+        store: &SqliteProjectStore,
+        temp: &TempDir,
+        project: &Project,
+        command_id: &str,
+    ) -> (String, String) {
         let node_id = Uuid::now_v7().to_string();
         let node_folder = temp.path().join("knowledge").join(&node_id);
         let node = store
@@ -34718,7 +36074,7 @@ mod tests {
                 None,
                 Some(node_folder.to_string_lossy().into_owned()),
                 create_node_command(
-                    "create-archive-snapshot-node",
+                    &format!("{command_id}-node"),
                     CoordinationNodeKind::KnowledgeStore,
                     vec![project.id.clone()],
                 ),
@@ -34742,7 +36098,7 @@ mod tests {
                         .into_owned(),
                 }],
                 RequestCoordinationSnapshot {
-                    command_id: "request-archive-snapshot".to_owned(),
+                    command_id: command_id.to_owned(),
                     actor: "local-user".to_owned(),
                     expected_node_version: node.version,
                 },
@@ -34759,32 +36115,1515 @@ mod tests {
             )
             .await
             .unwrap();
+        (node_id, snapshot_id)
+    }
 
-        let error = store
+    fn age_snapshot_project(temp: &TempDir, snapshot_id: &str, submitted_at_unix_ms: i64) {
+        Connection::open(temp.path().join("yard.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE coordination_snapshot_projects
+                    SET submitted_at_unix_ms = ?1
+                  WHERE snapshot_id = ?2",
+                params![submitted_at_unix_ms, snapshot_id],
+            )
+            .unwrap();
+    }
+
+    fn snapshot_collection_row(
+        temp: &TempDir,
+        snapshot_id: &str,
+    ) -> (String, Option<i64>, Option<String>) {
+        Connection::open(temp.path().join("yard.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT collection_status, abandoned_at_unix_ms, abandoned_reason
+                   FROM coordination_snapshot_projects
+                  WHERE snapshot_id = ?1",
+                [snapshot_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    fn expired_submission_unix_ms() -> i64 {
+        let now = to_i64(super::unix_time_ms().unwrap()).unwrap();
+        now - to_i64(coordination_node_store::SNAPSHOT_COLLECTION_EXPIRY_MS).unwrap() - 1_000
+    }
+
+    #[tokio::test]
+    async fn archiving_does_not_wait_for_snapshot_collection() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) = draft("snapshot-archive", "snapshot-archive-terminal");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        let (node_id, snapshot_id) =
+            create_submitted_snapshot(&store, &temp, &project, "request-archive-snapshot").await;
+
+        let command = archive_command(&project, "archive-before-collection");
+        let archived = store
+            .archive_project(&project.id, command.clone())
+            .await
+            .unwrap();
+        assert_eq!(archived.project_id, project.id);
+        assert_eq!(
+            archived.background,
+            ProjectBackgroundStatus {
+                snapshots_pending: 1,
+                snapshots_abandoned: 0,
+            }
+        );
+        assert!(matches!(
+            store.get_project(&project.id).await,
+            Err(ProjectStoreError::ProjectNotFound)
+        ));
+
+        // The archived orchestrator may still write its files; collection
+        // does not depend on project visibility.
+        store
+            .record_snapshot_project_collected(&snapshot_id, &project.id)
+            .await
+            .unwrap();
+        let snapshot = store
+            .get_coordination_snapshot(&node_id, &snapshot_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.projects[0].collection_status,
+            SnapshotCollectionStatus::Collected
+        );
+        assert_eq!(snapshot.progress.completed, 1);
+        let replayed = store.archive_project(&project.id, command).await.unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.background, ProjectBackgroundStatus::default());
+    }
+
+    #[tokio::test]
+    async fn expired_snapshot_collection_is_abandoned_until_files_arrive() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) = draft("snapshot-expiry", "snapshot-expiry-terminal");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        let (node_id, snapshot_id) =
+            create_submitted_snapshot(&store, &temp, &project, "request-expiring-snapshot").await;
+
+        let fresh = store
+            .get_coordination_snapshot(&node_id, &snapshot_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.projects[0].collection_status,
+            SnapshotCollectionStatus::Pending
+        );
+
+        age_snapshot_project(&temp, &snapshot_id, expired_submission_unix_ms());
+        let expired = store
+            .get_coordination_snapshot(&node_id, &snapshot_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            expired.projects[0].collection_status,
+            SnapshotCollectionStatus::Abandoned
+        );
+        assert_eq!(
+            expired.projects[0].abandoned_reason,
+            Some(SnapshotAbandonmentReason::Expired)
+        );
+        assert!(expired.projects[0].abandoned_at_unix_ms.is_some());
+        assert_eq!(expired.progress.completed, 0);
+        assert_eq!(expired.progress.abandoned, 1);
+
+        let archived = store
             .archive_project(
                 &project.id,
-                archive_command(&project, "archive-before-collection"),
+                archive_command(&project, "archive-after-expiry"),
             )
             .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ProjectStoreError::ProjectArchiveSnapshotCollectionPending
-        ));
-        assert_eq!(store.get_project(&project.id).await.unwrap().id, project.id);
+            .unwrap();
+        assert_eq!(
+            archived.background,
+            ProjectBackgroundStatus {
+                snapshots_pending: 0,
+                snapshots_abandoned: 1,
+            }
+        );
 
         store
             .record_snapshot_project_collected(&snapshot_id, &project.id)
             .await
             .unwrap();
-        let archived = store
-            .archive_project(
-                &project.id,
-                archive_command(&project, "archive-after-collection"),
+        let collected = store
+            .get_coordination_snapshot(&node_id, &snapshot_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            collected.projects[0].collection_status,
+            SnapshotCollectionStatus::Collected
+        );
+        assert_eq!(collected.projects[0].abandoned_at_unix_ms, None);
+        assert_eq!(collected.projects[0].abandoned_reason, None);
+        assert_eq!(collected.progress.abandoned, 0);
+    }
+
+    #[tokio::test]
+    async fn store_open_abandons_expired_snapshot_collections() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) = draft("snapshot-sweep", "snapshot-sweep-terminal");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        let (_, submitted_snapshot) =
+            create_submitted_snapshot(&store, &temp, &project, "request-swept-snapshot").await;
+        age_snapshot_project(&temp, &submitted_snapshot, expired_submission_unix_ms());
+        drop(store);
+
+        SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+            .await
+            .unwrap();
+        let (status, abandoned_at, reason) = snapshot_collection_row(&temp, &submitted_snapshot);
+        assert_eq!(status, "abandoned");
+        assert!(abandoned_at.is_some());
+        assert_eq!(reason.as_deref(), Some("expired"));
+
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let pending_delivery = connection
+            .execute(
+                "UPDATE coordination_snapshot_projects
+                    SET collection_status = 'abandoned',
+                        delivery_status = 'pending',
+                        delivery_error = NULL,
+                        result_runtime_status = NULL,
+                        submitted_at_unix_ms = NULL,
+                        abandoned_at_unix_ms = 1,
+                        abandoned_reason = 'expired'
+                  WHERE snapshot_id = ?1",
+                [&submitted_snapshot],
+            )
+            .unwrap_err();
+        assert!(
+            pending_delivery
+                .to_string()
+                .contains("CHECK constraint failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_snapshot_delivery_never_expires_and_does_not_block_archive() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) = draft("snapshot-delivery", "snapshot-delivery-terminal");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        let node_id = Uuid::now_v7().to_string();
+        let node_folder = temp.path().join("knowledge").join(&node_id);
+        let node = store
+            .create_coordination_node(
+                &node_id,
+                None,
+                Some(node_folder.to_string_lossy().into_owned()),
+                create_node_command(
+                    "create-delivery-node",
+                    CoordinationNodeKind::KnowledgeStore,
+                    vec![project.id.clone()],
+                ),
+            )
+            .await
+            .unwrap()
+            .node;
+        let snapshot_id = Uuid::now_v7().to_string();
+        store
+            .create_coordination_snapshot(
+                &node_id,
+                &snapshot_id,
+                node_folder
+                    .join(&snapshot_id)
+                    .to_string_lossy()
+                    .into_owned(),
+                vec![SnapshotProjectFolder {
+                    project_id: project.id.clone(),
+                    folder_path: node_folder
+                        .join(&snapshot_id)
+                        .join(&project.id)
+                        .to_string_lossy()
+                        .into_owned(),
+                }],
+                RequestCoordinationSnapshot {
+                    command_id: "request-delivering-snapshot".to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_node_version: node.version,
+                },
             )
             .await
             .unwrap();
-        assert_eq!(archived.project_id, project.id);
+        Connection::open(temp.path().join("yard.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE coordination_snapshots SET created_at_unix_ms = ?1 WHERE id = ?2",
+                params![expired_submission_unix_ms(), snapshot_id],
+            )
+            .unwrap();
+
+        let delivering = store
+            .get_coordination_snapshot(&node_id, &snapshot_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            delivering.projects[0].collection_status,
+            SnapshotCollectionStatus::Pending
+        );
+        // An archive racing the in-process delivery is not blocked; delivery
+        // re-reads the project and records the failure itself.
+        store
+            .archive_project(
+                &project.id,
+                archive_command(&project, "archive-during-delivery"),
+            )
+            .await
+            .unwrap();
+        store
+            .record_snapshot_project_delivery(
+                &snapshot_id,
+                &project.id,
+                SnapshotDeliveryResult::Failed {
+                    message: "Yard project was not found".to_owned(),
+                    ambiguous: false,
+                },
+            )
+            .await
+            .unwrap();
+        let failed = store
+            .get_coordination_snapshot(&node_id, &snapshot_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            failed.projects[0].collection_status,
+            SnapshotCollectionStatus::Abandoned
+        );
+    }
+
+    /// The verbatim `CREATE TABLE … ) STRICT;` block that starts at `marker`.
+    fn migration_table_ddl<'a>(migration: &'a str, marker: &str) -> &'a str {
+        let start = migration.find(marker).unwrap();
+        let end = start + migration[start..].find(") STRICT;").unwrap() + ") STRICT;".len();
+        &migration[start..end]
+    }
+
+    /// Undo 0038 on a database without restores: drop the restore commands
+    /// and rebuild acknowledgements (0036 DDL), cleanup jobs (0027 DDL,
+    /// `cancelled` read back as `succeeded`), retirements (0037 DDL), and
+    /// `archived_projects` (0027 DDL plus the 0037 columns) with their exact
+    /// v37 shapes.
+    #[allow(clippy::too_many_lines)]
+    fn downgrade_project_restore_schema_to_v37(connection: &Connection) {
+        let ack_rebuild = "RENAME TO command_acknowledgements;";
+        let ack_rebuild_end = super::ASSIGNMENT_DISPOSITION_MIGRATION
+            .find(ack_rebuild)
+            .unwrap()
+            + ack_rebuild.len();
+        let cleanup = migration_table_ddl(
+            PROJECT_ARCHIVING_MIGRATION,
+            "CREATE TABLE runtime_cleanup_jobs_v27 (",
+        );
+        let retired = migration_table_ddl(
+            super::ARCHIVE_ACTIVE_WORK_MIGRATION,
+            "CREATE TABLE retired_runtime_bindings_v32 (",
+        );
+        let archived = migration_table_ddl(
+            PROJECT_ARCHIVING_MIGRATION,
+            "CREATE TABLE archived_projects (",
+        );
+        let inputs_start = super::ARCHIVE_ACTIVE_WORK_MIGRATION
+            .find("ALTER TABLE archived_projects")
+            .unwrap();
+        let inputs_end = super::ARCHIVE_ACTIVE_WORK_MIGRATION
+            .find("PRAGMA user_version = 37;")
+            .unwrap();
+        let v32_archive_inputs = &super::ARCHIVE_ACTIVE_WORK_MIGRATION[inputs_start..inputs_end];
+        let retired_columns = "id, worker_id, command_id, reason, adapter, runtime_session,
+            runtime_workspace_id, terminal_id, tab_id, pane_id, provider_session_source,
+            provider_session_provider, provider_session_kind, provider_session_value,
+            retired_at_unix_ms";
+        let cleanup_columns = "id, command_id, worker_id, reason, adapter, runtime_session,
+            runtime_workspace_id, terminal_id, tab_id, pane_id, owns_tab, status, attempts,
+            last_error, next_attempt_at_unix_ms, created_at_unix_ms, updated_at_unix_ms,
+            completed_at_unix_ms, provider_session_source, provider_session_provider,
+            provider_session_kind, provider_session_value, expected_worker_version,
+            expected_binding_state, claim_token, claim_expires_at_unix_ms";
+        let archived_columns = "project_id, command_id, expected_project_version,
+            expected_orchestrator_worker_id, expected_orchestrator_worker_version,
+            expected_orchestrator_runtime_version, result_project_version,
+            result_orchestrator_worker_version, runtime_adapter, runtime_session,
+            runtime_workspace_id, archived_at_unix_ms, active_work,
+            expected_active_assignments_json";
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF; DROP TABLE IF EXISTS project_restore_commands;",
+            )
+            .unwrap();
+        connection
+            .execute_batch(&super::ASSIGNMENT_DISPOSITION_MIGRATION[..ack_rebuild_end])
+            .unwrap();
+        connection
+            .execute_batch(&format!(
+                "{cleanup}
+                 INSERT INTO runtime_cleanup_jobs_v27 ({cleanup_columns})
+                 SELECT {cleanup_columns} FROM (
+                     SELECT id, command_id, worker_id, reason, adapter, runtime_session,
+                            runtime_workspace_id, terminal_id, tab_id, pane_id, owns_tab,
+                            CASE status WHEN 'cancelled' THEN 'succeeded' ELSE status END
+                                AS status,
+                            attempts, last_error, next_attempt_at_unix_ms,
+                            created_at_unix_ms, updated_at_unix_ms, completed_at_unix_ms,
+                            provider_session_source, provider_session_provider,
+                            provider_session_kind, provider_session_value,
+                            expected_worker_version, expected_binding_state, claim_token,
+                            claim_expires_at_unix_ms
+                       FROM runtime_cleanup_jobs
+                 );
+                 DROP TABLE runtime_cleanup_jobs;
+                 ALTER TABLE runtime_cleanup_jobs_v27 RENAME TO runtime_cleanup_jobs;
+                 CREATE INDEX pending_runtime_cleanup_jobs
+                 ON runtime_cleanup_jobs(next_attempt_at_unix_ms, created_at_unix_ms)
+                 WHERE status = 'pending';
+                 CREATE UNIQUE INDEX claimed_runtime_cleanup_tokens
+                 ON runtime_cleanup_jobs(claim_token)
+                 WHERE claim_token IS NOT NULL;
+                 {retired}
+                 INSERT INTO retired_runtime_bindings_v32 ({retired_columns})
+                 SELECT {retired_columns} FROM retired_runtime_bindings;
+                 DROP TABLE retired_runtime_bindings;
+                 ALTER TABLE retired_runtime_bindings_v32 RENAME TO retired_runtime_bindings;
+                 CREATE INDEX retired_runtime_provider_sessions
+                 ON retired_runtime_bindings (
+                     adapter,
+                     runtime_session,
+                     provider_session_source,
+                     provider_session_provider,
+                     provider_session_kind,
+                     provider_session_value
+                 );
+                 CREATE TEMP TABLE archived_projects_v37_copy AS
+                 SELECT {archived_columns} FROM archived_projects
+                  WHERE restored_at_unix_ms IS NULL;
+                 DROP TABLE archived_projects;
+                 {archived}
+                 {v32_archive_inputs}
+                 INSERT INTO archived_projects ({archived_columns})
+                 SELECT {archived_columns} FROM archived_projects_v37_copy;
+                 DROP TABLE archived_projects_v37_copy;
+                 PRAGMA user_version = 37;
+                 PRAGMA foreign_keys = ON;"
+            ))
+            .unwrap();
+    }
+
+    /// Undo 0037 on a database whose archives each ended one worker: restore
+    /// the per-command retirement uniqueness (the 0027 DDL) and the 0027
+    /// `archived_projects` table verbatim, without the archive input columns.
+    fn downgrade_archive_active_work_schema_to_v36(connection: &Connection) {
+        downgrade_project_restore_schema_to_v37(connection);
+        let retired = migration_table_ddl(
+            PROJECT_ARCHIVING_MIGRATION,
+            "CREATE TABLE retired_runtime_bindings_v27 (",
+        );
+        let archived = migration_table_ddl(
+            PROJECT_ARCHIVING_MIGRATION,
+            "CREATE TABLE archived_projects (",
+        );
+        let archived_columns = "project_id, command_id, expected_project_version,
+            expected_orchestrator_worker_id, expected_orchestrator_worker_version,
+            expected_orchestrator_runtime_version, result_project_version,
+            result_orchestrator_worker_version, runtime_adapter, runtime_session,
+            runtime_workspace_id, archived_at_unix_ms";
+        connection
+            .execute_batch(&format!(
+                "PRAGMA foreign_keys = OFF;
+                 {retired}
+                 INSERT INTO retired_runtime_bindings_v27 SELECT * FROM retired_runtime_bindings;
+                 DROP TABLE retired_runtime_bindings;
+                 ALTER TABLE retired_runtime_bindings_v27 RENAME TO retired_runtime_bindings;
+                 CREATE INDEX retired_runtime_provider_sessions
+                 ON retired_runtime_bindings (
+                     adapter,
+                     runtime_session,
+                     provider_session_source,
+                     provider_session_provider,
+                     provider_session_kind,
+                     provider_session_value
+                 );
+                 CREATE TEMP TABLE archived_projects_v36_copy AS
+                 SELECT {archived_columns} FROM archived_projects;
+                 DROP TABLE archived_projects;
+                 {archived}
+                 INSERT INTO archived_projects ({archived_columns})
+                 SELECT {archived_columns} FROM archived_projects_v36_copy;
+                 DROP TABLE archived_projects_v36_copy;
+                 PRAGMA user_version = 36;
+                 PRAGMA foreign_keys = ON;"
+            ))
+            .unwrap();
+    }
+
+    /// Undo 0036 on a database without disposition data: drop the new
+    /// tables and rebuild acknowledgements, receipts, assignments, and
+    /// attempts with their exact 0035 shapes (the 0003/0009/0011 DDL).
+    fn downgrade_assignment_disposition_schema_to_v35(connection: &Connection) {
+        downgrade_archive_active_work_schema_to_v36(connection);
+        let ack_rebuild = "RENAME TO command_acknowledgements;";
+        let ack_rebuild_end = COORDINATION_NODE_DISPOSITIONS_MIGRATION
+            .find(ack_rebuild)
+            .unwrap()
+            + ack_rebuild.len();
+        let receipts = migration_table_ddl(
+            COMPLETION_RECEIPT_MIGRATION,
+            "CREATE TABLE completion_receipts (",
+        )
+        .replace(
+            "CREATE TABLE completion_receipts (",
+            "CREATE TABLE completion_receipts_v35 (",
+        );
+        let assignments =
+            migration_table_ddl(WORKER_HANDOFF_MIGRATION, "CREATE TABLE assignments_v9 (")
+                .replace("assignments_v9", "assignments_v35");
+        let attempts = migration_table_ddl(
+            WORKER_HANDOFF_MIGRATION,
+            "CREATE TABLE assignment_attempts_v9 (",
+        )
+        .replace("assignment_attempts_v9", "assignment_attempts_v35");
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE IF EXISTS worker_transcripts;
+                 DROP TABLE IF EXISTS transcript_capture_jobs;
+                 DROP TABLE IF EXISTS assignment_disposition_commands;
+                 DROP TABLE IF EXISTS assignment_cancellations;",
+            )
+            .unwrap();
+        connection
+            .execute_batch(&COORDINATION_NODE_DISPOSITIONS_MIGRATION[..ack_rebuild_end])
+            .unwrap();
+        connection
+            .execute_batch(&format!(
+                "{receipts}
+                 INSERT INTO completion_receipts_v35 (
+                    id, command_id, assignment_id, attempt_id, outcome,
+                    summary, actor, created_at_unix_ms
+                 )
+                 SELECT id, command_id, assignment_id, attempt_id, outcome,
+                        summary, actor, created_at_unix_ms
+                   FROM completion_receipts;
+                 DROP TABLE completion_receipts;
+                 ALTER TABLE completion_receipts_v35 RENAME TO completion_receipts;
+                 CREATE UNIQUE INDEX completion_receipt_assignment_attempt_identity
+                 ON completion_receipts(id, assignment_id, attempt_id);
+                 {assignments}
+                 INSERT INTO assignments_v35 SELECT * FROM assignments;
+                 DROP TABLE assignments;
+                 ALTER TABLE assignments_v35 RENAME TO assignments;
+                 CREATE UNIQUE INDEX one_open_assignment_per_worker
+                 ON assignments(worker_id)
+                 WHERE lifecycle IN ('allocating', 'active', 'handing_off');
+                 {attempts}
+                 INSERT INTO assignment_attempts_v35 SELECT * FROM assignment_attempts;
+                 DROP TABLE assignment_attempts;
+                 ALTER TABLE assignment_attempts_v35 RENAME TO assignment_attempts;
+                 PRAGMA user_version = 35;
+                 PRAGMA foreign_keys = ON;"
+            ))
+            .unwrap();
+    }
+
+    /// Undo 0035: drop the node tombstones and restore the 0028
+    /// acknowledgement types, which 0029..0034 kept unchanged.
+    fn downgrade_coordination_node_dispositions_schema_to_v34(connection: &Connection) {
+        downgrade_assignment_disposition_schema_to_v35(connection);
+        let ack_rebuild = "RENAME TO command_acknowledgements;";
+        let ack_rebuild_end =
+            VISIBILITY_DELETIONS_MIGRATION.find(ack_rebuild).unwrap() + ack_rebuild.len();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE IF EXISTS deleted_coordination_nodes;
+                 DROP TABLE IF EXISTS archived_coordination_node_automations;
+                 DROP TABLE IF EXISTS archived_coordination_nodes;
+                 DELETE FROM command_acknowledgements
+                  WHERE command_type IN (
+                      'coordination_node_archive',
+                      'coordination_node_delete'
+                  );",
+            )
+            .unwrap();
+        connection
+            .execute_batch(&VISIBILITY_DELETIONS_MIGRATION[..ack_rebuild_end])
+            .unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA user_version = 34;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+    }
+
+    fn downgrade_snapshot_expiry_schema_to_v33(connection: &Connection) {
+        downgrade_coordination_node_dispositions_schema_to_v34(connection);
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE IF EXISTS project_delete_commands;
+                 CREATE TABLE coordination_snapshot_projects_v28 (
+                    snapshot_id TEXT NOT NULL
+                        REFERENCES coordination_snapshots(id) ON DELETE RESTRICT,
+                    project_id TEXT NOT NULL
+                        REFERENCES projects(id) ON DELETE RESTRICT,
+                    project_version INTEGER NOT NULL CHECK (project_version > 0),
+                    orchestrator_worker_id TEXT NOT NULL
+                        REFERENCES workers(id) ON DELETE RESTRICT,
+                    folder_path TEXT NOT NULL,
+                    collection_status TEXT NOT NULL
+                        CHECK (collection_status IN ('pending', 'collected')),
+                    delivery_status TEXT NOT NULL
+                        CHECK (delivery_status IN ('pending', 'submitted', 'failed', 'ambiguous')),
+                    delivery_error TEXT,
+                    result_runtime_status TEXT,
+                    submitted_at_unix_ms INTEGER,
+                    collected_at_unix_ms INTEGER,
+                    PRIMARY KEY (snapshot_id, project_id),
+                    CHECK (
+                        (collection_status = 'pending' AND collected_at_unix_ms IS NULL)
+                        OR (collection_status = 'collected' AND collected_at_unix_ms IS NOT NULL)
+                    ),
+                    CHECK (
+                        (
+                            delivery_status = 'pending'
+                            AND delivery_error IS NULL
+                            AND result_runtime_status IS NULL
+                            AND submitted_at_unix_ms IS NULL
+                        )
+                        OR (
+                            delivery_status = 'submitted'
+                            AND delivery_error IS NULL
+                            AND result_runtime_status IS NOT NULL
+                            AND submitted_at_unix_ms IS NOT NULL
+                        )
+                        OR (
+                            delivery_status IN ('failed', 'ambiguous')
+                            AND delivery_error IS NOT NULL
+                            AND result_runtime_status IS NULL
+                            AND submitted_at_unix_ms IS NULL
+                        )
+                    )
+                 ) STRICT;
+                 INSERT INTO coordination_snapshot_projects_v28
+                 SELECT snapshot_id, project_id, project_version, orchestrator_worker_id,
+                        folder_path,
+                        CASE collection_status
+                            WHEN 'abandoned' THEN 'pending'
+                            ELSE collection_status
+                        END,
+                        delivery_status, delivery_error, result_runtime_status,
+                        submitted_at_unix_ms, collected_at_unix_ms
+                   FROM coordination_snapshot_projects;
+                 DROP TABLE coordination_snapshot_projects;
+                 ALTER TABLE coordination_snapshot_projects_v28
+                    RENAME TO coordination_snapshot_projects;
+                 PRAGMA user_version = 33;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+    }
+
+    /// Drop mainline's 0029..0033 objects from a v33 database (after ours were
+    /// removed by `downgrade_snapshot_expiry_schema_to_v33`), leaving v28.
+    fn downgrade_mainline_schema_to_v28(connection: &Connection) {
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE IF EXISTS summary_worker_commands;
+                 DROP TABLE IF EXISTS profile_launch_audits;
+                 DROP TABLE IF EXISTS agent_profile_files;
+                 DROP TABLE IF EXISTS cleanup_advisor_artifacts;
+                 DROP TABLE IF EXISTS worker_cleanup_pins;
+                 DROP TABLE IF EXISTS worker_cleanup_run_items;
+                 DROP TABLE IF EXISTS worker_cleanup_runs;
+                 DROP TABLE IF EXISTS worker_cleanup_policy;
+                 DROP TABLE IF EXISTS pane_management_leases;
+                 DROP TABLE IF EXISTS pane_management_batches;
+                 DROP TABLE IF EXISTS yard_installation;
+                 ALTER TABLE workers DROP COLUMN parent_worker_id;
+                 ALTER TABLE workers DROP COLUMN ownership_kind;
+                 DROP TABLE project_repositories;
+                 PRAGMA user_version = 28;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn populated_v33_database_migrates_snapshots_and_delete_replays() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let (expired_draft, expired_runtime) = draft("v28-expired", "v28-expired-terminal");
+        let expired_project = store
+            .create_project(expired_draft, expired_runtime)
+            .await
+            .unwrap();
+        let (expired_node, expired_snapshot) =
+            create_submitted_snapshot(&store, &temp, &expired_project, "v28-expired-snapshot")
+                .await;
+        let (collected_draft, collected_runtime) = draft("v28-collected", "v28-collected-terminal");
+        let collected_project = store
+            .create_project(collected_draft, collected_runtime)
+            .await
+            .unwrap();
+        let (collected_node, collected_snapshot) =
+            create_submitted_snapshot(&store, &temp, &collected_project, "v28-collected-snapshot")
+                .await;
+        store
+            .record_snapshot_project_collected(&collected_snapshot, &collected_project.id)
+            .await
+            .unwrap();
+        let deleted_project = create_archived_project(
+            &store,
+            "v28-deleted",
+            "v28-deleted-terminal",
+            "v28-archive-before-delete",
+        )
+        .await;
+        let legacy_delete = DeleteProject {
+            command_id: "v28-legacy-delete".to_owned(),
+            actor: "local-user".to_owned(),
+            archive: None,
+        };
+        store
+            .delete_project(&deleted_project.id, legacy_delete.clone())
+            .await
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_snapshot_expiry_schema_to_v33(&connection);
+        connection
+            .execute(
+                "UPDATE coordination_snapshot_projects
+                    SET submitted_at_unix_ms = ?1
+                  WHERE snapshot_id = ?2",
+                params![expired_submission_unix_ms(), expired_snapshot],
+            )
+            .unwrap();
+        drop(connection);
+
+        let migrated = SqliteProjectStore::open(&path).await.unwrap();
+        let expired = migrated
+            .get_coordination_snapshot(&expired_node, &expired_snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            expired.projects[0].collection_status,
+            SnapshotCollectionStatus::Abandoned
+        );
+        let collected = migrated
+            .get_coordination_snapshot(&collected_node, &collected_snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            collected.projects[0].collection_status,
+            SnapshotCollectionStatus::Collected
+        );
+        assert!(collected.projects[0].collected_at_unix_ms.is_some());
+        let replayed = migrated
+            .delete_project(&deleted_project.id, legacy_delete.clone())
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert!(matches!(
+            migrated
+                .delete_project(
+                    &deleted_project.id,
+                    DeleteProject {
+                        archive: Some(archive_command(&deleted_project, "unused").preconditions()),
+                        ..legacy_delete
+                    },
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+        drop(migrated);
+
+        let connection = Connection::open(path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let backfilled: (Option<String>, i64) = connection
+            .query_row(
+                "SELECT archive_json, archive_applied
+                   FROM project_delete_commands
+                  WHERE command_id = 'v28-legacy-delete'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(backfilled, (None, 0));
+        let foreign_key_violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_violations, 0);
+    }
+
+    fn user_version(connection: &Connection) -> i64 {
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// A database the pre-rebase fork left at version 29: shared v28 plus the
+    /// fork's own 0029 file, with none of mainline's 0029..0033 objects.
+    fn build_fork_v29_schema(connection: &Connection) {
+        downgrade_snapshot_expiry_schema_to_v33(connection);
+        downgrade_mainline_schema_to_v28(connection);
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .unwrap();
+        connection
+            .execute_batch(FORK_D897FD1_SNAPSHOT_EXPIRY_V29_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        assert_eq!(user_version(connection), 29);
+    }
+
+    #[test]
+    fn renumbered_snapshot_expiry_migration_differs_from_fork_file_only_in_version() {
+        let renumbered = super::SNAPSHOT_EXPIRY_AND_DELETE_COMMANDS_MIGRATION
+            .replace("PRAGMA user_version = 34;", "PRAGMA user_version = 29;");
+        assert_eq!(renumbered, FORK_D897FD1_SNAPSHOT_EXPIRY_V29_MIGRATION);
+    }
+
+    #[tokio::test]
+    async fn fresh_database_opens_at_rebased_schema_version() {
+        let temp = TempDir::new().unwrap();
+        drop(open_store(&temp).await);
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        assert_eq!(user_version(&connection), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 38);
+        assert_eq!(
+            super::classify_schema_lineage(&connection, SCHEMA_VERSION).unwrap(),
+            super::SchemaLineage::Rebased(SCHEMA_VERSION)
+        );
+        assert!(super::table_exists(&connection, "project_repositories").unwrap());
+        assert!(super::table_exists(&connection, "project_delete_commands").unwrap());
+        assert!(super::table_exists(&connection, "archived_coordination_nodes").unwrap());
+        for table in [
+            "assignment_cancellations",
+            "assignment_disposition_commands",
+            "transcript_capture_jobs",
+            "worker_transcripts",
+        ] {
+            assert!(super::table_exists(&connection, table).unwrap(), "{table}");
+        }
+        assert!(super::table_has_column(&connection, "archived_projects", "active_work").unwrap());
+        assert!(super::table_exists(&connection, "project_restore_commands").unwrap());
+        assert!(
+            super::table_has_column(&connection, "archived_projects", "restored_at_unix_ms")
+                .unwrap()
+        );
+
+        downgrade_snapshot_expiry_schema_to_v33(&connection);
+        assert!(!super::table_has_column(&connection, "archived_projects", "active_work").unwrap());
+        assert!(!super::table_exists(&connection, "project_restore_commands").unwrap());
+        assert!(!super::table_exists(&connection, "archived_coordination_nodes").unwrap());
+        for table in [
+            "assignment_cancellations",
+            "assignment_disposition_commands",
+            "transcript_capture_jobs",
+            "worker_transcripts",
+        ] {
+            assert!(!super::table_exists(&connection, table).unwrap(), "{table}");
+        }
+        assert_eq!(
+            super::classify_schema_lineage(&connection, 33).unwrap(),
+            super::SchemaLineage::Mainline(33)
+        );
+        downgrade_mainline_schema_to_v28(&connection);
+        assert_eq!(
+            super::classify_schema_lineage(&connection, 28).unwrap(),
+            super::SchemaLineage::Shared
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_v29_database_is_refused_unchanged() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let (draft, runtime) = draft("fork-v29", "fork-v29-terminal");
+        store.create_project(draft, runtime).await.unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        build_fork_v29_schema(&connection);
+        assert_eq!(
+            super::classify_schema_lineage(&connection, 29).unwrap(),
+            super::SchemaLineage::Fork(29)
+        );
+        let schema_before = schema_snapshot(&connection);
+        let projects_before = table_snapshot(&connection, "projects");
+        drop(connection);
+
+        let error = SqliteProjectStore::open(&path).await.unwrap_err();
+        assert!(
+            matches!(error, ProjectStoreError::InvalidSchemaLineage { .. }),
+            "{error:?}"
+        );
+
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&connection), 29);
+        assert_eq!(schema_snapshot(&connection), schema_before);
+        assert_eq!(table_snapshot(&connection, "projects"), projects_before);
+        assert!(!super::table_exists(&connection, "project_repositories").unwrap());
+    }
+
+    #[tokio::test]
+    async fn mixed_schema_lineage_markers_are_refused_unchanged() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        drop(open_store(&temp).await);
+
+        // A fork v29 database that also carries a mainline object.
+        let connection = Connection::open(&path).unwrap();
+        build_fork_v29_schema(&connection);
+        connection
+            .execute_batch(
+                "CREATE TABLE project_repositories (id TEXT PRIMARY KEY NOT NULL) STRICT;",
+            )
+            .unwrap();
+        let schema_before = schema_snapshot(&connection);
+        drop(connection);
+        assert!(matches!(
+            SqliteProjectStore::open(&path).await.unwrap_err(),
+            ProjectStoreError::InvalidSchemaLineage { .. }
+        ));
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&connection), 29);
+        assert_eq!(schema_snapshot(&connection), schema_before);
+        drop(connection);
+
+        // A mainline v33 database stamped with our first rebased version.
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        drop(open_store(&temp).await);
+        let connection = Connection::open(&path).unwrap();
+        downgrade_snapshot_expiry_schema_to_v33(&connection);
+        connection
+            .execute_batch("PRAGMA user_version = 34;")
+            .unwrap();
+        let schema_before = schema_snapshot(&connection);
+        drop(connection);
+        assert!(matches!(
+            SqliteProjectStore::open(&path).await.unwrap_err(),
+            ProjectStoreError::InvalidSchemaLineage { .. }
+        ));
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&connection), 34);
+        assert_eq!(schema_snapshot(&connection), schema_before);
+    }
+
+    /// Turn a canonical v28 database into the one 3fdcf5e left behind: its
+    /// 0028 created tombstones with an `actor` column and no command FK, never
+    /// wrote delete acknowledgements, and kept the 0027 acknowledgement types.
+    fn downgrade_visibility_deletions_schema_to_3fdcf5e(connection: &Connection) {
+        let ack_rebuild = "RENAME TO command_acknowledgements;";
+        let ack_rebuild_end =
+            PROJECT_ARCHIVING_MIGRATION.find(ack_rebuild).unwrap() + ack_rebuild.len();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 ALTER TABLE deleted_projects RENAME TO deleted_projects_canonical;
+                 ALTER TABLE deleted_workers RENAME TO deleted_workers_canonical;",
+            )
+            .unwrap();
+        connection
+            .execute_batch(HISTORICAL_VISIBILITY_DELETIONS_3FDCF5E_MIGRATION)
+            .unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO deleted_projects
+                 SELECT deleted.project_id, deleted.command_id, command.actor,
+                        deleted.orchestrator_worker_id, deleted.deleted_at_unix_ms
+                   FROM deleted_projects_canonical deleted
+                   JOIN command_acknowledgements command
+                     ON command.id = deleted.command_id;
+                 INSERT INTO deleted_workers
+                 SELECT deleted.worker_id, deleted.command_id, command.actor,
+                        deleted.expected_worker_version, deleted.deleted_at_unix_ms
+                   FROM deleted_workers_canonical deleted
+                   JOIN command_acknowledgements command
+                     ON command.id = deleted.command_id;
+                 DROP TABLE deleted_projects_canonical;
+                 DROP TABLE deleted_workers_canonical;
+                 DELETE FROM command_acknowledgements
+                  WHERE command_type IN ('project_delete', 'worker_delete');",
+            )
+            .unwrap();
+        connection
+            .execute_batch(&PROJECT_ARCHIVING_MIGRATION[..ack_rebuild_end])
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+    }
+
+    fn table_schema(connection: &Connection, table: &str) -> (String, Vec<String>) {
+        let sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT name FROM sqlite_master
+                  WHERE type = 'index' AND tbl_name = ?1
+                  ORDER BY name",
+            )
+            .unwrap();
+        let indexes = statement
+            .query_map([table], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap();
+        (sql, indexes)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn v28_database_from_3fdcf5e_is_repaired_so_deletes_work() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let legacy_project = create_archived_project(
+            &store,
+            "legacy-deleted",
+            "legacy-deleted-terminal",
+            "legacy-archive-before-delete",
+        )
+        .await;
+        let legacy_project_delete = DeleteProject {
+            command_id: "legacy-project-delete".to_owned(),
+            actor: "local-user".to_owned(),
+            archive: None,
+        };
+        let legacy_project_deleted = store
+            .delete_project(&legacy_project.id, legacy_project_delete.clone())
+            .await
+            .unwrap();
+        let (legacy_worker_id, legacy_worker_version) = create_ended_worker(
+            &store,
+            "legacy-worker",
+            "legacy-worker-terminal",
+            "end-legacy-worker",
+        )
+        .await;
+        let legacy_worker_delete = DeleteWorker {
+            command_id: "legacy-worker-delete".to_owned(),
+            actor: "local-user".to_owned(),
+            expected_worker_version: legacy_worker_version,
+        };
+        let legacy_worker_deleted = store
+            .delete_worker(&legacy_worker_id, legacy_worker_delete.clone())
+            .await
+            .unwrap();
+        let (active_draft, mut active_runtime) = draft("legacy-active", "legacy-active-terminal");
+        active_runtime.last_observed_at_unix_ms = super::unix_time_ms().unwrap();
+        let active_project = store
+            .create_project(active_draft, active_runtime)
+            .await
+            .unwrap();
+        let (_, active_snapshot) =
+            create_submitted_snapshot(&store, &temp, &active_project, "legacy-active-snapshot")
+                .await;
+        let archived_project = create_archived_project(
+            &store,
+            "legacy-archived",
+            "legacy-archived-terminal",
+            "legacy-archive-kept",
+        )
+        .await;
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_snapshot_expiry_schema_to_v33(&connection);
+        downgrade_mainline_schema_to_v28(&connection);
+        downgrade_visibility_deletions_schema_to_3fdcf5e(&connection);
+        connection
+            .execute(
+                "UPDATE coordination_snapshot_projects
+                    SET submitted_at_unix_ms = ?1
+                  WHERE snapshot_id = ?2",
+                params![expired_submission_unix_ms(), active_snapshot],
+            )
+            .unwrap();
+        assert!(super::table_has_column(&connection, "deleted_projects", "actor").unwrap());
+        assert!(
+            !table_schema(&connection, "command_acknowledgements")
+                .0
+                .contains("'project_delete'")
+        );
+        let legacy_acks: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM command_acknowledgements
+                  WHERE id IN ('legacy-project-delete', 'legacy-worker-delete')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_acks, 0);
+        drop(connection);
+
+        let migrated = SqliteProjectStore::open(&path).await.unwrap();
+        let fresh_temp = TempDir::new().unwrap();
+        drop(open_store(&fresh_temp).await);
+        let fresh = Connection::open(fresh_temp.path().join("yard.sqlite3")).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        for table in [
+            "command_acknowledgements",
+            "deleted_projects",
+            "deleted_workers",
+            "project_delete_commands",
+        ] {
+            assert_eq!(
+                table_schema(&connection, table),
+                table_schema(&fresh, table),
+                "{table}"
+            );
+        }
+        let mut synthesized = connection
+            .prepare(
+                "SELECT command.id, command.command_type, command.actor, command.status,
+                        command.created_at_unix_ms, command.updated_at_unix_ms
+                   FROM command_acknowledgements command
+                  WHERE command.id IN ('legacy-project-delete', 'legacy-worker-delete')
+                  ORDER BY command.id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let deleted_at = |deleted_at_unix_ms: u64| to_i64(deleted_at_unix_ms).unwrap();
+        assert_eq!(
+            synthesized.remove(0),
+            (
+                "legacy-project-delete".to_owned(),
+                "project_delete".to_owned(),
+                "local-user".to_owned(),
+                "succeeded".to_owned(),
+                deleted_at(legacy_project_deleted.deleted_at_unix_ms),
+                deleted_at(legacy_project_deleted.deleted_at_unix_ms),
+            )
+        );
+        assert_eq!(
+            synthesized.remove(0),
+            (
+                "legacy-worker-delete".to_owned(),
+                "worker_delete".to_owned(),
+                "local-user".to_owned(),
+                "succeeded".to_owned(),
+                deleted_at(legacy_worker_deleted.deleted_at_unix_ms),
+                deleted_at(legacy_worker_deleted.deleted_at_unix_ms),
+            )
+        );
+        let backfilled: (Option<String>, i64) = connection
+            .query_row(
+                "SELECT archive_json, archive_applied
+                   FROM project_delete_commands
+                  WHERE command_id = 'legacy-project-delete'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(backfilled, (None, 0));
+        let foreign_key_violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_violations, 0);
+        drop(connection);
+
+        assert!(
+            migrated
+                .delete_project(&legacy_project.id, legacy_project_delete)
+                .await
+                .unwrap()
+                .replayed
+        );
+        assert!(
+            migrated
+                .delete_worker(&legacy_worker_id, legacy_worker_delete)
+                .await
+                .unwrap()
+                .replayed
+        );
+        let active_delete = delete_with_archive(&active_project, "delete-after-repair");
+        let deleted = migrated
+            .delete_project(&active_project.id, active_delete.clone())
+            .await
+            .unwrap();
+        assert!(!deleted.replayed);
+        assert_eq!(
+            deleted.background,
+            ProjectBackgroundStatus {
+                snapshots_pending: 0,
+                snapshots_abandoned: 1,
+            }
+        );
+        assert!(
+            migrated
+                .delete_project(&active_project.id, active_delete)
+                .await
+                .unwrap()
+                .replayed
+        );
+        migrated
+            .delete_project(
+                &archived_project.id,
+                DeleteProject {
+                    command_id: "delete-archived-after-repair".to_owned(),
+                    actor: "local-user".to_owned(),
+                    archive: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            migrated
+                .delete_project(
+                    "missing-project",
+                    delete_with_archive(&archived_project, "delete-missing-after-repair"),
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::ProjectNotFound
+        ));
+    }
+
+    async fn assert_orchestrator_intervention_blocks_archive(
+        store: &SqliteProjectStore,
+        project: &Project,
+        label: &str,
+    ) {
+        assert!(matches!(
+            store
+                .archive_project(
+                    &project.id,
+                    archive_command(project, &format!("archive-during-{label}")),
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::OrchestratorInterventionInProgress
+        ));
+        assert!(matches!(
+            store
+                .delete_project(
+                    &project.id,
+                    delete_with_archive(project, &format!("delete-during-{label}")),
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::OrchestratorInterventionInProgress
+        ));
+        assert_eq!(store.get_project(&project.id).await.unwrap().id, project.id);
+    }
+
+    #[tokio::test]
+    async fn archiving_waits_for_pending_orchestrator_interventions() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) = draft("prompt-archive", "prompt-archive-terminal");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        store
+            .begin_orchestrator_prompt(
+                &project.id,
+                SendOrchestratorPrompt {
+                    command_id: "prompt-blocks-archive".to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_project_version: project.version,
+                    orchestrator_worker_id: project.orchestrator.id.clone(),
+                    text: "Report status before archive.".to_owned(),
+                },
+                TokenSpendCommandSource::Manual,
+            )
+            .await
+            .unwrap();
+        let project = store.get_project(&project.id).await.unwrap();
+        assert_orchestrator_intervention_blocks_archive(&store, &project, "prompt").await;
+        // Once the prompt resolves, even as ambiguous, archive proceeds.
+        store
+            .fail_orchestrator_prompt("prompt-blocks-archive", "Delivery is unknown.", true)
+            .await
+            .unwrap();
+        let project = store.get_project(&project.id).await.unwrap();
+        store
+            .archive_project(
+                &project.id,
+                archive_command(&project, "archive-after-prompt"),
+            )
+            .await
+            .unwrap();
+
+        let (project, _profile, replacement, _prepared, _started) =
+            create_orchestrator_replacement_fixture(
+                &store,
+                "replace-blocks-archive",
+                OldSessionDisposition::RetainForInspection,
+            )
+            .await;
+        store
+            .begin_project_orchestrator_replacement(&project.id, replacement.clone())
+            .await
+            .unwrap();
+        let project = store.get_project(&project.id).await.unwrap();
+        assert_orchestrator_intervention_blocks_archive(&store, &project, "replacement").await;
+        store
+            .fail_project_orchestrator_replacement(
+                &replacement.command_id,
+                "Replacement was not started.",
+                false,
+            )
+            .await
+            .unwrap();
+        let project = store.get_project(&project.id).await.unwrap();
+        store
+            .archive_project(
+                &project.id,
+                archive_command(&project, "archive-after-replacement"),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn archive_and_delete_expire_stale_snapshot_collections_themselves() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let expired_background = ProjectBackgroundStatus {
+            snapshots_pending: 0,
+            snapshots_abandoned: 1,
+        };
+        for (workspace_id, command_id, delete) in [
+            ("lazy-expiry-archive", "archive-applies-expiry", false),
+            ("lazy-expiry-delete", "delete-applies-expiry", true),
+        ] {
+            let (project_draft, runtime) = draft(workspace_id, &format!("{workspace_id}-terminal"));
+            let project = store.create_project(project_draft, runtime).await.unwrap();
+            let (_, snapshot_id) = create_submitted_snapshot(
+                &store,
+                &temp,
+                &project,
+                &format!("{command_id}-snapshot"),
+            )
+            .await;
+            // No snapshot read runs between aging and the command.
+            age_snapshot_project(&temp, &snapshot_id, expired_submission_unix_ms());
+            assert_eq!(snapshot_collection_row(&temp, &snapshot_id).0, "pending");
+
+            let background = if delete {
+                store
+                    .delete_project(&project.id, delete_with_archive(&project, command_id))
+                    .await
+                    .unwrap()
+                    .background
+            } else {
+                store
+                    .archive_project(&project.id, archive_command(&project, command_id))
+                    .await
+                    .unwrap()
+                    .background
+            };
+            assert_eq!(background, expired_background);
+            let (status, abandoned_at, reason) = snapshot_collection_row(&temp, &snapshot_id);
+            assert_eq!(status, "abandoned");
+            assert!(abandoned_at.is_some());
+            assert_eq!(reason.as_deref(), Some("expired"));
+        }
+    }
+
+    fn delete_with_archive(project: &Project, command_id: &str) -> DeleteProject {
+        DeleteProject {
+            command_id: command_id.to_owned(),
+            actor: "local-user".to_owned(),
+            archive: Some(archive_command(project, command_id).preconditions()),
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_active_project_archives_it_in_the_same_command() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) = draft("delete-active", "delete-active-terminal");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        let command = delete_with_archive(&project, "delete-active-command");
+
+        let deleted = store
+            .delete_project(&project.id, command.clone())
+            .await
+            .unwrap();
+        assert_eq!(deleted.orchestrator_worker_id, project.orchestrator.id);
+        assert!(deleted.cleanup_pending);
+        assert!(!deleted.replayed);
+        assert!(store.list_projects().await.unwrap().projects.is_empty());
+        assert!(
+            store
+                .list_worker_candidates()
+                .await
+                .unwrap()
+                .workers
+                .iter()
+                .all(|candidate| candidate.worker.id != project.orchestrator.id)
+        );
+        let cleanup = store
+            .claim_pending_runtime_cleanups(Some(&command.command_id), 10, 30_000)
+            .await
+            .unwrap();
+        assert_eq!(cleanup.jobs.len(), 1);
+        assert_eq!(cleanup.jobs[0].reason, "project_archive");
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let (archive_command_id, archive_applied): (String, i64) = connection
+            .query_row(
+                "SELECT archived.command_id, delete_command.archive_applied
+                   FROM archived_projects archived
+                   JOIN project_delete_commands delete_command
+                     ON delete_command.project_id = archived.project_id
+                  WHERE archived.project_id = ?1",
+                [&project.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(archive_command_id, command.command_id);
+        assert_eq!(archive_applied, 1);
+
+        let replayed = store
+            .delete_project(&project.id, command.clone())
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert!(replayed.cleanup_pending);
+        assert!(matches!(
+            store
+                .archive_project(&project.id, archive_command(&project, &command.command_id),)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+        assert!(matches!(
+            store
+                .delete_project(
+                    &project.id,
+                    DeleteProject {
+                        archive: None,
+                        ..command
+                    },
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_replays_when_another_command_archived_first() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let project = create_archived_project(
+            &store,
+            "delete-after-other-archive",
+            "delete-after-other-archive-terminal",
+            "other-tab-archive",
+        )
+        .await;
+        let command = delete_with_archive(&project, "delete-with-stale-archive");
+
+        let deleted = store
+            .delete_project(&project.id, command.clone())
+            .await
+            .unwrap();
+        assert!(!deleted.replayed);
+        let replayed = store.delete_project(&project.id, command).await.unwrap();
+        assert!(replayed.replayed);
+        let archive_applied: i64 = Connection::open(temp.path().join("yard.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT archive_applied FROM project_delete_commands WHERE project_id = ?1",
+                [&project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archive_applied, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_requires_preconditions_for_active_projects_and_reports_unknown_ids() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, _) = create_active_assignment(&store).await;
+        let project = store.get_project(&project_id).await.unwrap();
+
+        assert!(matches!(
+            store
+                .delete_project(
+                    &project.id,
+                    DeleteProject {
+                        command_id: "delete-without-preconditions".to_owned(),
+                        actor: "local-user".to_owned(),
+                        archive: None,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::ProjectNotArchived
+        ));
+        assert!(matches!(
+            store
+                .delete_project(
+                    &project.id,
+                    delete_with_archive(&project, "delete-with-active-work"),
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::ProjectHasActiveWork(_)
+        ));
+        assert_eq!(store.get_project(&project.id).await.unwrap().id, project.id);
+        for command in [
+            DeleteProject {
+                command_id: "delete-unknown-project".to_owned(),
+                actor: "local-user".to_owned(),
+                archive: None,
+            },
+            delete_with_archive(&project, "delete-unknown-with-archive"),
+        ] {
+            assert!(matches!(
+                store
+                    .delete_project("missing-project", command)
+                    .await
+                    .unwrap_err(),
+                ProjectStoreError::ProjectNotFound
+            ));
+        }
     }
 
     #[tokio::test]
@@ -34860,21 +37699,5634 @@ mod tests {
             ProjectStoreError::ProjectHasArchiveDependencies
         ));
 
+        assert_eq!(store.get_project(&project.id).await.unwrap().id, project.id);
+
+        // An ambiguous run is terminal, so it no longer blocks archive.
         store
             .mark_automation_run_failed(&run_id, "Dispatch outcome is unknown.", true)
             .await
             .unwrap();
-        let ambiguous_run_error = store
+        store
             .archive_project(
                 &project.id,
                 archive_command(&project, "archive-ambiguous-automation-run"),
             )
             .await
-            .unwrap_err();
+            .unwrap();
+    }
+
+    /// A workstream with one attached project and a live, provisioned
+    /// dedicated worker, as the UI creates it.
+    async fn provisioned_workstream(
+        store: &SqliteProjectStore,
+        temp: &TempDir,
+        prefix: &str,
+    ) -> (CoordinationNode, Project) {
+        let (project_draft, mut runtime) = draft(
+            &format!("{prefix}-project"),
+            &format!("{prefix}-project-terminal"),
+        );
+        runtime.provider_session = Some(provider_session(&format!("{prefix}-project-session")));
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        let node_id = Uuid::now_v7().to_string();
+        let node = store
+            .create_coordination_node(
+                &node_id,
+                Some(
+                    temp.path()
+                        .join("coordination")
+                        .join(&node_id)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                None,
+                create_node_command(
+                    &format!("{prefix}-create-node"),
+                    CoordinationNodeKind::Workstream,
+                    vec![project.id.clone()],
+                ),
+            )
+            .await
+            .unwrap()
+            .node;
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec(&format!("{prefix} coordinator")),
+            })
+            .await
+            .unwrap();
+        let terminal_id = format!("{prefix}-terminal");
+        seed_unassigned_worker(
+            store,
+            50,
+            &terminal_id,
+            &format!("{prefix}-workspace"),
+            &format!("{prefix}-tab"),
+            &format!("{prefix}-pane"),
+            Some(provider_session(&format!("{prefix}-session"))),
+        )
+        .await;
+        store
+            .reconcile_runtime_inventory(inventory(
+                50,
+                vec![observed_worker(
+                    &terminal_id,
+                    &format!("{prefix}-workspace"),
+                    &format!("{prefix}-tab"),
+                    &format!("{prefix}-pane"),
+                    Some(provider_session(&format!("{prefix}-session"))),
+                )],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let candidate = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| {
+                candidate
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.terminal_id == terminal_id)
+            })
+            .unwrap();
+        let pinned = store
+            .pin_worker_profile(&candidate.worker.id, &profile.id, profile.version)
+            .await
+            .unwrap();
+        let node = store
+            .configure_coordination_node(
+                &node_id,
+                ProvisionCoordinationNode {
+                    command_id: format!("{prefix}-provision-node"),
+                    actor: "local-user".to_owned(),
+                    profile_id: profile.id,
+                    expected_profile_version: profile.version,
+                    expected_node_version: node.version,
+                },
+                &pinned.id,
+                pinned.version,
+            )
+            .await
+            .unwrap()
+            .node;
+        let project = store.get_project(&project.id).await.unwrap();
+        (node, project)
+    }
+
+    fn workstream_automation(
+        node_id: &str,
+        automation_id: &str,
+        command_id: &str,
+        selected_project_ids: Vec<String>,
+    ) -> CreateAutomation {
+        CreateAutomation {
+            command_id: command_id.to_owned(),
+            actor: "local-user".to_owned(),
+            automation_id: automation_id.to_owned(),
+            name: "Workstream status".to_owned(),
+            scope: AutomationScope::WorkstreamCoordinationNode {
+                node_id: node_id.to_owned(),
+            },
+            placement: CanvasPlacement {
+                x: 100.0,
+                y: 120.0,
+                width: 240.0,
+                height: 140.0,
+            },
+            schedule: DailySchedule {
+                hour: 9,
+                minute: 30,
+                timezone: "UTC".to_owned(),
+            },
+            selected_project_ids,
+            prompt_template: "Summarize workstream status.".to_owned(),
+        }
+    }
+
+    fn node_archive(node: &CoordinationNode, command_id: &str) -> ArchiveCoordinationNode {
+        ArchiveCoordinationNode {
+            command_id: command_id.to_owned(),
+            actor: "local-user".to_owned(),
+            expected_node_version: node.version,
+            expected_worker_version: node.worker.as_ref().map(|worker| worker.version),
+        }
+    }
+
+    fn node_delete(node: &CoordinationNode, command_id: &str) -> DeleteCoordinationNode {
+        DeleteCoordinationNode {
+            command_id: command_id.to_owned(),
+            actor: "local-user".to_owned(),
+            archive: Some(node_archive(node, command_id).preconditions()),
+        }
+    }
+
+    fn lifecycle_event_types(connection: &Connection, aggregate_id: &str) -> Vec<String> {
+        connection
+            .prepare(
+                "SELECT event_type FROM lifecycle_events
+                  WHERE aggregate_id = ?1
+                  ORDER BY sequence",
+            )
+            .unwrap()
+            .query_map([aggregate_id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn archiving_workstream_ends_its_worker_pauses_automations_and_keeps_projects() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (node, project) = provisioned_workstream(&store, &temp, "archive-ws").await;
+        let worker = node.worker.clone().unwrap();
+        let active_id = Uuid::now_v7().to_string();
+        let active = store
+            .create_automation(
+                workstream_automation(
+                    &node.id,
+                    &active_id,
+                    "create-ws-active-automation",
+                    vec![project.id.clone()],
+                ),
+                100,
+            )
+            .await
+            .unwrap()
+            .automation;
+        let paused_id = Uuid::now_v7().to_string();
+        let paused = store
+            .create_automation(
+                workstream_automation(
+                    &node.id,
+                    &paused_id,
+                    "create-ws-paused-automation",
+                    Vec::new(),
+                ),
+                100,
+            )
+            .await
+            .unwrap()
+            .automation;
+        let paused = store
+            .set_automation_paused(
+                SetAutomationPaused {
+                    command_id: "pause-ws-automation".to_owned(),
+                    actor: "local-user".to_owned(),
+                    automation_id: paused_id.clone(),
+                    expected_version: paused.version,
+                    paused: true,
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .automation;
+
+        let listed_ids = |automations: yard_domain::Automations| {
+            automations
+                .automations
+                .into_iter()
+                .map(|automation| automation.id)
+                .collect::<Vec<_>>()
+        };
+        let mut both = vec![active_id.clone(), paused_id.clone()];
+        both.sort();
+        let mut listed = listed_ids(store.list_automations().await.unwrap());
+        listed.sort();
+        assert_eq!(listed, both);
+
+        let archive = node_archive(&node, "archive-workstream");
+        let archived = store
+            .archive_coordination_node(&node.id, archive.clone())
+            .await
+            .unwrap();
+        assert_eq!(archived.node_id, node.id);
+        assert_eq!(archived.kind, CoordinationNodeKind::Workstream);
+        assert_eq!(archived.worker_id.as_deref(), Some(worker.id.as_str()));
+        assert_eq!(archived.paused_automation_ids, [active_id.as_str()]);
+        assert!(archived.cleanup_pending);
+        assert!(!archived.replayed);
+
+        assert!(
+            store
+                .list_coordination_nodes()
+                .await
+                .unwrap()
+                .nodes
+                .is_empty()
+        );
         assert!(matches!(
-            ambiguous_run_error,
+            store.get_coordination_node(&node.id).await.unwrap_err(),
+            ProjectStoreError::CoordinationNodeArchived
+        ));
+        let ended = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.worker.id == worker.id)
+            .unwrap();
+        assert_eq!(ended.availability, WorkerAvailability::Ended);
+        assert!(ended.worker.runtime.is_none());
+        assert_eq!(ended.worker.version, worker.version + 1);
+
+        let paused_active = store.get_automation(&active_id).await.unwrap();
+        assert_eq!(paused_active.state, AutomationState::Paused);
+        assert_eq!(paused_active.next_run_at_unix_ms, None);
+        assert_eq!(paused_active.version, active.version + 1);
+        assert_eq!(
+            store.get_automation(&paused_id).await.unwrap().version,
+            paused.version
+        );
+        // Both leave the automation listing (and so the map) with the
+        // workstream; they stay readable and durable for audit.
+        assert!(listed_ids(store.list_automations().await.unwrap()).is_empty());
+        // Member projects are not touched: same version, binding, and
+        // attachment row.
+        assert_eq!(store.get_project(&project.id).await.unwrap(), project);
+
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let attachments: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM coordination_node_projects WHERE node_id = ?1",
+                [&node.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attachments, 1);
+        let cleanup: (String, String, String, String) = connection
+            .query_row(
+                "SELECT cleanup.reason, cleanup.expected_binding_state, cleanup.status,
+                        retired.reason
+                   FROM runtime_cleanup_jobs cleanup
+                   JOIN retired_runtime_bindings retired
+                     ON retired.command_id = cleanup.command_id
+                  WHERE cleanup.command_id = 'archive-workstream'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            cleanup,
+            (
+                "worker_session_end".to_owned(),
+                "detached".to_owned(),
+                "pending".to_owned(),
+                "worker_session_end".to_owned(),
+            )
+        );
+        assert_eq!(
+            lifecycle_event_types(&connection, &node.id).last().unwrap(),
+            "coordination_node_archived"
+        );
+        assert_eq!(
+            lifecycle_event_types(&connection, &worker.id)
+                .last()
+                .unwrap(),
+            "coordination_node_archive_worker_ended"
+        );
+        assert_eq!(
+            lifecycle_event_types(&connection, &active_id)
+                .last()
+                .unwrap(),
+            "automation_paused"
+        );
+        drop(connection);
+
+        let replayed = store
+            .archive_coordination_node(&node.id, archive.clone())
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(
+            replayed.paused_automation_ids,
+            archived.paused_automation_ids
+        );
+        assert_eq!(replayed.archived_at_unix_ms, archived.archived_at_unix_ms);
+        assert!(matches!(
+            store
+                .archive_coordination_node(
+                    &node.id,
+                    ArchiveCoordinationNode {
+                        actor: "another-user".to_owned(),
+                        ..archive.clone()
+                    },
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+        assert!(matches!(
+            store
+                .archive_coordination_node(
+                    &node.id,
+                    ArchiveCoordinationNode {
+                        command_id: "archive-workstream-again".to_owned(),
+                        ..archive
+                    },
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CoordinationNodeAlreadyArchived
+        ));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn archived_workstream_rejects_node_and_automation_mutations() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (node, project) = provisioned_workstream(&store, &temp, "frozen-ws").await;
+        let worker = node.worker.clone().unwrap();
+        let automation_id = Uuid::now_v7().to_string();
+        let automation = store
+            .create_automation(
+                workstream_automation(
+                    &node.id,
+                    &automation_id,
+                    "create-frozen-automation",
+                    Vec::new(),
+                ),
+                100,
+            )
+            .await
+            .unwrap()
+            .automation;
+        store
+            .archive_coordination_node(&node.id, node_archive(&node, "archive-frozen-ws"))
+            .await
+            .unwrap();
+        let archived_error = |error: ProjectStoreError| {
+            assert!(
+                matches!(error, ProjectStoreError::CoordinationNodeArchived),
+                "{error:?}"
+            );
+        };
+
+        archived_error(
+            store
+                .update_coordination_node(
+                    &node.id,
+                    UpdateCoordinationNode {
+                        command_id: "detach-frozen-ws".to_owned(),
+                        actor: "local-user".to_owned(),
+                        expected_version: node.version + 1,
+                        name: node.name.clone(),
+                        attached_project_ids: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap_err(),
+        );
+        archived_error(
+            store
+                .update_coordination_node_placement(
+                    &node.id,
+                    UpdateCoordinationNodePlacement {
+                        command_id: "move-frozen-ws".to_owned(),
+                        actor: "local-user".to_owned(),
+                        expected_version: node.placement.version,
+                        placement: node_placement(),
+                    },
+                )
+                .await
+                .unwrap_err(),
+        );
+        archived_error(
+            store
+                .begin_coordination_node_prompt(
+                    &node.id,
+                    SendCoordinationNodePrompt {
+                        command_id: "prompt-frozen-ws".to_owned(),
+                        actor: "local-user".to_owned(),
+                        expected_node_version: node.version + 1,
+                        worker_id: worker.id.clone(),
+                        text: "Report status.".to_owned(),
+                    },
+                    TokenSpendCommandSource::Manual,
+                )
+                .await
+                .unwrap_err(),
+        );
+        archived_error(
+            store
+                .begin_coordination_node_route(
+                    &node.id,
+                    SendCoordinationNodeRoute {
+                        command_id: "route-frozen-ws".to_owned(),
+                        actor: "local-user".to_owned(),
+                        expected_node_version: node.version + 1,
+                        worker_id: worker.id.clone(),
+                        target_project_id: project.id.clone(),
+                        expected_project_version: project.version,
+                        target_orchestrator_worker_id: project.orchestrator.id.clone(),
+                        text: "Write the status.".to_owned(),
+                    },
+                )
+                .await
+                .unwrap_err(),
+        );
+        archived_error(
+            store
+                .create_coordination_snapshot(
+                    &node.id,
+                    &Uuid::now_v7().to_string(),
+                    temp.path().join("snapshot").to_string_lossy().into_owned(),
+                    Vec::new(),
+                    RequestCoordinationSnapshot {
+                        command_id: "snapshot-frozen-ws".to_owned(),
+                        actor: "local-user".to_owned(),
+                        expected_node_version: node.version + 1,
+                    },
+                )
+                .await
+                .unwrap_err(),
+        );
+        archived_error(
+            store
+                .begin_coordination_node_runtime_provision(
+                    &node.id,
+                    ProvisionCoordinationNode {
+                        command_id: "reprovision-frozen-ws".to_owned(),
+                        actor: "local-user".to_owned(),
+                        profile_id: worker.profile_id.clone().unwrap(),
+                        expected_profile_version: worker.profile_version.unwrap(),
+                        expected_node_version: node.version + 1,
+                    },
+                )
+                .await
+                .unwrap_err(),
+        );
+        archived_error(
+            store
+                .create_automation(
+                    workstream_automation(
+                        &node.id,
+                        &Uuid::now_v7().to_string(),
+                        "create-automation-on-frozen-ws",
+                        Vec::new(),
+                    ),
+                    100,
+                )
+                .await
+                .unwrap_err(),
+        );
+        let paused = store.get_automation(&automation_id).await.unwrap();
+        assert_eq!(paused.version, automation.version + 1);
+        archived_error(
+            store
+                .set_automation_paused(
+                    SetAutomationPaused {
+                        command_id: "resume-frozen-automation".to_owned(),
+                        actor: "local-user".to_owned(),
+                        automation_id: automation_id.clone(),
+                        expected_version: paused.version,
+                        paused: false,
+                    },
+                    Some(200),
+                )
+                .await
+                .unwrap_err(),
+        );
+        archived_error(
+            store
+                .create_manual_automation_run(
+                    RunAutomationNow {
+                        command_id: "run-frozen-automation".to_owned(),
+                        actor: "local-user".to_owned(),
+                        automation_id: automation_id.clone(),
+                        expected_version: paused.version,
+                    },
+                    &Uuid::now_v7().to_string(),
+                    "dispatch-frozen-automation",
+                )
+                .await
+                .unwrap_err(),
+        );
+        archived_error(
+            store
+                .update_automation(
+                    UpdateAutomation {
+                        command_id: "edit-frozen-automation".to_owned(),
+                        actor: "local-user".to_owned(),
+                        automation_id: automation_id.clone(),
+                        expected_version: paused.version,
+                        name: "Renamed".to_owned(),
+                        scope: paused.scope.clone(),
+                        schedule: paused.schedule.clone(),
+                        selected_project_ids: Vec::new(),
+                        prompt_template: paused.prompt_template.clone(),
+                    },
+                    None,
+                )
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(store.get_automation(&automation_id).await.unwrap(), paused);
+    }
+
+    #[tokio::test]
+    async fn archived_workstream_worker_cleanup_is_accepted_as_detached() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (node, _) = provisioned_workstream(&store, &temp, "cleanup-ws").await;
+        let archived = store
+            .archive_coordination_node(&node.id, node_archive(&node, "archive-cleanup-ws"))
+            .await
+            .unwrap();
+        assert!(archived.cleanup_pending);
+
+        // The worker still appears in coordination_nodes.worker_id; ownership
+        // validation must treat the archived node's worker as detached.
+        let claimed = store
+            .claim_pending_runtime_cleanups(Some("archive-cleanup-ws"), 10, 30_000)
+            .await
+            .unwrap();
+        assert_eq!(claimed.rejected, 0);
+        assert_eq!(claimed.jobs.len(), 1);
+        let job = &claimed.jobs[0];
+        assert_eq!(job.worker_id, archived.worker_id.clone().unwrap());
+        assert_eq!(job.reason, "worker_session_end");
+        store
+            .succeed_runtime_cleanup(&job.id, &job.claim_token)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .archive_coordination_node(&node.id, node_archive(&node, "archive-cleanup-ws"))
+                .await
+                .unwrap()
+                .cleanup_pending
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn deleting_active_workstream_archives_it_in_one_command_and_replays() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (node, project) = provisioned_workstream(&store, &temp, "delete-ws").await;
+        let worker = node.worker.clone().unwrap();
+        let automation_id = Uuid::now_v7().to_string();
+        store
+            .create_automation(
+                workstream_automation(
+                    &node.id,
+                    &automation_id,
+                    "create-delete-ws-automation",
+                    vec![project.id.clone()],
+                ),
+                100,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .delete_coordination_node(
+                    &node.id,
+                    DeleteCoordinationNode {
+                        command_id: "delete-ws-without-archive".to_owned(),
+                        actor: "local-user".to_owned(),
+                        archive: None,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CoordinationNodeNotArchived
+        ));
+        let mut stale = node_delete(&node, "delete-ws-stale");
+        stale.archive.as_mut().unwrap().expected_node_version = node.version + 5;
+        assert!(matches!(
+            store
+                .delete_coordination_node(&node.id, stale)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CoordinationNodeVersionConflict { .. }
+        ));
+        assert_eq!(
+            store.list_coordination_nodes().await.unwrap().nodes.len(),
+            1
+        );
+
+        let delete = node_delete(&node, "delete-active-ws");
+        let deleted = store
+            .delete_coordination_node(&node.id, delete.clone())
+            .await
+            .unwrap();
+        assert_eq!(deleted.worker_id.as_deref(), Some(worker.id.as_str()));
+        assert_eq!(deleted.paused_automation_ids, [automation_id.as_str()]);
+        assert!(deleted.cleanup_pending);
+        assert!(!deleted.replayed);
+        assert!(
+            store
+                .list_coordination_nodes()
+                .await
+                .unwrap()
+                .nodes
+                .is_empty()
+        );
+        assert!(matches!(
+            store.get_coordination_node(&node.id).await.unwrap_err(),
+            ProjectStoreError::CoordinationNodeNotFound
+        ));
+        assert!(
+            store
+                .list_worker_candidates()
+                .await
+                .unwrap()
+                .workers
+                .iter()
+                .all(|candidate| candidate.worker.id != worker.id)
+        );
+        assert_eq!(store.get_project(&project.id).await.unwrap(), project);
+        assert_eq!(
+            store.get_automation(&automation_id).await.unwrap().state,
+            AutomationState::Paused
+        );
+
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let rows: (i64, i64, String, i64) = connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM coordination_nodes WHERE id = ?1),
+                    (SELECT COUNT(*) FROM coordination_node_projects WHERE node_id = ?1),
+                    (SELECT command_id FROM archived_coordination_nodes WHERE node_id = ?1),
+                    (SELECT archive_applied FROM deleted_coordination_nodes WHERE node_id = ?1)",
+                [&node.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, (1, 1, "delete-active-ws".to_owned(), 1));
+        assert_eq!(
+            lifecycle_event_types(&connection, &node.id)
+                .into_iter()
+                .rev()
+                .take(2)
+                .collect::<Vec<_>>(),
+            ["coordination_node_deleted", "coordination_node_archived"]
+        );
+        drop(connection);
+
+        let replayed = store
+            .delete_coordination_node(&node.id, delete.clone())
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(
+            replayed.paused_automation_ids,
+            deleted.paused_automation_ids
+        );
+        assert_eq!(replayed.deleted_at_unix_ms, deleted.deleted_at_unix_ms);
+        assert!(matches!(
+            store
+                .delete_coordination_node(
+                    &node.id,
+                    DeleteCoordinationNode {
+                        archive: None,
+                        ..delete.clone()
+                    },
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+        // A delete ID never replays as an archive.
+        assert!(matches!(
+            store
+                .archive_coordination_node(&node.id, node_archive(&node, "delete-active-ws"))
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+        assert!(matches!(
+            store
+                .delete_coordination_node(&node.id, node_delete(&node, "delete-ws-again"))
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CoordinationNodeAlreadyDeleted
+        ));
+        assert!(matches!(
+            store
+                .archive_coordination_node(&node.id, node_archive(&node, "archive-deleted-ws"))
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CoordinationNodeAlreadyArchived
+        ));
+        assert!(matches!(
+            store
+                .delete_coordination_node(
+                    &Uuid::now_v7().to_string(),
+                    node_delete(&node, "delete-unknown-ws"),
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CoordinationNodeNotFound
+        ));
+        // The tombstoned worker's runtime cleanup still passes ownership
+        // validation.
+        let claimed = store
+            .claim_pending_runtime_cleanups(Some("delete-active-ws"), 10, 30_000)
+            .await
+            .unwrap();
+        assert_eq!((claimed.jobs.len(), claimed.rejected), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn deleting_archived_workstream_ignores_archive_preconditions_and_replays() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (node, project) = provisioned_workstream(&store, &temp, "tab-ws").await;
+        // Another tab archived the node after this tab opened its delete sheet.
+        let archived = store
+            .archive_coordination_node(&node.id, node_archive(&node, "archive-from-other-tab"))
+            .await
+            .unwrap();
+        let delete = node_delete(&node, "delete-after-other-tab");
+        let deleted = store
+            .delete_coordination_node(&node.id, delete.clone())
+            .await
+            .unwrap();
+        assert!(!deleted.replayed);
+        assert_eq!(deleted.worker_id, archived.worker_id);
+        assert!(deleted.paused_automation_ids.is_empty());
+        let replayed = store
+            .delete_coordination_node(&node.id, delete)
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(store.get_project(&project.id).await.unwrap(), project);
+
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let archive_applied: i64 = connection
+            .query_row(
+                "SELECT archive_applied FROM deleted_coordination_nodes WHERE node_id = ?1",
+                [&node.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archive_applied, 0);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn workstream_archive_waits_only_for_pending_prompts_and_routes() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (node, project) = provisioned_workstream(&store, &temp, "busy-ws").await;
+        let worker = node.worker.clone().unwrap();
+        let prompt = SendCoordinationNodePrompt {
+            command_id: "prompt-busy-ws".to_owned(),
+            actor: "local-user".to_owned(),
+            expected_node_version: node.version,
+            worker_id: worker.id.clone(),
+            text: "Report release blockers.".to_owned(),
+        };
+        store
+            .begin_coordination_node_prompt(&node.id, prompt, TokenSpendCommandSource::Manual)
+            .await
+            .unwrap();
+        let preview = store
+            .coordination_node_disposition_preview(&node.id)
+            .await
+            .unwrap();
+        assert_eq!(preview.blockers.len(), 1);
+        assert_eq!(
+            preview.blockers[0].kind,
+            CoordinationNodeDispositionBlockerKind::Prompt
+        );
+        assert_eq!(preview.blockers[0].command_id, "prompt-busy-ws");
+        assert!(matches!(
+            store
+                .archive_coordination_node(&node.id, node_archive(&node, "archive-busy-prompt"))
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CoordinationNodeDispositionBlocked {
+                pending_prompts: 1,
+                pending_routes: 0,
+            }
+        ));
+        assert!(matches!(
+            store
+                .delete_coordination_node(&node.id, node_delete(&node, "delete-busy-prompt"))
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CoordinationNodeDispositionBlocked { .. }
+        ));
+        // An ambiguous prompt is terminal, so it no longer blocks.
+        store
+            .fail_coordination_node_prompt("prompt-busy-ws", "delivery outcome unknown", true)
+            .await
+            .unwrap();
+
+        let route = SendCoordinationNodeRoute {
+            command_id: "route-busy-ws".to_owned(),
+            actor: "local-user".to_owned(),
+            expected_node_version: node.version,
+            worker_id: worker.id.clone(),
+            target_project_id: project.id.clone(),
+            expected_project_version: project.version,
+            target_orchestrator_worker_id: project.orchestrator.id.clone(),
+            text: "Write the integration status.".to_owned(),
+        };
+        store
+            .begin_coordination_node_route(&node.id, route)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .archive_coordination_node(&node.id, node_archive(&node, "archive-busy-route"))
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CoordinationNodeDispositionBlocked {
+                pending_prompts: 0,
+                pending_routes: 1,
+            }
+        ));
+        assert_eq!(
+            store.list_coordination_nodes().await.unwrap().nodes.len(),
+            1
+        );
+        store
+            .fail_coordination_node_route("route-busy-ws", "runtime rejected delivery", false)
+            .await
+            .unwrap();
+        store
+            .archive_coordination_node(&node.id, node_archive(&node, "archive-idle-ws"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn knowledge_store_archive_and_delete_are_not_supported() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let node_id = Uuid::now_v7().to_string();
+        let node = store
+            .create_coordination_node(
+                &node_id,
+                None,
+                Some(
+                    temp.path()
+                        .join("knowledge")
+                        .join(&node_id)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                create_node_command(
+                    "create-unsupported-knowledge",
+                    CoordinationNodeKind::KnowledgeStore,
+                    Vec::new(),
+                ),
+            )
+            .await
+            .unwrap()
+            .node;
+        let not_supported = |error: ProjectStoreError| {
+            assert!(
+                matches!(error, ProjectStoreError::CoordinationNodeKindNotSupported),
+                "{error:?}"
+            );
+        };
+        not_supported(
+            store
+                .archive_coordination_node(&node.id, node_archive(&node, "archive-knowledge"))
+                .await
+                .unwrap_err(),
+        );
+        not_supported(
+            store
+                .delete_coordination_node(&node.id, node_delete(&node, "delete-knowledge"))
+                .await
+                .unwrap_err(),
+        );
+        not_supported(
+            store
+                .delete_coordination_node(
+                    &node.id,
+                    DeleteCoordinationNode {
+                        archive: None,
+                        ..node_delete(&node, "delete-knowledge-without-archive")
+                    },
+                )
+                .await
+                .unwrap_err(),
+        );
+        let preview = store
+            .coordination_node_disposition_preview(&node.id)
+            .await
+            .unwrap();
+        assert!(!preview.supported);
+        assert_eq!(store.get_coordination_node(&node.id).await.unwrap(), node);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn deleted_workstream_command_replays_read_as_not_found() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (node, project) = provisioned_workstream(&store, &temp, "replay-ws").await;
+        let rename = UpdateCoordinationNode {
+            command_id: "rename-replay-ws".to_owned(),
+            actor: "local-user".to_owned(),
+            expected_version: node.version,
+            name: "Renamed coordination".to_owned(),
+            attached_project_ids: vec![project.id.clone()],
+        };
+        let node = store
+            .update_coordination_node(&node.id, rename.clone())
+            .await
+            .unwrap()
+            .node;
+        let mut geometry = node_placement();
+        geometry.x += 40.0;
+        let placement = UpdateCoordinationNodePlacement {
+            command_id: "move-replay-ws".to_owned(),
+            actor: "local-user".to_owned(),
+            expected_version: node.placement.version,
+            placement: geometry,
+        };
+        let node = store
+            .update_coordination_node_placement(&node.id, placement.clone())
+            .await
+            .unwrap()
+            .node;
+        let create = || {
+            create_node_command(
+                "replay-ws-create-node",
+                CoordinationNodeKind::Workstream,
+                vec![project.id.clone()],
+            )
+        };
+        let workstream_path = Some(
+            temp.path()
+                .join("coordination")
+                .join(&node.id)
+                .to_string_lossy()
+                .into_owned(),
+        );
+
+        // An archived node still replays the commands it already accepted.
+        store
+            .archive_coordination_node(&node.id, node_archive(&node, "archive-replay-ws"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .update_coordination_node(&node.id, rename.clone())
+                .await
+                .unwrap()
+                .replayed
+        );
+        assert!(
+            store
+                .update_coordination_node_placement(&node.id, placement.clone())
+                .await
+                .unwrap()
+                .replayed
+        );
+
+        // Once deleted (its worker tombstoned with it), every replay reads
+        // as not found instead of failing on the missing worker.
+        store
+            .delete_coordination_node(
+                &node.id,
+                DeleteCoordinationNode {
+                    command_id: "delete-replay-ws".to_owned(),
+                    actor: "local-user".to_owned(),
+                    archive: None,
+                },
+            )
+            .await
+            .unwrap();
+        let not_found = |error: ProjectStoreError| {
+            assert!(
+                matches!(error, ProjectStoreError::CoordinationNodeNotFound),
+                "{error:?}"
+            );
+        };
+        not_found(
+            store
+                .create_coordination_node(&node.id, workstream_path, None, create())
+                .await
+                .unwrap_err(),
+        );
+        not_found(
+            store
+                .update_coordination_node(&node.id, rename)
+                .await
+                .unwrap_err(),
+        );
+        not_found(
+            store
+                .update_coordination_node_placement(&node.id, placement)
+                .await
+                .unwrap_err(),
+        );
+    }
+
+    #[tokio::test]
+    async fn workstream_disposition_checks_the_optional_worker_version() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (node, _project) = provisioned_workstream(&store, &temp, "worker-version-ws").await;
+        let worker = node.worker.clone().unwrap();
+        let stale_version = worker.version + 5;
+        let mut stale_archive = node_archive(&node, "archive-stale-worker");
+        stale_archive.expected_worker_version = Some(stale_version);
+        assert!(matches!(
+            store
+                .archive_coordination_node(&node.id, stale_archive)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::WorkerVersionConflict { current_version }
+                if current_version == worker.version
+        ));
+        let mut stale_delete = node_delete(&node, "delete-stale-worker");
+        stale_delete
+            .archive
+            .as_mut()
+            .unwrap()
+            .expected_worker_version = Some(stale_version);
+        assert!(matches!(
+            store
+                .delete_coordination_node(&node.id, stale_delete)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::WorkerVersionConflict { .. }
+        ));
+        // Nothing was written: the node is still active, its worker still
+        // runs, and the refused command ID is still free.
+        assert_eq!(store.get_coordination_node(&node.id).await.unwrap(), node);
+        let running = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.worker.id == worker.id)
+            .unwrap();
+        assert_eq!(running.worker.version, worker.version);
+        assert!(running.worker.runtime.is_some());
+        assert!(
+            !store
+                .archive_coordination_node(&node.id, node_archive(&node, "archive-stale-worker"))
+                .await
+                .unwrap()
+                .replayed
+        );
+
+        let bare_id = Uuid::now_v7().to_string();
+        let bare = store
+            .create_coordination_node(
+                &bare_id,
+                Some(
+                    temp.path()
+                        .join("coordination")
+                        .join(&bare_id)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                None,
+                create_node_command(
+                    "create-unprovisioned-worker-version",
+                    CoordinationNodeKind::Workstream,
+                    Vec::new(),
+                ),
+            )
+            .await
+            .unwrap()
+            .node;
+        let mut unprovisioned = node_archive(&bare, "archive-unprovisioned-worker");
+        unprovisioned.expected_worker_version = Some(1);
+        assert!(matches!(
+            store
+                .archive_coordination_node(&bare.id, unprovisioned)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CoordinationNodeNotProvisioned
+        ));
+        assert_eq!(store.get_coordination_node(&bare.id).await.unwrap(), bare);
+    }
+
+    #[tokio::test]
+    async fn runtime_topology_names_the_archived_workstream_whose_tab_awaits_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (node, _project) = provisioned_workstream(&store, &temp, "tab-label-ws").await;
+        let occupant = |topology: yard_domain::RuntimeTopology| {
+            topology
+                .managed_workspaces
+                .into_iter()
+                .find_map(|workspace| {
+                    let label = workspace.label;
+                    workspace
+                        .occupants
+                        .into_iter()
+                        .find(|occupant| occupant.terminal_id == "tab-label-ws-terminal")
+                        .map(|occupant| (label, occupant))
+                })
+                .unwrap()
+        };
+        store
+            .archive_coordination_node(&node.id, node_archive(&node, "archive-tab-label-ws"))
+            .await
+            .unwrap();
+        let (workspace_label, archived) =
+            occupant(store.runtime_topology("herdr", "default").await.unwrap());
+        assert_eq!(archived.kind, ManagedRuntimeOccupantKind::CleanupPending);
+        assert_eq!(
+            workspace_label,
+            "Archived workstream Release coordination—cleanup pending"
+        );
+        assert_eq!(
+            archived.label,
+            "Archived workstream Release coordination—close its Herdr tab"
+        );
+
+        store
+            .delete_coordination_node(
+                &node.id,
+                DeleteCoordinationNode {
+                    command_id: "delete-tab-label-ws".to_owned(),
+                    actor: "local-user".to_owned(),
+                    archive: None,
+                },
+            )
+            .await
+            .unwrap();
+        let (workspace_label, deleted) =
+            occupant(store.runtime_topology("herdr", "default").await.unwrap());
+        assert_eq!(
+            workspace_label,
+            "Deleted workstream Release coordination—cleanup pending"
+        );
+        assert_eq!(
+            deleted.label,
+            "Deleted workstream Release coordination—close its Herdr tab"
+        );
+    }
+
+    #[tokio::test]
+    async fn member_project_archive_ignores_archived_workstream_automation_selection() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (node, project) = provisioned_workstream(&store, &temp, "member-ws").await;
+        store
+            .create_automation(
+                workstream_automation(
+                    &node.id,
+                    &Uuid::now_v7().to_string(),
+                    "create-member-selection",
+                    vec![project.id.clone()],
+                ),
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .archive_project(
+                    &project.id,
+                    archive_command(&project, "archive-member-early")
+                )
+                .await
+                .unwrap_err(),
             ProjectStoreError::ProjectHasArchiveDependencies
         ));
-        assert_eq!(store.get_project(&project.id).await.unwrap().id, project.id);
+
+        let delete = node_delete(&node, "delete-member-ws");
+        store
+            .delete_coordination_node(&node.id, delete.clone())
+            .await
+            .unwrap();
+        let node_state = |connection: &Connection| -> (i64, Vec<String>) {
+            let version = connection
+                .query_row(
+                    "SELECT version FROM coordination_nodes WHERE id = ?1",
+                    [&node.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (version, lifecycle_event_types(connection, &node.id))
+        };
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let before = node_state(&connection);
+        // The paused automation of a deleted workstream can never run again,
+        // so its selection no longer keeps the member project from archiving.
+        store
+            .archive_project(
+                &project.id,
+                archive_command(&project, "archive-member-late"),
+            )
+            .await
+            .unwrap();
+        // The deleted node no longer changes: archiving its member project
+        // neither bumps its version nor adds to its audit trail.
+        assert_eq!(node_state(&connection), before);
+        drop(connection);
+        assert!(
+            store
+                .delete_coordination_node(&node.id, delete)
+                .await
+                .unwrap()
+                .replayed
+        );
+    }
+
+    #[tokio::test]
+    async fn workstream_disposition_preview_itemizes_its_dependencies() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (node, project) = provisioned_workstream(&store, &temp, "preview-ws").await;
+        let worker = node.worker.clone().unwrap();
+        let automation_id = Uuid::now_v7().to_string();
+        store
+            .create_automation(
+                workstream_automation(
+                    &node.id,
+                    &automation_id,
+                    "create-preview-automation",
+                    Vec::new(),
+                ),
+                100,
+            )
+            .await
+            .unwrap();
+
+        let preview = store
+            .coordination_node_disposition_preview(&node.id)
+            .await
+            .unwrap();
+        assert_eq!(preview.node_id, node.id);
+        assert_eq!(preview.node_version, node.version);
+        assert!(preview.supported);
+        let preview_worker = preview.worker.unwrap();
+        assert_eq!(preview_worker.worker_id, worker.id);
+        assert_eq!(preview_worker.worker_version, worker.version);
+        assert_eq!(
+            preview_worker.profile_name.as_deref(),
+            Some("preview-ws coordinator")
+        );
+        assert!(preview_worker.runtime_present);
+        assert!(preview_worker.will_end);
+        assert_eq!(preview.attached_projects.len(), 1);
+        assert_eq!(preview.attached_projects[0].project_id, project.id);
+        assert_eq!(preview.attached_projects[0].name, project.name);
+        assert_eq!(preview.automations.len(), 1);
+        assert_eq!(preview.automations[0].automation_id, automation_id);
+        assert_eq!(preview.automations[0].state, AutomationState::Active);
+        assert!(preview.blockers.is_empty());
+
+        store
+            .archive_coordination_node(&node.id, node_archive(&node, "archive-previewed-ws"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .coordination_node_disposition_preview(&node.id)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CoordinationNodeArchived
+        ));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn populated_v34_database_migrates_to_workstream_dispositions() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let (archived_draft, archived_runtime) = draft("v29-archived", "v29-archived-terminal");
+        let archived_project = store
+            .create_project(archived_draft, archived_runtime)
+            .await
+            .unwrap();
+        let project_archive = archive_command(&archived_project, "v29-project-archive");
+        store
+            .archive_project(&archived_project.id, project_archive.clone())
+            .await
+            .unwrap();
+        let (node, _) = provisioned_workstream(&store, &temp, "v29-ws").await;
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_coordination_node_dispositions_schema_to_v34(&connection);
+        assert!(!super::table_exists(&connection, "archived_coordination_nodes").unwrap());
+        drop(connection);
+
+        let migrated = SqliteProjectStore::open(&path).await.unwrap();
+        // Rows referencing the rebuilt acknowledgement table survive: the
+        // project archive replays and its pending cleanup is still claimable.
+        assert!(
+            migrated
+                .archive_project(&archived_project.id, project_archive)
+                .await
+                .unwrap()
+                .replayed
+        );
+        let claimed = migrated
+            .claim_pending_runtime_cleanups(Some("v29-project-archive"), 10, 30_000)
+            .await
+            .unwrap();
+        assert_eq!(claimed.jobs.len(), 1);
+        let deleted = migrated
+            .delete_coordination_node(&node.id, node_delete(&node, "v29-delete-ws"))
+            .await
+            .unwrap();
+        assert!(deleted.worker_id.is_some());
+        drop(migrated);
+
+        let fresh_temp = TempDir::new().unwrap();
+        drop(open_store(&fresh_temp).await);
+        let fresh = Connection::open(fresh_temp.path().join("yard.sqlite3")).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        for table in [
+            "command_acknowledgements",
+            "archived_coordination_nodes",
+            "archived_coordination_node_automations",
+            "deleted_coordination_nodes",
+        ] {
+            assert_eq!(
+                table_schema(&connection, table),
+                table_schema(&fresh, table),
+                "{table}"
+            );
+        }
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let foreign_key_violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_violations, 0);
+    }
+
+    #[tokio::test]
+    async fn v28_database_from_3fdcf5e_migrates_to_workstream_dispositions() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let (node, project) = provisioned_workstream(&store, &temp, "drift-ws").await;
+        let legacy_project = create_archived_project(
+            &store,
+            "drift-legacy",
+            "drift-legacy-terminal",
+            "drift-legacy-archive",
+        )
+        .await;
+        store
+            .delete_project(
+                &legacy_project.id,
+                DeleteProject {
+                    command_id: "drift-legacy-delete".to_owned(),
+                    actor: "local-user".to_owned(),
+                    archive: None,
+                },
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_snapshot_expiry_schema_to_v33(&connection);
+        downgrade_mainline_schema_to_v28(&connection);
+        downgrade_visibility_deletions_schema_to_3fdcf5e(&connection);
+        drop(connection);
+
+        let migrated = SqliteProjectStore::open(&path).await.unwrap();
+        let archived = migrated
+            .archive_coordination_node(&node.id, node_archive(&node, "drift-archive-ws"))
+            .await
+            .unwrap();
+        assert!(archived.cleanup_pending);
+        assert!(
+            migrated
+                .delete_coordination_node(
+                    &node.id,
+                    DeleteCoordinationNode {
+                        archive: None,
+                        ..node_delete(&node, "drift-delete-ws")
+                    },
+                )
+                .await
+                .is_ok()
+        );
+        // Mainline 0031 re-derives `ownership_kind` when this downgraded
+        // database migrates again; everything else on the project is untouched.
+        let mut expected = project;
+        let after = migrated.get_project(&expected.id).await.unwrap();
+        expected.orchestrator.ownership_kind = after.orchestrator.ownership_kind;
+        assert_eq!(after, expected);
+        drop(migrated);
+
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let foreign_key_violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_violations, 0);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn node_runtime_claim_and_confirm_refuse_a_workstream_archived_mid_provision() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) = draft("mid-provision", "mid-provision-terminal");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        let node_id = Uuid::now_v7().to_string();
+        let node = store
+            .create_coordination_node(
+                &node_id,
+                Some(
+                    temp.path()
+                        .join("coordination")
+                        .join(&node_id)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                None,
+                create_node_command(
+                    "mid-provision-create-node",
+                    CoordinationNodeKind::Workstream,
+                    vec![project.id.clone()],
+                ),
+            )
+            .await
+            .unwrap()
+            .node;
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("mid-provision coordinator"),
+            })
+            .await
+            .unwrap();
+        let provision = |command_id: &str| ProvisionCoordinationNode {
+            command_id: command_id.to_owned(),
+            actor: "local-user".to_owned(),
+            profile_id: profile.id.clone(),
+            expected_profile_version: profile.version,
+            expected_node_version: node.version,
+        };
+        store
+            .begin_coordination_node_runtime_provision(&node.id, provision("mid-provision"))
+            .await
+            .unwrap();
+        let runtime = WorkerRuntimeBinding {
+            adapter: "herdr".to_owned(),
+            session: "yard-coordination".to_owned(),
+            workspace_id: "mid-provision-workspace".to_owned(),
+            terminal_id: "mid-provision-node-terminal".to_owned(),
+            tab_id: Some("mid-provision-tab".to_owned()),
+            pane_id: "mid-provision-pane".to_owned(),
+            provider_session: None,
+            owns_tab: true,
+            observation_state: RuntimeObservationState::Observed,
+            process_state: RuntimeProcessState::Running,
+            status: ObservedStatus::Idle,
+            state_change_sequence: 1,
+            revision: 1,
+            version: 1,
+            last_observed_at_unix_ms: 30,
+        };
+
+        // The archive lands after provisioning began but before the runtime
+        // was claimed: neither the claim nor the confirmation may bind it.
+        store
+            .archive_coordination_node(&node.id, node_archive(&node, "mid-provision-archive"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .claim_provisioning_runtime("mid-provision", runtime.clone())
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CoordinationNodeArchived
+        ));
+        assert!(matches!(
+            store
+                .confirm_dedicated_runtime_provision("mid-provision", runtime.clone())
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CoordinationNodeArchived
+        ));
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let claims: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM provisioning_runtime_claims WHERE command_id = ?1",
+                ["mid-provision"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claims, 0);
+        drop(connection);
+
+        // A deleted workstream reads as not found.
+        store
+            .delete_coordination_node(
+                &node.id,
+                DeleteCoordinationNode {
+                    archive: None,
+                    ..node_delete(&node, "mid-provision-delete")
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .claim_provisioning_runtime("mid-provision", runtime)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CoordinationNodeNotFound
+        ));
+    }
+
+    // ---- Assignment disposition and transcript capture (migration 0036) ----
+
+    fn disposition_command(
+        command_id: &str,
+        assignment: &yard_domain::Assignment,
+        outcome: yard_domain::DispositionOutcome,
+        end_session: bool,
+    ) -> yard_domain::DisposeAssignment {
+        yard_domain::DisposeAssignment {
+            command_id: command_id.to_owned(),
+            actor: "local-user".to_owned(),
+            attempt_id: assignment.attempt.id.clone(),
+            expected_assignment_version: assignment.version,
+            expected_attempt_version: assignment.attempt.version,
+            outcome,
+            end_session,
+            expected_worker_version: end_session.then_some(assignment.worker.version),
+            expected_runtime_version: if end_session {
+                assignment
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.version)
+            } else {
+                None
+            },
+        }
+    }
+
+    async fn allocate_additional_assignment(
+        store: &SqliteProjectStore,
+        project_id: &str,
+        command_id: &str,
+        terminal_id: &str,
+    ) -> yard_domain::Assignment {
+        let project = store.get_project(project_id).await.unwrap();
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec(&format!("Implementer {terminal_id}")),
+            })
+            .await
+            .unwrap();
+        let allocation = ConfirmProfileAllocation {
+            command_id: command_id.to_owned(),
+            actor: "local-user".to_owned(),
+            profile_id: profile.id,
+            expected_profile_version: profile.version,
+            expected_project_version: project.version,
+            objective: format!("Finish the work in {terminal_id}."),
+            role: "implementer".to_owned(),
+            isolation_policy: IsolationPolicy::ProjectWorkspace,
+        };
+        store
+            .begin_profile_allocation(project_id, allocation.clone())
+            .await
+            .unwrap();
+        let (_, mut runtime) = draft(&project.runtime.workspace_id, terminal_id);
+        runtime.tab_id = Some(format!("tab-{terminal_id}"));
+        runtime.pane_id = format!("pane-{terminal_id}");
+        runtime.owns_tab = true;
+        store
+            .claim_provisioning_runtime(command_id, runtime.clone())
+            .await
+            .unwrap();
+        store
+            .persist_runtime_allocation(command_id, runtime)
+            .await
+            .unwrap();
+        store
+            .activate_profile_allocation(command_id)
+            .await
+            .unwrap()
+            .assignment
+    }
+
+    async fn listed_assignment(
+        store: &SqliteProjectStore,
+        project_id: &str,
+        assignment_id: &str,
+    ) -> yard_domain::Assignment {
+        store
+            .list_project_assignments(project_id)
+            .await
+            .unwrap()
+            .assignments
+            .into_iter()
+            .find(|assignment| assignment.id == assignment_id)
+            .unwrap()
+    }
+
+    fn count_rows(temp: &TempDir, sql: &str, value: &str) -> i64 {
+        Connection::open(temp.path().join("yard.sqlite3"))
+            .unwrap()
+            .query_row(sql, [value], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn minimal_completion_records_objective_and_actor_without_evidence_and_replays() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, active) = create_active_assignment(&store).await;
+        let command = disposition_command(
+            "quick-complete",
+            &active,
+            yard_domain::DispositionOutcome::Completed,
+            false,
+        );
+
+        let disposed = store
+            .dispose_assignment(
+                &project_id,
+                &active.id,
+                command.clone(),
+                yard_domain::RequestOrigin::Browser,
+            )
+            .await
+            .unwrap();
+
+        assert!(!disposed.replayed);
+        assert_eq!(
+            disposed.assignment.lifecycle,
+            AssignmentLifecycle::Completed
+        );
+        assert_eq!(
+            disposed.assignment.attempt.lifecycle,
+            AttemptLifecycle::Completed
+        );
+        assert_eq!(disposed.assignment.version, active.version + 1);
+        let receipt = disposed.receipt.clone().unwrap();
+        assert_eq!(
+            receipt.detail_level,
+            yard_domain::ReceiptDetailLevel::Minimal
+        );
+        assert_eq!(
+            receipt.objective_snapshot.as_deref(),
+            Some(active.objective.as_str())
+        );
+        assert_eq!(receipt.summary, yard_domain::MINIMAL_RECEIPT_SUMMARY);
+        assert_eq!(receipt.actor, "local-user");
+        assert_eq!(receipt.attempt_id, active.attempt.id);
+        assert!(receipt.artifact_refs.is_empty());
+        assert!(receipt.artifacts.is_empty());
+        assert!(receipt.evidence_refs.is_empty());
+        assert!(receipt.unresolved_blockers.is_empty());
+        assert_eq!(
+            disposed.assignment.completion_receipt.as_ref(),
+            Some(&receipt)
+        );
+        assert!(disposed.cancellation.is_none());
+        assert!(disposed.worker.is_none());
+        assert!(!disposed.cleanup_pending);
+        assert!(disposed.transcript_pending);
+
+        // Without end_session the worker keeps its runtime and is free again.
+        let candidate = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.worker.id == active.worker.id)
+            .unwrap();
+        assert_eq!(candidate.availability, WorkerAvailability::UnassignedLive);
+        assert_eq!(candidate.worker.version, active.worker.version);
+        assert!(candidate.worker.runtime.is_some());
+
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let (detail_level, origin, objective): (String, String, String) = connection
+            .query_row(
+                "SELECT detail_level, request_origin, objective_snapshot
+                   FROM completion_receipts WHERE assignment_id = ?1",
+                [&active.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(detail_level, "minimal");
+        assert_eq!(origin, "browser");
+        assert_eq!(objective, active.objective);
+        for table in [
+            "completion_receipt_artifacts",
+            "completion_receipt_evidence",
+            "completion_receipt_blockers",
+            "completion_receipt_artifact_links",
+        ] {
+            let rows: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE receipt_id = ?1"),
+                    [&receipt.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+        let (command_type, status): (String, String) = connection
+            .query_row(
+                "SELECT command_type, status FROM command_acknowledgements WHERE id = ?1",
+                ["quick-complete"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (command_type.as_str(), status.as_str()),
+            ("assignment_disposition", "succeeded")
+        );
+        let (job_status, terminal_id, pane_id, allocation_id): (String, String, String, String) =
+            connection
+                .query_row(
+                    "SELECT status, terminal_id, pane_id, allocation_id
+                       FROM transcript_capture_jobs WHERE command_id = ?1",
+                    ["quick-complete"],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+        assert_eq!(job_status, "pending");
+        assert_eq!(terminal_id, "terminal-2");
+        assert_eq!(pane_id, "pane-2");
+        assert_eq!(allocation_id, active.allocation_id);
+        let events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM lifecycle_events
+                  WHERE aggregate_id = ?1 AND event_type = 'completion_receipt_recorded'",
+                [&active.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+        drop(connection);
+        drop(store);
+
+        let store = open_store(&temp).await;
+        let replay = store
+            .dispose_assignment(
+                &project_id,
+                &active.id,
+                command.clone(),
+                yard_domain::RequestOrigin::None,
+            )
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.receipt, disposed.receipt);
+        assert_eq!(replay.assignment.version, disposed.assignment.version);
+
+        let mut changed = command.clone();
+        changed.outcome = yard_domain::DispositionOutcome::Cancelled;
+        assert!(matches!(
+            store
+                .dispose_assignment(
+                    &project_id,
+                    &active.id,
+                    changed,
+                    yard_domain::RequestOrigin::Browser
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+        let mut other_actor = command.clone();
+        other_actor.actor = "another-user".to_owned();
+        assert!(matches!(
+            store
+                .dispose_assignment(
+                    &project_id,
+                    &active.id,
+                    other_actor,
+                    yard_domain::RequestOrigin::Browser
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+        let mut other_session = command.clone();
+        other_session.end_session = true;
+        other_session.expected_worker_version = Some(active.worker.version);
+        assert!(matches!(
+            store
+                .dispose_assignment(
+                    &project_id,
+                    &active.id,
+                    other_session,
+                    yard_domain::RequestOrigin::Browser
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+        let again = disposition_command(
+            "quick-complete-again",
+            &active,
+            yard_domain::DispositionOutcome::Completed,
+            false,
+        );
+        assert!(matches!(
+            store
+                .dispose_assignment(
+                    &project_id,
+                    &active.id,
+                    again,
+                    yard_domain::RequestOrigin::Browser
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::AssignmentNotActive
+        ));
+        let reused = disposition_command(
+            "prompt-test-allocation",
+            &active,
+            yard_domain::DispositionOutcome::Completed,
+            false,
+        );
+        assert!(matches!(
+            store
+                .dispose_assignment(
+                    &project_id,
+                    &active.id,
+                    reused,
+                    yard_domain::RequestOrigin::Browser
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+        // The detailed path still refuses an empty receipt on a new assignment.
+        let empty = RecordCompletionReceipt {
+            command_id: "empty-detailed".to_owned(),
+            actor: "local-user".to_owned(),
+            attempt_id: active.attempt.id.clone(),
+            expected_assignment_version: active.version,
+            expected_attempt_version: active.attempt.version,
+            outcome: CompletionOutcome::Completed,
+            summary: "Done.".to_owned(),
+            artifact_refs: Vec::new(),
+            artifact_ids: Vec::new(),
+            evidence_refs: Vec::new(),
+            unresolved_blockers: Vec::new(),
+        };
+        assert!(matches!(
+            store
+                .record_completion_receipt(&project_id, &active.id, empty)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::InvalidCompletionReceipt(
+                yard_domain::CompletionValidationError::EvidenceRequired
+            )
+        ));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn ending_without_completion_cancels_and_ends_the_session_in_one_command() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, active) = create_active_assignment(&store).await;
+        let command = disposition_command(
+            "end-without-completion",
+            &active,
+            yard_domain::DispositionOutcome::Cancelled,
+            true,
+        );
+
+        let disposed = store
+            .dispose_assignment(
+                &project_id,
+                &active.id,
+                command.clone(),
+                yard_domain::RequestOrigin::None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            disposed.assignment.lifecycle,
+            AssignmentLifecycle::Cancelled
+        );
+        assert_eq!(
+            disposed.assignment.attempt.lifecycle,
+            AttemptLifecycle::Cancelled
+        );
+        assert!(disposed.receipt.is_none());
+        assert!(disposed.assignment.completion_receipt.is_none());
+        let cancellation = disposed.cancellation.clone().unwrap();
+        assert_eq!(
+            cancellation.reason,
+            yard_domain::CancellationReason::EndedWithoutCompletion
+        );
+        assert_eq!(cancellation.objective_snapshot, active.objective);
+        assert_eq!(
+            cancellation.request_origin,
+            yard_domain::RequestOrigin::None
+        );
+        assert_eq!(cancellation.command_id, "end-without-completion");
+        assert_eq!(cancellation.attempt_id, active.attempt.id);
+        assert_eq!(cancellation.actor, "local-user");
+        assert_eq!(
+            disposed.assignment.cancellation.as_ref(),
+            Some(&cancellation)
+        );
+        let worker = disposed.worker.clone().unwrap();
+        assert_eq!(worker.desired_state, yard_domain::WorkerDesiredState::Ended);
+        assert!(worker.runtime.is_none());
+        assert_eq!(worker.version, active.worker.version + 1);
+        assert!(disposed.cleanup_pending);
+        assert!(disposed.transcript_pending);
+
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let (reason, binding_state, expected_worker_version, status): (
+            String,
+            String,
+            i64,
+            String,
+        ) = connection
+            .query_row(
+                "SELECT reason, expected_binding_state, expected_worker_version, status
+                   FROM runtime_cleanup_jobs WHERE command_id = ?1",
+                ["end-without-completion"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(reason, "worker_session_end");
+        assert_eq!(binding_state, "detached");
+        assert_eq!(expected_worker_version, to_i64(worker.version).unwrap());
+        assert_eq!(status, "pending");
+        let retired: String = connection
+            .query_row(
+                "SELECT reason FROM retired_runtime_bindings WHERE command_id = ?1",
+                ["end-without-completion"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retired, "worker_session_end");
+        let receipts: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM completion_receipts WHERE assignment_id = ?1",
+                [&active.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipts, 0);
+        let open_allocations: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM worker_allocations
+                  WHERE worker_id = ?1 AND ended_at_unix_ms IS NULL",
+                [&active.worker.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(open_allocations, 0);
+        drop(connection);
+
+        // The detached cleanup job passes its ownership check.
+        let batch = store
+            .claim_pending_runtime_cleanups(Some("end-without-completion"), 10, 30_000)
+            .await
+            .unwrap();
+        assert_eq!(batch.rejected, 0);
+        assert_eq!(batch.jobs.len(), 1);
+
+        assert!(matches!(
+            store
+                .end_worker_session(
+                    &worker.id,
+                    EndWorkerSession {
+                        command_id: "end-again".to_owned(),
+                        actor: "local-user".to_owned(),
+                        expected_worker_version: worker.version,
+                        expected_runtime_version: None,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::WorkerAlreadyEnded
+        ));
+        store
+            .delete_worker(
+                &worker.id,
+                DeleteWorker {
+                    command_id: "delete-after-cancel".to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_worker_version: worker.version,
+                },
+            )
+            .await
+            .unwrap();
+        let listed = listed_assignment(&store, &project_id, &active.id).await;
+        assert_eq!(listed.lifecycle, AssignmentLifecycle::Cancelled);
+        assert_eq!(listed.cancellation, disposed.cancellation);
+        let replay = store
+            .dispose_assignment(
+                &project_id,
+                &active.id,
+                command,
+                yard_domain::RequestOrigin::Browser,
+            )
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.cancellation, disposed.cancellation);
+        assert!(
+            replay.cleanup_pending,
+            "the claimed cleanup job is still pending"
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn disposition_rejects_stale_versions_prompts_and_protected_workers_without_writing() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, active) = create_active_assignment(&store).await;
+        let complete = yard_domain::DispositionOutcome::Completed;
+
+        let mut stale = disposition_command("stale-assignment", &active, complete, false);
+        stale.expected_assignment_version += 1;
+        assert!(matches!(
+            store
+                .dispose_assignment(
+                    &project_id,
+                    &active.id,
+                    stale,
+                    yard_domain::RequestOrigin::None
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::AssignmentVersionConflict { .. }
+        ));
+        let mut stale_attempt = disposition_command("stale-attempt", &active, complete, false);
+        stale_attempt.attempt_id = "attempt-from-elsewhere".to_owned();
+        assert!(matches!(
+            store
+                .dispose_assignment(
+                    &project_id,
+                    &active.id,
+                    stale_attempt,
+                    yard_domain::RequestOrigin::None
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::AttemptNotCurrent { .. }
+        ));
+        let mut stale_attempt_version =
+            disposition_command("stale-attempt-version", &active, complete, false);
+        stale_attempt_version.expected_attempt_version += 1;
+        assert!(matches!(
+            store
+                .dispose_assignment(
+                    &project_id,
+                    &active.id,
+                    stale_attempt_version,
+                    yard_domain::RequestOrigin::None
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::AttemptVersionConflict { .. }
+        ));
+        let mut stale_worker = disposition_command("stale-worker", &active, complete, true);
+        stale_worker.expected_worker_version = Some(active.worker.version + 1);
+        assert!(matches!(
+            store
+                .dispose_assignment(
+                    &project_id,
+                    &active.id,
+                    stale_worker,
+                    yard_domain::RequestOrigin::None
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::WorkerVersionConflict { .. }
+        ));
+        let mut stale_runtime = disposition_command("stale-runtime", &active, complete, true);
+        stale_runtime.expected_runtime_version = Some(99);
+        assert!(matches!(
+            store
+                .dispose_assignment(
+                    &project_id,
+                    &active.id,
+                    stale_runtime,
+                    yard_domain::RequestOrigin::None
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::WorkerRuntimeVersionConflict { .. }
+        ));
+        assert!(matches!(
+            store
+                .dispose_assignment(
+                    "other-project",
+                    &active.id,
+                    disposition_command("wrong-project", &active, complete, false),
+                    yard_domain::RequestOrigin::None
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::AssignmentNotFound
+        ));
+
+        // A pending prompt blocks disposition, as it blocks completion.
+        let prompt = SendAssignmentPrompt {
+            command_id: "pending-disposition-prompt".to_owned(),
+            actor: "local-user".to_owned(),
+            attempt_id: active.attempt.id.clone(),
+            expected_assignment_version: active.version,
+            expected_attempt_version: active.attempt.version,
+            text: "Summarize before you stop.".to_owned(),
+        };
+        store
+            .begin_assignment_prompt(
+                &project_id,
+                &active.id,
+                prompt.clone(),
+                TokenSpendCommandSource::Manual,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .dispose_assignment(
+                    &project_id,
+                    &active.id,
+                    disposition_command("blocked-by-prompt", &active, complete, true),
+                    yard_domain::RequestOrigin::None
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::AssignmentInterventionInProgress
+        ));
+        store
+            .succeed_assignment_prompt(&prompt.command_id, "working")
+            .await
+            .unwrap();
+
+        // The Yard orchestrator's worker is protected.
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE yard_orchestrator SET worker_id = ?1 WHERE singleton_id = 1",
+                [&active.worker.id],
+            )
+            .unwrap();
+        let current = listed_assignment(&store, &project_id, &active.id).await;
+        assert!(matches!(
+            store
+                .dispose_assignment(
+                    &project_id,
+                    &active.id,
+                    disposition_command("protected-worker", &current, complete, false),
+                    yard_domain::RequestOrigin::None
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::YardOrchestratorSessionEndForbidden
+        ));
+        connection
+            .execute(
+                "UPDATE yard_orchestrator SET worker_id = NULL WHERE singleton_id = 1",
+                [],
+            )
+            .unwrap();
+
+        // A project orchestrator's worker is protected for both outcomes,
+        // with or without ending the session.
+        let orchestrator_worker_id: String = connection
+            .query_row(
+                "SELECT orchestrator_worker_id FROM projects WHERE id = ?1",
+                [&project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE projects SET orchestrator_worker_id = ?1 WHERE id = ?2",
+                [&active.worker.id, &project_id],
+            )
+            .unwrap();
+        let mut orchestrator_command_ids = Vec::new();
+        for (index, (outcome, end_session)) in [
+            (complete, false),
+            (complete, true),
+            (yard_domain::DispositionOutcome::Cancelled, false),
+            (yard_domain::DispositionOutcome::Cancelled, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let command_id = format!("protected-orchestrator-{index}");
+            assert!(
+                matches!(
+                    store
+                        .dispose_assignment(
+                            &project_id,
+                            &current.id,
+                            disposition_command(&command_id, &current, outcome, end_session,),
+                            yard_domain::RequestOrigin::None
+                        )
+                        .await
+                        .unwrap_err(),
+                    ProjectStoreError::OrchestratorSessionEndForbidden
+                ),
+                "{command_id}"
+            );
+            orchestrator_command_ids.push(command_id);
+        }
+        connection
+            .execute(
+                "UPDATE projects SET orchestrator_worker_id = ?1 WHERE id = ?2",
+                [&orchestrator_worker_id, &project_id],
+            )
+            .unwrap();
+
+        // A coordination node's worker is protected too.
+        connection
+            .execute(
+                "INSERT INTO coordination_nodes (
+                    id, name, kind, worker_id, workstream_cwd, knowledge_path,
+                    version, created_by, created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (
+                    '00000000-0000-4000-8000-000000000031', 'Node', 'workstream',
+                    ?1, '/tmp/node', NULL, 1, 'local-user', 1, 1
+                 )",
+                [&active.worker.id],
+            )
+            .unwrap();
+        for (command_id, end_session) in
+            [("protected-node-keep", false), ("protected-node-end", true)]
+        {
+            assert!(
+                matches!(
+                    store
+                        .dispose_assignment(
+                            &project_id,
+                            &active.id,
+                            disposition_command(command_id, &current, complete, end_session),
+                            yard_domain::RequestOrigin::None
+                        )
+                        .await
+                        .unwrap_err(),
+                    ProjectStoreError::CoordinationNodeSessionEndForbidden
+                ),
+                "{command_id}"
+            );
+        }
+        connection
+            .execute(
+                "DELETE FROM coordination_nodes WHERE worker_id = ?1",
+                [&active.worker.id],
+            )
+            .unwrap();
+
+        // Nothing was written by any rejected attempt.
+        for command_id in [
+            "stale-assignment",
+            "stale-attempt",
+            "stale-attempt-version",
+            "stale-worker",
+            "stale-runtime",
+            "wrong-project",
+            "blocked-by-prompt",
+            "protected-worker",
+            "protected-node-keep",
+            "protected-node-end",
+        ]
+        .into_iter()
+        .chain(orchestrator_command_ids.iter().map(String::as_str))
+        {
+            let acks: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM command_acknowledgements WHERE id = ?1",
+                    [command_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(acks, 0, "{command_id}");
+        }
+        drop(connection);
+        assert_eq!(current.lifecycle, AssignmentLifecycle::Active);
+        let completed = store
+            .dispose_assignment(
+                &project_id,
+                &active.id,
+                disposition_command("stale-assignment", &current, complete, true),
+                yard_domain::RequestOrigin::None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            completed.assignment.lifecycle,
+            AssignmentLifecycle::Completed
+        );
+        assert!(completed.worker.is_some());
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn stranded_handoff_source_can_only_be_cancelled_and_its_target_is_quarantined() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (source_project, source_assignment, target_project) =
+            create_handoff_fixture(&store).await;
+        let handoff = handoff_command(
+            "stranding-handoff",
+            &source_project,
+            &source_assignment,
+            &target_project,
+            HandoffTargetRole::Member,
+        );
+        store
+            .begin_worker_handoff(&source_project.id, &source_assignment.id, handoff.clone())
+            .await
+            .unwrap();
+        let handing_off =
+            listed_assignment(&store, &source_project.id, &source_assignment.id).await;
+        assert_eq!(handing_off.lifecycle, AssignmentLifecycle::HandingOff);
+
+        // While the handoff is still in flight, disposition waits.
+        assert!(matches!(
+            store
+                .dispose_assignment(
+                    &source_project.id,
+                    &source_assignment.id,
+                    disposition_command(
+                        "cancel-during-handoff",
+                        &handing_off,
+                        yard_domain::DispositionOutcome::Cancelled,
+                        false,
+                    ),
+                    yard_domain::RequestOrigin::None,
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::CommandInProgress
+        ));
+
+        let claimed = handoff_runtime("workspace-2", "terminal-stranded-target");
+        store
+            .claim_worker_handoff_runtime(&handoff.command_id, claimed.clone())
+            .await
+            .unwrap();
+        store
+            .fail_worker_handoff(
+                &handoff.command_id,
+                "prompt acknowledgement timed out",
+                true,
+            )
+            .await
+            .unwrap();
+        let stranded = listed_assignment(&store, &source_project.id, &source_assignment.id).await;
+        assert_eq!(stranded.lifecycle, AssignmentLifecycle::HandingOff);
+
+        assert!(matches!(
+            store
+                .dispose_assignment(
+                    &source_project.id,
+                    &source_assignment.id,
+                    disposition_command(
+                        "complete-stranded",
+                        &stranded,
+                        yard_domain::DispositionOutcome::Completed,
+                        false,
+                    ),
+                    yard_domain::RequestOrigin::None,
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::AssignmentHandoffUnresolved
+        ));
+
+        let cancelled = store
+            .dispose_assignment(
+                &source_project.id,
+                &source_assignment.id,
+                disposition_command(
+                    "cancel-stranded",
+                    &stranded,
+                    yard_domain::DispositionOutcome::Cancelled,
+                    true,
+                ),
+                yard_domain::RequestOrigin::Browser,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cancelled.assignment.lifecycle,
+            AssignmentLifecycle::Cancelled
+        );
+        assert_eq!(
+            cancelled.assignment.attempt.lifecycle,
+            AttemptLifecycle::Cancelled
+        );
+        assert!(cancelled.receipt.is_none());
+        assert!(cancelled.worker.is_some());
+
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let (ack_status, finished): (String, Option<i64>) = connection
+            .query_row(
+                "SELECT ack.status, handoff.finished_at_unix_ms
+                   FROM worker_handoff_commands handoff
+                   JOIN command_acknowledgements ack ON ack.id = handoff.command_id
+                  WHERE handoff.command_id = ?1",
+                ["stranding-handoff"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ack_status, "ambiguous");
+        assert!(finished.is_some());
+        let quarantined: String = connection
+            .query_row(
+                "SELECT terminal_id FROM quarantined_provisioning_runtime_bindings
+                  WHERE command_id = ?1",
+                ["stranding-handoff"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined, "terminal-stranded-target");
+        let recorded_handoff: Option<String> = connection
+            .query_row(
+                "SELECT handoff_command_id FROM assignment_disposition_commands
+                  WHERE command_id = ?1",
+                ["cancel-stranded"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded_handoff.as_deref(), Some("stranding-handoff"));
+        drop(connection);
+
+        // The quarantined target is never adopted by reconciliation.
+        let reconciliation = store
+            .reconcile_runtime_inventory(inventory(
+                super::unix_time_ms().unwrap(),
+                vec![observed_worker(
+                    "terminal-stranded-target",
+                    "workspace-2",
+                    "tab-terminal-stranded-target",
+                    "pane-terminal-stranded-target",
+                    claimed.provider_session,
+                )],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reconciliation.adopted_workers, 0);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn transcript_capture_jobs_retry_store_bounded_text_and_expire() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, active) = create_active_assignment(&store).await;
+        store
+            .dispose_assignment(
+                &project_id,
+                &active.id,
+                disposition_command(
+                    "capture-complete",
+                    &active,
+                    yard_domain::DispositionOutcome::Completed,
+                    false,
+                ),
+                yard_domain::RequestOrigin::Browser,
+            )
+            .await
+            .unwrap();
+
+        let jobs = store
+            .claim_pending_transcript_captures(Some("capture-complete"), 10, 30_000)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        let job = jobs[0].clone();
+        assert_eq!(job.worker_id, active.worker.id);
+        assert_eq!(job.assignment_id.as_deref(), Some(active.id.as_str()));
+        assert_eq!(job.terminal_id, "terminal-2");
+        assert_eq!(job.pane_id, "pane-2");
+        assert_eq!(job.tab_id.as_deref(), Some("tab-2"));
+        assert!(
+            store
+                .claim_pending_transcript_captures(Some("capture-complete"), 10, 30_000)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let guard = store
+            .transcript_capture_guard(&job.id, &job.claim_token)
+            .await
+            .unwrap();
+        assert!(guard.bound_to_worker);
+        assert!(!guard.worker_reallocated);
+        assert!(!guard.bound_elsewhere);
+
+        store
+            .fail_transcript_capture(&job.id, &job.claim_token, "Herdr socket timed out", 5_000)
+            .await
+            .unwrap();
+        let pending = store
+            .get_assignment_transcript(&project_id, &active.id)
+            .await
+            .unwrap();
+        assert_eq!(pending.status, yard_domain::TranscriptStatus::Pending);
+        assert_eq!(pending.attempts, 1);
+        assert_eq!(
+            pending.last_error.as_deref(),
+            Some("Herdr socket timed out")
+        );
+        assert!(pending.next_attempt_at_unix_ms.is_some());
+        assert!(pending.text.is_none());
+        assert!(matches!(
+            store
+                .succeed_transcript_capture(
+                    &job.id,
+                    &job.claim_token,
+                    yard_store_text("stale claim"),
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::TranscriptCaptureClaimLost
+        ));
+        assert!(
+            store
+                .claim_pending_transcript_captures(Some("capture-complete"), 10, 30_000)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a retry waits for its backoff"
+        );
+        Connection::open(temp.path().join("yard.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE transcript_capture_jobs SET next_attempt_at_unix_ms = 0
+                  WHERE command_id = 'capture-complete'",
+                [],
+            )
+            .unwrap();
+        let retried = store
+            .claim_pending_transcript_captures(None, 10, 30_000)
+            .await
+            .unwrap()
+            .remove(0);
+        let long_text = (0..10_005)
+            .map(|index| format!("line {index}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(
+            store
+                .succeed_transcript_capture(
+                    &retried.id,
+                    &retried.claim_token,
+                    yard_store_text(&long_text),
+                )
+                .await
+                .unwrap(),
+            super::TranscriptCaptureOutcome::Stored
+        );
+        let captured = store
+            .get_assignment_transcript(&project_id, &active.id)
+            .await
+            .unwrap();
+        assert_eq!(captured.status, yard_domain::TranscriptStatus::Captured);
+        assert_eq!(captured.line_count, 10_000);
+        assert!(captured.truncated);
+        assert!(captured.text.as_deref().unwrap().starts_with("line 5\n"));
+        assert_eq!(captured.attempts, 2);
+        assert!(captured.last_error.is_none());
+        assert!(captured.captured_at_unix_ms.is_some());
+        assert!(captured.next_attempt_at_unix_ms.is_none());
+        assert_eq!(captured.terminal_id.as_deref(), Some("terminal-2"));
+        assert!(
+            store
+                .claim_pending_transcript_captures(None, 10, 30_000)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            store
+                .get_assignment_transcript("other-project", &active.id)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::AssignmentNotFound
+        ));
+
+        // A worker that takes new work before its capture runs never stores
+        // the next assignment's scrollback.
+        let next = allocate_additional_assignment(
+            &store,
+            &project_id,
+            "capture-realloc-allocation",
+            "terminal-3",
+        )
+        .await;
+        store
+            .dispose_assignment(
+                &project_id,
+                &next.id,
+                disposition_command(
+                    "capture-before-realloc",
+                    &next,
+                    yard_domain::DispositionOutcome::Completed,
+                    false,
+                ),
+                yard_domain::RequestOrigin::Browser,
+            )
+            .await
+            .unwrap();
+        let reallocated = store
+            .claim_pending_transcript_captures(Some("capture-before-realloc"), 10, 30_000)
+            .await
+            .unwrap()
+            .remove(0);
+        Connection::open(temp.path().join("yard.sqlite3"))
+            .unwrap()
+            .execute(
+                "INSERT INTO worker_allocations (
+                    id, project_id, worker_id, mode, started_by_command_id,
+                    started_at_unix_ms, ended_at_unix_ms
+                 ) VALUES ('newer-allocation', ?1, ?2, 'adopt_existing', NULL, ?3, NULL)",
+                params![project_id, next.worker.id, i64::MAX / 2],
+            )
+            .unwrap();
+        assert!(
+            store
+                .transcript_capture_guard(&reallocated.id, &reallocated.claim_token)
+                .await
+                .unwrap()
+                .worker_reallocated
+        );
+        assert_eq!(
+            store
+                .succeed_transcript_capture(
+                    &reallocated.id,
+                    &reallocated.claim_token,
+                    yard_store_text("next assignment output"),
+                )
+                .await
+                .unwrap(),
+            super::TranscriptCaptureOutcome::Expired(
+                super::TranscriptCaptureExpiry::WorkerReallocated
+            )
+        );
+        let expired = store
+            .get_assignment_transcript(&project_id, &next.id)
+            .await
+            .unwrap();
+        assert_eq!(expired.status, yard_domain::TranscriptStatus::Unavailable);
+        assert_eq!(
+            expired.unavailable_reason,
+            Some(yard_domain::TranscriptUnavailableReason::WorkerReallocated)
+        );
+        assert!(expired.text.is_none());
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM worker_transcripts WHERE assignment_id = ?1",
+                &next.id
+            ),
+            0
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn capture_guard_ignores_earlier_allocations_and_expires_a_rebound_runtime() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, active) = create_active_assignment(&store).await;
+        // The worker had earlier work that ended before this assignment; only
+        // allocations started after the capture was queued count as reuse.
+        Connection::open(temp.path().join("yard.sqlite3"))
+            .unwrap()
+            .execute(
+                "INSERT INTO worker_allocations (
+                    id, project_id, worker_id, mode, started_by_command_id,
+                    started_at_unix_ms, ended_at_unix_ms
+                 ) VALUES ('earlier-allocation', ?1, ?2, 'adopt_existing', NULL, 1, 2)",
+                params![project_id, active.worker.id],
+            )
+            .unwrap();
+        store
+            .dispose_assignment(
+                &project_id,
+                &active.id,
+                disposition_command(
+                    "capture-after-earlier-work",
+                    &active,
+                    yard_domain::DispositionOutcome::Completed,
+                    false,
+                ),
+                yard_domain::RequestOrigin::Browser,
+            )
+            .await
+            .unwrap();
+        let job = store
+            .claim_pending_transcript_captures(Some("capture-after-earlier-work"), 10, 30_000)
+            .await
+            .unwrap()
+            .remove(0);
+        let guard = store
+            .transcript_capture_guard(&job.id, &job.claim_token)
+            .await
+            .unwrap();
+        assert!(!guard.worker_reallocated);
+        assert!(!guard.bound_elsewhere);
+        assert_eq!(
+            store
+                .succeed_transcript_capture(
+                    &job.id,
+                    &job.claim_token,
+                    yard_store_text("first assignment output"),
+                )
+                .await
+                .unwrap(),
+            super::TranscriptCaptureOutcome::Stored
+        );
+        assert_eq!(
+            store
+                .get_assignment_transcript(&project_id, &active.id)
+                .await
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("first assignment output")
+        );
+
+        // A second worker ends its session; reconciliation then binds its
+        // terminal to another Yard worker before the capture runs.
+        let next = allocate_additional_assignment(
+            &store,
+            &project_id,
+            "rebound-runtime-allocation",
+            "terminal-3",
+        )
+        .await;
+        store
+            .dispose_assignment(
+                &project_id,
+                &next.id,
+                disposition_command(
+                    "capture-rebound-runtime",
+                    &next,
+                    yard_domain::DispositionOutcome::Completed,
+                    true,
+                ),
+                yard_domain::RequestOrigin::Browser,
+            )
+            .await
+            .unwrap();
+        let rebound = store
+            .claim_pending_transcript_captures(Some("capture-rebound-runtime"), 10, 30_000)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(rebound.terminal_id, "terminal-3");
+        let moved = Connection::open(temp.path().join("yard.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE worker_runtime_bindings SET terminal_id = 'terminal-3'
+                  WHERE terminal_id = 'terminal-1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(moved, 1);
+        let guard = store
+            .transcript_capture_guard(&rebound.id, &rebound.claim_token)
+            .await
+            .unwrap();
+        assert!(!guard.bound_to_worker);
+        assert!(!guard.worker_reallocated);
+        assert!(guard.bound_elsewhere);
+        assert_eq!(
+            store
+                .succeed_transcript_capture(
+                    &rebound.id,
+                    &rebound.claim_token,
+                    yard_store_text("another worker's output"),
+                )
+                .await
+                .unwrap(),
+            super::TranscriptCaptureOutcome::Expired(super::TranscriptCaptureExpiry::RuntimeReused)
+        );
+        let expired = store
+            .get_assignment_transcript(&project_id, &next.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            expired.unavailable_reason,
+            Some(yard_domain::TranscriptUnavailableReason::RuntimeReused)
+        );
+        assert!(expired.text.is_none());
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM worker_transcripts WHERE assignment_id = ?1",
+                &next.id
+            ),
+            0
+        );
+    }
+
+    fn yard_store_text(text: &str) -> super::CapturedTranscriptText {
+        super::CapturedTranscriptText {
+            source: "recent_unwrapped".to_owned(),
+            format: "text".to_owned(),
+            text: text.to_owned(),
+            truncated: false,
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn detailed_completion_queues_a_capture_and_uncaptured_work_names_its_session() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, active) = create_active_assignment(&store).await;
+        let uncaptured = store
+            .get_assignment_transcript(&project_id, &active.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            uncaptured.status,
+            yard_domain::TranscriptStatus::Unavailable
+        );
+        assert_eq!(
+            uncaptured.unavailable_reason,
+            Some(yard_domain::TranscriptUnavailableReason::NotCaptured)
+        );
+        assert_eq!(uncaptured.terminal_id.as_deref(), Some("terminal-2"));
+
+        let recorded = store
+            .record_completion_receipt(
+                &project_id,
+                &active.id,
+                RecordCompletionReceipt {
+                    command_id: "detailed-with-capture".to_owned(),
+                    actor: "local-user".to_owned(),
+                    attempt_id: active.attempt.id.clone(),
+                    expected_assignment_version: active.version,
+                    expected_attempt_version: active.attempt.version,
+                    outcome: CompletionOutcome::Completed,
+                    summary: "Implemented and verified.".to_owned(),
+                    artifact_refs: Vec::new(),
+                    artifact_ids: Vec::new(),
+                    evidence_refs: vec!["test://suite".to_owned()],
+                    unresolved_blockers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded.receipt.detail_level,
+            yard_domain::ReceiptDetailLevel::Detailed
+        );
+        assert!(recorded.receipt.objective_snapshot.is_none());
+        let jobs = store
+            .claim_pending_transcript_captures(Some("detailed-with-capture"), 10, 30_000)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].terminal_id, "terminal-2");
+        store
+            .expire_transcript_capture(
+                &jobs[0].id,
+                &jobs[0].claim_token,
+                super::TranscriptCaptureExpiry::RuntimeClosed,
+            )
+            .await
+            .unwrap();
+        let closed = store
+            .get_assignment_transcript(&project_id, &active.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            closed.unavailable_reason,
+            Some(yard_domain::TranscriptUnavailableReason::RuntimeClosed)
+        );
+
+        // Work with no capture job (as before PR1) names a runtime only when
+        // it provably is the one the assignment ran in.
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .execute(
+                "DELETE FROM worker_transcripts WHERE assignment_id = ?1",
+                [&active.id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM transcript_capture_jobs WHERE assignment_id = ?1",
+                [&active.id],
+            )
+            .unwrap();
+        let fallback_terminal = |store: &SqliteProjectStore| {
+            let store = store.clone();
+            let project_id = project_id.clone();
+            let assignment_id = active.id.clone();
+            async move {
+                let transcript = store
+                    .get_assignment_transcript(&project_id, &assignment_id)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    transcript.unavailable_reason,
+                    Some(yard_domain::TranscriptUnavailableReason::NotCaptured)
+                );
+                transcript.terminal_id
+            }
+        };
+        // Idle since completion: the binding is still the assignment's own.
+        assert_eq!(
+            fallback_terminal(&store).await.as_deref(),
+            Some("terminal-2")
+        );
+        let ended_at: i64 = connection
+            .query_row(
+                "SELECT wa.ended_at_unix_ms FROM worker_allocations wa
+                   JOIN assignments a ON a.allocation_id = wa.id
+                  WHERE a.id = ?1",
+                [&active.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // Keep the window non-empty even when the test runs within one ms.
+        connection
+            .execute(
+                "UPDATE worker_allocations SET started_at_unix_ms = ?1
+                  WHERE id = (SELECT allocation_id FROM assignments WHERE id = ?2)",
+                params![ended_at - 1_000, active.id],
+            )
+            .unwrap();
+        // The worker later moved to another runtime under a new allocation
+        // (as a handoff does): its current binding is not this assignment's.
+        connection
+            .execute(
+                "INSERT INTO worker_allocations (
+                    id, project_id, worker_id, mode, started_by_command_id,
+                    started_at_unix_ms, ended_at_unix_ms
+                 ) VALUES ('later-allocation', ?1, ?2, 'handoff', NULL, ?3, NULL)",
+                params![project_id, active.worker.id, ended_at],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE worker_runtime_bindings SET terminal_id = 'terminal-elsewhere'
+                  WHERE worker_id = ?1",
+                [&active.worker.id],
+            )
+            .unwrap();
+        assert_eq!(fallback_terminal(&store).await, None);
+        // A binding retired when the allocation ended is the assignment's own.
+        connection
+            .execute(
+                "INSERT INTO retired_runtime_bindings (
+                    id, worker_id, command_id, reason, adapter, runtime_session,
+                    runtime_workspace_id, terminal_id, tab_id, pane_id,
+                    retired_at_unix_ms
+                 ) VALUES (
+                    'retired-at-end', ?1, 'detailed-with-capture', 'handoff_source',
+                    'herdr', 'session-a1', 'workspace-1', 'terminal-a1', NULL,
+                    'pane-a1', ?2
+                 )",
+                params![active.worker.id, ended_at],
+            )
+            .unwrap();
+        assert_eq!(
+            fallback_terminal(&store).await.as_deref(),
+            Some("terminal-a1")
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn populated_v35_database_migrates_receipts_with_artifact_links_to_dispositions() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let (project_id, linked) = create_active_assignment(&store).await;
+        let artifact_id = "019ff1a2-0000-7000-8000-000000000031";
+        let artifact = store
+            .register_artifact(
+                &project_id,
+                &linked.id,
+                artifact_id,
+                ArtifactRegistration {
+                    actor: "local-user".to_owned(),
+                    attempt_id: linked.attempt.id.clone(),
+                    expected_assignment_version: linked.version,
+                    expected_attempt_version: linked.attempt.version,
+                    kind: ArtifactKind::Markdown,
+                    display_name: "handoff.md".to_owned(),
+                    byte_size: 21,
+                    sha256: "c".repeat(64),
+                },
+            )
+            .await
+            .unwrap();
+        let legacy_receipt = RecordCompletionReceipt {
+            command_id: "legacy-linked-receipt".to_owned(),
+            actor: "local-user".to_owned(),
+            attempt_id: linked.attempt.id.clone(),
+            expected_assignment_version: linked.version,
+            expected_attempt_version: linked.attempt.version,
+            outcome: CompletionOutcome::Completed,
+            summary: "Linked the handoff notes.".to_owned(),
+            artifact_refs: vec!["yard://notes".to_owned()],
+            artifact_ids: vec![artifact_id.to_owned()],
+            evidence_refs: Vec::new(),
+            unresolved_blockers: vec!["Review pending".to_owned()],
+        };
+        store
+            .record_completion_receipt(&project_id, &linked.id, legacy_receipt.clone())
+            .await
+            .unwrap();
+        let open = allocate_additional_assignment(
+            &store,
+            &project_id,
+            "pre-migration-allocation",
+            "terminal-3",
+        )
+        .await;
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_assignment_disposition_schema_to_v35(&connection);
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 35);
+        let detail_columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('completion_receipts')
+                  WHERE name = 'detail_level'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(detail_columns, 0);
+        drop(connection);
+
+        let store = open_store(&temp).await;
+        let migrated = listed_assignment(&store, &project_id, &linked.id).await;
+        let receipt = migrated.completion_receipt.unwrap();
+        assert_eq!(
+            receipt.detail_level,
+            yard_domain::ReceiptDetailLevel::Detailed
+        );
+        assert!(receipt.objective_snapshot.is_none());
+        assert_eq!(receipt.artifacts, [artifact]);
+        assert_eq!(receipt.artifact_refs, ["yard://notes"]);
+        assert_eq!(receipt.unresolved_blockers, ["Review pending"]);
+        assert!(
+            store
+                .record_completion_receipt(&project_id, &linked.id, legacy_receipt)
+                .await
+                .unwrap()
+                .replayed
+        );
+
+        // A receipt linked to an artifact after migrating uses the recreated
+        // composite parent key.
+        let open = listed_assignment(&store, &project_id, &open.id).await;
+        assert_eq!(open.lifecycle, AssignmentLifecycle::Active);
+        let later_artifact_id = "019ff1a2-0000-7000-8000-000000000032";
+        store
+            .register_artifact(
+                &project_id,
+                &open.id,
+                later_artifact_id,
+                ArtifactRegistration {
+                    actor: "local-user".to_owned(),
+                    attempt_id: open.attempt.id.clone(),
+                    expected_assignment_version: open.version,
+                    expected_attempt_version: open.attempt.version,
+                    kind: ArtifactKind::Html,
+                    display_name: "report.html".to_owned(),
+                    byte_size: 34,
+                    sha256: "d".repeat(64),
+                },
+            )
+            .await
+            .unwrap();
+        let later = store
+            .record_completion_receipt(
+                &project_id,
+                &open.id,
+                RecordCompletionReceipt {
+                    command_id: "post-migration-linked-receipt".to_owned(),
+                    actor: "local-user".to_owned(),
+                    attempt_id: open.attempt.id.clone(),
+                    expected_assignment_version: open.version,
+                    expected_attempt_version: open.attempt.version,
+                    outcome: CompletionOutcome::Completed,
+                    summary: "Published the report.".to_owned(),
+                    artifact_refs: Vec::new(),
+                    artifact_ids: vec![later_artifact_id.to_owned()],
+                    evidence_refs: Vec::new(),
+                    unresolved_blockers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(later.receipt.artifacts.len(), 1);
+
+        let fresh_assignment = allocate_additional_assignment(
+            &store,
+            &project_id,
+            "post-migration-allocation",
+            "terminal-4",
+        )
+        .await;
+        let cancelled = store
+            .dispose_assignment(
+                &project_id,
+                &fresh_assignment.id,
+                disposition_command(
+                    "post-migration-cancel",
+                    &fresh_assignment,
+                    yard_domain::DispositionOutcome::Cancelled,
+                    true,
+                ),
+                yard_domain::RequestOrigin::None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cancelled.assignment.lifecycle,
+            AssignmentLifecycle::Cancelled
+        );
+        drop(store);
+
+        let fresh_temp = TempDir::new().unwrap();
+        drop(open_store(&fresh_temp).await);
+        let fresh = Connection::open(fresh_temp.path().join("yard.sqlite3")).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        for table in [
+            "command_acknowledgements",
+            "assignments",
+            "assignment_attempts",
+            "completion_receipts",
+            "assignment_cancellations",
+            "assignment_disposition_commands",
+            "transcript_capture_jobs",
+            "worker_transcripts",
+        ] {
+            assert_eq!(
+                table_schema(&connection, table),
+                table_schema(&fresh, table),
+                "{table}"
+            );
+        }
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+    }
+
+    /// Mainline's cleanup items point at receipts and assignments, and its
+    /// summary commands point at assignments. 0036 rebuilds both parents, so
+    /// a populated mainline-v33 database must keep every such row valid.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn populated_v33_database_keeps_mainline_cleanup_and_summary_rows_through_0037() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let (_, cleanup_assignment, receipt_id) =
+            create_eligible_cleanup_candidate(&store, "fk-0036").await;
+        let run = store
+            .start_worker_cleanup_run(
+                WorkerCleanupRunTrigger::Manual,
+                StartWorkerCleanupRun {
+                    command_id: "fk-0036-cleanup-run".to_owned(),
+                    actor: "cleanup-test".to_owned(),
+                    preview: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(run.candidate_count, 1);
+        let summary = create_summary_fixture(&store, "fk-0036").await;
+        drop(store);
+
+        let mainline_rows = |connection: &Connection| {
+            let items: Vec<(String, String, String)> = connection
+                .prepare(
+                    "SELECT run_id, assignment_id, completion_receipt_id
+                       FROM worker_cleanup_run_items ORDER BY run_id, worker_id",
+                )
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let summaries: Vec<(String, Option<String>)> = connection
+                .prepare(
+                    "SELECT command_id, result_assignment_id
+                       FROM summary_worker_commands ORDER BY command_id",
+                )
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            (items, summaries)
+        };
+        let connection = Connection::open(&path).unwrap();
+        downgrade_snapshot_expiry_schema_to_v33(&connection);
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 33);
+        assert_eq!(
+            super::classify_schema_lineage(&connection, 33).unwrap(),
+            super::SchemaLineage::Mainline(33)
+        );
+        let before = mainline_rows(&connection);
+        assert_eq!(
+            before.0,
+            [(
+                run.id.clone(),
+                cleanup_assignment.id.clone(),
+                receipt_id.clone()
+            )]
+        );
+        assert_eq!(
+            before.1,
+            [(
+                summary.command.command_id.clone(),
+                Some(summary.assignment.id.clone())
+            )]
+        );
+        drop(connection);
+
+        let store = open_store(&temp).await;
+        let migrated = listed_assignment(&store, &summary.project.id, &summary.assignment.id).await;
+        assert_eq!(migrated.lifecycle, AssignmentLifecycle::Active);
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        assert_eq!(mainline_rows(&connection), before);
+        let detail_level: String = connection
+            .query_row(
+                "SELECT detail_level FROM completion_receipts WHERE id = ?1",
+                [&receipt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(detail_level, "detailed");
+        // The cleanup item still resolves its receipt and assignment parents.
+        let joined: i64 = connection
+            .query_row(
+                "SELECT COUNT(*)
+                   FROM worker_cleanup_run_items i
+                   JOIN completion_receipts r ON r.id = i.completion_receipt_id
+                   JOIN assignments a ON a.id = i.assignment_id",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(joined, 1);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn v28_database_from_3fdcf5e_migrates_linked_receipts_to_dispositions() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let legacy_project = create_archived_project(
+            &store,
+            "drifted-deleted",
+            "drifted-deleted-terminal",
+            "drifted-archive-before-delete",
+        )
+        .await;
+        store
+            .delete_project(
+                &legacy_project.id,
+                DeleteProject {
+                    command_id: "drifted-project-delete".to_owned(),
+                    actor: "local-user".to_owned(),
+                    archive: None,
+                },
+            )
+            .await
+            .unwrap();
+        let (project_id, linked) = create_active_assignment(&store).await;
+        let artifact_id = "019ff1a2-0000-7000-8000-000000000033";
+        let artifact = store
+            .register_artifact(
+                &project_id,
+                &linked.id,
+                artifact_id,
+                ArtifactRegistration {
+                    actor: "local-user".to_owned(),
+                    attempt_id: linked.attempt.id.clone(),
+                    expected_assignment_version: linked.version,
+                    expected_attempt_version: linked.attempt.version,
+                    kind: ArtifactKind::Markdown,
+                    display_name: "drifted.md".to_owned(),
+                    byte_size: 8,
+                    sha256: "e".repeat(64),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .record_completion_receipt(
+                &project_id,
+                &linked.id,
+                RecordCompletionReceipt {
+                    command_id: "drifted-linked-receipt".to_owned(),
+                    actor: "local-user".to_owned(),
+                    attempt_id: linked.attempt.id.clone(),
+                    expected_assignment_version: linked.version,
+                    expected_attempt_version: linked.attempt.version,
+                    outcome: CompletionOutcome::Completed,
+                    summary: "Kept through the drift repair.".to_owned(),
+                    artifact_refs: Vec::new(),
+                    artifact_ids: vec![artifact_id.to_owned()],
+                    evidence_refs: Vec::new(),
+                    unresolved_blockers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let open = allocate_additional_assignment(
+            &store,
+            &project_id,
+            "drifted-open-allocation",
+            "terminal-3",
+        )
+        .await;
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_snapshot_expiry_schema_to_v33(&connection);
+        downgrade_mainline_schema_to_v28(&connection);
+        downgrade_visibility_deletions_schema_to_3fdcf5e(&connection);
+        drop(connection);
+
+        let store = open_store(&temp).await;
+        let migrated = listed_assignment(&store, &project_id, &linked.id).await;
+        let receipt = migrated.completion_receipt.unwrap();
+        assert_eq!(
+            receipt.detail_level,
+            yard_domain::ReceiptDetailLevel::Detailed
+        );
+        assert_eq!(receipt.artifacts, [artifact]);
+        let open = listed_assignment(&store, &project_id, &open.id).await;
+        let completed = store
+            .dispose_assignment(
+                &project_id,
+                &open.id,
+                disposition_command(
+                    "drifted-quick-complete",
+                    &open,
+                    yard_domain::DispositionOutcome::Completed,
+                    true,
+                ),
+                yard_domain::RequestOrigin::Browser,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            completed.receipt.unwrap().detail_level,
+            yard_domain::ReceiptDetailLevel::Minimal
+        );
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        let repaired_ack: String = connection
+            .query_row(
+                "SELECT command_type FROM command_acknowledgements WHERE id = ?1",
+                ["drifted-project-delete"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repaired_ack, "project_delete");
+    }
+
+    /// An archive that ends exactly the previewed active assignments.
+    fn cancel_archive_command(
+        preview: &yard_domain::ProjectDispositionPreview,
+        command_id: &str,
+    ) -> ArchiveProject {
+        ArchiveProject {
+            command_id: command_id.to_owned(),
+            actor: "local-user".to_owned(),
+            expected_project_version: preview.project_version,
+            expected_orchestrator_worker_id: preview.orchestrator_worker_id.clone(),
+            expected_orchestrator_worker_version: preview.orchestrator_worker_version,
+            expected_orchestrator_runtime_version: preview.orchestrator_runtime_version,
+            active_work: yard_domain::ProjectArchiveActiveWork::Cancel,
+            expected_active_assignments: Some(preview.expected_active_assignments()),
+        }
+    }
+
+    fn worker_ended(temp: &TempDir, worker_id: &str) -> bool {
+        count_rows(
+            temp,
+            "SELECT COUNT(*) FROM workers
+              WHERE id = ?1 AND ended_at_unix_ms IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM worker_runtime_bindings WHERE worker_id = ?1
+                )",
+            worker_id,
+        ) == 1
+    }
+
+    /// A summary command that is still allocating: requested, but its
+    /// allocation has not started, so it has no assignment yet.
+    async fn begin_allocating_summary(
+        store: &SqliteProjectStore,
+        suffix: &str,
+    ) -> (Project, RequestSummaryWorker) {
+        let (project_draft, orchestrator_runtime) = draft(
+            &format!("workspace-summary-{suffix}"),
+            &format!("terminal-parent-{suffix}"),
+        );
+        let project = store
+            .create_project(project_draft, orchestrator_runtime)
+            .await
+            .unwrap();
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec(&format!("Summarizer {suffix}")),
+            })
+            .await
+            .unwrap();
+        let command = RequestSummaryWorker {
+            command_id: format!("summary-{suffix}"),
+            actor: "local-user".to_owned(),
+            parent_worker_id: project.orchestrator.id.clone(),
+            expected_parent_worker_version: project.orchestrator.version,
+            expected_project_version: project.version,
+            profile_id: profile.id.clone(),
+            expected_profile_version: profile.version,
+            artifact_id: Uuid::now_v7().to_string(),
+            objective: "Summarize the durable state.".to_owned(),
+        };
+        let parent_runtime = project.orchestrator.runtime.as_ref().unwrap();
+        store
+            .begin_summary_worker(
+                &project.id,
+                command.clone(),
+                SummaryParentRuntimeCapture {
+                    adapter: parent_runtime.adapter.clone(),
+                    session: parent_runtime.session.clone(),
+                    workspace_id: parent_runtime.workspace_id.clone(),
+                    terminal_id: parent_runtime.terminal_id.clone(),
+                    tab_id: parent_runtime.tab_id.clone().unwrap(),
+                    pane_id: parent_runtime.pane_id.clone(),
+                    pane_instance_id: Some(format!("parent-instance-{suffix}")),
+                    provider_session: parent_runtime.provider_session.clone(),
+                    observed_at_unix_ms: 2,
+                },
+            )
+            .await
+            .unwrap();
+        (project, command)
+    }
+
+    fn summary_command_state(temp: &TempDir, command_id: &str) -> (String, Option<String>) {
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        connection
+            .query_row(
+                "SELECT status, error_message FROM summary_worker_commands
+                  WHERE command_id = ?1",
+                [command_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn archiving_with_cancel_ends_an_active_summary_worker_and_fails_its_command() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let summary = create_summary_fixture(&store, "archive-active").await;
+        let project_id = summary.project.id.clone();
+
+        // The summary assignment is listed on its own, not as user work.
+        let preview = store
+            .project_disposition_preview(&project_id)
+            .await
+            .unwrap();
+        assert!(preview.active_assignments.is_empty());
+        let listed = preview
+            .summary_worker_assignments
+            .iter()
+            .map(|assignment| assignment.assignment_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(listed, [summary.assignment.id.as_str()]);
+        assert_eq!(preview.summary_worker_assignments[0].role, "summary_worker");
+        assert_eq!(
+            preview.expected_active_assignments(),
+            [yard_domain::ExpectedActiveAssignment {
+                assignment_id: summary.assignment.id.clone(),
+                expected_assignment_version: summary.assignment.version,
+            }]
+        );
+
+        // Reject still refuses, and a cancel that leaves the summary worker
+        // out of the expected set is stale. Neither writes anything.
+        let error = store
+            .archive_project(&project_id, reject_archive_command(&preview, "reject"))
+            .await
+            .unwrap_err();
+        let ProjectStoreError::ProjectHasActiveWork(fresh) = error else {
+            panic!("expected active work, got {error:?}");
+        };
+        assert_eq!(*fresh, preview);
+        let mut without_summary = cancel_archive_command(&preview, "cancel-without-summary");
+        without_summary.expected_active_assignments = Some(Vec::new());
+        assert!(matches!(
+            store
+                .archive_project(&project_id, without_summary)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::ProjectArchivePreviewStale(_)
+        ));
+        assert_eq!(
+            summary_command_state(&temp, &summary.command.command_id),
+            ("active".to_owned(), None)
+        );
+
+        let archived = store
+            .archive_project(
+                &project_id,
+                cancel_archive_command(&preview, "archive-summary"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            archived.cancelled_assignment_ids,
+            std::slice::from_ref(&summary.assignment.id)
+        );
+        assert_eq!(
+            summary_command_state(&temp, &summary.command.command_id),
+            ("failed".to_owned(), Some("project_archived".to_owned()))
+        );
+        assert!(worker_ended(&temp, &summary.assignment.worker.id));
+        // Its runtime ends through the archive's runtime cleanup path.
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM runtime_cleanup_jobs
+                  WHERE command_id = 'archive-summary' AND worker_id = ?1
+                    AND reason = 'project_archive'",
+                &summary.assignment.worker.id,
+            ),
+            1
+        );
+        // No pane-management lease was held, and none is created or needed.
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM pane_management_leases WHERE project_id = ?1",
+                &project_id,
+            ),
+            0
+        );
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let lifecycle: String = connection
+            .query_row(
+                "SELECT lifecycle FROM assignments WHERE id = ?1",
+                [&summary.assignment.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lifecycle, "cancelled");
+        drop(connection);
+
+        // The replay reports the same cancellation and changes nothing.
+        let replayed = store
+            .archive_project(
+                &project_id,
+                cancel_archive_command(&preview, "archive-summary"),
+            )
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(
+            replayed.cancelled_assignment_ids,
+            archived.cancelled_assignment_ids
+        );
+    }
+
+    /// An archive from a preview that keeps the default reject behavior.
+    fn reject_archive_command(
+        preview: &yard_domain::ProjectDispositionPreview,
+        command_id: &str,
+    ) -> ArchiveProject {
+        ArchiveProject {
+            active_work: yard_domain::ProjectArchiveActiveWork::Reject,
+            expected_active_assignments: None,
+            ..cancel_archive_command(preview, command_id)
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn archiving_waits_while_a_summary_worker_is_allocating_and_not_after_it_failed() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project, command) = begin_allocating_summary(&store, "archive-allocating").await;
+        let preview = store
+            .project_disposition_preview(&project.id)
+            .await
+            .unwrap();
+        assert!(preview.active_assignments.is_empty());
+        assert!(preview.summary_worker_assignments.is_empty());
+
+        // Both archive modes, and delete from active, are blocked before any
+        // write while the summary command has no assignment to cancel.
+        for archive in [
+            reject_archive_command(&preview, "archive-while-allocating"),
+            cancel_archive_command(&preview, "cancel-while-allocating"),
+        ] {
+            let error = store
+                .archive_project(&project.id, archive)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ProjectStoreError::ProjectArchiveSummaryWorkerAllocating
+                ),
+                "{error:?}"
+            );
+        }
+        let error = store
+            .delete_project(
+                &project.id,
+                DeleteProject {
+                    command_id: "delete-while-allocating".to_owned(),
+                    actor: "local-user".to_owned(),
+                    archive: Some(reject_archive_command(&preview, "unused").preconditions()),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ProjectStoreError::ProjectArchiveSummaryWorkerAllocating
+            ),
+            "{error:?}"
+        );
+        for command_id in [
+            "archive-while-allocating",
+            "cancel-while-allocating",
+            "delete-while-allocating",
+        ] {
+            assert_eq!(
+                count_rows(
+                    &temp,
+                    "SELECT COUNT(*) FROM command_acknowledgements WHERE id = ?1",
+                    command_id,
+                ),
+                0,
+                "{command_id}"
+            );
+        }
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM archived_projects WHERE project_id = ?1",
+                &project.id,
+            ),
+            0
+        );
+        assert_eq!(
+            summary_command_state(&temp, &command.command_id),
+            ("allocating".to_owned(), None)
+        );
+
+        // A failed summary command no longer blocks, and the archive leaves
+        // its recorded failure as it was.
+        store
+            .fail_summary_worker(&command.command_id, "allocation failed")
+            .await
+            .unwrap();
+        let preview = store
+            .project_disposition_preview(&project.id)
+            .await
+            .unwrap();
+        let archived = store
+            .archive_project(
+                &project.id,
+                reject_archive_command(&preview, "archive-after-failure"),
+            )
+            .await
+            .unwrap();
+        assert!(archived.cancelled_assignment_ids.is_empty());
+        assert_eq!(
+            summary_command_state(&temp, &command.command_id),
+            ("failed".to_owned(), Some("allocation failed".to_owned()))
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn archiving_with_cancel_ends_exactly_the_previewed_workers_without_receipts() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, first) = create_active_assignment(&store).await;
+        let second =
+            allocate_additional_assignment(&store, &project_id, "second-allocation", "terminal-3")
+                .await;
+        // Work that already closed is not listed and its worker is untouched.
+        let finished = allocate_additional_assignment(
+            &store,
+            &project_id,
+            "finished-allocation",
+            "terminal-4",
+        )
+        .await;
+        store
+            .dispose_assignment(
+                &project_id,
+                &finished.id,
+                disposition_command(
+                    "finish-before-archive",
+                    &finished,
+                    yard_domain::DispositionOutcome::Completed,
+                    false,
+                ),
+                yard_domain::RequestOrigin::None,
+            )
+            .await
+            .unwrap();
+
+        let preview = store
+            .project_disposition_preview(&project_id)
+            .await
+            .unwrap();
+        let project = store.get_project(&project_id).await.unwrap();
+        assert_eq!(preview.project_version, project.version);
+        assert_eq!(preview.orchestrator_worker_id, project.orchestrator.id);
+        let listed = preview
+            .active_assignments
+            .iter()
+            .map(|assignment| assignment.assignment_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(listed, [first.id.as_str(), second.id.as_str()]);
+        let entry = &preview.active_assignments[1];
+        assert_eq!(entry.objective, second.objective);
+        assert_eq!(entry.worker_id, second.worker.id);
+        assert_eq!(entry.profile_name, second.profile_name);
+        assert_eq!(entry.assignment_version, second.version);
+        assert_eq!(entry.lifecycle, AssignmentLifecycle::Active);
+        assert!(entry.runtime_present);
+
+        // A stale set, in IDs or versions, refuses with a fresh preview and
+        // writes nothing.
+        let mut missing_one = cancel_archive_command(&preview, "archive-missing-one");
+        missing_one
+            .expected_active_assignments
+            .as_mut()
+            .unwrap()
+            .retain(|expected| expected.assignment_id == first.id);
+        let mut old_version = cancel_archive_command(&preview, "archive-old-version");
+        old_version.expected_active_assignments.as_mut().unwrap()[0].expected_assignment_version +=
+            1;
+        let mut extra = cancel_archive_command(&preview, "archive-extra");
+        extra.expected_active_assignments.as_mut().unwrap().push(
+            yard_domain::ExpectedActiveAssignment {
+                assignment_id: finished.id.clone(),
+                expected_assignment_version: finished.version,
+            },
+        );
+        for stale in [missing_one, old_version, extra] {
+            let command_id = stale.command_id.clone();
+            let error = store.archive_project(&project_id, stale).await.unwrap_err();
+            let ProjectStoreError::ProjectArchivePreviewStale(fresh) = error else {
+                panic!("expected a stale preview, got {error:?}");
+            };
+            assert_eq!(*fresh, preview);
+            assert_eq!(
+                count_rows(
+                    &temp,
+                    "SELECT COUNT(*) FROM command_acknowledgements WHERE id = ?1",
+                    &command_id,
+                ),
+                0
+            );
+        }
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM assignment_cancellations WHERE reason = ?1",
+                "project_archived",
+            ),
+            0
+        );
+        assert_eq!(store.get_project(&project_id).await.unwrap(), project);
+
+        let command = cancel_archive_command(&preview, "archive-and-end-workers");
+        let archived = store
+            .archive_project_from(
+                &project_id,
+                command.clone(),
+                yard_domain::RequestOrigin::Browser,
+            )
+            .await
+            .unwrap();
+        assert!(!archived.replayed);
+        assert!(archived.cleanup_pending);
+        let mut expected_ids = vec![first.id.clone(), second.id.clone()];
+        expected_ids.sort();
+        assert_eq!(archived.cancelled_assignment_ids, expected_ids);
+        assert!(matches!(
+            store.get_project(&project_id).await.unwrap_err(),
+            ProjectStoreError::ProjectNotFound
+        ));
+
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        for assignment in [&first, &second] {
+            let (lifecycle, attempt, version): (String, String, i64) = connection
+                .query_row(
+                    "SELECT assignment.lifecycle, attempt.lifecycle, assignment.version
+                       FROM assignments assignment
+                       JOIN assignment_attempts attempt
+                         ON attempt.assignment_id = assignment.id
+                      WHERE assignment.id = ?1",
+                    [&assignment.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (lifecycle.as_str(), attempt.as_str()),
+                ("cancelled", "cancelled")
+            );
+            assert_eq!(u64::try_from(version).unwrap(), assignment.version + 1);
+            let (command_id, reason, actor, origin, objective): (
+                String,
+                String,
+                String,
+                String,
+                String,
+            ) = connection
+                .query_row(
+                    "SELECT command_id, reason, actor, request_origin, objective_snapshot
+                       FROM assignment_cancellations WHERE assignment_id = ?1",
+                    [&assignment.id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(command_id, "archive-and-end-workers");
+            assert_eq!(reason, "project_archived");
+            assert_eq!(actor, "local-user");
+            assert_eq!(origin, "browser");
+            assert_eq!(objective, assignment.objective);
+            // Archive is never completion.
+            let receipts: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM completion_receipts WHERE assignment_id = ?1",
+                    [&assignment.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(receipts, 0);
+            let open_allocations: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM worker_allocations
+                      WHERE id = ?1 AND ended_at_unix_ms IS NULL",
+                    [&assignment.allocation_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(open_allocations, 0);
+            assert!(worker_ended(&temp, &assignment.worker.id));
+            let (retired_reason, cleanup_reason, cleanup_state, captures): (
+                String,
+                String,
+                String,
+                i64,
+            ) = connection
+                .query_row(
+                    "SELECT retired.reason, cleanup.reason, cleanup.expected_binding_state,
+                            (SELECT COUNT(*) FROM transcript_capture_jobs capture
+                              WHERE capture.command_id = ?1
+                                AND capture.worker_id = ?2
+                                AND capture.assignment_id = ?3
+                                AND capture.status = 'pending')
+                       FROM retired_runtime_bindings retired
+                       JOIN runtime_cleanup_jobs cleanup
+                         ON cleanup.command_id = retired.command_id
+                        AND cleanup.worker_id = retired.worker_id
+                      WHERE retired.command_id = ?1 AND retired.worker_id = ?2
+                        AND cleanup.status = 'pending'",
+                    params![
+                        "archive-and-end-workers",
+                        assignment.worker.id,
+                        assignment.id
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (
+                    retired_reason.as_str(),
+                    cleanup_reason.as_str(),
+                    cleanup_state.as_str()
+                ),
+                ("project_archive", "project_archive", "detached")
+            );
+            assert_eq!(captures, 1);
+        }
+        // The orchestrator and both members were retired under one command.
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM retired_runtime_bindings WHERE command_id = ?1",
+                "archive-and-end-workers",
+            ),
+            3
+        );
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM lifecycle_events
+                  WHERE event_type = ?1",
+                "assignment_cancelled",
+            ),
+            2
+        );
+        // The worker whose work had already finished keeps its session.
+        assert!(!worker_ended(&temp, &finished.worker.id));
+        let finished_state: String = connection
+            .query_row(
+                "SELECT lifecycle FROM assignments WHERE id = ?1",
+                [&finished.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(finished_state, "completed");
+
+        // Every member cleanup validates as detached.
+        let claimed = store
+            .claim_pending_runtime_cleanups(Some("archive-and-end-workers"), 10, 30_000)
+            .await
+            .unwrap();
+        assert_eq!(claimed.rejected, 0);
+        assert_eq!(claimed.jobs.len(), 3);
+
+        // Replays report the same cancellations; any other input conflicts.
+        let replayed = store
+            .archive_project(&project_id, command.clone())
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.cancelled_assignment_ids, expected_ids);
+        let mut fewer = command.clone();
+        fewer.expected_active_assignments.as_mut().unwrap().pop();
+        let mut rejecting = command.clone();
+        rejecting.active_work = yard_domain::ProjectArchiveActiveWork::Reject;
+        rejecting.expected_active_assignments = None;
+        for conflicting in [fewer, rejecting] {
+            assert!(matches!(
+                store
+                    .archive_project(&project_id, conflicting)
+                    .await
+                    .unwrap_err(),
+                ProjectStoreError::IdempotencyConflict
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn archiving_with_cancel_and_no_active_work_matches_an_empty_preview() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) = draft("cancel-empty", "cancel-empty-terminal");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        let preview = store
+            .project_disposition_preview(&project.id)
+            .await
+            .unwrap();
+        assert!(preview.active_assignments.is_empty());
+
+        let archived = store
+            .archive_project(
+                &project.id,
+                cancel_archive_command(&preview, "cancel-empty"),
+            )
+            .await
+            .unwrap();
+        assert!(archived.cancelled_assignment_ids.is_empty());
+        assert!(matches!(
+            store
+                .project_disposition_preview(&project.id)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::ProjectNotFound
+        ));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn deleting_active_project_with_cancel_ends_members_and_replays() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, active) = create_active_assignment(&store).await;
+        let preview = store
+            .project_disposition_preview(&project_id)
+            .await
+            .unwrap();
+        let delete = |command_id: &str| DeleteProject {
+            command_id: command_id.to_owned(),
+            actor: "local-user".to_owned(),
+            archive: Some(cancel_archive_command(&preview, command_id).preconditions()),
+        };
+
+        let mut stale = delete("delete-stale-preview");
+        stale.archive.as_mut().unwrap().expected_active_assignments = Some(Vec::new());
+        assert!(matches!(
+            store.delete_project(&project_id, stale).await.unwrap_err(),
+            ProjectStoreError::ProjectArchivePreviewStale(_)
+        ));
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM command_acknowledgements WHERE id = ?1",
+                "delete-stale-preview",
+            ),
+            0
+        );
+
+        let command = delete("delete-and-end-workers");
+        let deleted = store
+            .delete_project(&project_id, command.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            deleted.cancelled_assignment_ids,
+            std::slice::from_ref(&active.id)
+        );
+        assert!(deleted.cleanup_pending);
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM assignment_cancellations
+                  WHERE command_id = ?1 AND reason = 'project_archived'",
+                "delete-and-end-workers",
+            ),
+            1
+        );
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM completion_receipts WHERE assignment_id = ?1",
+                &active.id,
+            ),
+            0
+        );
+        assert!(worker_ended(&temp, &active.worker.id));
+        // Only the orchestrator is tombstoned; the ended member stays in
+        // worker history.
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM deleted_workers WHERE command_id = ?1",
+                "delete-and-end-workers",
+            ),
+            1
+        );
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM deleted_workers WHERE worker_id = ?1",
+                &active.worker.id,
+            ),
+            0
+        );
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM transcript_capture_jobs WHERE command_id = ?1",
+                "delete-and-end-workers",
+            ),
+            1
+        );
+
+        let replayed = store
+            .delete_project(&project_id, command.clone())
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(
+            replayed.cancelled_assignment_ids,
+            std::slice::from_ref(&active.id)
+        );
+        let mut different = command;
+        different.archive.as_mut().unwrap().active_work =
+            yard_domain::ProjectArchiveActiveWork::Reject;
+        different
+            .archive
+            .as_mut()
+            .unwrap()
+            .expected_active_assignments = None;
+        assert!(matches!(
+            store
+                .delete_project(&project_id, different)
+                .await
+                .unwrap_err(),
+            ProjectStoreError::IdempotencyConflict
+        ));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn archiving_with_cancel_closes_a_stranded_handoff_source() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (source_project, source_assignment, target_project) =
+            create_handoff_fixture(&store).await;
+        let handoff = handoff_command(
+            "archive-stranded-handoff",
+            &source_project,
+            &source_assignment,
+            &target_project,
+            HandoffTargetRole::Member,
+        );
+        store
+            .begin_worker_handoff(&source_project.id, &source_assignment.id, handoff.clone())
+            .await
+            .unwrap();
+
+        // While the handoff is in flight the archive waits, whatever it lists.
+        let in_flight = store
+            .project_disposition_preview(&source_project.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            in_flight.active_assignments[0].lifecycle,
+            AssignmentLifecycle::HandingOff
+        );
+        assert!(matches!(
+            store
+                .archive_project(
+                    &source_project.id,
+                    cancel_archive_command(&in_flight, "archive-during-handoff"),
+                )
+                .await
+                .unwrap_err(),
+            ProjectStoreError::ProjectArchiveHandoffInProgress
+        ));
+
+        store
+            .claim_worker_handoff_runtime(
+                &handoff.command_id,
+                handoff_runtime("workspace-2", "terminal-archive-stranded"),
+            )
+            .await
+            .unwrap();
+        store
+            .fail_worker_handoff(
+                &handoff.command_id,
+                "prompt acknowledgement timed out",
+                true,
+            )
+            .await
+            .unwrap();
+        let preview = store
+            .project_disposition_preview(&source_project.id)
+            .await
+            .unwrap();
+        let archived = store
+            .archive_project(
+                &source_project.id,
+                cancel_archive_command(&preview, "archive-stranded-source"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            archived.cancelled_assignment_ids,
+            std::slice::from_ref(&source_assignment.id)
+        );
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let (lifecycle, finished, quarantined): (String, Option<i64>, i64) = connection
+            .query_row(
+                "SELECT assignment.lifecycle, handoff.finished_at_unix_ms,
+                        (SELECT COUNT(*) FROM quarantined_provisioning_runtime_bindings
+                          WHERE command_id = handoff.command_id)
+                   FROM assignments assignment
+                   JOIN worker_handoff_commands handoff
+                     ON handoff.source_assignment_id = assignment.id
+                  WHERE assignment.id = ?1",
+                [&source_assignment.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(lifecycle, "cancelled");
+        assert!(finished.is_some());
+        assert_eq!(quarantined, 1);
+        assert!(worker_ended(&temp, &source_assignment.worker.id));
+
+        // The quarantine sits in the target's workspace; it came from a
+        // handoff into the target, so it never blocks the target's Restore.
+        let target_project = store.get_project(&target_project.id).await.unwrap();
+        let target_archived = store
+            .archive_project(
+                &target_project.id,
+                archive_command(&target_project, "archive-stranded-target"),
+            )
+            .await
+            .unwrap();
+        assert!(target_archived.restorable);
+        assert!(
+            store
+                .list_archived_projects()
+                .await
+                .unwrap()
+                .projects
+                .iter()
+                .find(|project| project.project_id == target_project.id)
+                .unwrap()
+                .restorable
+        );
+        store
+            .restore_project(
+                &target_project.id,
+                restore_command("restore-stranded-target", "archive-stranded-target"),
+                super::ProjectRestoreRuntime::Absent,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn populated_v33_archive_replays_as_reject_after_0037() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let archived = create_archived_project(
+            &store,
+            "v33-archived",
+            "v33-archived-terminal",
+            "v33-archive-before-upgrade",
+        )
+        .await;
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_snapshot_expiry_schema_to_v33(&connection);
+        assert_eq!(
+            super::classify_schema_lineage(&connection, 33).unwrap(),
+            super::SchemaLineage::Mainline(33)
+        );
+        assert!(!super::table_has_column(&connection, "archived_projects", "active_work").unwrap());
+        drop(connection);
+
+        let store = open_store(&temp).await;
+        let replayed = store
+            .archive_project(
+                &archived.id,
+                archive_command(&archived, "v33-archive-before-upgrade"),
+            )
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert!(replayed.cancelled_assignment_ids.is_empty());
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&connection), SCHEMA_VERSION);
+        let (work, json): (String, Option<String>) = connection
+            .query_row(
+                "SELECT active_work, expected_active_assignments_json
+                   FROM archived_projects WHERE command_id = ?1",
+                ["v33-archive-before-upgrade"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((work.as_str(), json), ("reject", None));
+        let violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn populated_v36_database_migrates_to_archive_active_work() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let archived = create_archived_project(
+            &store,
+            "v36-archived",
+            "v36-archived-terminal",
+            "v36-archive-before-upgrade",
+        )
+        .await;
+        let (project_id, active) = create_active_assignment(&store).await;
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_archive_active_work_schema_to_v36(&connection);
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 36);
+        let input_columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('archived_projects')
+                  WHERE name IN ('active_work', 'expected_active_assignments_json')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(input_columns, 0);
+        drop(connection);
+
+        let store = open_store(&temp).await;
+        // The pre-upgrade archive replays as the reject-only archive it was.
+        let replayed = store
+            .archive_project(
+                &archived.id,
+                archive_command(&archived, "v36-archive-before-upgrade"),
+            )
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert!(replayed.cancelled_assignment_ids.is_empty());
+        assert!(replayed.cleanup_pending);
+        let claimed = store
+            .claim_pending_runtime_cleanups(Some("v36-archive-before-upgrade"), 10, 30_000)
+            .await
+            .unwrap();
+        assert_eq!((claimed.jobs.len(), claimed.rejected), (1, 0));
+
+        // A post-upgrade archive ends two workers under one command.
+        let preview = store
+            .project_disposition_preview(&project_id)
+            .await
+            .unwrap();
+        let ended = store
+            .archive_project(
+                &project_id,
+                cancel_archive_command(&preview, "v36-archive-after-upgrade"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ended.cancelled_assignment_ids,
+            std::slice::from_ref(&active.id)
+        );
+        drop(store);
+
+        let fresh_temp = TempDir::new().unwrap();
+        drop(open_store(&fresh_temp).await);
+        let fresh = Connection::open(fresh_temp.path().join("yard.sqlite3")).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        for table in ["retired_runtime_bindings", "archived_projects"] {
+            assert_eq!(
+                table_schema(&connection, table),
+                table_schema(&fresh, table),
+                "{table}"
+            );
+        }
+        let (legacy_work, legacy_json): (String, Option<String>) = connection
+            .query_row(
+                "SELECT active_work, expected_active_assignments_json
+                   FROM archived_projects WHERE command_id = ?1",
+                ["v36-archive-before-upgrade"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((legacy_work.as_str(), legacy_json), ("reject", None));
+        let retired: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM retired_runtime_bindings WHERE command_id = ?1",
+                ["v36-archive-after-upgrade"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retired, 2);
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+    }
+
+    #[tokio::test]
+    async fn v28_database_from_3fdcf5e_migrates_to_archive_active_work() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let legacy_project = create_archived_project(
+            &store,
+            "drifted-v32-deleted",
+            "drifted-v32-deleted-terminal",
+            "drifted-v32-archive",
+        )
+        .await;
+        store
+            .delete_project(
+                &legacy_project.id,
+                DeleteProject {
+                    command_id: "drifted-v32-delete".to_owned(),
+                    actor: "local-user".to_owned(),
+                    archive: None,
+                },
+            )
+            .await
+            .unwrap();
+        let (project_id, active) = create_active_assignment(&store).await;
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_snapshot_expiry_schema_to_v33(&connection);
+        downgrade_mainline_schema_to_v28(&connection);
+        downgrade_visibility_deletions_schema_to_3fdcf5e(&connection);
+        drop(connection);
+
+        let store = open_store(&temp).await;
+        let preview = store
+            .project_disposition_preview(&project_id)
+            .await
+            .unwrap();
+        let project = store.get_project(&project_id).await.unwrap();
+        let deleted = store
+            .delete_project(
+                &project_id,
+                DeleteProject {
+                    command_id: "drifted-v32-delete-active".to_owned(),
+                    actor: "local-user".to_owned(),
+                    archive: Some(
+                        cancel_archive_command(&preview, "drifted-v32-delete-active")
+                            .preconditions(),
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.orchestrator_worker_id, project.orchestrator.id);
+        assert_eq!(
+            deleted.cancelled_assignment_ids,
+            std::slice::from_ref(&active.id)
+        );
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        let repaired_ack: String = connection
+            .query_row(
+                "SELECT command_type FROM command_acknowledgements WHERE id = ?1",
+                ["drifted-v32-delete"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repaired_ack, "project_delete");
+    }
+
+    fn restore_command(command_id: &str, archive_command_id: &str) -> yard_domain::RestoreProject {
+        yard_domain::RestoreProject {
+            command_id: command_id.to_owned(),
+            actor: "local-user".to_owned(),
+            expected_archive_command_id: archive_command_id.to_owned(),
+        }
+    }
+
+    /// The retired orchestrator observed again as the same pane, as the
+    /// server's identity check hands it over.
+    fn observed_retired_binding(
+        retired: &super::RetiredOrchestratorRuntime,
+    ) -> WorkerRuntimeBinding {
+        WorkerRuntimeBinding {
+            adapter: retired.adapter.clone(),
+            session: retired.session.clone(),
+            workspace_id: retired.workspace_id.clone(),
+            terminal_id: retired.terminal_id.clone(),
+            tab_id: retired.tab_id.clone(),
+            pane_id: retired.pane_id.clone(),
+            provider_session: retired.provider_session.clone(),
+            owns_tab: retired.owns_tab,
+            observation_state: RuntimeObservationState::Observed,
+            process_state: RuntimeProcessState::Running,
+            status: ObservedStatus::Working,
+            state_change_sequence: 7,
+            revision: 9,
+            version: 1,
+            last_observed_at_unix_ms: super::unix_time_ms().unwrap(),
+        }
+    }
+
+    /// Rebind with the project's retired orchestrator observed again. When
+    /// the plan has none (the restore is expected to be refused or to
+    /// replay), the binding names a pane that was never retired.
+    async fn rebind_live_runtime(
+        store: &SqliteProjectStore,
+        project_id: &str,
+        archive_command_id: &str,
+    ) -> super::ProjectRestoreRuntime {
+        let retired = match store
+            .project_restore_plan(
+                project_id,
+                restore_command("rebind-plan", archive_command_id),
+            )
+            .await
+        {
+            Ok(super::ProjectRestorePlan::Ready {
+                retired_orchestrator: Some(retired),
+            }) => *retired,
+            _ => super::RetiredOrchestratorRuntime {
+                adapter: "herdr".to_owned(),
+                session: "unobserved".to_owned(),
+                workspace_id: "unobserved".to_owned(),
+                terminal_id: "unobserved".to_owned(),
+                tab_id: None,
+                pane_id: "unobserved".to_owned(),
+                provider_session: None,
+                owns_tab: false,
+                pane_instance_id: None,
+            },
+        };
+        super::ProjectRestoreRuntime::Rebind(Box::new(observed_retired_binding(&retired)))
+    }
+
+    fn restore_unavailable(
+        result: Result<yard_domain::RestoredProject, ProjectStoreError>,
+    ) -> yard_domain::ProjectRestoreUnavailableReason {
+        match result {
+            Err(ProjectStoreError::ProjectRestoreUnavailable(reason)) => reason,
+            other => panic!("expected project_restore_unavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_never_binds_an_observation_other_than_the_retired_identity() {
+        use yard_domain::RestoredOrchestratorRuntime;
+
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) = draft("recycled-workspace", "recycled-terminal");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        store
+            .archive_project(&project.id, archive_command(&project, "recycled-archive"))
+            .await
+            .unwrap();
+        let super::ProjectRestorePlan::Ready {
+            retired_orchestrator: Some(retired),
+        } = store
+            .project_restore_plan(
+                &project.id,
+                restore_command("recycled-restore", "recycled-archive"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected the archived orchestrator runtime");
+        };
+        // Herdr without pane-management leases records no instance.
+        assert_eq!(retired.pane_instance_id, None);
+        // A Yard-held lease on the orchestrator's pane supplies the instance
+        // the server compares against the fresh observation.
+        {
+            let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO yard_installation (singleton_id, installation_uuid, created_at_unix_ms)
+                     VALUES (1, 'installation-1', 1)",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO pane_management_leases (
+                        worker_id, project_id, allocation_id, installation_uuid,
+                        herdr_session, pane_id, pane_instance_id, owner_id, lease_token,
+                        expires_at_unix_ms, acquisition_request_id, status,
+                        renew_after_unix_ms, created_at_unix_ms, updated_at_unix_ms
+                     )
+                     SELECT wa.worker_id, wa.project_id, wa.id, 'installation-1',
+                            ?2, ?3, 'instance-a', 'owner', 'token', 2, 'acquire-1',
+                            'active', 1, 1, 1
+                       FROM worker_allocations wa
+                      WHERE wa.worker_id = ?1
+                      ORDER BY wa.started_at_unix_ms DESC, wa.id DESC
+                      LIMIT 1",
+                    params![project.orchestrator.id, retired.session, retired.pane_id],
+                )
+                .unwrap();
+        }
+        let super::ProjectRestorePlan::Ready {
+            retired_orchestrator: Some(retired),
+        } = store
+            .project_restore_plan(
+                &project.id,
+                restore_command("recycled-restore", "recycled-archive"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected the archived orchestrator runtime");
+        };
+        assert_eq!(retired.pane_instance_id.as_deref(), Some("instance-a"));
+        // The pane id came back behind another terminal: the server must not
+        // hand that over, and the store refuses it even if it does.
+        let mut recycled = observed_retired_binding(&retired);
+        recycled.terminal_id = "recycled-terminal-reused".to_owned();
+        let restored = store
+            .restore_project(
+                &project.id,
+                restore_command("recycled-restore", "recycled-archive"),
+                super::ProjectRestoreRuntime::Rebind(Box::new(recycled)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.orchestrator_runtime,
+            RestoredOrchestratorRuntime::Unbound
+        );
+        let current = store.get_project(&project.id).await.unwrap();
+        assert!(current.orchestrator.runtime.is_none());
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM retired_runtime_bindings
+                  WHERE terminal_id = ?1 AND released_at_unix_ms IS NULL",
+                "recycled-terminal",
+            ),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_orchestrator_is_not_a_completed_runtime_cleanup_candidate() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) =
+            draft("restore-cleanup-workspace", "restore-cleanup-terminal");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        store
+            .archive_project(
+                &project.id,
+                archive_command(&project, "restore-cleanup-archive"),
+            )
+            .await
+            .unwrap();
+        store
+            .restore_project(
+                &project.id,
+                restore_command("restore-cleanup", "restore-cleanup-archive"),
+                rebind_live_runtime(&store, &project.id, "restore-cleanup-archive").await,
+            )
+            .await
+            .unwrap();
+        let current = store.get_project(&project.id).await.unwrap();
+        assert!(current.orchestrator.runtime.is_some());
+        // Two guards keep it out of mainline's worker cleanup: its latest
+        // allocation is Restore's open `adopt_existing` one (cleanup takes only
+        // `create_new`), and it is still the project's orchestrator.
+        let orchestrator_id = current.orchestrator.id.clone();
+        let (mode, open, protected): (String, bool, bool) =
+            Connection::open(temp.path().join("yard.sqlite3"))
+                .unwrap()
+                .query_row(
+                    "SELECT wa.mode, wa.ended_at_unix_ms IS NULL,
+                        EXISTS (SELECT 1 FROM projects WHERE orchestrator_worker_id = wa.worker_id)
+                   FROM worker_allocations wa
+                  WHERE wa.worker_id = ?1
+                  ORDER BY wa.started_at_unix_ms DESC, wa.id DESC
+                  LIMIT 1",
+                    [&orchestrator_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(mode, "adopt_existing");
+        assert!(open);
+        assert!(protected);
+        let preview = store.preview_completed_runtime_cleanup(100).await.unwrap();
+        assert!(
+            preview
+                .candidates
+                .iter()
+                .all(|candidate| candidate.worker_id != orchestrator_id)
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn restoring_a_live_orchestrator_rebinds_it_and_replays() {
+        use yard_domain::{ProjectVisibility, RestoredOrchestratorRuntime};
+
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_draft, runtime) = draft("restore-workspace", "restore-terminal");
+        let project = store.create_project(project_draft, runtime).await.unwrap();
+        let archived = store
+            .archive_project(&project.id, archive_command(&project, "restore-archive"))
+            .await
+            .unwrap();
+        assert!(archived.restorable);
+        assert_eq!(archived.visibility, ProjectVisibility::Archived);
+        let listed = store.list_archived_projects().await.unwrap().projects;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].project_id, project.id);
+        assert_eq!(listed[0].archive_command_id, "restore-archive");
+        assert!(listed[0].restorable);
+        assert!(listed[0].cleanup_pending);
+        // A cleanup runner already holds the orchestrator job's claim.
+        let claimed = store
+            .claim_pending_runtime_cleanups(Some("restore-archive"), 10, 30_000)
+            .await
+            .unwrap();
+        assert_eq!(claimed.jobs.len(), 1);
+
+        let command = restore_command("restore-1", "restore-archive");
+        let super::ProjectRestorePlan::Ready {
+            retired_orchestrator: Some(retired),
+        } = store
+            .project_restore_plan(&project.id, command.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("expected the archived orchestrator runtime");
+        };
+        assert_eq!(retired.terminal_id, "restore-terminal");
+        assert_eq!(retired.workspace_id, "restore-workspace");
+        let restored = store
+            .restore_project(
+                &project.id,
+                command.clone(),
+                rebind_live_runtime(&store, &project.id, "restore-archive").await,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.orchestrator_runtime,
+            RestoredOrchestratorRuntime::Rebound
+        );
+        assert_eq!(restored.visibility, ProjectVisibility::Active);
+        assert_eq!(restored.archive_command_id, "restore-archive");
+        assert!(restored.cancelled_assignment_ids.is_empty());
+        assert!(!restored.replayed);
+
+        let current = store.get_project(&project.id).await.unwrap();
+        assert_eq!(current.version, project.version + 2);
+        assert_eq!(current.orchestrator.id, project.orchestrator.id);
+        assert_eq!(
+            current.orchestrator.version,
+            project.orchestrator.version + 2
+        );
+        assert_eq!(
+            current.orchestrator.desired_state,
+            yard_domain::WorkerDesiredState::Running
+        );
+        let runtime = current.orchestrator.runtime.clone().unwrap();
+        assert_eq!(runtime.terminal_id, "restore-terminal");
+        assert_eq!(runtime.version, 2);
+        assert_eq!(runtime.status, ObservedStatus::Working);
+        assert!(
+            store
+                .list_projects()
+                .await
+                .unwrap()
+                .projects
+                .iter()
+                .any(|listed| listed.id == project.id)
+        );
+        assert!(
+            store
+                .list_archived_projects()
+                .await
+                .unwrap()
+                .projects
+                .is_empty()
+        );
+        // Restore cleared the claim, so the late runner cannot finish the job.
+        assert!(matches!(
+            store
+                .succeed_runtime_cleanup(&claimed.jobs[0].id, &claimed.jobs[0].claim_token)
+                .await,
+            Err(ProjectStoreError::RuntimeCleanupClaimLost)
+        ));
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM runtime_cleanup_jobs
+                  WHERE command_id = ?1 AND status = 'cancelled'
+                    AND claim_token IS NULL AND completed_at_unix_ms IS NOT NULL",
+                "restore-archive",
+            ),
+            1
+        );
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM retired_runtime_bindings
+                  WHERE command_id = 'restore-archive'
+                    AND released_by_command_id = ?1
+                    AND released_at_unix_ms IS NOT NULL",
+                "restore-1",
+            ),
+            1
+        );
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM worker_allocations
+                  WHERE started_by_command_id = ?1 AND mode = 'adopt_existing'
+                    AND ended_at_unix_ms IS NULL",
+                "restore-1",
+            ),
+            1
+        );
+
+        // Replays, conflicts, and a second command.
+        let replayed = store
+            .restore_project(
+                &project.id,
+                command.clone(),
+                super::ProjectRestoreRuntime::Absent,
+            )
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(
+            replayed.orchestrator_runtime,
+            RestoredOrchestratorRuntime::Rebound
+        );
+        assert!(matches!(
+            store
+                .project_restore_plan(&project.id, command.clone())
+                .await
+                .unwrap(),
+            super::ProjectRestorePlan::Replayed(_)
+        ));
+        let mut changed = command.clone();
+        changed.actor = "other-user".to_owned();
+        assert!(matches!(
+            store
+                .restore_project(&project.id, changed, super::ProjectRestoreRuntime::Absent)
+                .await,
+            Err(ProjectStoreError::IdempotencyConflict)
+        ));
+        assert!(matches!(
+            store
+                .restore_project(
+                    &project.id,
+                    restore_command("restore-2", "restore-archive"),
+                    super::ProjectRestoreRuntime::Absent,
+                )
+                .await,
+            Err(ProjectStoreError::ProjectRestoreNotArchived)
+        ));
+        let archive_replay = store
+            .archive_project(&project.id, archive_command(&project, "restore-archive"))
+            .await
+            .unwrap();
+        assert!(archive_replay.replayed);
+        assert_eq!(archive_replay.visibility, ProjectVisibility::Active);
+        assert!(!archive_replay.restorable);
+
+        // Re-archive after Restore retires the same identity again.
+        let rearchived = store
+            .archive_project(&project.id, archive_command(&current, "restore-rearchive"))
+            .await
+            .unwrap();
+        assert!(rearchived.restorable);
+        assert!(rearchived.cleanup_pending);
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM retired_runtime_bindings
+                  WHERE terminal_id = ?1 AND released_at_unix_ms IS NULL",
+                "restore-terminal",
+            ),
+            1
+        );
+        assert_eq!(
+            restore_unavailable(
+                store
+                    .restore_project(
+                        &project.id,
+                        restore_command("restore-3", "restore-archive"),
+                        super::ProjectRestoreRuntime::Absent,
+                    )
+                    .await
+            ),
+            yard_domain::ProjectRestoreUnavailableReason::ArchiveChanged
+        );
+        let replay_after_rearchive = store
+            .restore_project(&project.id, command, super::ProjectRestoreRuntime::Absent)
+            .await
+            .unwrap();
+        assert_eq!(
+            replay_after_rearchive.visibility,
+            ProjectVisibility::Archived
+        );
+        let again = store
+            .restore_project(
+                &project.id,
+                restore_command("restore-3", "restore-rearchive"),
+                rebind_live_runtime(&store, &project.id, "restore-rearchive").await,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            again.orchestrator_runtime,
+            RestoredOrchestratorRuntime::Rebound
+        );
+        assert_eq!(
+            store
+                .get_project(&project.id)
+                .await
+                .unwrap()
+                .orchestrator
+                .runtime
+                .unwrap()
+                .version,
+            3
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn restoring_without_the_archived_runtime_restores_the_orchestrator_unbound() {
+        use yard_domain::RestoredOrchestratorRuntime;
+
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let closed = create_archived_project(
+            &store,
+            "restore-closed",
+            "restore-closed-terminal",
+            "restore-closed-archive",
+        )
+        .await;
+        let restored = store
+            .restore_project(
+                &closed.id,
+                restore_command("restore-closed", "restore-closed-archive"),
+                super::ProjectRestoreRuntime::Absent,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.orchestrator_runtime,
+            RestoredOrchestratorRuntime::Unbound
+        );
+        let current = store.get_project(&closed.id).await.unwrap();
+        assert!(current.orchestrator.runtime.is_none());
+        assert_eq!(
+            current.orchestrator.desired_state,
+            yard_domain::WorkerDesiredState::Running
+        );
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM runtime_cleanup_jobs
+                  WHERE command_id = ?1 AND status = 'cancelled'",
+                "restore-closed-archive",
+            ),
+            1
+        );
+
+        // A reused identity keeps its retirement, so the pane that now owns
+        // it is never adopted as this orchestrator or as a free worker.
+        let reused = create_archived_project(
+            &store,
+            "restore-reused",
+            "restore-reused-terminal",
+            "restore-reused-archive",
+        )
+        .await;
+        let restored = store
+            .restore_project(
+                &reused.id,
+                restore_command("restore-reused", "restore-reused-archive"),
+                super::ProjectRestoreRuntime::Conflict,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.orchestrator_runtime,
+            RestoredOrchestratorRuntime::Unbound
+        );
+        assert!(
+            store
+                .get_project(&reused.id)
+                .await
+                .unwrap()
+                .orchestrator
+                .runtime
+                .is_none()
+        );
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM retired_runtime_bindings
+                  WHERE command_id = ?1 AND released_at_unix_ms IS NULL",
+                "restore-reused-archive",
+            ),
+            1
+        );
+        store
+            .reconcile_runtime_inventory(inventory(
+                super::unix_time_ms().unwrap(),
+                vec![observed_worker(
+                    "restore-reused-terminal",
+                    "restore-reused",
+                    "tab-1",
+                    "pane-1",
+                    None,
+                )],
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .list_worker_candidates()
+                .await
+                .unwrap()
+                .workers
+                .iter()
+                .any(|candidate| candidate
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.terminal_id == "restore-reused-terminal"))
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn restore_refuses_a_reserved_workspace_a_changed_archive_or_a_deleted_project() {
+        use yard_domain::ProjectRestoreUnavailableReason;
+
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        assert!(matches!(
+            store
+                .project_restore_plan("missing-project", restore_command("restore-missing", "a"))
+                .await,
+            Err(ProjectStoreError::ProjectNotFound)
+        ));
+        let (active_draft, active_runtime) = draft("restore-active", "restore-active-terminal");
+        let active = store
+            .create_project(active_draft, active_runtime)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .restore_project(
+                    &active.id,
+                    restore_command("restore-active", "a"),
+                    super::ProjectRestoreRuntime::Absent,
+                )
+                .await,
+            Err(ProjectStoreError::ProjectRestoreNotArchived)
+        ));
+
+        // Another project took the workspace after its cleanup finished.
+        let taken = create_archived_project(
+            &store,
+            "restore-taken",
+            "restore-taken-terminal",
+            "restore-taken-archive",
+        )
+        .await;
+        let claimed = store
+            .claim_pending_runtime_cleanups(Some("restore-taken-archive"), 10, 30_000)
+            .await
+            .unwrap();
+        store
+            .succeed_runtime_cleanup(&claimed.jobs[0].id, &claimed.jobs[0].claim_token)
+            .await
+            .unwrap();
+        assert!(store.list_archived_projects().await.unwrap().projects[0].restorable);
+        let (mut newcomer_draft, mut newcomer_runtime) =
+            draft("restore-taken", "restore-newcomer-terminal");
+        newcomer_draft.name = "Newcomer".to_owned();
+        newcomer_runtime.last_observed_at_unix_ms = super::unix_time_ms().unwrap();
+        store
+            .create_project(newcomer_draft, newcomer_runtime)
+            .await
+            .unwrap();
+        let listed = store.list_archived_projects().await.unwrap().projects;
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].restorable);
+        assert!(matches!(
+            store
+                .project_restore_plan(
+                    &taken.id,
+                    restore_command("restore-taken", "restore-taken-archive"),
+                )
+                .await,
+            Err(ProjectStoreError::ProjectRestoreUnavailable(
+                ProjectRestoreUnavailableReason::WorkspaceReserved
+            ))
+        ));
+        assert_eq!(
+            restore_unavailable(
+                store
+                    .restore_project(
+                        &taken.id,
+                        restore_command("restore-taken", "restore-taken-archive"),
+                        super::ProjectRestoreRuntime::Absent,
+                    )
+                    .await
+            ),
+            ProjectRestoreUnavailableReason::WorkspaceReserved
+        );
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM command_acknowledgements WHERE id = ?1",
+                "restore-taken",
+            ),
+            0
+        );
+
+        // The caller saw a different archive.
+        let changed = create_archived_project(
+            &store,
+            "restore-changed",
+            "restore-changed-terminal",
+            "restore-changed-archive",
+        )
+        .await;
+        assert_eq!(
+            restore_unavailable(
+                store
+                    .restore_project(
+                        &changed.id,
+                        restore_command("restore-changed", "an-older-archive"),
+                        super::ProjectRestoreRuntime::Absent,
+                    )
+                    .await
+            ),
+            ProjectRestoreUnavailableReason::ArchiveChanged
+        );
+
+        // Deletion is permanent.
+        let deleted = create_archived_project(
+            &store,
+            "restore-deleted",
+            "restore-deleted-terminal",
+            "restore-deleted-archive",
+        )
+        .await;
+        store
+            .delete_project(
+                &deleted.id,
+                DeleteProject {
+                    command_id: "restore-deleted-delete".to_owned(),
+                    actor: "local-user".to_owned(),
+                    archive: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            restore_unavailable(
+                store
+                    .restore_project(
+                        &deleted.id,
+                        restore_command("restore-deleted", "restore-deleted-archive"),
+                        super::ProjectRestoreRuntime::Absent,
+                    )
+                    .await
+            ),
+            ProjectRestoreUnavailableReason::ProjectDeleted
+        );
+        assert!(
+            !store
+                .list_archived_projects()
+                .await
+                .unwrap()
+                .projects
+                .iter()
+                .any(|listed| listed.project_id == deleted.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_keeps_archive_cancellations_and_member_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, active) = create_active_assignment(&store).await;
+        let preview = store
+            .project_disposition_preview(&project_id)
+            .await
+            .unwrap();
+        let archived = store
+            .archive_project(
+                &project_id,
+                cancel_archive_command(&preview, "restore-cancel-archive"),
+            )
+            .await
+            .unwrap();
+        // The ended member's pending cleanup in the same workspace belongs to
+        // this project, so it does not reserve the workspace against Restore.
+        assert!(archived.restorable);
+        let restored = store
+            .restore_project(
+                &project_id,
+                restore_command("restore-cancel", "restore-cancel-archive"),
+                rebind_live_runtime(&store, &project_id, "restore-cancel-archive").await,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.cancelled_assignment_ids,
+            std::slice::from_ref(&active.id)
+        );
+        let member = store
+            .list_project_assignments(&project_id)
+            .await
+            .unwrap()
+            .assignments
+            .into_iter()
+            .find(|assignment| assignment.id == active.id)
+            .unwrap();
+        assert_eq!(member.lifecycle, AssignmentLifecycle::Cancelled);
+        assert!(worker_ended(&temp, &active.worker.id));
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM runtime_cleanup_jobs
+                  WHERE command_id = 'restore-cancel-archive' AND status = 'pending'
+                    AND worker_id = ?1",
+                &active.worker.id,
+            ),
+            1
+        );
+        assert_eq!(
+            count_rows(
+                &temp,
+                "SELECT COUNT(*) FROM runtime_cleanup_jobs
+                  WHERE command_id = 'restore-cancel-archive' AND status = 'cancelled'
+                    AND worker_id = ?1",
+                &preview.orchestrator_worker_id,
+            ),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_project_orchestrator_can_be_transferred() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project, transfer) =
+            create_project_orchestrator_transfer_fixture(&store, "workspace-transfer").await;
+        store
+            .archive_project(
+                &project.id,
+                archive_command(&project, "transfer-restore-archive"),
+            )
+            .await
+            .unwrap();
+        store
+            .restore_project(
+                &project.id,
+                restore_command("transfer-restore", "transfer-restore-archive"),
+                rebind_live_runtime(&store, &project.id, "transfer-restore-archive").await,
+            )
+            .await
+            .unwrap();
+        let restored = store.get_project(&project.id).await.unwrap();
+        let transferred = store
+            .transfer_project_orchestrator(
+                &project.id,
+                TransferProjectOrchestrator {
+                    expected_project_version: restored.version,
+                    expected_orchestrator_worker_version: restored.orchestrator.version,
+                    expected_orchestrator_runtime: restored.orchestrator.runtime.clone().unwrap(),
+                    ..transfer.clone()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(transferred.project.orchestrator.id, transfer.worker_id);
+        assert_eq!(transferred.replaced_worker_id, project.orchestrator.id);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn populated_v37_database_migrates_to_project_restore() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let archived = create_archived_project(
+            &store,
+            "v37-archived",
+            "v37-archived-terminal",
+            "v37-archive-before-upgrade",
+        )
+        .await;
+        let (active_draft, active_runtime) = draft("v37-active", "v37-active-terminal");
+        let active = store
+            .create_project(active_draft, active_runtime)
+            .await
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_project_restore_schema_to_v37(&connection);
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 37);
+        let restore_columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('archived_projects')
+                  WHERE name IN ('restore_command_id', 'restored_at_unix_ms')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restore_columns, 0);
+        drop(connection);
+
+        let store = open_store(&temp).await;
+        // The pre-upgrade archive still replays, and is restorable.
+        let replayed = store
+            .archive_project(
+                &archived.id,
+                archive_command(&archived, "v37-archive-before-upgrade"),
+            )
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert!(replayed.restorable);
+        assert!(replayed.cleanup_pending);
+        let claimed = store
+            .claim_pending_runtime_cleanups(Some("v37-archive-before-upgrade"), 10, 30_000)
+            .await
+            .unwrap();
+        assert_eq!((claimed.jobs.len(), claimed.rejected), (1, 0));
+        store
+            .restore_project(
+                &archived.id,
+                restore_command("v37-restore", "v37-archive-before-upgrade"),
+                rebind_live_runtime(&store, &archived.id, "v37-archive-before-upgrade").await,
+            )
+            .await
+            .unwrap();
+        let restored = store.get_project(&archived.id).await.unwrap();
+        store
+            .archive_project(&archived.id, archive_command(&restored, "v37-rearchive"))
+            .await
+            .unwrap();
+        store
+            .archive_project(
+                &active.id,
+                archive_command(&active, "v37-archive-after-upgrade"),
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let fresh_temp = TempDir::new().unwrap();
+        drop(open_store(&fresh_temp).await);
+        let fresh = Connection::open(fresh_temp.path().join("yard.sqlite3")).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        for table in [
+            "command_acknowledgements",
+            "runtime_cleanup_jobs",
+            "retired_runtime_bindings",
+            "archived_projects",
+            "project_restore_commands",
+        ] {
+            assert_eq!(
+                table_schema(&connection, table),
+                table_schema(&fresh, table),
+                "{table}"
+            );
+        }
+        let archive_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM archived_projects WHERE project_id = ?1",
+                [&archived.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archive_rows, 2);
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+    }
+
+    #[tokio::test]
+    async fn v28_database_from_3fdcf5e_migrates_to_project_restore() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let legacy_project = create_archived_project(
+            &store,
+            "drifted-v33-deleted",
+            "drifted-v33-deleted-terminal",
+            "drifted-v33-archive",
+        )
+        .await;
+        store
+            .delete_project(
+                &legacy_project.id,
+                DeleteProject {
+                    command_id: "drifted-v33-delete".to_owned(),
+                    actor: "local-user".to_owned(),
+                    archive: None,
+                },
+            )
+            .await
+            .unwrap();
+        let archived = create_archived_project(
+            &store,
+            "drifted-v33-archived",
+            "drifted-v33-archived-terminal",
+            "drifted-v33-restorable-archive",
+        )
+        .await;
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_snapshot_expiry_schema_to_v33(&connection);
+        downgrade_mainline_schema_to_v28(&connection);
+        downgrade_visibility_deletions_schema_to_3fdcf5e(&connection);
+        drop(connection);
+
+        let store = open_store(&temp).await;
+        let listed = store.list_archived_projects().await.unwrap().projects;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].project_id, archived.id);
+        assert!(listed[0].restorable);
+        let restored = store
+            .restore_project(
+                &archived.id,
+                restore_command("drifted-v33-restore", "drifted-v33-restorable-archive"),
+                super::ProjectRestoreRuntime::Absent,
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored.visibility, yard_domain::ProjectVisibility::Active);
+        assert_eq!(
+            restore_unavailable(
+                store
+                    .restore_project(
+                        &legacy_project.id,
+                        restore_command("drifted-v33-restore-deleted", "drifted-v33-archive"),
+                        super::ProjectRestoreRuntime::Absent,
+                    )
+                    .await
+            ),
+            yard_domain::ProjectRestoreUnavailableReason::ProjectDeleted
+        );
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        let repaired_ack: String = connection
+            .query_row(
+                "SELECT command_type FROM command_acknowledgements WHERE id = ?1",
+                ["drifted-v33-delete"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repaired_ack, "project_delete");
     }
 }

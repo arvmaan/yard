@@ -4,6 +4,7 @@ import {
 } from './runtimeCapabilities'
 import type {
   Assignment,
+  CompletionReceipt,
   ObservedStatus,
   Project,
   RuntimeInventory,
@@ -159,6 +160,16 @@ export function statusReportMatchesLatestRoute(
   return latestProjectRoute?.command_id === report.command_id
 }
 
+/**
+ * The project's "last" line for a receipt. A minimal receipt has no
+ * handoff text, so it names the objective it completed instead.
+ */
+function completionLine(receipt: CompletionReceipt) {
+  return receipt.detail_level === 'minimal' && receipt.objective_snapshot
+    ? `Completed: ${receipt.objective_snapshot}`
+    : receipt.summary
+}
+
 export function projectUpdates(
   projects: Project[],
   assignments: Assignment[],
@@ -187,6 +198,15 @@ export function projectUpdates(
           assignment.completion_receipt?.created_at_unix_ms ??
           assignment.updated_at_unix_ms,
       )
+      const latestCancellation = newest(
+        projectAssignments.filter(
+          (assignment) =>
+            assignment.lifecycle === 'cancelled' && assignment.cancellation,
+        ),
+        (assignment) =>
+          assignment.cancellation?.cancelled_at_unix_ms ??
+          assignment.updated_at_unix_ms,
+      )
       const latestRoute = newest(
         routes.filter((route) => route.target_project_id === project.id),
         (route) => route.updated_at_unix_ms,
@@ -213,15 +233,23 @@ export function projectUpdates(
         orchestratorRuntime.process_state !== 'running' ||
         orchestratorRuntime.observation_state === 'ambiguous' ||
         orchestratorStatus === 'unknown'
+      const completionAt =
+        latestCompletion?.completion_receipt?.created_at_unix_ms ?? 0
+      const cancellation = latestCancellation?.cancellation
+      // A cancellation is a durable outcome like a receipt, so it counts
+      // wherever the newest durable event matters.
+      const cancellationAt = cancellation?.cancelled_at_unix_ms ?? 0
       const routeIsLatest =
         latestRoute !== undefined &&
-        latestRoute.updated_at_unix_ms >
-          (latestCompletion?.completion_receipt?.created_at_unix_ms ?? 0) &&
+        latestRoute.updated_at_unix_ms > completionAt &&
+        latestRoute.updated_at_unix_ms > cancellationAt &&
         latestRoute.updated_at_unix_ms >
           (latestActive?.updated_at_unix_ms ?? 0)
 
-      const durableLast = latestCompletion?.completion_receipt
-        ? latestCompletion.completion_receipt.summary
+      const durableLast = cancellation && cancellationAt > completionAt
+        ? `Ended without completion: ${cancellation.objective_snapshot}`
+        : latestCompletion?.completion_receipt
+        ? completionLine(latestCompletion.completion_receipt)
         : latestActive
           ? `Started ${latestActive.objective}`
           : latestRoute
@@ -297,7 +325,8 @@ export function projectUpdates(
         updatedAt: Math.max(
           project.updated_at_unix_ms,
           latestActive?.updated_at_unix_ms ?? 0,
-          latestCompletion?.completion_receipt?.created_at_unix_ms ?? 0,
+          completionAt,
+          cancellationAt,
           latestRoute?.updated_at_unix_ms ?? 0,
         ),
       }

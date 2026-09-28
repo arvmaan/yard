@@ -309,19 +309,27 @@ fn validate_origin(headers: &HeaderMap) -> Result<(), ApiError> {
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(origin_forbidden)?;
-    let uri = origin.parse::<Uri>().map_err(|_| origin_forbidden())?;
-    let scheme_allowed = matches!(uri.scheme_str(), Some("http" | "https"));
-    let host_allowed = uri.authority().is_some_and(|authority| {
-        matches!(
-            authority.host(),
-            "127.0.0.1" | "localhost" | "[::1]" | "::1"
-        )
-    });
-    let path_allowed = uri.path_and_query().is_none_or(|path| path.as_str() == "/");
-    if !scheme_allowed || !host_allowed || !path_allowed {
+    if !is_loopback_origin(origin) {
         return Err(origin_forbidden());
     }
     Ok(())
+}
+
+/// Whether `origin` is an `http(s)` origin on a loopback host name.
+pub(super) fn is_loopback_origin(origin: &str) -> bool {
+    let Ok(uri) = origin.parse::<Uri>() else {
+        return false;
+    };
+    let scheme_allowed = matches!(uri.scheme_str(), Some("http" | "https"));
+    let host_allowed = uri
+        .authority()
+        .is_some_and(|authority| is_loopback_host_name(authority.host()));
+    let path_allowed = uri.path_and_query().is_none_or(|path| path.as_str() == "/");
+    scheme_allowed && host_allowed && path_allowed
+}
+
+pub(super) fn is_loopback_host_name(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
 }
 
 fn origin_forbidden() -> ApiError {
@@ -365,6 +373,20 @@ fn terminal_error(error: &TerminalServiceError) -> ApiError {
         )) => ApiError {
             status: StatusCode::NOT_FOUND,
             code: "project_not_found",
+            message: error.to_string(),
+        },
+        TerminalServiceError::CoordinationNode(CoordinationNodeServiceError::Store(
+            yard_store::ProjectStoreError::CoordinationNodeArchived,
+        )) => ApiError {
+            status: StatusCode::CONFLICT,
+            code: "coordination_node_archived",
+            message: error.to_string(),
+        },
+        TerminalServiceError::CoordinationNode(CoordinationNodeServiceError::Store(
+            yard_store::ProjectStoreError::CoordinationNodeNotFound,
+        )) => ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "coordination_node_not_found",
             message: error.to_string(),
         },
         TerminalServiceError::RuntimeBindingMissing

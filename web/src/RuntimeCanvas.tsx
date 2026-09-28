@@ -1380,7 +1380,7 @@ function AssignedWorkerMarker({
           <small>
             {assignment.lifecycle === 'active' &&
             runtimeState.status === 'done'
-              ? 'Review completion'
+              ? 'Ready to complete'
               : assignment.role}
           </small>
         </span>
@@ -2000,8 +2000,12 @@ function buildNodes(
       linkedChildren,
       agentPositions,
     )
+    // Only successful completions count. Work ended without completion
+    // carries a cancellation, never a receipt, so it is never shown as done.
     const completedBuildingCount = allProjectAssignments.filter(
-      (assignment) => assignment.completion_receipt !== null,
+      (assignment) =>
+        assignment.lifecycle === 'completed' &&
+        assignment.completion_receipt !== null,
     ).length
     // Real observed usage, not a simulated figure: summed from each assigned
     // worker's own Herdr-reported token counts, the same `tokens` field

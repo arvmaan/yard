@@ -6,6 +6,7 @@ use thiserror::Error;
 use yard_domain::{
     Assignment, AssignmentLifecycle, AttemptLifecycle, ProviderSessionRef, WorkerRuntimeBinding,
 };
+use yard_store::ProjectStoreError;
 
 use crate::coordination_node_service::{CoordinationNodeService, CoordinationNodeServiceError};
 use crate::intervention_service::{InterventionService, InterventionServiceError};
@@ -437,7 +438,18 @@ impl TerminalService {
                 worker_id,
                 node_version,
             } => {
-                let node = self.coordination_nodes.get(node_id).await?;
+                // Archiving or deleting the node revokes its terminal.
+                let node =
+                    self.coordination_nodes
+                        .get(node_id)
+                        .await
+                        .map_err(|error| match error {
+                            CoordinationNodeServiceError::Store(
+                                ProjectStoreError::CoordinationNodeArchived
+                                | ProjectStoreError::CoordinationNodeNotFound,
+                            ) => TerminalServiceError::CoordinationNodeChanged,
+                            error => error.into(),
+                        })?;
                 let worker = node
                     .worker
                     .ok_or(TerminalServiceError::CoordinationNodeChanged)?;

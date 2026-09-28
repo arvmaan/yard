@@ -5,30 +5,44 @@ import {
   LoaderCircle,
   X,
 } from 'lucide-react'
-import type { Project } from './types'
+import {
+  projectDispositionBlocker,
+  projectDispositionConfirmLabel,
+} from './backgroundStatus'
+import { ProjectActiveWorkers } from './ProjectActiveWorkers'
+import type { Project, ProjectDispositionPreview } from './types'
 import { useModalDialog } from './useModalDialog'
 
 interface ArchiveProjectDialogProps {
-  activeAssignmentCount: number
+  alreadyArchived: boolean
   busy: boolean
   error: string | null
+  onCheckAgain: () => void
   onClose: () => void
   onConfirm: () => Promise<void>
+  preview: ProjectDispositionPreview | null
+  previewError: string | null
   project: Project
   returnFocus: HTMLElement | null
 }
 
 export function ArchiveProjectDialog({
-  activeAssignmentCount,
+  alreadyArchived,
   busy,
   error,
+  onCheckAgain,
   onClose,
   onConfirm,
+  preview,
+  previewError,
   project,
   returnFocus,
 }: ArchiveProjectDialogProps) {
   const dialogRef = useRef<HTMLElement>(null)
-  const blocked = activeAssignmentCount > 0
+  // Nothing is sent until the preview has listed what the command ends.
+  const blocker = projectDispositionBlocker(preview)
+  const ready = preview !== null && blocker === null
+  const confirmLabel = projectDispositionConfirmLabel('archive', preview)
   useModalDialog({
     canClose: !busy,
     dialogRef,
@@ -72,16 +86,44 @@ export function ArchiveProjectDialog({
         </div>
         <div className="end-session-impact">
           <CircleAlert aria-hidden="true" size={17} />
-          <p>
-            {blocked
-              ? `Complete or hand off ${activeAssignmentCount} active assignment${activeAssignmentCount === 1 ? '' : 's'} before archiving.`
-              : 'Yard will remove this project from the active map, release its workspace binding, end its orchestrator, and retain its durable history. The Herdr workspace itself is not deleted.'}
-          </p>
+          <div>
+            <p>
+              {'Yard will remove this project from the active map, release its workspace binding, end its orchestrator, and retain its durable history. The Herdr workspace itself is not deleted, and runtime cleanup and knowledge snapshots continue in the background.'}
+            </p>
+            {preview ? <ProjectActiveWorkers preview={preview} /> : null}
+            {!preview && !previewError ? (
+              <p className="disposition-impact-loading">
+                Checking what this affects…
+              </p>
+            ) : null}
+          </div>
         </div>
+        {blocker && !error ? (
+          <p className="dialog-error" role="alert">
+            <CircleAlert aria-hidden="true" size={16} />
+            <span>{blocker}</span>
+          </p>
+        ) : null}
         {error ? (
           <p className="dialog-error" role="alert">
             <CircleAlert aria-hidden="true" size={16} />
             <span>{error}</span>
+          </p>
+        ) : null}
+        {previewError && !false ? (
+          <p className="dialog-error" role="alert">
+            <CircleAlert aria-hidden="true" size={16} />
+            <span>{previewError}</span>
+            {alreadyArchived ? null : (
+              <button
+                className="secondary-button"
+                disabled={busy}
+                onClick={onCheckAgain}
+                type="button"
+              >
+                Check again
+              </button>
+            )}
           </p>
         ) : null}
         <footer className="end-session-actions">
@@ -94,9 +136,9 @@ export function ArchiveProjectDialog({
             Keep project
           </button>
           <button
-            autoFocus={!blocked}
+            autoFocus={ready}
             className="destructive-button"
-            disabled={busy || blocked}
+            disabled={busy || !ready}
             onClick={() => void onConfirm()}
             type="button"
           >
@@ -109,7 +151,7 @@ export function ArchiveProjectDialog({
             ) : (
               <FolderArchive aria-hidden="true" size={16} />
             )}
-            Archive project
+            {confirmLabel}
           </button>
         </footer>
       </section>

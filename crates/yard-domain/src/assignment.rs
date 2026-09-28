@@ -43,6 +43,9 @@ pub enum AssignmentLifecycle {
     HandedOff,
     Completed,
     Failed,
+    /// Ended without a successful completion. The reason is recorded in the
+    /// assignment's [`AssignmentCancellation`]; no receipt is written.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +57,7 @@ pub enum AttemptLifecycle {
     HandedOff,
     Completed,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,12 +73,37 @@ pub enum CompletionOutcome {
     Completed,
 }
 
+/// How much handoff detail a completion receipt carries.
+///
+/// `Detailed` receipts come from the evidence-backed completion form and must
+/// reference at least one artifact or evidence item. `Minimal` receipts come
+/// only from the assignment disposition command: they record the actor, the
+/// commit time, and a server-side copy of the objective, and explicitly carry
+/// no artifacts, evidence, or blockers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptDetailLevel {
+    #[default]
+    Detailed,
+    Minimal,
+}
+
+/// Summary stored on every minimal receipt, for human readers. The typed
+/// marker is [`ReceiptDetailLevel::Minimal`], never this text.
+pub const MINIMAL_RECEIPT_SUMMARY: &str = "Completed without a detailed handoff.";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionReceipt {
     pub id: String,
     pub assignment_id: String,
     pub attempt_id: String,
     pub outcome: CompletionOutcome,
+    #[serde(default)]
+    pub detail_level: ReceiptDetailLevel,
+    /// The assignment objective copied inside the completing transaction.
+    /// Always present on minimal receipts; absent on detailed receipts.
+    #[serde(default)]
+    pub objective_snapshot: Option<String>,
     pub summary: String,
     pub artifact_refs: Vec<String>,
     pub artifacts: Vec<Artifact>,
@@ -82,6 +111,42 @@ pub struct CompletionReceipt {
     pub unresolved_blockers: Vec<String>,
     pub actor: String,
     pub created_at_unix_ms: u64,
+}
+
+/// Why an assignment ended without a successful completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationReason {
+    /// The user ended the worker without completing its assignment.
+    EndedWithoutCompletion,
+    /// The assignment's project was archived while the work was open.
+    ProjectArchived,
+}
+
+/// Where a lifecycle command came from, recorded as provenance only.
+///
+/// `Browser` means the request carried a loopback `Origin` header. `None`
+/// means it carried no `Origin` (a CLI or agent client). This is not
+/// authentication: a local process can forge either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestOrigin {
+    Browser,
+    None,
+}
+
+/// The durable record of an assignment that ended without completion. It is
+/// written instead of a receipt, so nothing downstream mistakes it for success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssignmentCancellation {
+    pub assignment_id: String,
+    pub attempt_id: String,
+    pub command_id: String,
+    pub reason: CancellationReason,
+    pub actor: String,
+    pub request_origin: RequestOrigin,
+    pub objective_snapshot: String,
+    pub cancelled_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +188,8 @@ pub struct Assignment {
     pub lifecycle: AssignmentLifecycle,
     pub attempt: AssignmentAttempt,
     pub completion_receipt: Option<CompletionReceipt>,
+    #[serde(default)]
+    pub cancellation: Option<AssignmentCancellation>,
     #[serde(with = "crate::serde_u64")]
     pub version: u64,
     pub created_at_unix_ms: u64,
@@ -202,6 +269,115 @@ impl RecordCompletionReceipt {
         }
         Ok(self)
     }
+}
+
+/// The terminal outcome requested by an assignment disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispositionOutcome {
+    /// Record a minimal completion receipt.
+    Completed,
+    /// Record a cancellation (`ended_without_completion`), never a receipt.
+    Cancelled,
+}
+
+/// One-request completion or cancellation of an assignment, optionally ending
+/// the worker's session in the same transaction.
+///
+/// `expected_worker_version` is required exactly when `end_session` is true;
+/// `expected_runtime_version` may accompany it and must be absent otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisposeAssignment {
+    pub command_id: String,
+    pub actor: String,
+    pub attempt_id: String,
+    #[serde(with = "crate::serde_u64")]
+    pub expected_assignment_version: u64,
+    #[serde(with = "crate::serde_u64")]
+    pub expected_attempt_version: u64,
+    pub outcome: DispositionOutcome,
+    #[serde(default)]
+    pub end_session: bool,
+    #[serde(default, with = "crate::serde_u64::option")]
+    pub expected_worker_version: Option<u64>,
+    #[serde(default, with = "crate::serde_u64::option")]
+    pub expected_runtime_version: Option<u64>,
+}
+
+impl DisposeAssignment {
+    /// Normalize and validate an assignment disposition command.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispositionValidationError`] for blank or oversized values,
+    /// zero optimistic versions, or session versions that do not match
+    /// `end_session`.
+    pub fn normalize(mut self) -> Result<Self, DispositionValidationError> {
+        self.command_id =
+            disposition_required("command_id", &self.command_id, MAX_COMMAND_ID_BYTES)?;
+        self.actor = disposition_required("actor", &self.actor, MAX_ACTOR_BYTES)?;
+        self.attempt_id =
+            disposition_required("attempt_id", &self.attempt_id, MAX_COMMAND_ID_BYTES)?;
+        if self.expected_assignment_version == 0
+            || self.expected_attempt_version == 0
+            || self.expected_worker_version == Some(0)
+            || self.expected_runtime_version == Some(0)
+        {
+            return Err(DispositionValidationError::InvalidVersion);
+        }
+        if self.end_session {
+            if self.expected_worker_version.is_none() {
+                return Err(DispositionValidationError::WorkerVersionRequired);
+            }
+        } else if self.expected_worker_version.is_some() || self.expected_runtime_version.is_some()
+        {
+            return Err(DispositionValidationError::UnexpectedSessionVersions);
+        }
+        Ok(self)
+    }
+}
+
+/// The committed result of an assignment disposition, including replays.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DisposedAssignment {
+    pub command_id: String,
+    pub assignment: Assignment,
+    pub receipt: Option<CompletionReceipt>,
+    pub cancellation: Option<AssignmentCancellation>,
+    /// The ended worker, present when the command ended the session.
+    pub worker: Option<Worker>,
+    pub cleanup_pending: bool,
+    pub transcript_pending: bool,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DispositionValidationError {
+    #[error("{0} is required")]
+    Required(&'static str),
+    #[error("{field} must be at most {max} bytes")]
+    TooLong { field: &'static str, max: usize },
+    #[error("expected versions must be greater than zero")]
+    InvalidVersion,
+    #[error("expected_worker_version is required when end_session is true")]
+    WorkerVersionRequired,
+    #[error("worker and runtime versions are only accepted when end_session is true")]
+    UnexpectedSessionVersions,
+}
+
+fn disposition_required(
+    field: &'static str,
+    value: &str,
+    max: usize,
+) -> Result<String, DispositionValidationError> {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Err(DispositionValidationError::Required(field));
+    }
+    if value.len() > max {
+        return Err(DispositionValidationError::TooLong { field, max });
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -435,10 +611,26 @@ fn receipt_values(
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletionOutcome, CompletionValidationError, ConfirmProfileAllocation,
-        ConfirmWorkerAllocation, ConfirmWorkerHandoff, HandoffTargetRole, IsolationPolicy,
-        RecordCompletionReceipt,
+        AssignmentLifecycle, AttemptLifecycle, CancellationReason, CompletionOutcome,
+        CompletionReceipt, CompletionValidationError, ConfirmProfileAllocation,
+        ConfirmWorkerAllocation, ConfirmWorkerHandoff, DisposeAssignment, DispositionOutcome,
+        DispositionValidationError, HandoffTargetRole, IsolationPolicy, ReceiptDetailLevel,
+        RecordCompletionReceipt, RequestOrigin,
     };
+
+    fn disposition(end_session: bool) -> DisposeAssignment {
+        DisposeAssignment {
+            command_id: " disposition-1 ".to_owned(),
+            actor: " local-user ".to_owned(),
+            attempt_id: " attempt-1 ".to_owned(),
+            expected_assignment_version: 2,
+            expected_attempt_version: 2,
+            outcome: DispositionOutcome::Completed,
+            end_session,
+            expected_worker_version: end_session.then_some(3),
+            expected_runtime_version: end_session.then_some(1),
+        }
+    }
 
     #[test]
     fn normalizes_confirmed_allocation() {
@@ -548,5 +740,124 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, CompletionValidationError::EvidenceRequired);
+    }
+
+    #[test]
+    fn untyped_receipt_json_defaults_to_detailed_and_still_requires_evidence() {
+        let receipt: CompletionReceipt = serde_json::from_value(serde_json::json!({
+            "id": "receipt-1",
+            "assignment_id": "assignment-1",
+            "attempt_id": "attempt-1",
+            "outcome": "completed",
+            "summary": "Implemented the API.",
+            "artifact_refs": [],
+            "artifacts": [],
+            "evidence_refs": ["test://workspace"],
+            "unresolved_blockers": [],
+            "actor": "local-user",
+            "created_at_unix_ms": 1
+        }))
+        .unwrap();
+        assert_eq!(receipt.detail_level, ReceiptDetailLevel::Detailed);
+        assert_eq!(receipt.objective_snapshot, None);
+
+        // A stray detail marker on the detailed endpoint is ignored, so an
+        // empty receipt is still rejected rather than accepted as minimal.
+        let command: RecordCompletionReceipt = serde_json::from_value(serde_json::json!({
+            "command_id": "receipt-1",
+            "actor": "local-user",
+            "attempt_id": "attempt-1",
+            "expected_assignment_version": "2",
+            "expected_attempt_version": "2",
+            "outcome": "completed",
+            "detail_level": "minimal",
+            "summary": "Done.",
+            "artifact_refs": [],
+            "evidence_refs": [],
+            "unresolved_blockers": []
+        }))
+        .unwrap();
+        assert_eq!(
+            command.normalize().unwrap_err(),
+            CompletionValidationError::EvidenceRequired
+        );
+    }
+
+    #[test]
+    fn cancelled_is_a_distinct_serialized_lifecycle() {
+        assert_eq!(
+            serde_json::to_value(AssignmentLifecycle::Cancelled).unwrap(),
+            "cancelled"
+        );
+        assert_eq!(
+            serde_json::to_value(AttemptLifecycle::Cancelled).unwrap(),
+            "cancelled"
+        );
+        assert_eq!(
+            serde_json::to_value(CancellationReason::EndedWithoutCompletion).unwrap(),
+            "ended_without_completion"
+        );
+        assert_eq!(
+            serde_json::to_value(CancellationReason::ProjectArchived).unwrap(),
+            "project_archived"
+        );
+        assert_eq!(serde_json::to_value(RequestOrigin::None).unwrap(), "none");
+        assert_eq!(
+            serde_json::to_value(ReceiptDetailLevel::Minimal).unwrap(),
+            "minimal"
+        );
+    }
+
+    #[test]
+    fn normalizes_assignment_disposition_commands() {
+        let command = disposition(true).normalize().unwrap();
+        assert_eq!(command.command_id, "disposition-1");
+        assert_eq!(command.actor, "local-user");
+        assert_eq!(command.attempt_id, "attempt-1");
+        assert_eq!(command.expected_worker_version, Some(3));
+
+        let body: DisposeAssignment = serde_json::from_value(serde_json::json!({
+            "command_id": "disposition-2",
+            "actor": "local-user",
+            "attempt_id": "attempt-1",
+            "expected_assignment_version": "2",
+            "expected_attempt_version": "2",
+            "outcome": "cancelled"
+        }))
+        .unwrap();
+        assert!(!body.end_session);
+        assert_eq!(body.outcome, DispositionOutcome::Cancelled);
+        assert!(body.normalize().is_ok());
+
+        let mut missing_worker = disposition(true);
+        missing_worker.expected_worker_version = None;
+        assert_eq!(
+            missing_worker.normalize().unwrap_err(),
+            DispositionValidationError::WorkerVersionRequired
+        );
+        let mut stray_versions = disposition(false);
+        stray_versions.expected_runtime_version = Some(1);
+        assert_eq!(
+            stray_versions.normalize().unwrap_err(),
+            DispositionValidationError::UnexpectedSessionVersions
+        );
+        let mut zero = disposition(false);
+        zero.expected_attempt_version = 0;
+        assert_eq!(
+            zero.normalize().unwrap_err(),
+            DispositionValidationError::InvalidVersion
+        );
+        let mut blank = disposition(false);
+        blank.command_id = "  ".to_owned();
+        assert_eq!(
+            blank.normalize().unwrap_err(),
+            DispositionValidationError::Required("command_id")
+        );
+        let mut long = disposition(false);
+        long.actor = "a".repeat(121);
+        assert!(matches!(
+            long.normalize().unwrap_err(),
+            DispositionValidationError::TooLong { field: "actor", .. }
+        ));
     }
 }

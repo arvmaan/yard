@@ -530,6 +530,13 @@ export interface Projects {
   projects: Project[]
 }
 
+export type ProjectArchiveActiveWork = 'reject' | 'cancel'
+
+export interface ExpectedActiveAssignment {
+  assignment_id: string
+  expected_assignment_version: string
+}
+
 export interface ArchiveProjectInput {
   command_id: string
   actor: string
@@ -537,7 +544,51 @@ export interface ArchiveProjectInput {
   expected_orchestrator_worker_id: string
   expected_orchestrator_worker_version: string
   expected_orchestrator_runtime_version: string | null
+  // With 'cancel', exactly the previewed active assignments are recorded as
+  // cancelled (never completed) and their workers are ended.
+  active_work?: ProjectArchiveActiveWork
+  expected_active_assignments?: ExpectedActiveAssignment[] | null
 }
+
+// One assignment an archive or delete from active would end.
+export interface ProjectDispositionAssignment {
+  assignment_id: string
+  assignment_version: string
+  lifecycle: AssignmentLifecycle
+  objective: string
+  role: string
+  profile_name: string
+  worker_id: string
+  runtime_present: boolean
+}
+
+// What archiving or deleting an active project ends, read before the
+// confirmation; the versions are the ones the command sends back.
+export interface ProjectDispositionPreview {
+  project_id: string
+  name: string
+  project_version: string
+  orchestrator_worker_id: string
+  orchestrator_worker_version: string
+  orchestrator_runtime_version: string | null
+  active_assignments: ProjectDispositionAssignment[]
+  // Yard's own summary workers, listed separately; a cancel ends them too
+  // and must list them in expected_active_assignments.
+  summary_worker_assignments?: ProjectDispositionAssignment[]
+}
+
+export type ProjectArchivePreconditions = Omit<
+  ArchiveProjectInput,
+  'command_id' | 'actor'
+>
+
+// Work that continues after an archive or delete commits; never an error.
+export interface ProjectBackgroundStatus {
+  snapshots_pending: number
+  snapshots_abandoned: number
+}
+
+export type ProjectVisibility = 'active' | 'archived' | 'deleted'
 
 export interface ArchivedProject {
   command_id: string
@@ -545,12 +596,64 @@ export interface ArchivedProject {
   orchestrator_worker_id: string
   archived_at_unix_ms: number
   cleanup_pending: boolean
+  background: ProjectBackgroundStatus
+  cancelled_assignment_ids?: string[]
+  // Whether Restore can undo this archive now; only then is Undo offered.
+  restorable?: boolean
+  visibility?: ProjectVisibility
   replayed: boolean
+}
+
+export interface RestoreProjectInput {
+  command_id: string
+  actor: string
+  // The archive the user saw; a newer archive (or none) is refused.
+  expected_archive_command_id: string
+}
+
+export interface RestoredProject {
+  command_id: string
+  project_id: string
+  archive_command_id: string
+  orchestrator_worker_id: string
+  // 'unbound' when the archived Herdr tab was closed or reused.
+  orchestrator_runtime: 'rebound' | 'unbound'
+  // Restore never reopens what the archive cancelled.
+  cancelled_assignment_ids: string[]
+  restored_at_unix_ms: number
+  visibility: ProjectVisibility
+  replayed: boolean
+}
+
+export type ProjectRestoreUnavailableReason =
+  | 'herdr_unreachable'
+  | 'workspace_reserved'
+  | 'runtime_reserved'
+  | 'archive_changed'
+  | 'project_deleted'
+  | 'orchestrator_unavailable'
+
+// One archived (not deleted) project in the Archived view.
+export interface ArchivedProjectSummary {
+  project_id: string
+  name: string
+  archive_command_id: string
+  orchestrator_worker_id: string
+  archived_at_unix_ms: number
+  cancelled_assignment_ids: string[]
+  cleanup_pending: boolean
+  restorable: boolean
+}
+
+export interface ArchivedProjects {
+  projects: ArchivedProjectSummary[]
 }
 
 export interface DeleteProjectInput {
   command_id: string
   actor: string
+  // Lets one request archive an active project before deleting it.
+  archive?: ProjectArchivePreconditions | null
 }
 
 export interface DeletedProject {
@@ -559,6 +662,8 @@ export interface DeletedProject {
   orchestrator_worker_id: string
   deleted_at_unix_ms: number
   cleanup_pending: boolean
+  background: ProjectBackgroundStatus
+  cancelled_assignment_ids?: string[]
   replayed: boolean
 }
 
@@ -770,6 +875,7 @@ export type AssignmentLifecycle =
   | 'handed_off'
   | 'completed'
   | 'failed'
+  | 'cancelled'
 export type AttemptLifecycle =
   | 'starting'
   | 'active'
@@ -777,6 +883,7 @@ export type AttemptLifecycle =
   | 'handed_off'
   | 'completed'
   | 'failed'
+  | 'cancelled'
 export type HandoffTargetRole = 'member' | 'orchestrator'
 
 export interface AssignmentAttempt {
@@ -790,11 +897,20 @@ export interface AssignmentAttempt {
   updated_at_unix_ms: number
 }
 
+/**
+ * `detailed` receipts come from the evidence-backed form. `minimal` receipts
+ * come from one-click Complete: they carry the actor, time, and a server-side
+ * copy of the objective, and explicitly no artifacts or evidence.
+ */
+export type ReceiptDetailLevel = 'detailed' | 'minimal'
+
 export interface CompletionReceipt {
   id: string
   assignment_id: string
   attempt_id: string
   outcome: 'completed'
+  detail_level: ReceiptDetailLevel
+  objective_snapshot: string | null
   summary: string
   artifact_refs: string[]
   artifacts: Artifact[]
@@ -827,6 +943,21 @@ export interface ArtifactContent {
   content: string
 }
 
+export type CancellationReason = 'ended_without_completion' | 'project_archived'
+export type RequestOrigin = 'browser' | 'none'
+
+/** Written instead of a receipt when work ends without completion. */
+export interface AssignmentCancellation {
+  assignment_id: string
+  attempt_id: string
+  command_id: string
+  reason: CancellationReason
+  actor: string
+  request_origin: RequestOrigin
+  objective_snapshot: string
+  cancelled_at_unix_ms: number
+}
+
 export interface Assignment {
   id: string
   project_id: string
@@ -841,6 +972,7 @@ export interface Assignment {
   lifecycle: AssignmentLifecycle
   attempt: AssignmentAttempt
   completion_receipt: CompletionReceipt | null
+  cancellation: AssignmentCancellation | null
   version: string
   created_at_unix_ms: number
   updated_at_unix_ms: number
@@ -1095,6 +1227,62 @@ export interface RecordedCompletionReceipt {
   replayed: boolean
 }
 
+export type DispositionOutcome = 'completed' | 'cancelled'
+
+/**
+ * One-request completion (minimal receipt) or cancellation. Worker and
+ * runtime versions are sent exactly when `end_session` is true.
+ */
+export interface DisposeAssignmentInput {
+  command_id: string
+  actor: string
+  attempt_id: string
+  expected_assignment_version: string
+  expected_attempt_version: string
+  outcome: DispositionOutcome
+  end_session: boolean
+  expected_worker_version?: string
+  expected_runtime_version?: string
+}
+
+export interface DisposedAssignment {
+  command_id: string
+  assignment: Assignment
+  receipt: CompletionReceipt | null
+  cancellation: AssignmentCancellation | null
+  worker: Worker | null
+  cleanup_pending: boolean
+  transcript_pending: boolean
+  replayed: boolean
+}
+
+export type TranscriptStatus = 'pending' | 'captured' | 'unavailable'
+export type TranscriptUnavailableReason =
+  | 'not_captured'
+  | 'runtime_closed'
+  | 'runtime_reused'
+  | 'worker_reallocated'
+
+/** Read-only terminal text Yard retained after an assignment ended. */
+export interface WorkerTranscript {
+  worker_id: string
+  assignment_id: string | null
+  status: TranscriptStatus
+  unavailable_reason: TranscriptUnavailableReason | null
+  terminal_id: string | null
+  provider_session: ProviderSessionRef | null
+  source: string | null
+  format: string | null
+  text: string | null
+  line_count: number
+  byte_count: number
+  truncated: boolean
+  captured_at_unix_ms: number | null
+  attempts: number
+  last_error: string | null
+  next_attempt_at_unix_ms: number | null
+}
+
 export interface SendAssignmentPromptInput {
   command_id: string
   actor: string
@@ -1215,6 +1403,79 @@ export interface CoordinationNodeCommandResult {
   replayed: boolean
 }
 
+export interface ArchiveCoordinationNodeInput {
+  command_id: string
+  actor: string
+  expected_node_version: string
+  // Optional: the node version already pins which worker is attached.
+  expected_worker_version?: string | null
+}
+
+export type CoordinationNodeArchivePreconditions = Omit<
+  ArchiveCoordinationNodeInput,
+  'command_id' | 'actor'
+>
+
+export interface ArchivedCoordinationNode {
+  command_id: string
+  node_id: string
+  kind: CoordinationNodeKind
+  worker_id: string | null
+  paused_automation_ids: string[]
+  archived_at_unix_ms: number
+  cleanup_pending: boolean
+  replayed: boolean
+}
+
+export interface DeleteCoordinationNodeInput {
+  command_id: string
+  actor: string
+  // Lets one request archive an active node before deleting it.
+  archive?: CoordinationNodeArchivePreconditions | null
+}
+
+export interface DeletedCoordinationNode {
+  command_id: string
+  node_id: string
+  kind: CoordinationNodeKind
+  worker_id: string | null
+  paused_automation_ids: string[]
+  deleted_at_unix_ms: number
+  cleanup_pending: boolean
+  replayed: boolean
+}
+
+export interface CoordinationNodeDispositionWorker {
+  worker_id: string
+  worker_version: string
+  profile_name: string | null
+  runtime_present: boolean
+  will_end: boolean
+}
+
+export interface CoordinationNodeDispositionBlocker {
+  kind: 'prompt' | 'route'
+  command_id: string
+  started_at_unix_ms: number
+}
+
+// What archive or delete would do, read when the confirmation opens.
+export interface CoordinationNodeDispositionPreview {
+  node_id: string
+  name: string
+  kind: CoordinationNodeKind
+  node_version: string
+  supported: boolean
+  worker: CoordinationNodeDispositionWorker | null
+  attached_projects: Array<{ project_id: string; name: string }>
+  automations: Array<{
+    automation_id: string
+    name: string
+    state: AutomationState
+  }>
+  blockers: CoordinationNodeDispositionBlocker[]
+}
+
 export interface ProvisionCoordinationNodeInput {
   command_id: string
   actor: string
@@ -1290,7 +1551,7 @@ export interface RequestCoordinationSnapshotInput {
   expected_node_version: string
 }
 
-export type SnapshotCollectionStatus = 'pending' | 'collected'
+export type SnapshotCollectionStatus = 'pending' | 'collected' | 'abandoned'
 
 export interface SnapshotProjectCollection {
   project_id: string
@@ -1303,6 +1564,8 @@ export interface SnapshotProjectCollection {
   runtime_status: string | null
   submitted_at_unix_ms: number | null
   collected_at_unix_ms: number | null
+  abandoned_at_unix_ms: number | null
+  abandoned_reason: 'expired' | null
 }
 
 export interface CoordinationSnapshot {
@@ -1314,6 +1577,7 @@ export interface CoordinationSnapshot {
   progress: {
     completed: number
     total: number
+    abandoned: number
   }
   requested_by: string
   created_at_unix_ms: number

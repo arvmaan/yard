@@ -1,12 +1,18 @@
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use yard_domain::{
-    CoordinationDeliveryStatus, CoordinationNode, CoordinationNodeCommandResult,
-    CoordinationNodeKind, CoordinationNodePlacement, CoordinationNodePromptAcknowledgement,
-    CoordinationNodeRoute, CoordinationNodeRoutes, CoordinationNodes, CoordinationSnapshot,
-    CoordinationSnapshots, CreateCoordinationNode, ProvisionCoordinationNode,
-    RequestCoordinationSnapshot, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
+    ArchiveCoordinationNode, ArchivedCoordinationNode, AutomationState, CoordinationDeliveryStatus,
+    CoordinationNode, CoordinationNodeArchivePreconditions, CoordinationNodeCommandResult,
+    CoordinationNodeDispositionAutomation, CoordinationNodeDispositionBlocker,
+    CoordinationNodeDispositionBlockerKind, CoordinationNodeDispositionPreview,
+    CoordinationNodeDispositionProject, CoordinationNodeDispositionWorker, CoordinationNodeKind,
+    CoordinationNodePlacement, CoordinationNodePromptAcknowledgement, CoordinationNodeRoute,
+    CoordinationNodeRoutes, CoordinationNodes, CoordinationSnapshot, CoordinationSnapshots,
+    CreateCoordinationNode, DeleteCoordinationNode, DeletedCoordinationNode,
+    ProjectBackgroundStatus, ProvisionCoordinationNode, RequestCoordinationSnapshot,
+    SendCoordinationNodePrompt, SendCoordinationNodeRoute, SnapshotAbandonmentReason,
     SnapshotCollectionProgress, SnapshotCollectionStatus, SnapshotProjectCollection,
-    UpdateCoordinationNode, UpdateCoordinationNodePlacement, canonical_coordination_uuid,
+    UpdateCoordinationNode, UpdateCoordinationNodePlacement, WorkerDesiredState,
+    canonical_coordination_uuid,
 };
 
 use super::{
@@ -18,6 +24,11 @@ use super::{
 };
 
 const MAX_ROUTE_LIST_LIMIT: usize = 500;
+/// A project snapshot that is still uncollected this long after its prompt
+/// was submitted (or, when delivery failed or was ambiguous, after the
+/// snapshot was requested) is marked `abandoned` with reason `expired`.
+/// Yard keeps checking the folder, so late files still mark it collected.
+pub(super) const SNAPSHOT_COLLECTION_EXPIRY_MS: u64 = 24 * 60 * 60 * 1_000;
 
 pub(super) fn archive_project_attachments(
     transaction: &Transaction<'_>,
@@ -25,6 +36,41 @@ pub(super) fn archive_project_attachments(
     actor: &str,
     now: u64,
 ) -> Result<(), ProjectStoreError> {
+    version_project_attachments(
+        transaction,
+        project_id,
+        actor,
+        now,
+        "coordination_node_project_archived",
+    )
+}
+
+/// A restored project is listed again under the workstreams it stayed
+/// attached to, so each of them gets a new version.
+pub(super) fn restore_project_attachments(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    actor: &str,
+    now: u64,
+) -> Result<(), ProjectStoreError> {
+    version_project_attachments(
+        transaction,
+        project_id,
+        actor,
+        now,
+        "coordination_node_project_restored",
+    )
+}
+
+fn version_project_attachments(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    actor: &str,
+    now: u64,
+    event_type: &str,
+) -> Result<(), ProjectStoreError> {
+    // An archived (or deleted) node no longer changes, so it keeps the
+    // version and audit trail its tombstone recorded.
     let attached_nodes = {
         let mut statement = transaction.prepare(
             "SELECT node.id, node.version
@@ -32,6 +78,10 @@ pub(super) fn archive_project_attachments(
                JOIN coordination_node_projects attached
                  ON attached.node_id = node.id
               WHERE attached.project_id = ?1
+                AND NOT EXISTS (
+                    SELECT 1 FROM archived_coordination_nodes archived
+                     WHERE archived.node_id = node.id
+                )
               ORDER BY node.id",
         )?;
         statement
@@ -63,7 +113,7 @@ pub(super) fn archive_project_attachments(
             "coordination_node",
             &node_id,
             next_version,
-            "coordination_node_project_archived",
+            event_type,
             actor,
             now,
         )?;
@@ -76,9 +126,14 @@ pub(super) async fn list_nodes(
 ) -> Result<CoordinationNodes, ProjectStoreError> {
     store
         .run(|connection| {
+            // A deleted node was archived first, so this hides both.
             let mut statement = connection.prepare(
                 "SELECT id
-                   FROM coordination_nodes
+                   FROM coordination_nodes node
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM archived_coordination_nodes archived
+                         WHERE archived.node_id = node.id
+                  )
                   ORDER BY created_at_unix_ms, id",
             )?;
             let ids = statement
@@ -99,7 +154,7 @@ pub(super) async fn get_node(
 ) -> Result<CoordinationNode, ProjectStoreError> {
     let node_id = canonical_node_id(node_id)?;
     store
-        .run(move |connection| select_node(connection, &node_id))
+        .run(move |connection| select_active_node(connection, &node_id))
         .await
 }
 
@@ -318,7 +373,7 @@ pub(super) async fn update_node(
                 });
             }
             reject_reused_command(&transaction, &command.command_id)?;
-            let current = select_node(&transaction, &node_id)?;
+            let current = select_active_node(&transaction, &node_id)?;
             if current.version != command.expected_version {
                 return Err(ProjectStoreError::CoordinationNodeVersionConflict {
                     current_version: current.version,
@@ -440,7 +495,7 @@ pub(super) async fn update_placement(
                 });
             }
             reject_reused_command(&transaction, &command.command_id)?;
-            let current = select_node(&transaction, &node_id)?;
+            let current = select_active_node(&transaction, &node_id)?;
             if current.placement.version != command.expected_version {
                 return Err(
                     ProjectStoreError::CoordinationNodePlacementVersionConflict {
@@ -596,7 +651,7 @@ pub(super) async fn configure_node(
             } else {
                 reject_reused_command(&transaction, &command.command_id)?;
             }
-            let current = select_node(&transaction, &node_id)?;
+            let current = select_active_node(&transaction, &node_id)?;
             if current.kind != CoordinationNodeKind::Workstream {
                 return Err(ProjectStoreError::CoordinationNodeKindMismatch);
             }
@@ -752,7 +807,7 @@ pub(super) async fn begin_prompt(
                 };
             }
             reject_reused_command(&transaction, &command.command_id)?;
-            let node = select_node(&transaction, &node_id)?;
+            let node = select_active_node(&transaction, &node_id)?;
             validate_workstream_command(&node, command.expected_node_version, &command.worker_id)?;
             reject_pending_node_intervention(&transaction, &node_id)?;
             let runtime = node
@@ -960,7 +1015,7 @@ pub(super) async fn begin_route(
                 };
             }
             reject_reused_command(&transaction, &command.command_id)?;
-            let node = select_node(&transaction, &node_id)?;
+            let node = select_active_node(&transaction, &node_id)?;
             validate_workstream_command(&node, command.expected_node_version, &command.worker_id)?;
             if node
                 .attached_project_ids
@@ -1158,7 +1213,7 @@ pub(super) async fn create_snapshot(
                 return Ok(snapshot);
             }
             reject_reused_command(&transaction, &command.command_id)?;
-            let node = select_node(&transaction, &node_id)?;
+            let node = select_active_node(&transaction, &node_id)?;
             if node.kind != CoordinationNodeKind::KnowledgeStore {
                 return Err(ProjectStoreError::CoordinationNodeKindMismatch);
             }
@@ -1297,8 +1352,82 @@ pub(super) async fn get_snapshot(
     let node_id = canonical_node_id(node_id)?;
     let snapshot_id = canonical_snapshot_id(snapshot_id)?;
     store
-        .run(move |connection| select_snapshot(connection, &node_id, &snapshot_id))
+        .run(move |connection| {
+            // Every collection refresh ends with this read, so expiry is
+            // applied lazily here after the folder check had its chance.
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            abandon_expired_snapshot_collections(
+                &transaction,
+                unix_time_ms()?,
+                Some(&snapshot_id),
+                None,
+            )?;
+            let snapshot = select_snapshot(&transaction, &node_id, &snapshot_id)?;
+            transaction.commit()?;
+            Ok(snapshot)
+        })
         .await
+}
+
+/// Mark uncollected project snapshots older than
+/// [`SNAPSHOT_COLLECTION_EXPIRY_MS`] as abandoned. A delivery that is still
+/// pending is never expired; startup recovery first marks an interrupted one
+/// ambiguous.
+pub(super) fn abandon_expired_snapshot_collections(
+    connection: &Connection,
+    now: u64,
+    snapshot_id: Option<&str>,
+    project_id: Option<&str>,
+) -> Result<usize, ProjectStoreError> {
+    let cutoff = now.saturating_sub(SNAPSHOT_COLLECTION_EXPIRY_MS);
+    connection
+        .execute(
+            "UPDATE coordination_snapshot_projects
+                SET collection_status = 'abandoned',
+                    abandoned_at_unix_ms = ?1,
+                    abandoned_reason = 'expired'
+              WHERE collection_status = 'pending'
+                AND delivery_status <> 'pending'
+                AND COALESCE(
+                        submitted_at_unix_ms,
+                        (
+                            SELECT snapshot.created_at_unix_ms
+                              FROM coordination_snapshots snapshot
+                             WHERE snapshot.id =
+                                   coordination_snapshot_projects.snapshot_id
+                        )
+                    ) <= ?2
+                AND (?3 IS NULL OR snapshot_id = ?3)
+                AND (?4 IS NULL OR project_id = ?4)",
+            params![to_i64(now)?, to_i64(cutoff)?, snapshot_id, project_id],
+        )
+        .map_err(Into::into)
+}
+
+/// Snapshot work for one project that continues in the background, after
+/// applying expiry. Archive and delete report it but never wait for it.
+pub(super) fn project_background_status(
+    connection: &Connection,
+    project_id: &str,
+    now: u64,
+) -> Result<ProjectBackgroundStatus, ProjectStoreError> {
+    abandon_expired_snapshot_collections(connection, now, None, Some(project_id))?;
+    connection
+        .query_row(
+            "SELECT COALESCE(SUM(collection_status = 'pending'), 0),
+                    COALESCE(SUM(collection_status = 'abandoned'), 0)
+               FROM coordination_snapshot_projects
+              WHERE project_id = ?1",
+            [project_id],
+            |row| {
+                Ok(ProjectBackgroundStatus {
+                    snapshots_pending: super::row_u64(row, 0)?,
+                    snapshots_abandoned: super::row_u64(row, 1)?,
+                })
+            },
+        )
+        .map_err(Into::into)
 }
 
 pub(super) async fn record_snapshot_delivery(
@@ -1375,12 +1504,16 @@ pub(super) async fn record_snapshot_collected(
     let project_id = canonical_project_id(project_id)?;
     store
         .run(move |connection| {
+            // The folder is the source of truth, so files that arrive after
+            // expiry still collect an abandoned project snapshot.
             let rows = connection.execute(
                 "UPDATE coordination_snapshot_projects
                     SET collection_status = 'collected',
-                        collected_at_unix_ms = ?1
+                        collected_at_unix_ms = ?1,
+                        abandoned_at_unix_ms = NULL,
+                        abandoned_reason = NULL
                   WHERE snapshot_id = ?2 AND project_id = ?3
-                    AND collection_status = 'pending'",
+                    AND collection_status IN ('pending', 'abandoned')",
                 params![to_i64(unix_time_ms()?)?, snapshot_id, project_id],
             )?;
             if rows == 0 {
@@ -1401,10 +1534,858 @@ pub(super) async fn record_snapshot_collected(
         .await
 }
 
+pub(super) async fn disposition_preview(
+    store: &SqliteProjectStore,
+    node_id: &str,
+) -> Result<CoordinationNodeDispositionPreview, ProjectStoreError> {
+    let node_id = canonical_node_id(node_id)?;
+    store
+        .run(move |connection| {
+            let node = select_active_node(connection, &node_id)?;
+            let worker = node
+                .worker
+                .as_ref()
+                .map(|worker| {
+                    let profile_name = match (&worker.profile_id, worker.profile_version) {
+                        (Some(profile_id), Some(profile_version)) => connection
+                            .query_row(
+                                "SELECT name FROM worker_profile_revisions
+                                  WHERE profile_id = ?1 AND version = ?2",
+                                params![profile_id, to_i64(profile_version)?],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .optional()?,
+                        _ => None,
+                    };
+                    Ok::<_, ProjectStoreError>(CoordinationNodeDispositionWorker {
+                        worker_id: worker.id.clone(),
+                        worker_version: worker.version,
+                        profile_name,
+                        runtime_present: worker.runtime.is_some(),
+                        will_end: worker.desired_state == WorkerDesiredState::Running,
+                    })
+                })
+                .transpose()?;
+            let attached_projects = node
+                .attached_project_ids
+                .iter()
+                .map(|project_id| {
+                    Ok(CoordinationNodeDispositionProject {
+                        project_id: project_id.clone(),
+                        name: connection.query_row(
+                            "SELECT name FROM projects WHERE id = ?1",
+                            [project_id],
+                            |row| row.get::<_, String>(0),
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ProjectStoreError>>()?;
+            let automations = {
+                let mut statement = connection.prepare(
+                    "SELECT id, name, state
+                       FROM automations
+                      WHERE scope_kind = 'workstream_coordination_node'
+                        AND scope_node_id = ?1
+                      ORDER BY created_at_unix_ms, id",
+                )?;
+                statement
+                    .query_map([&node_id], |row| {
+                        Ok(CoordinationNodeDispositionAutomation {
+                            automation_id: row.get(0)?,
+                            name: row.get(1)?,
+                            state: match row.get::<_, String>(2)?.as_str() {
+                                "active" => AutomationState::Active,
+                                "paused" => AutomationState::Paused,
+                                value => {
+                                    return Err(super::enum_conversion_error(
+                                        2,
+                                        "automation state",
+                                        value,
+                                    ));
+                                }
+                            },
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            Ok(CoordinationNodeDispositionPreview {
+                supported: disposition_supported(node.kind),
+                blockers: pending_node_interventions(connection, &node_id)?,
+                node_id: node.id,
+                name: node.name,
+                kind: node.kind,
+                node_version: node.version,
+                worker,
+                attached_projects,
+                automations,
+            })
+        })
+        .await
+}
+
+pub(super) async fn archive_node(
+    store: &SqliteProjectStore,
+    node_id: &str,
+    command: ArchiveCoordinationNode,
+) -> Result<ArchivedCoordinationNode, ProjectStoreError> {
+    let node_id = canonical_node_id(node_id)?;
+    let command = command.normalize()?;
+    store
+        .run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(existing) = select_archived_node_command(&transaction, &command.command_id)?
+            {
+                if !existing.matches(&node_id, &command) {
+                    return Err(ProjectStoreError::IdempotencyConflict);
+                }
+                let cleanup_pending =
+                    super::runtime_cleanup_pending(&transaction, &command.command_id)?;
+                let paused_automation_ids =
+                    paused_automation_ids(&transaction, &command.command_id)?;
+                transaction.commit()?;
+                return Ok(ArchivedCoordinationNode {
+                    command_id: existing.command_id,
+                    node_id: existing.node_id,
+                    kind: existing.kind,
+                    worker_id: existing.worker_id,
+                    paused_automation_ids,
+                    archived_at_unix_ms: existing.archived_at_unix_ms,
+                    cleanup_pending,
+                    replayed: true,
+                });
+            }
+            reject_reused_command(&transaction, &command.command_id)?;
+            if archived_node_exists(&transaction, &node_id)? {
+                return Err(ProjectStoreError::CoordinationNodeAlreadyArchived);
+            }
+            // Unknown IDs and unsupported kinds are rejected before anything
+            // is written.
+            if !disposition_supported(node_kind(&transaction, &node_id)?) {
+                return Err(ProjectStoreError::CoordinationNodeKindNotSupported);
+            }
+            let now = unix_time_ms()?;
+            transaction.execute(
+                "INSERT INTO command_acknowledgements (
+                    id, command_type, actor, status, error_message,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (
+                    ?1, 'coordination_node_archive', ?2, 'pending', NULL, ?3, ?3
+                 )",
+                params![command.command_id, command.actor, to_i64(now)?],
+            )?;
+            let archived = archive_node_tx(
+                &transaction,
+                &node_id,
+                &command.command_id,
+                &command.actor,
+                &command.preconditions(),
+                now,
+            )?;
+            mark_command_succeeded(&transaction, &command.command_id, now)?;
+            transaction.commit()?;
+            Ok(ArchivedCoordinationNode {
+                command_id: command.command_id,
+                node_id,
+                kind: archived.kind,
+                worker_id: archived.worker_id,
+                paused_automation_ids: archived.paused_automation_ids,
+                archived_at_unix_ms: now,
+                cleanup_pending: archived.cleanup_pending,
+                replayed: false,
+            })
+        })
+        .await
+}
+
+#[allow(clippy::too_many_lines)]
+pub(super) async fn delete_node(
+    store: &SqliteProjectStore,
+    node_id: &str,
+    command: DeleteCoordinationNode,
+) -> Result<DeletedCoordinationNode, ProjectStoreError> {
+    let node_id = canonical_node_id(node_id)?;
+    let command = command.normalize()?;
+    store
+        .run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(existing) = select_deleted_node_command(&transaction, &command.command_id)?
+            {
+                if !existing.matches(&node_id, &command) {
+                    return Err(ProjectStoreError::IdempotencyConflict);
+                }
+                let cleanup_pending = existing
+                    .worker_id
+                    .as_deref()
+                    .map(|worker_id| super::worker_runtime_cleanup_pending(&transaction, worker_id))
+                    .transpose()?
+                    .unwrap_or(false);
+                let paused_automation_ids = if existing.archive_applied {
+                    paused_automation_ids(&transaction, &command.command_id)?
+                } else {
+                    Vec::new()
+                };
+                transaction.commit()?;
+                return Ok(DeletedCoordinationNode {
+                    command_id: existing.command_id,
+                    node_id: existing.node_id,
+                    kind: existing.kind,
+                    worker_id: existing.worker_id,
+                    paused_automation_ids,
+                    deleted_at_unix_ms: existing.deleted_at_unix_ms,
+                    cleanup_pending,
+                    replayed: true,
+                });
+            }
+            reject_reused_command(&transaction, &command.command_id)?;
+            if deleted_node_exists(&transaction, &node_id)? {
+                return Err(ProjectStoreError::CoordinationNodeAlreadyDeleted);
+            }
+
+            // An archive by any command, including another tab's, wins over
+            // this command's archive preconditions.
+            let archived_target = select_archived_node_target(&transaction, &node_id)?;
+            let kind = node_kind(&transaction, &node_id)?;
+            if !disposition_supported(kind) {
+                return Err(ProjectStoreError::CoordinationNodeKindNotSupported);
+            }
+            if archived_target.is_none() && command.archive.is_none() {
+                return Err(ProjectStoreError::CoordinationNodeNotArchived);
+            }
+            let now = unix_time_ms()?;
+            transaction.execute(
+                "INSERT INTO command_acknowledgements (
+                    id, command_type, actor, status, error_message,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (
+                    ?1, 'coordination_node_delete', ?2, 'succeeded', NULL, ?3, ?3
+                 )",
+                params![command.command_id, command.actor, to_i64(now)?],
+            )?;
+            let archive_applied = archived_target.is_none();
+            let (worker_id, paused_automation_ids) = if let Some(target) = archived_target {
+                (target.worker_id, Vec::new())
+            } else {
+                let archive = command
+                    .archive
+                    .as_ref()
+                    .ok_or(ProjectStoreError::CoordinationNodeNotArchived)?;
+                let archived = archive_node_tx(
+                    &transaction,
+                    &node_id,
+                    &command.command_id,
+                    &command.actor,
+                    archive,
+                    now,
+                )?;
+                (archived.worker_id, archived.paused_automation_ids)
+            };
+            let node_version = transaction.query_row(
+                "SELECT version FROM coordination_nodes WHERE id = ?1",
+                [&node_id],
+                |row| super::row_u64(row, 0),
+            )?;
+            transaction.execute(
+                "INSERT INTO deleted_coordination_nodes (
+                    command_id, node_id, actor, archive_json, archive_applied,
+                    node_version, deleted_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    command.command_id,
+                    node_id,
+                    command.actor,
+                    command
+                        .archive
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .map_err(ProjectStoreError::StoredResultJson)?,
+                    archive_applied,
+                    to_i64(node_version)?,
+                    to_i64(now)?,
+                ],
+            )?;
+            // The dedicated worker belongs to the node, so it leaves Yard
+            // views with it, as a deleted project's orchestrator does.
+            // Member projects and their attachment rows are not touched.
+            if let Some(worker_id) = worker_id.as_deref()
+                && !super::deleted_worker_exists(&transaction, worker_id)?
+            {
+                let worker_version = transaction.query_row(
+                    "SELECT version FROM workers WHERE id = ?1",
+                    [worker_id],
+                    |row| super::row_u64(row, 0),
+                )?;
+                transaction.execute(
+                    "INSERT INTO deleted_workers (
+                        worker_id, command_id, expected_worker_version,
+                        deleted_at_unix_ms
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        worker_id,
+                        command.command_id,
+                        to_i64(worker_version)?,
+                        to_i64(now)?,
+                    ],
+                )?;
+            }
+            insert_lifecycle_event(
+                &transaction,
+                "coordination_node",
+                &node_id,
+                node_version,
+                "coordination_node_deleted",
+                &command.actor,
+                now,
+            )?;
+            let cleanup_pending = worker_id
+                .as_deref()
+                .map(|worker_id| super::worker_runtime_cleanup_pending(&transaction, worker_id))
+                .transpose()?
+                .unwrap_or(false);
+            transaction.commit()?;
+            Ok(DeletedCoordinationNode {
+                command_id: command.command_id,
+                node_id,
+                kind,
+                worker_id,
+                paused_automation_ids,
+                deleted_at_unix_ms: now,
+                cleanup_pending,
+                replayed: false,
+            })
+        })
+        .await
+}
+
+struct ArchivedNodeTransition {
+    kind: CoordinationNodeKind,
+    worker_id: Option<String>,
+    paused_automation_ids: Vec<String>,
+    cleanup_pending: bool,
+}
+
+/// Archive an active workstream inside the caller's transaction.
+///
+/// The caller owns the command: `command_id` must already be in
+/// `command_acknowledgements`, and the archive row, retired worker runtime,
+/// cleanup job, and paused automations are all recorded under it. Attached
+/// projects, their bindings and assignments, and the attachment rows are not
+/// touched.
+#[allow(clippy::too_many_lines)]
+fn archive_node_tx(
+    transaction: &Transaction<'_>,
+    node_id: &str,
+    command_id: &str,
+    actor: &str,
+    preconditions: &CoordinationNodeArchivePreconditions,
+    now: u64,
+) -> Result<ArchivedNodeTransition, ProjectStoreError> {
+    let node = select_active_node(transaction, node_id)?;
+    if !disposition_supported(node.kind) {
+        return Err(ProjectStoreError::CoordinationNodeKindNotSupported);
+    }
+    if node.version != preconditions.expected_node_version {
+        return Err(ProjectStoreError::CoordinationNodeVersionConflict {
+            current_version: node.version,
+        });
+    }
+    if let Some(expected_worker_version) = preconditions.expected_worker_version {
+        let worker = node
+            .worker
+            .as_ref()
+            .ok_or(ProjectStoreError::CoordinationNodeNotProvisioned)?;
+        if worker.version != expected_worker_version {
+            return Err(ProjectStoreError::WorkerVersionConflict {
+                current_version: worker.version,
+            });
+        }
+    }
+    let blockers = pending_node_interventions(transaction, node_id)?;
+    if !blockers.is_empty() {
+        let pending_prompts = blockers
+            .iter()
+            .filter(|blocker| blocker.kind == CoordinationNodeDispositionBlockerKind::Prompt)
+            .count();
+        return Err(ProjectStoreError::CoordinationNodeDispositionBlocked {
+            pending_prompts,
+            pending_routes: blockers.len() - pending_prompts,
+        });
+    }
+    let next_node_version = node
+        .version
+        .checked_add(1)
+        .ok_or(ProjectStoreError::VersionOverflow)?;
+
+    let (result_worker_version, cleanup_pending) = match node.worker.as_ref() {
+        Some(worker) if worker.desired_state == WorkerDesiredState::Running => {
+            let next_worker_version = worker
+                .version
+                .checked_add(1)
+                .ok_or(ProjectStoreError::VersionOverflow)?;
+            // Ending the dedicated worker is a worker session end: its runtime
+            // is retired and cleanup succeeds only once Herdr no longer shows
+            // it. Yard never closes the tab; the user does.
+            let cleanup_pending = if let Some(runtime) = worker.runtime.as_ref() {
+                super::insert_retired_runtime_binding(
+                    transaction,
+                    command_id,
+                    &worker.id,
+                    "worker_session_end",
+                    runtime,
+                    now,
+                )?;
+                super::insert_runtime_cleanup_job(
+                    transaction,
+                    command_id,
+                    &worker.id,
+                    "worker_session_end",
+                    runtime,
+                    super::RuntimeCleanupExpectation {
+                        worker_version: Some(next_worker_version),
+                        binding_state: "detached",
+                    },
+                    now,
+                )?;
+                let runtime_rows = transaction.execute(
+                    "DELETE FROM worker_runtime_bindings
+                      WHERE worker_id = ?1 AND version = ?2",
+                    params![worker.id, to_i64(runtime.version)?],
+                )?;
+                if runtime_rows != 1 {
+                    return Err(ProjectStoreError::WorkerRuntimeVersionConflict {
+                        current_version: None,
+                    });
+                }
+                true
+            } else {
+                false
+            };
+            let worker_rows = transaction.execute(
+                "UPDATE workers
+                    SET ended_at_unix_ms = ?1, version = ?2,
+                        updated_at_unix_ms = ?1
+                  WHERE id = ?3 AND version = ?4
+                    AND ended_at_unix_ms IS NULL",
+                params![
+                    to_i64(now)?,
+                    to_i64(next_worker_version)?,
+                    worker.id,
+                    to_i64(worker.version)?,
+                ],
+            )?;
+            if worker_rows != 1 {
+                return Err(ProjectStoreError::WorkerVersionConflict {
+                    current_version: worker.version,
+                });
+            }
+            insert_lifecycle_event(
+                transaction,
+                "worker",
+                &worker.id,
+                next_worker_version,
+                "coordination_node_archive_worker_ended",
+                actor,
+                now,
+            )?;
+            (Some(next_worker_version), cleanup_pending)
+        }
+        Some(worker) => (Some(worker.version), false),
+        None => (None, false),
+    };
+    let worker_id = node.worker.as_ref().map(|worker| worker.id.clone());
+    transaction.execute(
+        "INSERT INTO archived_coordination_nodes (
+            command_id, node_id, actor, expected_node_version,
+            expected_worker_version, result_node_version, worker_id,
+            result_worker_version, archived_at_unix_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            command_id,
+            node_id,
+            actor,
+            to_i64(preconditions.expected_node_version)?,
+            preconditions
+                .expected_worker_version
+                .map(to_i64)
+                .transpose()?,
+            to_i64(next_node_version)?,
+            worker_id,
+            result_worker_version.map(to_i64).transpose()?,
+            to_i64(now)?,
+        ],
+    )?;
+    pause_node_automations(transaction, command_id, node_id, actor, now)?;
+    let node_rows = transaction.execute(
+        "UPDATE coordination_nodes
+            SET version = ?1, updated_at_unix_ms = ?2
+          WHERE id = ?3 AND version = ?4",
+        params![
+            to_i64(next_node_version)?,
+            to_i64(now)?,
+            node_id,
+            to_i64(node.version)?,
+        ],
+    )?;
+    if node_rows != 1 {
+        return Err(ProjectStoreError::CoordinationNodeVersionConflict {
+            current_version: node.version,
+        });
+    }
+    insert_lifecycle_event(
+        transaction,
+        "coordination_node",
+        node_id,
+        next_node_version,
+        "coordination_node_archived",
+        actor,
+        now,
+    )?;
+    Ok(ArchivedNodeTransition {
+        kind: node.kind,
+        worker_id,
+        paused_automation_ids: paused_automation_ids(transaction, command_id)?,
+        cleanup_pending,
+    })
+}
+
+/// Pause the node's active automations so no scheduled run targets the
+/// archived node. Already paused automations are left as they are.
+fn pause_node_automations(
+    transaction: &Transaction<'_>,
+    command_id: &str,
+    node_id: &str,
+    actor: &str,
+    now: u64,
+) -> Result<(), ProjectStoreError> {
+    let automations = {
+        let mut statement = transaction.prepare(
+            "SELECT id, version
+               FROM automations
+              WHERE scope_kind = 'workstream_coordination_node'
+                AND scope_node_id = ?1
+                AND state = 'active'
+              ORDER BY created_at_unix_ms, id",
+        )?;
+        statement
+            .query_map([node_id], |row| {
+                Ok((row.get::<_, String>(0)?, super::row_u64(row, 1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (automation_id, current_version) in automations {
+        let next_version = current_version
+            .checked_add(1)
+            .ok_or(ProjectStoreError::VersionOverflow)?;
+        let rows = transaction.execute(
+            "UPDATE automations
+                SET state = 'paused', next_run_at_unix_ms = NULL,
+                    version = ?1, updated_at_unix_ms = ?2
+              WHERE id = ?3 AND version = ?4 AND state = 'active'",
+            params![
+                to_i64(next_version)?,
+                to_i64(now)?,
+                automation_id,
+                to_i64(current_version)?,
+            ],
+        )?;
+        if rows != 1 {
+            return Err(ProjectStoreError::AutomationVersionConflict { current_version });
+        }
+        transaction.execute(
+            "INSERT INTO archived_coordination_node_automations (
+                command_id, automation_id, result_automation_version
+             ) VALUES (?1, ?2, ?3)",
+            params![command_id, automation_id, to_i64(next_version)?],
+        )?;
+        insert_lifecycle_event(
+            transaction,
+            "automation",
+            &automation_id,
+            next_version,
+            "automation_paused",
+            actor,
+            now,
+        )?;
+    }
+    Ok(())
+}
+
+/// Only workstreams have a disposition today. Knowledge stores still own
+/// snapshot collection, which archive would have to settle first.
+const fn disposition_supported(kind: CoordinationNodeKind) -> bool {
+    matches!(kind, CoordinationNodeKind::Workstream)
+}
+
+/// Pending (not ambiguous) node prompts and routes. Restart recovery turns an
+/// interrupted one ambiguous, so each of these is still being delivered.
+fn pending_node_interventions(
+    connection: &Connection,
+    node_id: &str,
+) -> Result<Vec<CoordinationNodeDispositionBlocker>, ProjectStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT 'prompt', prompt.command_id, command.created_at_unix_ms
+           FROM coordination_node_prompt_commands prompt
+           JOIN command_acknowledgements command
+             ON command.id = prompt.command_id
+          WHERE prompt.node_id = ?1 AND command.status = 'pending'
+         UNION ALL
+         SELECT 'route', route.command_id, command.created_at_unix_ms
+           FROM coordination_node_route_commands route
+           JOIN command_acknowledgements command
+             ON command.id = route.command_id
+          WHERE route.node_id = ?1 AND command.status = 'pending'
+          ORDER BY 3, 2",
+    )?;
+    statement
+        .query_map([node_id], |row| {
+            Ok(CoordinationNodeDispositionBlocker {
+                kind: if row.get::<_, String>(0)? == "prompt" {
+                    CoordinationNodeDispositionBlockerKind::Prompt
+                } else {
+                    CoordinationNodeDispositionBlockerKind::Route
+                },
+                command_id: row.get(1)?,
+                started_at_unix_ms: super::row_u64(row, 2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Read a node that can still change. An archived node answers
+/// `CoordinationNodeArchived`, so its mutations fail as a conflict; a deleted
+/// node reads as not found.
+pub(super) fn select_active_node(
+    connection: &Connection,
+    node_id: &str,
+) -> Result<CoordinationNode, ProjectStoreError> {
+    reject_inactive_node(connection, node_id)?;
+    select_node(connection, node_id)
+}
+
+pub(super) fn reject_inactive_node(
+    connection: &Connection,
+    node_id: &str,
+) -> Result<(), ProjectStoreError> {
+    if deleted_node_exists(connection, node_id)? {
+        Err(ProjectStoreError::CoordinationNodeNotFound)
+    } else if archived_node_exists(connection, node_id)? {
+        Err(ProjectStoreError::CoordinationNodeArchived)
+    } else {
+        Ok(())
+    }
+}
+
+fn archived_node_exists(connection: &Connection, node_id: &str) -> Result<bool, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM archived_coordination_nodes WHERE node_id = ?1
+             )",
+            [node_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn deleted_node_exists(connection: &Connection, node_id: &str) -> Result<bool, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM deleted_coordination_nodes WHERE node_id = ?1
+             )",
+            [node_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+struct ArchivedNodeDeletionTarget {
+    worker_id: Option<String>,
+}
+
+/// The node's archive row, whichever command wrote it, or `None` while the
+/// node is still active.
+fn select_archived_node_target(
+    connection: &Connection,
+    node_id: &str,
+) -> Result<Option<ArchivedNodeDeletionTarget>, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT worker_id FROM archived_coordination_nodes WHERE node_id = ?1",
+            [node_id],
+            |row| {
+                Ok(ArchivedNodeDeletionTarget {
+                    worker_id: row.get(0)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn node_kind(
+    connection: &Connection,
+    node_id: &str,
+) -> Result<CoordinationNodeKind, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT kind FROM coordination_nodes WHERE id = ?1",
+            [node_id],
+            |row| node_kind_from_row(row, 0),
+        )
+        .optional()?
+        .ok_or(ProjectStoreError::CoordinationNodeNotFound)
+}
+
+fn paused_automation_ids(
+    connection: &Connection,
+    command_id: &str,
+) -> Result<Vec<String>, ProjectStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT automation_id
+           FROM archived_coordination_node_automations
+          WHERE command_id = ?1
+          ORDER BY automation_id",
+    )?;
+    statement
+        .query_map([command_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+struct StoredArchivedNode {
+    command_id: String,
+    node_id: String,
+    kind: CoordinationNodeKind,
+    actor: String,
+    expected_node_version: u64,
+    expected_worker_version: Option<u64>,
+    worker_id: Option<String>,
+    archived_at_unix_ms: u64,
+}
+
+impl StoredArchivedNode {
+    fn matches(&self, node_id: &str, command: &ArchiveCoordinationNode) -> bool {
+        self.node_id == node_id
+            && self.actor == command.actor
+            && self.expected_node_version == command.expected_node_version
+            && self.expected_worker_version == command.expected_worker_version
+    }
+}
+
+/// An archive command's stored row. A delete that archived an active node
+/// shares its command ID, so the type filter keeps it from replaying here.
+fn select_archived_node_command(
+    connection: &Connection,
+    command_id: &str,
+) -> Result<Option<StoredArchivedNode>, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT archived.command_id, archived.node_id, node.kind,
+                    archived.actor, archived.expected_node_version,
+                    archived.expected_worker_version, archived.worker_id,
+                    archived.archived_at_unix_ms
+               FROM archived_coordination_nodes archived
+               JOIN command_acknowledgements command
+                 ON command.id = archived.command_id
+               JOIN coordination_nodes node ON node.id = archived.node_id
+              WHERE archived.command_id = ?1
+                AND command.command_type = 'coordination_node_archive'",
+            [command_id],
+            |row| {
+                Ok(StoredArchivedNode {
+                    command_id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    kind: node_kind_from_row(row, 2)?,
+                    actor: row.get(3)?,
+                    expected_node_version: super::row_u64(row, 4)?,
+                    expected_worker_version: super::row_optional_u64(row, 5)?,
+                    worker_id: row.get(6)?,
+                    archived_at_unix_ms: super::row_u64(row, 7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+struct StoredDeletedNode {
+    command_id: String,
+    node_id: String,
+    kind: CoordinationNodeKind,
+    actor: String,
+    archive: Option<CoordinationNodeArchivePreconditions>,
+    archive_applied: bool,
+    worker_id: Option<String>,
+    deleted_at_unix_ms: u64,
+}
+
+impl StoredDeletedNode {
+    fn matches(&self, node_id: &str, command: &DeleteCoordinationNode) -> bool {
+        self.node_id == node_id && self.actor == command.actor && self.archive == command.archive
+    }
+}
+
+fn select_deleted_node_command(
+    connection: &Connection,
+    command_id: &str,
+) -> Result<Option<StoredDeletedNode>, ProjectStoreError> {
+    let stored = connection
+        .query_row(
+            "SELECT deleted.command_id, deleted.node_id, node.kind,
+                    deleted.actor, deleted.archive_json,
+                    deleted.archive_applied, archived.worker_id,
+                    deleted.deleted_at_unix_ms
+               FROM deleted_coordination_nodes deleted
+               JOIN command_acknowledgements command
+                 ON command.id = deleted.command_id
+               JOIN archived_coordination_nodes archived
+                 ON archived.node_id = deleted.node_id
+               JOIN coordination_nodes node ON node.id = deleted.node_id
+              WHERE deleted.command_id = ?1
+                AND command.command_type = 'coordination_node_delete'",
+            [command_id],
+            |row| {
+                Ok((
+                    StoredDeletedNode {
+                        command_id: row.get(0)?,
+                        node_id: row.get(1)?,
+                        kind: node_kind_from_row(row, 2)?,
+                        actor: row.get(3)?,
+                        archive: None,
+                        archive_applied: row.get(5)?,
+                        worker_id: row.get(6)?,
+                        deleted_at_unix_ms: super::row_u64(row, 7)?,
+                    },
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    stored
+        .map(|(mut stored, archive_json)| {
+            stored.archive = archive_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(ProjectStoreError::StoredResultJson)?;
+            Ok(stored)
+        })
+        .transpose()
+}
+
 pub(super) fn select_node(
     connection: &Connection,
     node_id: &str,
 ) -> Result<CoordinationNode, ProjectStoreError> {
+    // A deleted node reads as not found everywhere, command replays
+    // included: its dedicated worker was tombstoned with it.
+    if deleted_node_exists(connection, node_id)? {
+        return Err(ProjectStoreError::CoordinationNodeNotFound);
+    }
     let base = connection
         .query_row(
             "SELECT n.id, n.name, n.kind, n.worker_id,
@@ -1506,7 +2487,8 @@ fn select_snapshot(
         "SELECT project_id, project_version, orchestrator_worker_id,
                 folder_path, collection_status, delivery_status,
                 delivery_error, result_runtime_status,
-                submitted_at_unix_ms, collected_at_unix_ms
+                submitted_at_unix_ms, collected_at_unix_ms,
+                abandoned_at_unix_ms, abandoned_reason
            FROM coordination_snapshot_projects
           WHERE snapshot_id = ?1
           ORDER BY project_id",
@@ -1514,18 +2496,21 @@ fn select_snapshot(
     let projects = statement
         .query_map([snapshot_id], snapshot_project_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
-    let completed = projects
-        .iter()
-        .filter(|project| project.collection_status == SnapshotCollectionStatus::Collected)
-        .count();
+    let count = |status| {
+        projects
+            .iter()
+            .filter(|project| project.collection_status == status)
+            .count()
+    };
     Ok(CoordinationSnapshot {
         id: snapshot_id.to_owned(),
         node_id: node_id.to_owned(),
         command_id,
         folder_path,
         progress: SnapshotCollectionProgress {
-            completed,
+            completed: count(SnapshotCollectionStatus::Collected),
             total: projects.len(),
+            abandoned: count(SnapshotCollectionStatus::Abandoned),
         },
         projects,
         requested_by,
@@ -1543,6 +2528,7 @@ fn snapshot_project_from_row(row: &Row<'_>) -> rusqlite::Result<SnapshotProjectC
         collection_status: match row.get::<_, String>(4)?.as_str() {
             "pending" => SnapshotCollectionStatus::Pending,
             "collected" => SnapshotCollectionStatus::Collected,
+            "abandoned" => SnapshotCollectionStatus::Abandoned,
             value => {
                 return Err(super::enum_conversion_error(
                     4,
@@ -1556,6 +2542,18 @@ fn snapshot_project_from_row(row: &Row<'_>) -> rusqlite::Result<SnapshotProjectC
         runtime_status: row.get(7)?,
         submitted_at_unix_ms: super::row_optional_u64(row, 8)?,
         collected_at_unix_ms: super::row_optional_u64(row, 9)?,
+        abandoned_at_unix_ms: super::row_optional_u64(row, 10)?,
+        abandoned_reason: row
+            .get::<_, Option<String>>(11)?
+            .map(|value| match value.as_str() {
+                "expired" => Ok(SnapshotAbandonmentReason::Expired),
+                value => Err(super::enum_conversion_error(
+                    11,
+                    "snapshot abandonment",
+                    value,
+                )),
+            })
+            .transpose()?,
     })
 }
 

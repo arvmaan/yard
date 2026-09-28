@@ -1054,17 +1054,28 @@ select:focus-visible {
   font-size: 13px;
 }
 
-.error-banner,
-.notice-banner {
+/* Error and notice stack, so a background error never hides a notice. */
+.canvas-banners {
   position: absolute;
   right: 14px;
   bottom: 14px;
   z-index: 15;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  width: min(440px, calc(100% - 28px));
+  pointer-events: none;
+}
+
+.error-banner,
+.notice-banner {
   display: grid;
+  pointer-events: auto;
   grid-template-columns: 20px minmax(0, 1fr) 32px;
   align-items: center;
   gap: 8px;
-  width: min(440px, calc(100% - 28px));
+  width: 100%;
   padding: 8px 8px 8px 12px;
   border-radius: 4px;
   box-shadow: var(--shadow);
@@ -5831,6 +5842,33 @@ html[data-yard-allocation-dragging="true"]
   line-height: 1.45;
 }
 
+.disposition-impact-list {
+  display: grid;
+  gap: 3px;
+  margin: 7px 0 0;
+  padding-left: 15px;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.disposition-active-workers {
+  margin-top: 8px;
+}
+
+.disposition-active-workers > p {
+  margin: 7px 0 0;
+}
+
+.disposition-active-workers .disposition-impact-list {
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.end-session-impact .disposition-impact-loading {
+  margin-top: 7px;
+  opacity: 0.8;
+}
+
 .end-session-dialog .dialog-error {
   margin: 0 16px 16px;
 }
@@ -9810,4 +9848,297 @@ html[data-yard-allocation-dragging="true"]
   .agent-workspace-toolbar__target small {
     display: none;
   }
+}
+
+
+/* Worker completion: one primary Complete, an inline overflow, and the
+   pre-commit Undo window. The overflow is inline because .inspector clips. */
+.assignment-primary-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.assignment-primary-actions .command-button {
+  margin-top: 0;
+}
+
+.assignment-more-button {
+  width: 36px;
+  height: auto;
+  min-height: 36px;
+}
+
+.quick-complete-pending {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border: 1px solid color-mix(in srgb, var(--teal) 40%, var(--line));
+  border-radius: 4px;
+  background: var(--teal-soft);
+  color: var(--teal);
+}
+
+.quick-complete-pending span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.quick-complete-pending strong {
+  font-size: 11px;
+}
+
+.quick-complete-pending small {
+  font-size: 9px;
+  line-height: 1.4;
+}
+
+.quick-complete-toasts {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  pointer-events: auto;
+}
+
+.notice-banner.quick-complete-toast {
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  border-color: color-mix(in srgb, var(--teal) 40%, var(--line));
+  background: var(--teal-soft);
+  color: var(--teal);
+}
+
+.quick-complete-toast span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.assignment-action-error {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 8px;
+  border: 1px solid color-mix(in srgb, var(--vermilion) 45%, var(--line));
+  border-radius: 4px;
+  background: var(--vermilion-soft);
+  color: var(--vermilion);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.assignment-action-error span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.assignment-action-error .secondary-button {
+  min-height: 30px;
+  padding: 4px 8px;
+}
+
+.assignment-overflow {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--paper);
+}
+
+.assignment-overflow .secondary-button,
+.assignment-overflow .destructive-button {
+  justify-content: flex-start;
+  width: 100%;
+}
+
+.assignment-overflow__preference {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: start;
+  gap: 7px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+  color: var(--ink);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.assignment-overflow__preference span {
+  display: grid;
+  gap: 2px;
+}
+
+.assignment-overflow__preference small {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.runtime-badge[data-lifecycle="completed"] {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--status-success) 45%, var(--line));
+  color: var(--teal);
+}
+
+.runtime-badge[data-lifecycle="cancelled"] {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--vermilion) 45%, var(--line));
+  color: var(--vermilion);
+}
+
+.assignment-cancellation > .eyebrow {
+  color: var(--vermilion);
+}
+
+.worker-disposition-actions {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px 16px;
+  border-top: 1px solid var(--line);
+}
+
+.worker-disposition-actions .command-button {
+  margin-top: 0;
+}
+
+.worker-disposition-note {
+  margin-top: -3px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.retained-transcript {
+  display: grid;
+  gap: 7px;
+}
+
+.retained-transcript__meta,
+.retained-transcript__status {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  gap: 6px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.retained-transcript__status span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.retained-transcript__status strong {
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.retained-transcript__status code {
+  overflow-wrap: anywhere;
+  font: 9px/1.4 "IBM Plex Mono", monospace;
+}
+
+.retained-transcript__text {
+  max-height: 240px;
+  margin: 0;
+  padding: 8px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--mineral);
+  color: var(--ink);
+  font: 10px/1.45 "IBM Plex Mono", monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.retained-transcript__text:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+/* Archived shelf: one card per archived project with its Restore action. */
+.archived-projects {
+  padding: 0;
+  list-style: none;
+}
+
+.archived-project-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 260px;
+  min-width: 260px;
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-muted);
+}
+
+.archived-project-row > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.archived-project-row strong,
+.archived-project-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.archived-project-row small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.archived-project-row .archived-project-row__error,
+.archived-projects__error {
+  color: var(--status-danger);
+}
+
+.archived-projects__error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 6px;
+  font-size: 11px;
+}
+
+.archived-project-row button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* The Undo offered right after an archive; styled like a notice but kept
+   separate so the archive notice stays one element. */
+.archive-undo-toast {
+  display: grid;
+  pointer-events: auto;
+  grid-template-columns: 20px minmax(0, 1fr) auto 32px;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 8px 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--teal) 45%, var(--line));
+  border-radius: 4px;
+  background: var(--teal-soft);
+  box-shadow: var(--shadow);
+  color: var(--teal);
+  font-size: 12px;
+}
+
+.archive-undo-toast[data-error="true"] {
+  border-color: color-mix(in srgb, var(--vermilion) 45%, var(--line));
+  background: var(--vermilion-soft);
+  color: var(--vermilion);
 }

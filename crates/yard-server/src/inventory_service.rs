@@ -850,13 +850,14 @@ struct RetirementIdentity {
     workspace: String,
 }
 
-enum RetirementResolution {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetirementResolution {
     Target,
     Absent,
     Conflict,
 }
 
-fn retirement_resolution(
+pub(crate) fn retirement_resolution(
     inventory: &RuntimeInventory,
     request: &RuntimeRetirementRequest,
 ) -> RetirementResolution {

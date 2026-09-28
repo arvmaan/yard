@@ -3,7 +3,11 @@ import {
   runtimeCapabilityProcessState,
   runtimeCapabilityStatus,
 } from './runtimeCapabilities'
-import type { RuntimeInventory, WorkerCandidate } from './types'
+import type {
+  AssignmentLifecycle,
+  RuntimeInventory,
+  WorkerCandidate,
+} from './types'
 
 export type WorkerAttentionState = 'actionable' | 'quiet' | 'stale'
 
@@ -36,8 +40,17 @@ export function workerAttentionState(
   candidate: WorkerCandidate,
   snapshotCurrent: boolean,
   inventory: RuntimeInventory | null,
+  latestAssignmentLifecycle: AssignmentLifecycle | null = null,
 ): WorkerAttentionState {
-  if (candidate.worker.desired_state === 'ended') return 'quiet'
+  // Ended sessions and work the user ended without completion are settled:
+  // they never ask for attention and are never offered as stale.
+  if (
+    candidate.worker.desired_state === 'ended' ||
+    candidate.availability === 'ended' ||
+    latestAssignmentLifecycle === 'cancelled'
+  ) {
+    return 'quiet'
+  }
 
   const capabilities = resolveRuntimeCapabilities(
     snapshotCurrent,

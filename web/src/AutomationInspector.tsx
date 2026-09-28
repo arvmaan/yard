@@ -74,13 +74,15 @@ export function AutomationInspector({
     [coordinationNodes, projects],
   )
   const fallbackTarget = targets[0]
-  const initialTarget =
-    targets.find(
-      (target) =>
-        target.key === automationScopeKey(automation.scope),
-    ) ?? fallbackTarget
+  const currentTargetKey = automationScopeKey(automation.scope)
+  // A target that is no longer listed (e.g. an archived workstream) is never
+  // silently swapped for another one: the user must choose a target first.
+  const currentTargetMissing = !targets.some(
+    (target) => target.key === currentTargetKey,
+  )
   const [name, setName] = useState(automation.name)
-  const [targetKey, setTargetKey] = useState(initialTarget.key)
+  const [targetKey, setTargetKey] = useState(currentTargetKey)
+  const targetUnchosen = currentTargetMissing && targetKey === currentTargetKey
   const [hour, setHour] = useState(automation.schedule.hour)
   const [minute, setMinute] = useState(automation.schedule.minute)
   const [timezone, setTimezone] = useState(automation.schedule.timezone)
@@ -176,8 +178,13 @@ export function AutomationInspector({
         <select
           id="automation-edit-target"
           onChange={(event) => chooseTarget(event.target.value)}
-          value={selectedTarget.key}
+          value={targetUnchosen ? currentTargetKey : selectedTarget.key}
         >
+          {currentTargetMissing ? (
+            <option disabled value={currentTargetKey}>
+              Unavailable target — choose one
+            </option>
+          ) : null}
           {targets.map((target) => (
             <option key={target.key} value={target.key}>
               {target.label}
@@ -270,6 +277,7 @@ export function AutomationInspector({
           disabled={
             busy ||
             !dirty ||
+            targetUnchosen ||
             !name.trim() ||
             !promptTemplate.trim() ||
             !scheduleValid

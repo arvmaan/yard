@@ -7,7 +7,9 @@ import {
   Network,
   RefreshCw,
   Save,
+  Trash2,
 } from 'lucide-react'
+import { snapshotProgressLabel } from './backgroundStatus'
 import { WorkerInterventions } from './WorkerInterventions'
 import {
   resolveRuntimeCapabilities,
@@ -26,6 +28,8 @@ export function CoordinationNodeInspector({
   busy,
   inventory,
   node,
+  onArchive,
+  onDelete,
   onProvision,
   onRouteChange,
   onSnapshot,
@@ -39,6 +43,8 @@ export function CoordinationNodeInspector({
   busy: boolean
   inventory: RuntimeInventory | null
   node: CoordinationNode
+  onArchive: (node: CoordinationNode, trigger: HTMLButtonElement) => void
+  onDelete: (node: CoordinationNode, trigger: HTMLButtonElement) => void
   onProvision: (node: CoordinationNode, profile: WorkerProfile) => void
   onRouteChange: (route: CoordinationNodeRoute) => void
   onSnapshot: (node: CoordinationNode) => void
@@ -266,10 +272,7 @@ export function CoordinationNodeInspector({
                   <FolderArchive aria-hidden="true" size={16} />
                 </span>
                 <div>
-                  <strong>
-                    {snapshot.progress.completed}/{snapshot.progress.total}{' '}
-                    collected
-                  </strong>
+                  <strong>{snapshotProgressLabel(snapshot.progress)}</strong>
                   <small>
                     {new Date(snapshot.created_at_unix_ms).toLocaleString()}
                   </small>
@@ -282,6 +285,29 @@ export function CoordinationNodeInspector({
           )}
         </section>
       )}
+
+      {node.kind === 'workstream' ? (
+        <div className="inspector-actions disposition-actions">
+          <button
+            className="secondary-button"
+            disabled={busy}
+            onClick={(event) => onArchive(node, event.currentTarget)}
+            type="button"
+          >
+            <FolderArchive aria-hidden="true" size={16} />
+            Archive workstream
+          </button>
+          <button
+            className="destructive-button"
+            disabled={busy}
+            onClick={(event) => onDelete(node, event.currentTarget)}
+            type="button"
+          >
+            <Trash2 aria-hidden="true" size={16} />
+            Delete workstream…
+          </button>
+        </div>
+      ) : null}
     </>
   )
 }
