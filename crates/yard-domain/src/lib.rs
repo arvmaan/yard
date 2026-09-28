@@ -13,6 +13,7 @@ mod orchestrator_workflow_profile;
 mod pane_management;
 mod profile;
 mod project;
+mod repository_files;
 pub mod serde_u64;
 mod status_report;
 mod summary_worker;
@@ -114,6 +115,10 @@ pub use project::{
     ProjectValidationError, ProjectWorkflowProfilePin, Projects, RuntimeObservationState,
     RuntimeProcessState, SetProjectRepository, UpdateProjectPlacement,
     UpdateProjectWorkflowProfile, Worker, WorkerRuntimeBinding,
+};
+pub use repository_files::{
+    RepositoryDiff, RepositoryDiffHunk, RepositoryDiffLine, RepositoryDiffLineKind, RepositoryFile,
+    RepositoryFileContent, RepositoryFileMode, RepositoryFileState, RepositoryFiles,
 };
 pub use status_report::{
     MAX_STATUS_BLOCKER_BYTES, MAX_STATUS_BLOCKERS, MAX_STATUS_COMMAND_ID_BYTES,

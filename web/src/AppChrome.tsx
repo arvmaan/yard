@@ -13,6 +13,7 @@ import {
   ChevronDown,
   CircleAlert,
   FileCode2,
+  Files,
   FolderPlus,
   LoaderCircle,
   Map as MapIcon,
@@ -242,7 +243,10 @@ interface GlobalCommandBarProps extends RuntimeHealthPopoverProps {
   onOpenSettings: () => void
   onToggleResources: (trigger: HTMLButtonElement) => void
   onWorkspaceModeChange: (
-    mode: Extract<AgentWorkspaceView, 'map' | 'chat' | 'terminal'>,
+    mode: Extract<
+      AgentWorkspaceView,
+      'map' | 'chat' | 'terminal' | 'changes'
+    >,
     trigger: HTMLButtonElement,
   ) => void
   projectPulseTriggerRef: RefObject<HTMLButtonElement | null>
@@ -289,6 +293,7 @@ export function GlobalCommandBar({
     { icon: MapIcon, label: 'Map', value: 'map' },
     { icon: MessageSquareText, label: 'Chat', value: 'chat' },
     { icon: SquareTerminal, label: 'Terminal', value: 'terminal' },
+    { icon: Files, label: 'Files', value: 'changes' },
   ] as const
 
   return (
@@ -343,7 +348,7 @@ export function GlobalCommandBar({
             event.currentTarget.querySelectorAll<HTMLButtonElement>(
               '[role="tab"]',
             ),
-          )
+          ).filter((tab) => tab.offsetParent !== null)
           const current = tabs.indexOf(
             document.activeElement as HTMLButtonElement,
           )
@@ -365,6 +370,11 @@ export function GlobalCommandBar({
           <button
             aria-label={`${label} view`}
             aria-selected={workspaceMode === value}
+            className={
+              value === 'changes'
+                ? 'global-workspace-switcher__files'
+                : undefined
+            }
             key={value}
             onClick={(event) =>
               onWorkspaceModeChange(value, event.currentTarget)

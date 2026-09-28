@@ -17,6 +17,7 @@ pub mod project_orchestrator_transfer_service;
 pub mod project_service;
 mod provider_agents;
 pub mod reconciliation_service;
+pub mod repository_files_service;
 pub mod runtime_cleanup_service;
 mod status_protocol;
 pub mod summary_worker_service;

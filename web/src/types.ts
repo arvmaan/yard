@@ -389,6 +389,94 @@ export interface Project {
   updated_at_unix_ms: number
 }
 
+export interface ProjectRepository {
+  id: string
+  project_id: string
+  root_path: string
+  git_common_dir: string
+  created_at_unix_ms: number
+  updated_at_unix_ms: number
+}
+
+export interface ProjectRepositories {
+  repositories: ProjectRepository[]
+}
+
+export interface SetProjectRepositoryInput {
+  root_path: string
+}
+
+export type RepositoryFileMode = 'browse' | 'review'
+export type RepositoryFileState =
+  | 'tracked'
+  | 'untracked'
+  | 'added'
+  | 'modified'
+  | 'deleted'
+  | 'renamed'
+  | 'type_changed'
+  | 'conflicted'
+
+export interface RepositoryFile {
+  path: string
+  previous_path: string | null
+  state: RepositoryFileState
+  staged: boolean
+  unstaged: boolean
+  additions: number | null
+  deletions: number | null
+}
+
+export interface RepositoryFiles {
+  repository_id: string
+  root_path: string
+  mode: RepositoryFileMode
+  files: RepositoryFile[]
+  truncated: boolean
+}
+
+export interface RepositoryFileContent {
+  repository_id: string
+  root_path: string
+  path: string
+  content: string | null
+  binary: boolean
+  truncated: boolean
+  unavailable: boolean
+}
+
+export type RepositoryDiffLineKind =
+  | 'context'
+  | 'addition'
+  | 'deletion'
+  | 'no_newline'
+
+export interface RepositoryDiffLine {
+  kind: RepositoryDiffLineKind
+  old_line: number | null
+  new_line: number | null
+  content: string
+}
+
+export interface RepositoryDiffHunk {
+  old_start: number
+  old_lines: number
+  new_start: number
+  new_lines: number
+  lines: RepositoryDiffLine[]
+}
+
+export interface RepositoryDiff {
+  repository_id: string
+  root_path: string
+  path: string
+  previous_path: string | null
+  hunks: RepositoryDiffHunk[]
+  binary: boolean
+  truncated: boolean
+  unavailable: boolean
+}
+
 export type ArchitectureEcosystem = 'cargo' | 'npm'
 export type ArchitectureNodeKind =
   | 'application'

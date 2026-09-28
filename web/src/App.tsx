@@ -132,6 +132,7 @@ import {
   type TerminalPresentation,
 } from './AgentWorkspaceContext'
 import { AgentWorkspaceShell } from './AgentWorkspaceShell'
+import { ProjectRepositoriesSection } from './RepositoryFilesWorkspace'
 import { ProjectPulseWorkspace } from './ProjectPulseWorkspace'
 import { HerdrInventoryWorkspace } from './HerdrInventoryWorkspace'
 import {
@@ -1986,6 +1987,10 @@ function ProjectInspector({
           ))}
         </div>
       </fieldset>
+      <ProjectRepositoriesSection
+        onChanged={onRefresh}
+        project={project}
+      />
       <section
         aria-label="Orchestrator runtime"
         className="durable-runtime-section"
@@ -7284,11 +7289,23 @@ function App() {
       ) : null}
       <AgentWorkspaceShell
         activeTarget={activeAgentWorkspaceTarget}
+        assignments={assignments}
         coordinationRoutes={coordinationNodeRoutes}
         mode={agentWorkspaceMode}
         onCoordinationChange={recordYardRoute}
         onCoordinationNodeChange={recordCoordinationNodeRoute}
         onModeChange={setAgentWorkspaceMode}
+        onOpenProjectRepositories={(projectId) => {
+          setAgentWorkspaceMode('map')
+          setSelection({ kind: 'project', id: projectId })
+          window.setTimeout(
+            () =>
+              document
+                .getElementById(`project-repositories-${projectId}`)
+                ?.focus(),
+            0,
+          )
+        }}
         onPresentationChange={setTerminalPresentation}
         onRefresh={() => void refresh()}
         onRecoverTarget={(target, trigger) => {

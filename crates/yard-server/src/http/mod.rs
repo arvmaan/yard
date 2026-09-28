@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, put},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use yard_domain::{
     AgentProfile, AgentProfiles, ArchiveProject, ArchivedProject, Artifact, ArtifactContent,
@@ -25,23 +25,25 @@ use yard_domain::{
     DeletedWorker, EndWorkerSession, EndedWorkerSession, ManageAllAgents,
     OrchestratorPromptAcknowledgement, OrchestratorTerminalOutput, OrchestratorWorkflowProfile,
     OrchestratorWorkflowProfiles, PaneManagementBatchResult, PaneManagementPreview, Project,
-    ProjectArchitecture, ProjectRelationships, Projects, PromptAcknowledgement,
-    ProvisionCoordinationNode, ProvisionYardOrchestrator, ReceiveSummaryWorker,
-    RecordCompletionReceipt, RecordedCompletionReceipt, RecoverYardOrchestrator,
-    RecoveredYardOrchestrator, ReplaceProjectOrchestrator, ReplacedProjectOrchestrator,
-    RequestCoordinationSnapshot, RequestSummaryWorker, ResetOrchestratorWorkflowProfile,
-    RunAutomationNow, RuntimeInventory, RuntimeSessions, RuntimeTopology, SendAssignmentPrompt,
-    SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
-    SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SetAutomationPaused,
-    StartWorkerCleanupRun, SummaryWorker, SummaryWorkers, TerminalOutput, TokenSpendSettings,
-    TransferProjectOrchestrator, TransferredProjectOrchestrator, UpdateAgentProfile,
-    UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
-    UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
-    UpdateProjectWorkflowProfile, UpdateTokenSpendSettings, UpdateWorkerCleanupPolicy,
-    UpdateWorkerProfile, UploadArtifact, WorkerCandidates, WorkerCleanupDashboard,
-    WorkerCleanupPolicy, WorkerCleanupRun, WorkerCleanupRunTrigger, WorkerProfile, WorkerProfiles,
-    YardOrchestrator, YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute,
-    YardOrchestratorRoutes, YardOrchestratorTerminalOutput,
+    ProjectArchitecture, ProjectRelationships, ProjectRepositories, ProjectRepository, Projects,
+    PromptAcknowledgement, ProvisionCoordinationNode, ProvisionYardOrchestrator,
+    ReceiveSummaryWorker, RecordCompletionReceipt, RecordedCompletionReceipt,
+    RecoverYardOrchestrator, RecoveredYardOrchestrator, ReplaceProjectOrchestrator,
+    ReplacedProjectOrchestrator, RepositoryDiff, RepositoryFileContent, RepositoryFileMode,
+    RepositoryFiles, RequestCoordinationSnapshot, RequestSummaryWorker,
+    ResetOrchestratorWorkflowProfile, RunAutomationNow, RuntimeInventory, RuntimeSessions,
+    RuntimeTopology, SendAssignmentPrompt, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
+    SendOrchestratorPrompt, SendYardOrchestratorPrompt, SendYardOrchestratorRoute,
+    SetAutomationPaused, SetProjectRepository, StartWorkerCleanupRun, SummaryWorker,
+    SummaryWorkers, TerminalOutput, TokenSpendSettings, TransferProjectOrchestrator,
+    TransferredProjectOrchestrator, UpdateAgentProfile, UpdateAutomation,
+    UpdateAutomationPlacement, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
+    UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
+    UpdateTokenSpendSettings, UpdateWorkerCleanupPolicy, UpdateWorkerProfile, UploadArtifact,
+    WorkerCandidates, WorkerCleanupDashboard, WorkerCleanupPolicy, WorkerCleanupRun,
+    WorkerCleanupRunTrigger, WorkerProfile, WorkerProfiles, YardOrchestrator,
+    YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute, YardOrchestratorRoutes,
+    YardOrchestratorTerminalOutput,
 };
 use yard_herdr::HerdrError;
 use yard_store::{MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT, ProjectStoreError, YardStore};
@@ -69,6 +71,7 @@ use crate::project_orchestrator_transfer_service::{
 };
 use crate::project_service::{ProjectService, ProjectServiceError};
 use crate::reconciliation_service::{ReconciliationService, ReconciliationServiceError};
+use crate::repository_files_service::{RepositoryFilesService, RepositoryFilesServiceError};
 use crate::summary_worker_service::{SummaryWorkerService, SummaryWorkerServiceError};
 use crate::terminal_service::{RuntimeTerminal, TerminalService};
 use crate::worker_cleanup_service::WorkerCleanupService;
@@ -88,6 +91,7 @@ struct AppState {
     reconciliation: ReconciliationService,
     projects: ProjectService,
     architecture: ArchitectureService,
+    repository_files: RepositoryFilesService,
     profiles: ProfileService,
     orchestrator_workflow_profiles: OrchestratorWorkflowProfileService,
     allocations: AllocationService,
@@ -235,6 +239,7 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         Arc::clone(&store),
     );
     let architecture = ArchitectureService::new(Arc::clone(&store));
+    let repository_files = RepositoryFilesService::new(projects.clone());
     let profiles = ProfileService::new(Arc::clone(&store));
     let orchestrator_workflow_profiles =
         OrchestratorWorkflowProfileService::new(Arc::clone(&store));
@@ -481,6 +486,26 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             get(get_project_architecture),
         )
         .route(
+            "/api/v1/projects/{project_id}/repositories",
+            get(list_project_repositories).post(link_project_repository),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/repositories/{repository_id}",
+            put(relink_project_repository).delete(unlink_project_repository),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/repositories/{repository_id}/files",
+            get(list_repository_files),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/repositories/{repository_id}/files/content",
+            get(get_repository_file_content),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/repositories/{repository_id}/diff",
+            get(get_repository_diff),
+        )
+        .route(
             "/api/v1/projects/{project_id}/archive",
             axum::routing::post(archive_project),
         )
@@ -587,6 +612,7 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             reconciliation,
             projects,
             architecture,
+            repository_files,
             profiles,
             orchestrator_workflow_profiles,
             allocations,
@@ -1412,6 +1438,119 @@ async fn get_project_architecture(
         .map_err(ApiError::from)
 }
 
+async fn list_project_repositories(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<NoStoreJson<ProjectRepositories>, ApiError> {
+    state
+        .projects
+        .list_repositories(&project_id)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn link_project_repository(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(repository): Json<SetProjectRepository>,
+) -> Result<CreatedProjectRepository, ApiError> {
+    state
+        .projects
+        .link_repository(&project_id, &uuid::Uuid::now_v7().to_string(), repository)
+        .await
+        .map(CreatedProjectRepository)
+        .map_err(ApiError::from)
+}
+
+async fn relink_project_repository(
+    State(state): State<AppState>,
+    Path((project_id, repository_id)): Path<(String, String)>,
+    Json(repository): Json<SetProjectRepository>,
+) -> Result<NoStoreJson<ProjectRepository>, ApiError> {
+    state
+        .projects
+        .relink_repository(&project_id, &repository_id, repository)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn unlink_project_repository(
+    State(state): State<AppState>,
+    Path((project_id, repository_id)): Path<(String, String)>,
+) -> Result<NoStoreJson<ProjectRepository>, ApiError> {
+    state
+        .projects
+        .unlink_repository(&project_id, &repository_id)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryFilesQuery {
+    mode: RepositoryFileMode,
+}
+
+async fn list_repository_files(
+    State(state): State<AppState>,
+    Path((project_id, repository_id)): Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<RepositoryFilesQuery>,
+) -> Result<NoStoreJson<RepositoryFiles>, ApiError> {
+    state
+        .repository_files
+        .list(&project_id, &repository_id, query.mode)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryPathQuery {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryDiffQuery {
+    path: String,
+    previous_path: Option<String>,
+}
+
+async fn get_repository_file_content(
+    State(state): State<AppState>,
+    Path((project_id, repository_id)): Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<RepositoryPathQuery>,
+) -> Result<NoStoreJson<RepositoryFileContent>, ApiError> {
+    state
+        .repository_files
+        .content(&project_id, &repository_id, &query.path)
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn get_repository_diff(
+    State(state): State<AppState>,
+    Path((project_id, repository_id)): Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<RepositoryDiffQuery>,
+) -> Result<NoStoreJson<RepositoryDiff>, ApiError> {
+    state
+        .repository_files
+        .diff(
+            &project_id,
+            &repository_id,
+            &query.path,
+            query.previous_path.as_deref(),
+        )
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
 async fn archive_project(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -2079,6 +2218,18 @@ impl IntoResponse for CreatedProject {
     }
 }
 
+struct CreatedProjectRepository(ProjectRepository);
+
+impl IntoResponse for CreatedProjectRepository {
+    fn into_response(self) -> Response {
+        let location = format!(
+            "/api/v1/projects/{}/repositories/{}",
+            self.0.project_id, self.0.id
+        );
+        created_response(&location, self.0)
+    }
+}
+
 struct CreatedWorkerProfile(WorkerProfile);
 
 impl IntoResponse for CreatedWorkerProfile {
@@ -2281,6 +2432,40 @@ impl From<ArchitectureServiceError> for ApiError {
                 code: "architecture_unavailable",
                 message: "Project architecture is unavailable".to_owned(),
             },
+        }
+    }
+}
+
+impl From<RepositoryFilesServiceError> for ApiError {
+    fn from(error: RepositoryFilesServiceError) -> Self {
+        match error {
+            RepositoryFilesServiceError::Project(error) => Self::from(error),
+            RepositoryFilesServiceError::RepositoryIdentityChanged => Self {
+                status: StatusCode::CONFLICT,
+                code: "repository_identity_changed",
+                message: error.to_string(),
+            },
+            RepositoryFilesServiceError::InvalidPath | RepositoryFilesServiceError::PathEscape => {
+                Self {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "invalid_repository_path",
+                    message: error.to_string(),
+                }
+            }
+            RepositoryFilesServiceError::GitUnavailable(_)
+            | RepositoryFilesServiceError::GitTimeout
+            | RepositoryFilesServiceError::GitFailed(_) => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "repository_read_unavailable",
+                message: error.to_string(),
+            },
+            RepositoryFilesServiceError::InvalidGitOutput | RepositoryFilesServiceError::Io(_) => {
+                Self {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    code: "repository_read_failed",
+                    message: "Repository files could not be read".to_owned(),
+                }
+            }
         }
     }
 }
@@ -4007,12 +4192,12 @@ mod tests {
     use yard_domain::{
         ArchiveProject, AutomationScope, CanvasPlacement, ConfigureYardOrchestrator,
         CoordinationNodeKind, CreateAutomation, CreateCoordinationNode, CreateProject,
-        CreateWorkerProfile, DailySchedule, FocusObservation, ObservedStatus, ObservedWorker,
-        OrchestratorWorkflowProfileValidationError, PaneObservation, ProjectRuntimeBinding,
-        ProviderSessionRef, ProvisionCoordinationNode, RunAutomationNow, RuntimeInventory,
-        RuntimeObservationState, RuntimeProcessState, RuntimeSession, RuntimeSessions,
-        UpdateTokenSpendSettings, WorkerProfileSpec, WorkerRuntimeBinding, WorkspaceObservation,
-        WorktreeObservation,
+        CreateWorkerProfile, DailySchedule, DeleteProject, FocusObservation, ObservedStatus,
+        ObservedWorker, OrchestratorWorkflowProfileValidationError, PaneObservation,
+        ProjectRuntimeBinding, ProviderSessionRef, ProvisionCoordinationNode, RunAutomationNow,
+        RuntimeInventory, RuntimeObservationState, RuntimeProcessState, RuntimeSession,
+        RuntimeSessions, UpdateTokenSpendSettings, WorkerProfileSpec, WorkerRuntimeBinding,
+        WorkspaceObservation, WorktreeObservation,
     };
     use yard_herdr::{HerdrAdapter, HerdrConfig, HerdrError};
     use yard_store::{
@@ -9321,6 +9506,281 @@ mod tests {
             architecture["repositories"][0]["nodes"][0]["kind"],
             "application"
         );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn project_repository_routes_manage_browse_review_and_fail_closed() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            Arc::new(FakeInventory),
+            runtime.clone(),
+            runtime.clone(),
+            runtime,
+            store.clone(),
+            artifacts,
+        );
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body("terminal-1")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let project = response_json(created).await;
+        let project_id = project["id"].as_str().unwrap();
+        let repository = temp.path().join("files-repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(repository.join("tracked.txt"), "before\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Yard Tests",
+                    "-c",
+                    "user.email=yard@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "base",
+                ])
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(repository.join("tracked.txt"), "after\n").unwrap();
+        std::fs::write(repository.join("untracked.txt"), "new\n").unwrap();
+
+        let linked_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/projects/{project_id}/repositories"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "root_path": repository.to_string_lossy()
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(linked_response.status(), StatusCode::CREATED);
+        assert_eq!(linked_response.headers()[header::CACHE_CONTROL], "no-store");
+        let linked = response_json(linked_response).await;
+        let repository_id = linked["id"].as_str().unwrap();
+        assert_eq!(
+            linked["root_path"],
+            std::fs::canonicalize(&repository)
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert!(
+            std::path::Path::new(linked["git_common_dir"].as_str().unwrap())
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case(".git"))
+        );
+
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/{project_id}/repositories"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(listed).await["repositories"][0]["id"],
+            repository_id
+        );
+
+        let relinked = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!(
+                        "/api/v1/projects/{project_id}/repositories/{repository_id}"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "root_path": repository.to_string_lossy()
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(relinked.status(), StatusCode::OK);
+
+        let browse = get_json(
+            &app,
+            &format!(
+                "/api/v1/projects/{project_id}/repositories/{repository_id}/files?mode=browse"
+            ),
+        )
+        .await;
+        assert_eq!(browse["repository_id"], repository_id);
+        assert_eq!(browse["root_path"], linked["root_path"]);
+        assert_eq!(browse["files"].as_array().unwrap().len(), 2);
+
+        let review = get_json(
+            &app,
+            &format!(
+                "/api/v1/projects/{project_id}/repositories/{repository_id}/files?mode=review"
+            ),
+        )
+        .await;
+        assert_eq!(review["files"].as_array().unwrap().len(), 2);
+        assert!(
+            review["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|file| file["path"] == "tracked.txt" && file["unstaged"] == true)
+        );
+
+        let content = get_json(
+            &app,
+            &format!(
+                "/api/v1/projects/{project_id}/repositories/{repository_id}/files/content?path=tracked.txt"
+            ),
+        )
+        .await;
+        assert_eq!(content["content"], "after\n");
+        let diff = get_json(
+            &app,
+            &format!(
+                "/api/v1/projects/{project_id}/repositories/{repository_id}/diff?path=tracked.txt"
+            ),
+        )
+        .await;
+        let diff_lines = diff["hunks"][0]["lines"].as_array().unwrap();
+        assert!(diff_lines.iter().any(|line| line["kind"] == "deletion"));
+        assert!(diff_lines.iter().any(|line| line["kind"] == "addition"));
+
+        let escape = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/projects/{project_id}/repositories/{repository_id}/files/content?path=..%2Foutside"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(escape.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(escape).await["error"]["code"],
+            "invalid_repository_path"
+        );
+
+        let active = store.get_project(project_id).await.unwrap();
+        store
+            .archive_project(
+                project_id,
+                ArchiveProject {
+                    command_id: "archive-repository-files-route".to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_project_version: active.version,
+                    expected_orchestrator_worker_id: active.orchestrator.id.clone(),
+                    expected_orchestrator_worker_version: active.orchestrator.version,
+                    expected_orchestrator_runtime_version: active
+                        .orchestrator
+                        .runtime
+                        .as_ref()
+                        .map(|runtime| runtime.version),
+                },
+            )
+            .await
+            .unwrap();
+        let archived = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/{project_id}/repositories"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(archived.status(), StatusCode::NOT_FOUND);
+
+        store
+            .delete_project(
+                project_id,
+                DeleteProject {
+                    command_id: "delete-repository-files-route".to_owned(),
+                    actor: "local-user".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/{project_id}/repositories"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NOT_FOUND);
+
+        let unlinked = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!(
+                        "/api/v1/projects/{project_id}/repositories/{repository_id}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlinked.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -27,6 +27,7 @@ import {
   X,
 } from 'lucide-react'
 import { AgentChatWorkspace } from './AgentChatWorkspace'
+import { RepositoryFilesWorkspace } from './RepositoryFilesWorkspace'
 import {
   isTerminalWorkspaceMode,
   type AgentWorkspaceTarget,
@@ -47,6 +48,7 @@ import {
 import { groupRuntimeLensEntries, runtimeLensEntryKey, runtimeLensEntryLabel } from './runtimeLensTargets'
 import { useModalDialog } from './useModalDialog'
 import type {
+  Assignment,
   CoordinationNodeRoute,
   Project,
   RuntimeInventory,
@@ -247,6 +249,7 @@ function AgentWindowDetailsDialog({
 
 export function AgentWorkspaceShell({
   activeTarget,
+  assignments,
   inventory,
   inventoryCurrent,
   lensEntries,
@@ -254,6 +257,7 @@ export function AgentWorkspaceShell({
   onCoordinationChange,
   onCoordinationNodeChange,
   onModeChange,
+  onOpenProjectRepositories,
   onPresentationChange,
   onRefresh,
   onRecoverTarget,
@@ -268,6 +272,7 @@ export function AgentWorkspaceShell({
   coordinationRoutes,
 }: {
   activeTarget: AgentWorkspaceTarget | null
+  assignments: Assignment[]
   coordinationRoutes: CoordinationNodeRoute[]
   inventory: RuntimeInventory | null
   inventoryCurrent: boolean
@@ -276,6 +281,7 @@ export function AgentWorkspaceShell({
   onCoordinationChange: (route: YardOrchestratorRoute) => void
   onCoordinationNodeChange: (route: CoordinationNodeRoute) => void
   onModeChange: (mode: AgentWorkspaceView) => void
+  onOpenProjectRepositories: (projectId: string) => void
   onPresentationChange: (presentation: TerminalPresentation) => void
   onRefresh: () => void
   onRecoverTarget: (
@@ -866,7 +872,6 @@ export function AgentWorkspaceShell({
             </button>
             <button
               aria-selected={mode === 'changes'}
-              disabled={!activeTarget}
               onClick={() => onModeChange('changes')}
               role="tab"
               tabIndex={mode === 'changes' ? 0 : -1}
@@ -994,7 +999,7 @@ export function AgentWorkspaceShell({
             variant="workspace"
           />
         ) : null}
-        {!activeTarget ? (
+        {!activeTarget && mode !== 'changes' ? (
           <div className="agent-workspace-picker-state" role="status">
             {mode === 'chat' ? (
               <MessageSquareText aria-hidden="true" size={22} />
@@ -1070,27 +1075,14 @@ export function AgentWorkspaceShell({
             </small>
           </div>
         ) : null}
-        {activeTarget && mode === 'changes' ? (
-          <section
-            aria-label={"Files for " + activeTarget.label}
-            className="changes-workspace"
-          >
-            <header className="changes-workspace__header">
-              <GitBranch aria-hidden="true" size={14} />
-              <span>
-                <strong>Repository files</strong>
-                <small>{activeTarget.label}</small>
-              </span>
-            </header>
-            <div className="changes-workspace__state" role="status">
-              <strong>Repository browsing is not available yet</strong>
-              <span>
-                Yard no longer infers repository identity from terminal
-                directories. Repository-backed browsing will return in the next
-                slice.
-              </span>
-            </div>
-          </section>
+        {mode === 'changes' ? (
+          <RepositoryFilesWorkspace
+            activeTarget={activeTarget}
+            assignments={assignments}
+            label={activeTarget?.label ?? 'project repositories'}
+            onOpenProjectRepositories={onOpenProjectRepositories}
+            projects={projects}
+          />
         ) : null}
         {terminalVisible && activeTarget ? (
           <Suspense

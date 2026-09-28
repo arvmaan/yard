@@ -53,7 +53,13 @@ import type {
   PaneManagementPreview,
   Project,
   ProjectArchitecture,
+  ProjectRepositories,
+  ProjectRepository,
   Projects,
+  RepositoryDiff,
+  RepositoryFileContent,
+  RepositoryFileMode,
+  RepositoryFiles,
   ProvisionYardOrchestratorInput,
   RecoverYardOrchestratorInput,
   RecoveredYardOrchestrator,
@@ -78,6 +84,7 @@ import type {
   SendOrchestratorPromptInput,
   SendYardOrchestratorPromptInput,
   SendYardOrchestratorRouteInput,
+  SetProjectRepositoryInput,
   TerminalOutput,
   SummaryWorker,
   SummaryWorkers,
@@ -250,6 +257,100 @@ export function fetchProjectArchitecture(
 ): Promise<ProjectArchitecture> {
   return requestJson(
     `/api/v1/projects/${encodeURIComponent(projectId)}/architecture`,
+    { signal },
+  )
+}
+
+export function fetchProjectRepositories(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ProjectRepositories> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/repositories`,
+    { signal },
+  )
+}
+
+export function linkProjectRepository(
+  projectId: string,
+  repository: SetProjectRepositoryInput,
+  signal?: AbortSignal,
+): Promise<ProjectRepository> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/repositories`,
+    {
+      body: JSON.stringify(repository),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal,
+    },
+  )
+}
+
+export function relinkProjectRepository(
+  projectId: string,
+  repositoryId: string,
+  repository: SetProjectRepositoryInput,
+  signal?: AbortSignal,
+): Promise<ProjectRepository> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/repositories/${encodeURIComponent(repositoryId)}`,
+    {
+      body: JSON.stringify(repository),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'PUT',
+      signal,
+    },
+  )
+}
+
+export function unlinkProjectRepository(
+  projectId: string,
+  repositoryId: string,
+  signal?: AbortSignal,
+): Promise<ProjectRepository> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/repositories/${encodeURIComponent(repositoryId)}`,
+    { method: 'DELETE', signal },
+  )
+}
+
+export function fetchRepositoryFiles(
+  projectId: string,
+  repositoryId: string,
+  mode: RepositoryFileMode,
+  signal?: AbortSignal,
+): Promise<RepositoryFiles> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/repositories/${encodeURIComponent(repositoryId)}/files?mode=${mode}`,
+    { signal },
+  )
+}
+
+export function fetchRepositoryFileContent(
+  projectId: string,
+  repositoryId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<RepositoryFileContent> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/repositories/${encodeURIComponent(repositoryId)}/files/content?path=${encodeURIComponent(path)}`,
+    { signal },
+  )
+}
+
+export function fetchRepositoryDiff(
+  projectId: string,
+  repositoryId: string,
+  path: string,
+  previousPath?: string | null,
+  signal?: AbortSignal,
+): Promise<RepositoryDiff> {
+  const previous = previousPath
+    ? `&previous_path=${encodeURIComponent(previousPath)}`
+    : ''
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/repositories/${encodeURIComponent(repositoryId)}/diff?path=${encodeURIComponent(path)}${previous}`,
     { signal },
   )
 }

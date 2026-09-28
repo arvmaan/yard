@@ -4808,71 +4808,491 @@ html[data-yard-allocation-dragging="true"]
   background: var(--surface-muted);
 }
 
-.changes-workspace {
+.repository-files-workspace {
+  position: relative;
   display: grid;
-  height: 100%;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: 42px minmax(0, 1fr);
-  background: var(--paper);
+  grid-template-rows: auto minmax(0, 1fr);
+  background: var(--surface-muted);
+  color: var(--ink);
 }
 
-.changes-workspace__header {
+.repository-files-toolbar {
   display: grid;
   min-width: 0;
-  grid-template-columns: 20px minmax(0, 1fr);
-  align-items: center;
-  gap: 7px;
-  padding: 6px 10px;
+  grid-template-columns: minmax(130px, 1fr) minmax(130px, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+  padding: 7px 10px;
   border-bottom: 1px solid var(--line-strong);
   background: var(--paper);
 }
 
-.changes-workspace__header > svg {
-  color: var(--teal);
-}
-
-.changes-workspace__header > span {
+.repository-files-toolbar label,
+.repository-review-queue label {
   display: grid;
   min-width: 0;
-  gap: 1px;
+  gap: 2px;
+  color: var(--muted);
+  font: 8px/1.2 "IBM Plex Mono", monospace;
+  text-transform: uppercase;
 }
 
-.changes-workspace__header strong,
-.changes-workspace__header small {
+.repository-files-toolbar select,
+.repository-review-queue select {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--ink);
+  font: 10px "IBM Plex Sans Variable", sans-serif;
+}
+
+.repository-files-layout {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-columns: minmax(210px, 260px) minmax(0, 1fr);
+}
+
+.repository-files-list,
+.repository-file-pane {
+  min-width: 0;
+  min-height: 0;
   overflow: hidden;
+  background: var(--paper);
+}
+
+.repository-files-list {
+  display: grid;
+  grid-template-rows: 38px auto minmax(0, 1fr) 24px;
+  border-right: 1px solid var(--line-strong);
+}
+
+.repository-files-list > header,
+.repository-content > header,
+.repository-diff > header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--paper);
+}
+
+.repository-files-list > header > span,
+.repository-diff > header > span {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.repository-files-list > header strong {
+  font-size: 11px;
+}
+
+.repository-files-list > header small,
+.repository-files-list > footer,
+.repository-content > header small,
+.repository-diff > header small,
+.repository-diff > footer {
+  color: var(--muted);
+  font: 8px/1.2 "IBM Plex Mono", monospace;
+}
+
+.repository-files-list > footer,
+.repository-diff > footer {
+  padding: 6px 8px;
+  border-top: 1px solid var(--line);
+}
+
+.repository-files-filter {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) 24px;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--line);
+}
+
+.repository-files-filter input {
+  width: 100%;
+  min-width: 0;
+  height: 26px;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  outline: 0;
+  font: 10px "IBM Plex Mono", monospace;
+}
+
+.repository-files-list__rows {
+  min-width: 0;
+  overflow: auto;
+  outline: 0;
+}
+
+.repository-files-list__rows:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--blue);
+}
+
+.repository-files-list__rows > p {
+  margin: 0;
+  padding: 12px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.repository-tree-directory,
+.repository-file-row {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  padding-block: 5px;
+  padding-right: 7px;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+
+.repository-tree-directory {
+  grid-template-columns: 13px 13px minmax(0, 1fr);
+  font-size: 10px;
+}
+
+.repository-file-row {
+  grid-template-columns: 13px minmax(0, 1fr);
+}
+
+.repository-file-row small {
+  grid-column: 2;
+  overflow: hidden;
+  color: var(--muted);
+  font: 7px/1.2 "IBM Plex Mono", monospace;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.changes-workspace__header strong {
-  font-size: 11px;
+.repository-file-row span {
+  overflow: hidden;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.changes-workspace__header small {
-  color: var(--muted);
-  font: 8px/1.2 "IBM Plex Mono", monospace;
+.repository-tree-directory:hover,
+.repository-file-row:hover,
+.repository-file-row[aria-selected="true"] {
+  background: var(--blue-soft);
 }
-.changes-workspace__state {
+
+.repository-file-row[data-state="added"],
+.repository-file-row[data-state="untracked"] {
+  color: var(--green);
+}
+
+.repository-file-row[data-state="deleted"] {
+  color: var(--red);
+}
+
+.repository-file-row[data-state="renamed"] {
+  color: var(--blue);
+}
+
+.repository-file-pane {
+  overflow: auto;
+  background: var(--surface-muted);
+}
+
+.repository-files-empty {
   display: grid;
   min-width: 0;
+  min-height: 160px;
   place-content: center;
   justify-items: center;
-  gap: 5px;
+  gap: 6px;
   padding: 24px;
   color: var(--muted);
   text-align: center;
 }
 
-.changes-workspace__state strong {
+.repository-files-empty strong {
   color: var(--ink);
   font-size: 12px;
 }
 
-.changes-workspace__state span {
-  max-width: 480px;
+.repository-files-empty span {
+  max-width: 560px;
   overflow-wrap: anywhere;
   font: 9px/1.4 "IBM Plex Mono", monospace;
+}
+
+.repository-content,
+.repository-diff {
+  min-width: 0;
+  min-height: 100%;
+  background: var(--paper);
+}
+
+.repository-content > header,
+.repository-diff > header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.repository-content > header strong,
+.repository-diff > header strong {
+  font: 10px "IBM Plex Mono", monospace;
+}
+
+.repository-content ol {
+  min-width: max-content;
+  margin: 0;
+  padding: 10px 18px 24px 56px;
+  color: var(--muted);
+  font: 10px/1.55 "IBM Plex Mono", monospace;
+}
+
+.repository-content li {
+  padding-left: 10px;
+}
+
+.repository-content code {
+  color: var(--ink);
+  white-space: pre;
+}
+
+.repository-diff {
+  overflow: auto;
+  outline: 0;
+}
+
+.repository-diff-hunk {
+  min-width: max-content;
+  border-bottom: 1px solid var(--line-strong);
+}
+
+.repository-diff-hunk[data-selected="true"] {
+  box-shadow: inset 3px 0 0 var(--blue);
+}
+
+.repository-diff-hunk > header {
+  position: sticky;
+  top: 35px;
+  z-index: 1;
+  display: flex;
+  min-width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 8px 5px 12px;
+  background: var(--blue-soft);
+}
+
+.repository-diff-hunk > header code {
+  color: var(--blue);
+  font: 9px "IBM Plex Mono", monospace;
+}
+
+.repository-diff-line {
+  display: block;
+  width: 100%;
+  min-width: 100%;
+  padding: 1px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+  font: 10px/1.5 "IBM Plex Mono", monospace;
+  text-align: left;
+}
+
+.repository-diff-line code {
+  color: inherit;
+  white-space: pre;
+}
+
+.repository-diff-line:hover,
+.repository-diff-line:focus-visible {
+  box-shadow: inset 3px 0 var(--blue);
+}
+
+.repository-diff-line[data-kind="addition"] {
+  background: var(--green-soft);
+}
+
+.repository-diff-line[data-kind="deletion"] {
+  background: var(--red-soft);
+}
+
+.repository-comment-composer,
+.repository-review-queue {
+  position: absolute;
+  z-index: 4;
+  display: grid;
+  width: min(420px, calc(100% - 24px));
+  max-height: min(460px, calc(100% - 80px));
+  gap: 8px;
+  padding: 10px;
+  overflow: auto;
+  border: 1px solid var(--ink);
+  border-radius: 6px;
+  background: var(--paper);
+  box-shadow: var(--shadow-strong);
+}
+
+.repository-comment-composer {
+  right: 12px;
+  bottom: 12px;
+}
+
+.repository-review-queue {
+  left: 12px;
+  bottom: 12px;
+  width: min(360px, calc(100% - 24px));
+}
+
+.repository-comment-composer > header,
+.repository-review-queue > header,
+.repository-review-queue > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.repository-comment-composer pre {
+  max-height: 110px;
+  margin: 0;
+  overflow: auto;
+  padding: 7px;
+  background: var(--surface-muted);
+  font: 9px/1.4 "IBM Plex Mono", monospace;
+}
+
+.repository-comment-composer textarea {
+  min-height: 84px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 7px;
+  background: var(--paper);
+  color: var(--ink);
+  font: 10px/1.4 "IBM Plex Sans Variable", sans-serif;
+}
+
+.repository-review-queue > div {
+  padding: 5px 0;
+  border-bottom: 1px solid var(--line);
+  font: 9px "IBM Plex Mono", monospace;
+}
+
+.repository-review-receipt {
+  position: absolute;
+  right: 12px;
+  top: 54px;
+  z-index: 3;
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--green);
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--green);
+  font: 8px "IBM Plex Mono", monospace;
+}
+
+.project-repositories {
+  display: grid;
+  gap: 8px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  outline: 0;
+}
+
+.project-repositories:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--blue);
+}
+
+.project-repositories__heading,
+.project-repository__actions,
+.project-repository-form > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.project-repositories__heading p,
+.project-repositories__heading small {
+  margin: 0;
+}
+
+.project-repositories__heading small,
+.project-repository dt,
+.project-repository code {
+  color: var(--muted);
+  font: 8px/1.35 "IBM Plex Mono", monospace;
+}
+
+.project-repository {
+  display: grid;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-muted);
+}
+
+.project-repository dl,
+.project-repository dl > div,
+.project-repository-form,
+.project-repository-form label {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  margin: 0;
+}
+
+.project-repository dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.project-repository__actions,
+.project-repository-form > div {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+
+.project-repository-form label > span {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.project-repository-form input {
+  width: 100%;
+  min-width: 0;
+  height: 31px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--ink);
+  font: 9px "IBM Plex Mono", monospace;
 }
 
 .terminal-mode-loading {
@@ -6215,6 +6635,52 @@ html[data-yard-allocation-dragging="true"]
 }
 
 @media (max-width: 760px) {
+  .repository-files-toolbar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 5px;
+    padding: 5px 6px;
+  }
+
+  .repository-files-toolbar > .segmented-control {
+    grid-column: 1 / -1;
+    height: 28px;
+  }
+
+  .repository-files-layout {
+    grid-template:
+      "files" minmax(150px, 40%)
+      "pane" minmax(0, 1fr)
+      / minmax(0, 1fr);
+  }
+
+  .repository-files-list {
+    grid-area: files;
+    border-right: 0;
+    border-bottom: 1px solid var(--line-strong);
+  }
+
+  .repository-file-pane {
+    grid-area: pane;
+  }
+
+  .repository-comment-composer,
+  .repository-review-queue {
+    right: 6px;
+    bottom: 6px;
+    left: 6px;
+    width: auto;
+    max-height: calc(100% - 58px);
+  }
+
+  .repository-review-receipt {
+    top: 94px;
+    right: 6px;
+    left: 6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .agent-workspace-shell {
     inset: 46px 0 0;
     grid-template:
@@ -9251,6 +9717,10 @@ html[data-yard-allocation-dragging="true"]
 
   .global-workspace-switcher button {
     width: 25px;
+  }
+
+  .global-workspace-switcher__files {
+    display: none !important;
   }
 
   .agent-workspace-toolbar {

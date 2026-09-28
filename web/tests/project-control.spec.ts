@@ -32,6 +32,7 @@ import type {
   ObservedWorker,
   OrchestratorWorkflowProfile,
   ProjectArchitecture,
+  ProjectRepository,
   ProjectRelationship,
   ProvisionYardOrchestratorInput,
   RecoverYardOrchestratorInput,
@@ -509,6 +510,13 @@ interface MockState {
   projectRelationships: ProjectRelationship[]
   projects: ReturnType<typeof initialProjects>
   projectArchitectures: Record<string, ProjectArchitecture>
+  projectRepositories: Record<string, ProjectRepository[]>
+  repositoryMutations: Array<{
+    method: 'POST' | 'PUT' | 'DELETE'
+    projectId: string
+    repositoryId: string | null
+    rootPath: string | null
+  }>
   projectRequests: number
   projectDetailRequests: number
   projectOrchestratorCommands: ChangeProjectOrchestratorInput[]
@@ -827,6 +835,8 @@ async function mockApi(
     projectRelationships: [],
     projects: initialProjectState,
     projectArchitectures: initialArchitectures(),
+    projectRepositories: {},
+    repositoryMutations: [],
     projectRequests: 0,
     projectDetailRequests: 0,
     projectOrchestratorCommands: [],
@@ -1973,6 +1983,227 @@ async function mockApi(
     const architectureMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)\/architecture$/,
     )
+    const repositoryCollectionMatch = url.pathname.match(
+      /^\/api\/v1\/projects\/([^/]+)\/repositories$/,
+    )
+    const repositoryItemMatch = url.pathname.match(
+      /^\/api\/v1\/projects\/([^/]+)\/repositories\/([^/]+)$/,
+    )
+    const repositoryFilesMatch = url.pathname.match(
+      /^\/api\/v1\/projects\/([^/]+)\/repositories\/([^/]+)\/files$/,
+    )
+    const repositoryContentMatch = url.pathname.match(
+      /^\/api\/v1\/projects\/([^/]+)\/repositories\/([^/]+)\/files\/content$/,
+    )
+    const repositoryDiffMatch = url.pathname.match(
+      /^\/api\/v1\/projects\/([^/]+)\/repositories\/([^/]+)\/diff$/,
+    )
+
+    if (repositoryCollectionMatch && request.method() === 'GET') {
+      const projectId = decodeURIComponent(repositoryCollectionMatch[1])
+      await route.fulfill({
+        json: {
+          repositories: state.projectRepositories[projectId] ?? [],
+        },
+      })
+      return
+    }
+
+    if (repositoryCollectionMatch && request.method() === 'POST') {
+      const projectId = decodeURIComponent(repositoryCollectionMatch[1])
+      const input = request.postDataJSON() as { root_path: string }
+      const rootPath = input.root_path.replace(/\/+$/, '')
+      const repository: ProjectRepository = {
+        id: `repository-${projectId}-${(state.projectRepositories[projectId]?.length ?? 0) + 1}`,
+        project_id: projectId,
+        root_path: rootPath,
+        git_common_dir: `${rootPath}/.git`,
+        created_at_unix_ms: Date.now(),
+        updated_at_unix_ms: Date.now(),
+      }
+      state.projectRepositories[projectId] = [
+        ...(state.projectRepositories[projectId] ?? []),
+        repository,
+      ]
+      state.repositoryMutations.push({
+        method: 'POST',
+        projectId,
+        repositoryId: null,
+        rootPath: input.root_path,
+      })
+      await route.fulfill({ json: repository, status: 201 })
+      return
+    }
+
+    if (repositoryItemMatch && request.method() === 'PUT') {
+      const projectId = decodeURIComponent(repositoryItemMatch[1])
+      const repositoryId = decodeURIComponent(repositoryItemMatch[2])
+      const input = request.postDataJSON() as { root_path: string }
+      const current = state.projectRepositories[projectId]?.find(
+        (repository) => repository.id === repositoryId,
+      )
+      if (!current) {
+        await route.fulfill({ status: 404 })
+        return
+      }
+      const rootPath = input.root_path.replace(/\/+$/, '')
+      const repository = {
+        ...current,
+        root_path: rootPath,
+        git_common_dir: `${rootPath}/.git`,
+        updated_at_unix_ms: Date.now(),
+      }
+      state.projectRepositories[projectId] = (
+        state.projectRepositories[projectId] ?? []
+      ).map((candidate) =>
+        candidate.id === repositoryId ? repository : candidate,
+      )
+      state.repositoryMutations.push({
+        method: 'PUT',
+        projectId,
+        repositoryId,
+        rootPath: input.root_path,
+      })
+      await route.fulfill({ json: repository })
+      return
+    }
+
+    if (repositoryItemMatch && request.method() === 'DELETE') {
+      const projectId = decodeURIComponent(repositoryItemMatch[1])
+      const repositoryId = decodeURIComponent(repositoryItemMatch[2])
+      const current = state.projectRepositories[projectId]?.find(
+        (repository) => repository.id === repositoryId,
+      )
+      if (!current) {
+        await route.fulfill({ status: 404 })
+        return
+      }
+      state.projectRepositories[projectId] = (
+        state.projectRepositories[projectId] ?? []
+      ).filter((repository) => repository.id !== repositoryId)
+      state.repositoryMutations.push({
+        method: 'DELETE',
+        projectId,
+        repositoryId,
+        rootPath: null,
+      })
+      await route.fulfill({ json: current })
+      return
+    }
+
+    if (repositoryFilesMatch && request.method() === 'GET') {
+      const repositoryId = decodeURIComponent(repositoryFilesMatch[2])
+      const mode = url.searchParams.get('mode')
+      const repository = Object.values(state.projectRepositories)
+        .flat()
+        .find((candidate) => candidate.id === repositoryId)
+      if (!repository) {
+        await route.fulfill({ status: 404 })
+        return
+      }
+      await route.fulfill({
+        json: {
+          repository_id: repositoryId,
+          root_path: repository.root_path,
+          mode,
+          truncated: false,
+          files:
+            mode === 'review'
+              ? [
+                  {
+                    path: 'src/app.ts',
+                    previous_path: null,
+                    state: 'modified',
+                    staged: true,
+                    unstaged: true,
+                    additions: null,
+                    deletions: null,
+                  },
+                ]
+              : [
+                  {
+                    path: 'README.md',
+                    previous_path: null,
+                    state: 'tracked',
+                    staged: false,
+                    unstaged: false,
+                    additions: null,
+                    deletions: null,
+                  },
+                  {
+                    path: 'src/app.ts',
+                    previous_path: null,
+                    state: 'tracked',
+                    staged: false,
+                    unstaged: false,
+                    additions: null,
+                    deletions: null,
+                  },
+                ],
+        },
+      })
+      return
+    }
+
+    if (repositoryContentMatch && request.method() === 'GET') {
+      const repositoryId = decodeURIComponent(repositoryContentMatch[2])
+      const repository = Object.values(state.projectRepositories)
+        .flat()
+        .find((candidate) => candidate.id === repositoryId)
+      await route.fulfill({
+        json: {
+          repository_id: repositoryId,
+          root_path: repository?.root_path ?? '',
+          path: url.searchParams.get('path'),
+          content: '# API migration\n\nRepository review stays in Yard.\n',
+          binary: false,
+          truncated: false,
+          unavailable: false,
+        },
+      })
+      return
+    }
+
+    if (repositoryDiffMatch && request.method() === 'GET') {
+      const repositoryId = decodeURIComponent(repositoryDiffMatch[2])
+      const repository = Object.values(state.projectRepositories)
+        .flat()
+        .find((candidate) => candidate.id === repositoryId)
+      await route.fulfill({
+        json: {
+          repository_id: repositoryId,
+          root_path: repository?.root_path ?? '',
+          path: url.searchParams.get('path'),
+          previous_path: null,
+          binary: false,
+          truncated: false,
+          unavailable: false,
+          hunks: [
+            {
+              old_start: 10,
+              old_lines: 2,
+              new_start: 10,
+              new_lines: 2,
+              lines: [
+                {
+                  kind: 'deletion',
+                  old_line: 10,
+                  new_line: null,
+                  content: 'return oldValue',
+                },
+                {
+                  kind: 'addition',
+                  old_line: null,
+                  new_line: 10,
+                  content: 'return reviewedValue',
+                },
+              ],
+            },
+          ],
+        },
+      })
+      return
+    }
 
     if (architectureMatch && request.method() === 'GET') {
       const projectId = decodeURIComponent(architectureMatch[1])
@@ -4870,7 +5101,10 @@ test('shows only actionable conditional chrome and routes attention to workers',
   await page.goto('/')
 
   const commandBar = page.locator('.command-bar')
-  await expect(commandBar.getByRole('tab')).toHaveCount(3)
+  await expect(commandBar.getByRole('tab')).toHaveCount(4)
+  await expect(
+    commandBar.getByRole('tab', { name: 'Files view' }),
+  ).toBeVisible()
   await expect(
     commandBar.getByRole('tab', { name: 'Map view' }),
   ).toHaveAttribute('aria-selected', 'true')
@@ -9030,30 +9264,49 @@ test('recovers a stopped dedicated Superintendent session without replacing it',
   )
 })
 
-test('keeps the CWD-derived file browser unavailable', async ({
+test('links, browses, reviews, comments, and unlinks a repository in Yard', async ({
   page,
 }, testInfo) => {
   const state = await mockApi(page)
-  seedActiveAssignment(state)
-  await page.setViewportSize({ width: 1280, height: 800 })
+  const seeded = seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1440, height: 900 })
   await page.goto('/')
 
-  await page.locator('.assigned-worker-marker').click()
-  await page.getByRole('button', { name: 'Open chat', exact: true }).click()
-  await page.getByRole('tab', { name: 'Files', exact: true }).click()
+  await page
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
+  const repositories = page.getByLabel('Project repositories')
+  await expect(repositories).toBeVisible()
+  await repositories
+    .getByLabel('Absolute checkout path')
+    .fill('/tmp/yard/repository-files')
+  await repositories
+    .getByRole('button', { name: 'Link repository' })
+    .click()
+  await expect(repositories).toContainText('/tmp/yard/repository-files')
+  await expect(repositories).toContainText(
+    '/tmp/yard/repository-files/.git',
+  )
+  expect(state.repositoryMutations[0]).toMatchObject({
+    method: 'POST',
+    projectId: 'project-1',
+    rootPath: '/tmp/yard/repository-files',
+  })
 
-  const filesWorkspace = page.getByLabel('Files for Implementer')
+  await page.getByRole('tab', { name: 'Files view' }).click()
+  const filesWorkspace = page.getByRole('region', {
+    name: 'Repository files',
+  })
   await expect(filesWorkspace).toBeVisible()
-  await expect(filesWorkspace).toContainText(
-    'Repository browsing is not available yet',
+  await expect(filesWorkspace.getByLabel('Files project')).toHaveValue(
+    'project-1',
   )
+  await filesWorkspace
+    .getByRole('option', { name: /README\.md/ })
+    .click()
   await expect(filesWorkspace).toContainText(
-    'Yard no longer infers repository identity from terminal directories.',
+    'Repository review stays in Yard.',
   )
-  await expect(filesWorkspace.getByLabel('Repository directory')).toHaveCount(0)
-  await expect(
-    filesWorkspace.getByRole('button', { name: 'Browse' }),
-  ).toHaveCount(0)
   expect(
     await page.evaluate(() =>
       Object.keys(window.localStorage).filter((key) =>
@@ -9061,8 +9314,43 @@ test('keeps the CWD-derived file browser unavailable', async ({
       ),
     ),
   ).toEqual([])
+
+  await filesWorkspace
+    .getByRole('button', { name: 'Review', exact: true })
+    .click()
+  await filesWorkspace
+    .getByRole('option', { name: /app\.ts/ })
+    .click()
+  await expect(filesWorkspace).toContainText('return reviewedValue')
+  await filesWorkspace
+    .getByRole('button', { name: 'Comment on line 10' })
+    .first()
+    .click()
+  await page
+    .getByRole('textbox', { name: 'Review comment' })
+    .fill('Keep the reviewed value bounded.')
+  await page.getByRole('button', { name: 'Queue comment' }).click()
+  await expect(page.getByLabel('Queued review comments')).toContainText(
+    'src/app.ts:10',
+  )
+  await page.getByRole('button', { name: 'Send review' }).click()
+  await expect(page.getByText(/Sent via prompt acknowledgement/)).toBeVisible()
+  expect(state.promptCommands).toHaveLength(1)
+  expect(state.promptCommands[0]).toMatchObject({
+    actor: 'local-user',
+    attempt_id: seeded.attempt.id,
+    expected_assignment_version: seeded.version,
+    expected_attempt_version: seeded.attempt.version,
+  })
+  expect(state.promptCommands[0].text).toContain(
+    'Repository: /tmp/yard/repository-files [repository-project-1-1]',
+  )
+  expect(state.promptCommands[0].text).toContain(
+    'Keep the reviewed value bounded.',
+  )
+
   await page.screenshot({
-    path: testInfo.outputPath('repository-files-unavailable-desktop.png'),
+    path: testInfo.outputPath('repository-files-desktop.png'),
     fullPage: true,
   })
 
@@ -9074,8 +9362,26 @@ test('keeps the CWD-derived file browser unavailable', async ({
     ),
   ).toBeLessThanOrEqual(0)
   await page.screenshot({
-    path: testInfo.outputPath('repository-files-unavailable-mobile.png'),
+    path: testInfo.outputPath('repository-files-mobile.png'),
     fullPage: true,
+  })
+
+  await page.getByRole('tab', { name: 'Map view' }).click()
+  await page
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
+  page.once('dialog', (dialog) => dialog.accept())
+  await page
+    .getByLabel('Project repositories')
+    .getByRole('button', { name: 'Unlink' })
+    .click()
+  await expect(page.getByLabel('Project repositories')).not.toContainText(
+    '/tmp/yard/repository-files',
+  )
+  expect(state.repositoryMutations.at(-1)).toMatchObject({
+    method: 'DELETE',
+    projectId: 'project-1',
+    repositoryId: 'repository-project-1-1',
   })
 })
 
@@ -10393,6 +10699,9 @@ test('persists independent automatic token-use settings while keeping manual act
     fullPage: true,
   })
   await page.setViewportSize({ width: 320, height: 844 })
+  await expect(
+    page.getByRole('tab', { name: 'Files view' }),
+  ).toHaveCount(0)
   const commandBarLayout = await page.locator('.command-bar').evaluate((bar) => {
     const bounds = bar.getBoundingClientRect()
     return {

@@ -115,3 +115,27 @@ Browse, Review, assignment feedback, desktop, and mobile.
 - Eager patch generation or per-file Git subprocesses.
 - A parallel review comment or message history.
 - Multiple competing file/review surfaces.
+
+## Implementation status
+
+Implemented in the repository-files slice:
+
+- direct project repository link, list, relink, and unlink routes plus project
+  inspector controls;
+- bounded Browse and Review metadata, lazy numbered text content, and structured
+  diff hunks in the existing Files surface;
+- fail-closed selected reads with repository identity revalidation, contained
+  relative paths, hardened bounded Git subprocesses, and explicit binary,
+  oversized, deleted, renamed, untracked, staged, unstaged, and unborn states;
+- keyboard navigation, fuzzy filtering, project/repository picking, and batched
+  review feedback through the existing assignment prompt acknowledgement;
+- route, service, unit/performance, desktop, and mobile regression coverage.
+
+Deferred:
+
+- syntax highlighting remains plain monospace to avoid adding and eagerly
+  loading a new dependency;
+- per-file addition/deletion counts remain absent because computing them would
+  spend another Git subprocess outside the metadata-list budget;
+- runtime CWD suggestions remain absent; durable project repository
+  associations are the only selection and authorization source.
