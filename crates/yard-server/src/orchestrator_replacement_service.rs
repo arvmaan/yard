@@ -8,8 +8,9 @@ use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 use yard_domain::{
-    ObservedWorker, Project, ReplaceProjectOrchestrator, ReplacedProjectOrchestrator,
-    RuntimeInventory, RuntimeObservationState, RuntimeProcessState, WorkerRuntimeBinding,
+    ObservedWorker, Project, ProjectRuntimeBinding, ReplaceProjectOrchestrator,
+    ReplacedProjectOrchestrator, RuntimeInventory, RuntimeObservationState, RuntimeProcessState,
+    WorkerRuntimeBinding,
 };
 use yard_store::{
     BeginProjectOrchestratorReplacement, OrchestratorReplacementPrepareIntent,
@@ -795,138 +796,16 @@ impl OrchestratorReplacementService {
         project: &Project,
         expected: &WorkerRuntimeBinding,
     ) -> Result<String, OrchestratorReplacementServiceError> {
-        if project.runtime.adapter != expected.adapter
-            || project.runtime.session != expected.session
-            || project.runtime.workspace_id != expected.workspace_id
-        {
-            return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged);
-        }
         let inventory = self.source.inventory(&project.runtime.session).await?;
-        if inventory.adapter != project.runtime.adapter
-            || inventory.session != project.runtime.session
-        {
-            return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged);
-        }
-        let workspace = inventory
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.runtime_id == project.runtime.workspace_id)
-            .ok_or_else(|| {
-                OrchestratorReplacementServiceError::RuntimeWorkspaceMissing(
-                    project.runtime.workspace_id.clone(),
-                )
-            })?;
-        let observed_worker = inventory.workers.iter().find(|worker| {
-            worker.terminal_id == expected.terminal_id
-                || expected
-                    .provider_session
-                    .as_ref()
-                    .is_some_and(|provider| worker.provider_session.as_ref() == Some(provider))
-        });
-        if let Some(observed) = observed_worker {
-            if observed.workspace_id != project.runtime.workspace_id
-                || observed.pane_id != expected.pane_id
-                || Some(observed.tab_id.as_str()) != expected.tab_id.as_deref()
-                || matches!(
-                    (
-                        expected.provider_session.as_ref(),
-                        observed.provider_session.as_ref()
-                    ),
-                    (Some(expected), observed) if observed != Some(expected)
-                )
-                || !observed.interactive_ready
-            {
-                return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged);
-            }
-            return workspace
-                .worktree
-                .as_ref()
-                .map(|worktree| worktree.checkout_path.clone())
-                .or_else(|| {
-                    observed
-                        .foreground_cwd
-                        .clone()
-                        .or_else(|| observed.cwd.clone())
-                })
-                .ok_or(OrchestratorReplacementServiceError::RuntimeCwdUnavailable);
-        }
-
-        let restored_panes = inventory
-            .panes
-            .iter()
-            .filter(|pane| {
-                expected.provider_session.is_none()
-                    && pane.workspace_id == project.runtime.workspace_id
-                    && pane.runtime_id == expected.pane_id
-                    && Some(pane.tab_id.as_str()) == expected.tab_id.as_deref()
-                    && pane.provider_session.is_none()
-                    && !inventory
-                        .workers
-                        .iter()
-                        .any(|worker| worker.pane_id == pane.runtime_id)
-            })
-            .collect::<Vec<_>>();
-        let [restored] = restored_panes.as_slice() else {
-            return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged);
-        };
-        workspace
-            .worktree
-            .as_ref()
-            .map(|worktree| worktree.checkout_path.clone())
-            .or_else(|| {
-                restored
-                    .foreground_cwd
-                    .clone()
-                    .or_else(|| restored.cwd.clone())
-            })
-            .ok_or(OrchestratorReplacementServiceError::RuntimeCwdUnavailable)
+        displaced_runtime_cwd(&project.runtime, expected, &inventory)
     }
 
     async fn verify_replacement_runtime(
         &self,
-        mut runtime: WorkerRuntimeBinding,
+        runtime: WorkerRuntimeBinding,
     ) -> Result<WorkerRuntimeBinding, OrchestratorReplacementServiceError> {
         let inventory = self.source.inventory(&runtime.session).await?;
-        if inventory.adapter != runtime.adapter
-            || inventory.session != runtime.session
-            || !inventory
-                .workspaces
-                .iter()
-                .any(|workspace| workspace.runtime_id == runtime.workspace_id)
-        {
-            return Err(OrchestratorReplacementServiceError::ReplacementUnverified);
-        }
-        let observed = inventory
-            .workers
-            .iter()
-            .find(|worker| worker.terminal_id == runtime.terminal_id)
-            .ok_or(OrchestratorReplacementServiceError::ReplacementUnverified)?;
-        if observed.workspace_id != runtime.workspace_id
-            || observed.pane_id != runtime.pane_id
-            || Some(observed.tab_id.as_str()) != runtime.tab_id.as_deref()
-            || !observed.interactive_ready
-        {
-            return Err(OrchestratorReplacementServiceError::ReplacementUnverified);
-        }
-        let provider_session = observed
-            .provider_session
-            .clone()
-            .ok_or(OrchestratorReplacementServiceError::ReplacementUnverified)?;
-        if runtime
-            .provider_session
-            .as_ref()
-            .is_some_and(|expected| expected != &provider_session)
-        {
-            return Err(OrchestratorReplacementServiceError::ReplacementUnverified);
-        }
-        runtime.provider_session = Some(provider_session);
-        runtime.observation_state = RuntimeObservationState::Observed;
-        runtime.process_state = RuntimeProcessState::Running;
-        runtime.status = observed.status;
-        runtime.state_change_sequence = observed.state_change_sequence;
-        runtime.revision = observed.revision;
-        runtime.last_observed_at_unix_ms = inventory.observed_at_unix_ms;
-        Ok(runtime)
+        verified_replacement_runtime(runtime, &inventory)
     }
 
     async fn reconcile_after_ambiguous_failure(
@@ -988,6 +867,317 @@ impl OrchestratorReplacementService {
             }
         }
     }
+}
+
+fn displaced_runtime_cwd(
+    project: &ProjectRuntimeBinding,
+    expected: &WorkerRuntimeBinding,
+    inventory: &RuntimeInventory,
+) -> Result<String, OrchestratorReplacementServiceError> {
+    if project.adapter != expected.adapter
+        || project.session != expected.session
+        || project.workspace_id != expected.workspace_id
+    {
+        return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+            "the saved orchestrator binding does not belong to the project's durable runtime workspace"
+                .to_owned(),
+        ));
+    }
+    if inventory.adapter != project.adapter || inventory.session != project.session {
+        return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+            "the inventory adapter or session does not match the project's durable runtime binding"
+                .to_owned(),
+        ));
+    }
+    if inventory.observed_at_unix_ms < expected.last_observed_at_unix_ms {
+        return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+            "the runtime inventory is older than the saved orchestrator binding".to_owned(),
+        ));
+    }
+
+    let workspaces = inventory
+        .workspaces
+        .iter()
+        .filter(|workspace| workspace.runtime_id == project.workspace_id)
+        .collect::<Vec<_>>();
+    let [workspace] = workspaces.as_slice() else {
+        if workspaces.is_empty() {
+            return Err(
+                OrchestratorReplacementServiceError::RuntimeWorkspaceMissing(
+                    project.workspace_id.clone(),
+                ),
+            );
+        }
+        return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+            "the project's durable workspace is ambiguous in fresh inventory".to_owned(),
+        ));
+    };
+    let workspace_cwd = workspace
+        .worktree
+        .as_ref()
+        .map(|worktree| worktree.checkout_path.clone());
+
+    let Some(provider_session) = expected.provider_session.as_ref() else {
+        return providerless_displaced_runtime_cwd(expected, inventory, workspace_cwd.as_deref());
+    };
+    provider_displaced_runtime_cwd(expected, inventory, workspace_cwd, provider_session)
+}
+
+fn provider_displaced_runtime_cwd(
+    expected: &WorkerRuntimeBinding,
+    inventory: &RuntimeInventory,
+    workspace_cwd: Option<String>,
+    provider_session: &yard_domain::ProviderSessionRef,
+) -> Result<String, OrchestratorReplacementServiceError> {
+    let provider_workers = inventory
+        .workers
+        .iter()
+        .filter(|worker| worker.provider_session.as_ref() == Some(provider_session))
+        .collect::<Vec<_>>();
+    let provider_panes = inventory
+        .panes
+        .iter()
+        .filter(|pane| pane.provider_session.as_ref() == Some(provider_session))
+        .collect::<Vec<_>>();
+    if provider_workers.len() > 1 || provider_panes.len() > 1 {
+        return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+            "the expected provider identity is observed more than once".to_owned(),
+        ));
+    }
+    if let Some(worker) = provider_workers.first() {
+        if !worker_matches_capture(worker, expected)
+            || provider_panes
+                .first()
+                .is_some_and(|pane| !pane_matches_capture(pane, expected))
+            || inventory.workers.iter().any(|other| {
+                other.provider_session.as_ref() != Some(provider_session)
+                    && worker_or_capture_topology_overlaps(other, expected)
+            })
+            || inventory.panes.iter().any(|pane| {
+                pane_or_capture_topology_overlaps(pane, expected)
+                    && pane.provider_session.as_ref() != Some(provider_session)
+                    && !(pane.provider_session.is_none() && pane_matches_capture(pane, expected))
+            })
+            || !worker.interactive_ready
+        {
+            return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+                "the expected provider identity is present with mismatched, duplicated, or non-interactive topology"
+                    .to_owned(),
+            ));
+        }
+        return workspace_cwd
+            .or_else(|| worker.foreground_cwd.clone().or_else(|| worker.cwd.clone()))
+            .ok_or_else(|| {
+                OrchestratorReplacementServiceError::RuntimeCwdUnavailable(
+                    "the exact displaced orchestrator and project workspace have no usable working directory"
+                        .to_owned(),
+                )
+            });
+    }
+    if !provider_panes.is_empty() {
+        return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+            "the expected provider identity remains on a pane without an interactive worker"
+                .to_owned(),
+        ));
+    }
+    if inventory.observed_at_unix_ms <= expected.last_observed_at_unix_ms {
+        return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+            "the expected provider identity is absent, but the inventory observation is not newer than the saved binding"
+                .to_owned(),
+        ));
+    }
+    if !captured_topology_is_absent_or_explicitly_reused(inventory, expected, provider_session) {
+        return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+            "the expected provider identity is absent, but captured topology is occupied without a distinct provider identity"
+                .to_owned(),
+        ));
+    }
+
+    workspace_cwd.ok_or_else(|| {
+        OrchestratorReplacementServiceError::RuntimeCwdUnavailable(
+            "the expected displaced provider identity is absent from fresh inventory, but the project workspace has no worktree checkout; replacement refused to borrow a reused pane or worker working directory"
+                .to_owned(),
+        )
+    })
+}
+
+fn verified_replacement_runtime(
+    mut runtime: WorkerRuntimeBinding,
+    inventory: &RuntimeInventory,
+) -> Result<WorkerRuntimeBinding, OrchestratorReplacementServiceError> {
+    if inventory.adapter != runtime.adapter
+        || inventory.session != runtime.session
+        || inventory.observed_at_unix_ms < runtime.last_observed_at_unix_ms
+        || inventory
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.runtime_id == runtime.workspace_id)
+            .count()
+            != 1
+    {
+        return Err(OrchestratorReplacementServiceError::ReplacementUnverified);
+    }
+    let observed = inventory
+        .workers
+        .iter()
+        .filter(|worker| {
+            worker.terminal_id == runtime.terminal_id
+                || runtime
+                    .provider_session
+                    .as_ref()
+                    .is_some_and(|provider| worker.provider_session.as_ref() == Some(provider))
+        })
+        .collect::<Vec<_>>();
+    let [observed] = observed.as_slice() else {
+        return Err(OrchestratorReplacementServiceError::ReplacementUnverified);
+    };
+    if !worker_matches_capture(observed, &runtime) || !observed.interactive_ready {
+        return Err(OrchestratorReplacementServiceError::ReplacementUnverified);
+    }
+    let provider_session = observed
+        .provider_session
+        .clone()
+        .ok_or(OrchestratorReplacementServiceError::ReplacementUnverified)?;
+    if runtime
+        .provider_session
+        .as_ref()
+        .is_some_and(|expected| expected != &provider_session)
+    {
+        return Err(OrchestratorReplacementServiceError::ReplacementUnverified);
+    }
+    runtime.provider_session = Some(provider_session);
+    runtime.observation_state = RuntimeObservationState::Observed;
+    runtime.process_state = RuntimeProcessState::Running;
+    runtime.status = observed.status;
+    runtime.state_change_sequence = observed.state_change_sequence;
+    runtime.revision = observed.revision;
+    runtime.last_observed_at_unix_ms = inventory.observed_at_unix_ms;
+    Ok(runtime)
+}
+
+fn providerless_displaced_runtime_cwd(
+    expected: &WorkerRuntimeBinding,
+    inventory: &RuntimeInventory,
+    workspace_cwd: Option<&str>,
+) -> Result<String, OrchestratorReplacementServiceError> {
+    let terminal_workers = inventory
+        .workers
+        .iter()
+        .filter(|worker| worker.terminal_id == expected.terminal_id)
+        .collect::<Vec<_>>();
+    if terminal_workers.len() > 1 {
+        return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+            "the providerless displaced terminal identity is observed more than once".to_owned(),
+        ));
+    }
+    if let Some(worker) = terminal_workers.first() {
+        if worker.provider_session.is_some()
+            || !worker_matches_capture(worker, expected)
+            || !worker.interactive_ready
+        {
+            return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+                "the providerless displaced runtime is present with mismatched or non-interactive topology"
+                    .to_owned(),
+            ));
+        }
+        return workspace_cwd
+            .map(str::to_owned)
+            .or_else(|| worker.foreground_cwd.clone().or_else(|| worker.cwd.clone()))
+            .ok_or_else(|| {
+                OrchestratorReplacementServiceError::RuntimeCwdUnavailable(
+                    "the exact providerless displaced orchestrator and project workspace have no usable working directory"
+                        .to_owned(),
+                )
+            });
+    }
+
+    let restored_panes = inventory
+        .panes
+        .iter()
+        .filter(|pane| {
+            pane.workspace_id == expected.workspace_id
+                && pane.runtime_id == expected.pane_id
+                && Some(pane.tab_id.as_str()) == expected.tab_id.as_deref()
+                && pane.provider_session.is_none()
+                && !inventory
+                    .workers
+                    .iter()
+                    .any(|worker| worker.pane_id == pane.runtime_id)
+        })
+        .collect::<Vec<_>>();
+    let [restored] = restored_panes.as_slice() else {
+        return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+            "the providerless displaced topology is absent, reused, or ambiguous".to_owned(),
+        ));
+    };
+    workspace_cwd
+        .map(str::to_owned)
+        .or_else(|| {
+            pane_matches_capture(restored, expected)
+                .then(|| {
+                    restored
+                        .foreground_cwd
+                        .clone()
+                        .or_else(|| restored.cwd.clone())
+                })
+                .flatten()
+        })
+        .ok_or_else(|| {
+            OrchestratorReplacementServiceError::RuntimeCwdUnavailable(
+                "the restored providerless pane is not the exact saved terminal identity and the project workspace has no worktree checkout"
+                    .to_owned(),
+            )
+        })
+}
+
+fn worker_or_capture_topology_overlaps(
+    worker: &ObservedWorker,
+    capture: &WorkerRuntimeBinding,
+) -> bool {
+    worker.terminal_id == capture.terminal_id
+        || worker.pane_id == capture.pane_id
+        || capture
+            .tab_id
+            .as_deref()
+            .is_some_and(|tab_id| worker.tab_id == tab_id)
+}
+
+fn pane_or_capture_topology_overlaps(
+    pane: &yard_domain::PaneObservation,
+    capture: &WorkerRuntimeBinding,
+) -> bool {
+    pane.terminal_id == capture.terminal_id
+        || pane.runtime_id == capture.pane_id
+        || capture
+            .tab_id
+            .as_deref()
+            .is_some_and(|tab_id| pane.tab_id == tab_id)
+}
+
+fn captured_topology_is_absent_or_explicitly_reused(
+    inventory: &RuntimeInventory,
+    capture: &WorkerRuntimeBinding,
+    expected_provider: &yard_domain::ProviderSessionRef,
+) -> bool {
+    inventory
+        .workers
+        .iter()
+        .filter(|worker| worker_or_capture_topology_overlaps(worker, capture))
+        .all(|worker| {
+            worker
+                .provider_session
+                .as_ref()
+                .is_some_and(|provider| provider != expected_provider)
+        })
+        && inventory
+            .panes
+            .iter()
+            .filter(|pane| pane_or_capture_topology_overlaps(pane, capture))
+            .all(|pane| {
+                pane.provider_session
+                    .as_ref()
+                    .is_some_and(|provider| provider != expected_provider)
+            })
 }
 
 async fn replacement_recovery_inventory(
@@ -1450,10 +1640,10 @@ pub enum OrchestratorReplacementServiceError {
     UnsupportedProfile(String),
     #[error("the project-bound runtime workspace '{0}' is not currently observed")]
     RuntimeWorkspaceMissing(String),
-    #[error("the project workspace has no usable working directory")]
-    RuntimeCwdUnavailable,
-    #[error("the displaced orchestrator provider or topology identity changed")]
-    RuntimeIdentityChanged,
+    #[error("{0}")]
+    RuntimeCwdUnavailable(String),
+    #[error("the displaced orchestrator runtime identity conflicts with fresh inventory: {0}")]
+    RuntimeIdentityChanged(String),
     #[error("Herdr replacement provisioning failed: {0}")]
     RuntimeProvision(String),
     #[error("Herdr replacement provisioning outcome is ambiguous: {0}")]
@@ -1483,7 +1673,7 @@ mod tests {
         ObservedWorker, OldSessionDisposition, PaneObservation, ProjectRuntimeBinding,
         ProviderSessionRef, ReplaceProjectOrchestrator, RuntimeInventory, RuntimeObservationState,
         RuntimeProcessState, RuntimeSession, RuntimeSessions, TabObservation, WorkerProfileSpec,
-        WorkerRuntimeBinding, WorkspaceObservation,
+        WorkerRuntimeBinding, WorkspaceObservation, WorktreeObservation,
     };
     use yard_store::{
         BeginProjectOrchestratorReplacement, OrchestratorReplacementPrepareIntent,
@@ -1492,8 +1682,9 @@ mod tests {
     };
 
     use super::{
-        CaptureResolution, OrchestratorReplacementService, PrepareIntentResolution,
-        STRANDED_PENDING_MESSAGE, resolve_prepare_intent, resolve_replacement_capture,
+        CaptureResolution, OrchestratorReplacementService, OrchestratorReplacementServiceError,
+        PrepareIntentResolution, STRANDED_PENDING_MESSAGE, displaced_runtime_cwd,
+        resolve_prepare_intent, resolve_replacement_capture, verified_replacement_runtime,
     };
     use crate::{
         allocation_service::{
@@ -1601,6 +1792,258 @@ mod tests {
             workers,
             child_agents: Vec::new(),
         }
+    }
+
+    fn project_runtime() -> ProjectRuntimeBinding {
+        ProjectRuntimeBinding {
+            adapter: "herdr".to_owned(),
+            session: "default".to_owned(),
+            workspace_id: "workspace-1".to_owned(),
+        }
+    }
+
+    fn with_worktree(mut inventory: RuntimeInventory) -> RuntimeInventory {
+        inventory.workspaces[0].worktree = Some(WorktreeObservation {
+            repository_key: "project".to_owned(),
+            repository_name: "project".to_owned(),
+            repository_root: "/tmp/project".to_owned(),
+            checkout_path: "/tmp/project-worktree".to_owned(),
+            is_linked: true,
+        });
+        inventory
+    }
+
+    #[test]
+    fn exact_live_displaced_provider_uses_exact_worker_cwd() {
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+
+        assert_eq!(
+            displaced_runtime_cwd(
+                &project_runtime(),
+                &expected,
+                &inventory(vec![observed_worker(&expected)]),
+            )
+            .unwrap(),
+            "/tmp/project"
+        );
+    }
+
+    #[test]
+    fn absent_displaced_provider_with_reused_topology_uses_workspace_worktree() {
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+        let mut reused = expected.clone();
+        reused.terminal_id = "terminal-reused".to_owned();
+        reused.provider_session = Some(provider_session("provider-reused"));
+        let mut reused = observed_worker(&reused);
+        reused.cwd = Some("/tmp/reused-occupant".to_owned());
+        reused.foreground_cwd = Some("/tmp/reused-occupant".to_owned());
+
+        assert_eq!(
+            displaced_runtime_cwd(
+                &project_runtime(),
+                &expected,
+                &with_worktree(inventory(vec![reused])),
+            )
+            .unwrap(),
+            "/tmp/project-worktree"
+        );
+    }
+
+    #[test]
+    fn absent_displaced_provider_without_topology_uses_workspace_worktree() {
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+
+        assert_eq!(
+            displaced_runtime_cwd(
+                &project_runtime(),
+                &expected,
+                &with_worktree(inventory(Vec::new())),
+            )
+            .unwrap(),
+            "/tmp/project-worktree"
+        );
+    }
+
+    #[test]
+    fn absent_displaced_provider_rejects_providerless_topology_reuse() {
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+        let mut unknown = expected.clone();
+        unknown.provider_session = None;
+
+        assert!(matches!(
+            displaced_runtime_cwd(
+                &project_runtime(),
+                &expected,
+                &with_worktree(inventory(vec![observed_worker(&unknown)])),
+            ),
+            Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+                _
+            ))
+        ));
+    }
+
+    #[test]
+    fn displaced_provider_present_on_wrong_pane_is_rejected() {
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+        let mut moved = expected.clone();
+        moved.pane_id = "pane-other".to_owned();
+
+        assert!(matches!(
+            displaced_runtime_cwd(
+                &project_runtime(),
+                &expected,
+                &with_worktree(inventory(vec![observed_worker(&moved)])),
+            ),
+            Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+                _
+            ))
+        ));
+    }
+
+    #[test]
+    fn reused_topology_without_workspace_cwd_refuses_occupant_cwd() {
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+        let mut reused = expected.clone();
+        reused.provider_session = Some(provider_session("provider-reused"));
+        let mut reused = observed_worker(&reused);
+        reused.cwd = Some("/tmp/reused-occupant".to_owned());
+        reused.foreground_cwd = Some("/tmp/reused-occupant".to_owned());
+
+        let error = displaced_runtime_cwd(&project_runtime(), &expected, &inventory(vec![reused]))
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            OrchestratorReplacementServiceError::RuntimeCwdUnavailable(_)
+        ));
+        assert!(error.to_string().contains("refused to borrow"));
+    }
+
+    #[test]
+    fn displaced_runtime_verification_rejects_duplicate_stale_and_ambiguous_inventory() {
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+        let exact = observed_worker(&expected);
+        let mut duplicate = exact.clone();
+        duplicate.terminal_id = "terminal-duplicate".to_owned();
+        assert!(matches!(
+            displaced_runtime_cwd(
+                &project_runtime(),
+                &expected,
+                &with_worktree(inventory(vec![exact.clone(), duplicate])),
+            ),
+            Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+                _
+            ))
+        ));
+
+        let mut stale = with_worktree(inventory(vec![exact.clone()]));
+        stale.observed_at_unix_ms = expected.last_observed_at_unix_ms - 1;
+        assert!(matches!(
+            displaced_runtime_cwd(&project_runtime(), &expected, &stale),
+            Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+                _
+            ))
+        ));
+
+        let mut unconfirmed_absence = with_worktree(inventory(Vec::new()));
+        unconfirmed_absence.observed_at_unix_ms = expected.last_observed_at_unix_ms;
+        assert!(matches!(
+            displaced_runtime_cwd(&project_runtime(), &expected, &unconfirmed_absence),
+            Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+                _
+            ))
+        ));
+
+        let mut ambiguous = with_worktree(inventory(vec![exact]));
+        ambiguous.workspaces.push(ambiguous.workspaces[0].clone());
+        assert!(matches!(
+            displaced_runtime_cwd(&project_runtime(), &expected, &ambiguous),
+            Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+                _
+            ))
+        ));
+    }
+
+    #[test]
+    fn noninteractive_displaced_provider_remains_a_conflict() {
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+        let mut observed = observed_worker(&expected);
+        observed.interactive_ready = false;
+
+        assert!(matches!(
+            displaced_runtime_cwd(
+                &project_runtime(),
+                &expected,
+                &with_worktree(inventory(vec![observed])),
+            ),
+            Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+                _
+            ))
+        ));
+    }
+
+    #[test]
+    fn fresh_replacement_verification_requires_one_exact_runtime() {
+        let replacement = runtime(
+            "terminal-replacement",
+            "pane-replacement",
+            Some(provider_session("provider-replacement")),
+        );
+        assert!(
+            verified_replacement_runtime(
+                replacement.clone(),
+                &inventory(vec![observed_worker(&replacement)]),
+            )
+            .is_ok()
+        );
+
+        let mut wrong_pane = replacement.clone();
+        wrong_pane.pane_id = "pane-other".to_owned();
+        assert!(matches!(
+            verified_replacement_runtime(
+                replacement.clone(),
+                &inventory(vec![observed_worker(&wrong_pane)]),
+            ),
+            Err(OrchestratorReplacementServiceError::ReplacementUnverified)
+        ));
+
+        let mut stale = inventory(vec![observed_worker(&replacement)]);
+        stale.observed_at_unix_ms = replacement.last_observed_at_unix_ms - 1;
+        assert!(matches!(
+            verified_replacement_runtime(replacement, &stale),
+            Err(OrchestratorReplacementServiceError::ReplacementUnverified)
+        ));
     }
 
     fn prepare_intent(tab_label: &str) -> OrchestratorReplacementPrepareIntent {

@@ -2782,13 +2782,13 @@ impl From<OrchestratorReplacementServiceError> for ApiError {
                 message,
             },
             OrchestratorReplacementServiceError::RuntimeWorkspaceMissing(_)
-            | OrchestratorReplacementServiceError::RuntimeIdentityChanged
+            | OrchestratorReplacementServiceError::RuntimeIdentityChanged(_)
             | OrchestratorReplacementServiceError::ReplacementUnverified => Self {
                 status: StatusCode::CONFLICT,
                 code: "orchestrator_replacement_identity_changed",
                 message: error.to_string(),
             },
-            OrchestratorReplacementServiceError::RuntimeCwdUnavailable => Self {
+            OrchestratorReplacementServiceError::RuntimeCwdUnavailable(_) => Self {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "runtime_cwd_unavailable",
                 message: error.to_string(),
@@ -4276,6 +4276,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stale_binding_cwd_error_preserves_safe_replacement_detail() {
+        let error = ApiError::from(OrchestratorReplacementServiceError::RuntimeCwdUnavailable(
+            "safe stale binding has no workspace worktree checkout".to_owned(),
+        ));
+
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.code, "runtime_cwd_unavailable");
+        assert_eq!(
+            error.message,
+            "safe stale binding has no workspace worktree checkout"
+        );
+    }
+
     #[derive(Default)]
     struct RolledBackPromptRuntime {
         start_calls: AtomicUsize,
@@ -4923,6 +4937,53 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct StaleBindingReplacementInventory {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl InventorySource for StaleBindingReplacementInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            HandoffInventory.sessions().await
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            let mut inventory = HandoffInventory.inventory(session_name).await?;
+            if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                inventory.observed_at_unix_ms += 1;
+                inventory
+                    .workers
+                    .retain(|worker| worker.terminal_id != "terminal-target-orchestrator");
+                inventory.workers.push(ObservedWorker {
+                    runtime_id: "terminal-reused-occupant".to_owned(),
+                    pane_instance_id: None,
+                    terminal_id: "terminal-reused-occupant".to_owned(),
+                    workspace_id: "workspace-2".to_owned(),
+                    tab_id: "tab-target-orchestrator".to_owned(),
+                    pane_id: "pane-target-orchestrator".to_owned(),
+                    name: Some("unrelated-reused-occupant".to_owned()),
+                    provider: Some("codex".to_owned()),
+                    display_provider: Some("Codex".to_owned()),
+                    status: ObservedStatus::Working,
+                    focused: false,
+                    launch_pending: false,
+                    interactive_ready: true,
+                    state_change_sequence: 7,
+                    cwd: Some("/tmp/reused-occupant".to_owned()),
+                    foreground_cwd: Some("/tmp/reused-occupant".to_owned()),
+                    tokens: BTreeMap::new(),
+                    provider_session: Some(provider_session("reused-occupant-session")),
+                    revision: 7,
+                });
+            }
+            Ok(inventory)
+        }
+    }
+
+    #[derive(Default)]
     struct ReplacementWorkspaceMissingInventory {
         calls: AtomicUsize,
     }
@@ -5233,6 +5294,7 @@ mod tests {
         start_calls: AtomicUsize,
         replacement_prompt_failure: AtomicBool,
         replacement_start_ambiguity: AtomicBool,
+        retirement_identity_conflict: AtomicBool,
         retirement_failures: AtomicUsize,
         retirement_calls: Mutex<Vec<RuntimeRetirementRequest>>,
         start_requests: Mutex<Vec<RuntimeProvisionRequest>>,
@@ -5346,6 +5408,7 @@ mod tests {
             let mut prepared = FakeRuntime.provision_worker(request).await?;
             prepared.provider_session = None;
             prepared.process_state = yard_domain::RuntimeProcessState::Unknown;
+            prepared.last_observed_at_unix_ms = 1;
             Ok(prepared)
         }
 
@@ -5412,6 +5475,9 @@ mod tests {
             request: RuntimeRetirementRequest,
         ) -> Result<(), RuntimeRetirementError> {
             self.retirement_calls.lock().unwrap().push(request);
+            if self.retirement_identity_conflict.load(Ordering::SeqCst) {
+                return Err(RuntimeRetirementError::IdentityNotObserved);
+            }
             let should_fail = self
                 .retirement_failures
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -6567,6 +6633,7 @@ mod tests {
             start_calls: AtomicUsize::new(0),
             replacement_prompt_failure: AtomicBool::new(false),
             replacement_start_ambiguity: AtomicBool::new(false),
+            retirement_identity_conflict: AtomicBool::new(false),
             retirement_failures: AtomicUsize::new(retirement_failures),
             retirement_calls: Mutex::new(Vec::new()),
             start_requests: Mutex::new(Vec::new()),
@@ -7167,6 +7234,7 @@ mod tests {
 
         assert!(command["expected_orchestrator_runtime"]["provider_session"].is_null());
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -7189,6 +7257,91 @@ mod tests {
         assert_eq!(retirements.len(), 1);
         assert!(retirements[0].provider_session.is_none());
         assert_eq!(retirements[0].terminal_id, "terminal-target-orchestrator");
+    }
+
+    #[tokio::test]
+    async fn stale_binding_replacement_provisions_without_claiming_or_closing_reused_pane() {
+        let (app, temp, runtime) = handoff_test_router_with_source(
+            0,
+            Arc::new(StaleBindingReplacementInventory::default()),
+        )
+        .await;
+        runtime
+            .retirement_identity_conflict
+            .store(true, Ordering::SeqCst);
+        let (uri, command, _project_id) = create_orchestrator_replacement_request(&app).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let replacement = response_json(response).await;
+        assert_eq!(
+            replacement["project"]["orchestrator"]["runtime"]["terminal_id"],
+            "terminal-yard-replace-fa0a6b32d50a8ac9"
+        );
+        assert_eq!(replacement["cleanup_pending"], true);
+        {
+            let requests = runtime.start_requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].workspace_id, "workspace-2");
+            assert_eq!(requests[0].cwd, "/tmp/target-api");
+        }
+        {
+            let retirements = runtime.retirement_calls.lock().unwrap();
+            assert_eq!(retirements.len(), 1);
+            assert_eq!(retirements[0].terminal_id, "terminal-target-orchestrator");
+            assert_eq!(
+                retirements[0].provider_session,
+                Some(provider_session("target-orchestrator-session"))
+            );
+        }
+
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let (displaced_captures, reused_captures): (i64, i64) = connection
+            .query_row(
+                "SELECT
+                    SUM(terminal_id = 'terminal-target-orchestrator'),
+                    SUM(terminal_id = 'terminal-reused-occupant')
+                   FROM orchestrator_replacement_runtime_bindings
+                  WHERE command_id = 'replace-command-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(displaced_captures, 1);
+        assert_eq!(reused_captures, 0);
+
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/projects/{}/orchestrator/replace",
+                        replacement["project"]["id"].as_str().unwrap()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay = response_json(replay).await;
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["cleanup_pending"], true);
+        assert_eq!(runtime.start_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.retirement_calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
