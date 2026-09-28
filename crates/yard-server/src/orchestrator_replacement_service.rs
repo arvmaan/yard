@@ -737,31 +737,31 @@ impl OrchestratorReplacementService {
                 );
             }
         };
-        if let Err(error) = self
-            .store
-            .record_project_orchestrator_replacement_started_runtime(
-                &command_id,
-                started.clone(),
-                OrchestratorReplacementStartEvidence::Confirmed,
-            )
-            .await
-        {
-            let quarantine = self
-                .store
-                .quarantine_provisioning_runtime(&command_id, started)
-                .await;
-            let message = format!("{error}; quarantine result: {quarantine:?}");
-            self.fail_ambiguous_replacement(&command_id, &message)
-                .await?;
-            return Err(error.into());
-        }
-        let replacement = match self.verify_replacement_runtime(started).await {
+        let replacement = match self.verify_replacement_runtime(started.clone()).await {
             Ok(runtime) => runtime,
             Err(error) => {
                 self.fail_ambiguous_replacement(&command_id, &error.to_string())
                     .await?;
                 return Err(error);
             }
+        };
+        if let Err(error) = self
+            .store
+            .record_project_orchestrator_replacement_started_runtime(
+                &command_id,
+                replacement.clone(),
+                OrchestratorReplacementStartEvidence::Confirmed,
+            )
+            .await
+        {
+            let quarantine = self
+                .store
+                .quarantine_provisioning_runtime(&command_id, replacement)
+                .await;
+            let message = format!("{error}; quarantine result: {quarantine:?}");
+            self.fail_ambiguous_replacement(&command_id, &message)
+                .await?;
+            return Err(error.into());
         };
         if let Err(error) = self
             .verify_target_and_displaced_runtime(
