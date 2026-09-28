@@ -44,10 +44,28 @@ fn validate_protocol(snapshot: &SessionSnapshot, config: &HerdrConfig) -> Result
 }
 
 fn project(
-    snapshot: SessionSnapshot,
+    mut snapshot: SessionSnapshot,
     session_name: &str,
     observed_at_unix_ms: u64,
 ) -> RuntimeInventory {
+    // Herdr's agent-list payload is terminal-centric and may omit the pane
+    // instance identity that is present on the matching pane. Carry that exact
+    // identity across only after terminal and pane ancestry agree; topology
+    // validation runs before this projection.
+    let pane_instances = snapshot
+        .panes
+        .iter()
+        .map(|pane| (pane.pane_id.as_str(), pane.pane_instance_id.clone()))
+        .collect::<HashMap<_, _>>();
+    for agent in &mut snapshot.agents {
+        if agent.pane_instance_id.is_none() {
+            agent.pane_instance_id = pane_instances
+                .get(agent.pane_id.as_str())
+                .cloned()
+                .flatten();
+        }
+    }
+
     RuntimeInventory {
         adapter: "herdr".to_owned(),
         session: session_name.to_owned(),
@@ -318,6 +336,10 @@ mod tests {
         assert_eq!(inventory.workspaces[0].runtime_id, "w1");
         assert_eq!(inventory.workers[0].provider.as_deref(), Some("codex"));
         assert_eq!(inventory.workers[0].pane_id, "w1:p1");
+        assert_eq!(
+            inventory.workers[0].pane_instance_id,
+            inventory.panes[0].pane_instance_id
+        );
     }
 
     #[test]
