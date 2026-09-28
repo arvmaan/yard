@@ -7,15 +7,20 @@ import {
   type WebSocketRoute,
 } from '@playwright/test'
 import type {
+  ArchiveCoordinationNodeInput,
   ArchiveProjectInput,
+  ArchivedCoordinationNode,
   Artifact,
   Assignment,
+  AssignmentCancellation,
   Automation,
   AutomationRun,
   ChangeProjectOrchestratorInput,
   CompletionReceipt,
   ConfigureYardOrchestratorInput,
   CoordinationNode,
+  CoordinationNodeDispositionBlocker,
+  CoordinationNodeDispositionPreview,
   CoordinationNodeRoute,
   CoordinationSnapshot,
   CreateProjectRelationshipInput,
@@ -26,12 +31,19 @@ import type {
   ConfirmWorkerHandoffInput,
   CreateProjectFromProfileInput,
   CreateWorkspaceProjectFromProfileInput,
+  DeleteCoordinationNodeInput,
+  DeleteProjectInput,
+  DeletedCoordinationNode,
+  DeletedProject,
   DeleteWorkerInput,
+  DisposeAssignmentInput,
+  DisposedAssignment,
   EndWorkerSessionInput,
   ObservedChildAgent,
   ObservedStatus,
   ObservedWorker,
   OrchestratorWorkflowProfile,
+  ProjectDispositionPreview,
   ProjectRepository,
   ProjectRelationship,
   ProvisionYardOrchestratorInput,
@@ -41,6 +53,8 @@ import type {
   ReplaceProjectOrchestratorInput,
   ResetOrchestratorWorkflowProfileInput,
   RuntimeInventory,
+  RestoredProject,
+  RestoreProjectInput,
   RuntimeTopology,
   ProvisionCoordinationNodeInput,
   RecordCompletionReceiptInput,
@@ -59,6 +73,7 @@ import type {
   WorkerCandidate,
   WorkerProfile,
   WorkerRuntimeBinding,
+  WorkerTranscript,
   WorkspaceObservation,
   YardOrchestrator,
   YardOrchestratorRoute,
@@ -440,6 +455,26 @@ interface MockState {
   coordinationNodeRoutes: CoordinationNodeRoute[]
   coordinationSnapshotCommands: RequestCoordinationSnapshotInput[]
   coordinationSnapshots: CoordinationSnapshot[]
+  coordinationNodeArchiveCommands: ArchiveCoordinationNodeInput[]
+  coordinationNodeDeleteCommands: DeleteCoordinationNodeInput[]
+  coordinationNodeDispositionAttempts: Array<{
+    mode: 'archive' | 'delete'
+    input: ArchiveCoordinationNodeInput | DeleteCoordinationNodeInput
+  }>
+  coordinationNodeDispositionNetworkFailures: number
+  // Commits the archive/delete, then drops the response.
+  coordinationNodeDispositionLostResponses: number
+  coordinationNodeDispositionResults: Record<
+    string,
+    {
+      mode: 'archive' | 'delete'
+      input: ArchiveCoordinationNodeInput | DeleteCoordinationNodeInput
+      response: ArchivedCoordinationNode | DeletedCoordinationNode
+    }
+  >
+  coordinationNodeBlockers: Record<string, CoordinationNodeDispositionBlocker[]>
+  archivedCoordinationNodes: CoordinationNode[]
+  deletedCoordinationNodeIds: string[]
   yardOrchestrator: YardOrchestrator
   yardOrchestratorFailure: boolean
   yardOrchestratorConfigureCommands: ConfigureYardOrchestratorInput[]
@@ -465,6 +500,45 @@ interface MockState {
   projectOrchestratorCommands: ChangeProjectOrchestratorInput[]
   projectOrchestratorReplacementCommands: ReplaceProjectOrchestratorInput[]
   projectArchiveCommands: ArchiveProjectInput[]
+  projectArchiveAttempts: ArchiveProjectInput[]
+  projectDeleteCommands: DeleteProjectInput[]
+  projectDeleteAttempts: DeleteProjectInput[]
+  projectDeleteNetworkFailures: number
+  // Aborts the next archive POSTs before anything is recorded.
+  projectArchiveNetworkFailures: number
+  // Aborts the next project disposition preview GETs.
+  projectPreviewNetworkFailures: number
+  // Archives (and the Archived list) report restorable: false.
+  projectArchiveNotRestorable: boolean
+  // The next restore is refused with this error before anything changes.
+  projectRestoreRefusal: {
+    code: string
+    message: string
+    reason?: string
+  } | null
+  projectDeleteResults: Record<
+    string,
+    { input: DeleteProjectInput; response: DeletedProject }
+  >
+  archivedProjects: ReturnType<typeof initialProjects>
+  // What each mock archive ended, so Restore can put it back.
+  archivedProjectSnapshots: Record<
+    string,
+    {
+      archiveCommandId: string
+      archivedAt: number
+      cancelledAssignmentIds: string[]
+      candidate: WorkerCandidate | null
+      inventoryWorker: (typeof inventory)['workers'][number] | null
+    }
+  >
+  archivedListRequests: number
+  projectRestoreAttempts: RestoreProjectInput[]
+  projectRestoreHerdrFailures: number
+  projectRestoreResults: Record<
+    string,
+    { input: RestoreProjectInput; response: RestoredProject }
+  >
   assignmentRequests: number
   profiles: ReturnType<typeof profile>[]
   workerCandidates: WorkerCandidate[]
@@ -496,6 +570,17 @@ interface MockState {
   requestLog: string[]
   completionCommands: RecordCompletionReceiptInput[]
   completionRequestCommandIds: string[]
+  dispositionCommands: DisposeAssignmentInput[]
+  dispositionRequestCommandIds: string[]
+  dispositionResults: Record<
+    string,
+    { input: DisposeAssignmentInput; response: DisposedAssignment }
+  >
+  // Aborts the next disposition POSTs before anything is recorded.
+  dispositionNetworkFailures: number
+  workerDeleteCommands: DeleteWorkerInput[]
+  transcripts: Record<string, WorkerTranscript>
+  transcriptRequests: string[]
   artifacts: Map<string, { artifact: Artifact; content: string }>
   allocationCommands: ConfirmWorkerAssignmentInput[]
   allocationRequestCommandIds: string[]
@@ -669,6 +754,7 @@ function assignment(
       updated_at_unix_ms: now,
     },
     completion_receipt: null as CompletionReceipt | null,
+    cancellation: null as AssignmentCancellation | null,
     version: '2',
     created_at_unix_ms: now,
     updated_at_unix_ms: now,
@@ -679,7 +765,9 @@ async function mockApi(
   page: Page,
   options: {
     allocationFailsOnce?: boolean
-    archiveDependency?: 'unfinished_handoff' | 'snapshot_collection_pending'
+    archiveHandoffInFlight?: boolean
+    archiveSnapshotsPending?: number
+    restoreHerdrFailures?: number
     handoffFailsOnce?: boolean
     betaFails?: boolean
     fleetFailure?: 'partial' | 'total' | 'discovery'
@@ -692,6 +780,10 @@ async function mockApi(
     fleetWaits?: Promise<void>[]
     completionDelayMs?: number
     completionFailsOnce?: boolean
+    dispositionCleanupPending?: boolean
+    dispositionNetworkFailures?: number
+    transcriptText?: string
+    transcriptUnavailable?: boolean
     conflictNextPlacement?: boolean
     endSessionCleanupPending?: boolean
     promptDelayMs?: number
@@ -766,6 +858,15 @@ async function mockApi(
     coordinationNodeRoutes: [],
     coordinationSnapshotCommands: [],
     coordinationSnapshots: [],
+    coordinationNodeArchiveCommands: [],
+    coordinationNodeDeleteCommands: [],
+    coordinationNodeDispositionAttempts: [],
+    coordinationNodeDispositionNetworkFailures: 0,
+    coordinationNodeDispositionLostResponses: 0,
+    coordinationNodeDispositionResults: {},
+    coordinationNodeBlockers: {},
+    archivedCoordinationNodes: [],
+    deletedCoordinationNodeIds: [],
     yardOrchestrator: {
       worker: null,
       version: '1',
@@ -792,6 +893,21 @@ async function mockApi(
     projectOrchestratorCommands: [],
     projectOrchestratorReplacementCommands: [],
     projectArchiveCommands: [],
+    projectArchiveAttempts: [],
+    projectDeleteCommands: [],
+    projectDeleteAttempts: [],
+    projectDeleteNetworkFailures: 0,
+    projectArchiveNetworkFailures: 0,
+    projectPreviewNetworkFailures: 0,
+    projectArchiveNotRestorable: false,
+    projectRestoreRefusal: null,
+    projectDeleteResults: {},
+    archivedProjects: [],
+    archivedProjectSnapshots: {},
+    archivedListRequests: 0,
+    projectRestoreAttempts: [],
+    projectRestoreHerdrFailures: options.restoreHerdrFailures ?? 0,
+    projectRestoreResults: {},
     assignmentRequests: 0,
     profiles: initialProfileState,
     workerCandidates: initialWorkerCandidates(
@@ -827,6 +943,13 @@ async function mockApi(
     inventoryResponsePlans: new Map(),
     requestLog: [],
     completionCommands: [],
+    dispositionCommands: [],
+    dispositionRequestCommandIds: [],
+    dispositionResults: {},
+    dispositionNetworkFailures: options.dispositionNetworkFailures ?? 0,
+    workerDeleteCommands: [],
+    transcripts: {},
+    transcriptRequests: [],
     completionRequestCommandIds: [],
     artifacts: new Map(),
     allocationCommands: [],
@@ -1045,6 +1168,24 @@ async function mockApi(
     const snapshotMatch = url.pathname.match(
       /^\/api\/v1\/coordination-nodes\/([^/]+)\/snapshots$/,
     )
+    const previewMatch = url.pathname.match(
+      /^\/api\/v1\/coordination-nodes\/([^/]+)\/disposition-preview$/,
+    )
+    const dispositionMatch = url.pathname.match(
+      /^\/api\/v1\/coordination-nodes\/([^/]+)\/(archive|delete)$/,
+    )
+    const nodeError = async (status: number, code: string, message: string) =>
+      route.fulfill({ status, json: { error: { code, message } } })
+    // Mirrors the server: archived nodes are hidden and read as a conflict,
+    // deleted nodes read as not found.
+    const nodeVisibility = (nodeId: string) =>
+      state.deletedCoordinationNodeIds.includes(nodeId)
+        ? 'deleted'
+        : state.archivedCoordinationNodes.some((node) => node.id === nodeId)
+          ? 'archived'
+          : state.coordinationNodes.some((node) => node.id === nodeId)
+            ? 'active'
+            : 'unknown'
 
     if (
       request.method() === 'GET' &&
@@ -1093,6 +1234,263 @@ async function mockApi(
           replayed: false,
         },
       })
+      return
+    }
+    if (nodeMatch && request.method() === 'GET') {
+      const nodeId = decodeURIComponent(nodeMatch[1])
+      const visibility = nodeVisibility(nodeId)
+      if (visibility === 'archived') {
+        await nodeError(
+          409,
+          'coordination_node_archived',
+          'This workstream is archived and can no longer change',
+        )
+        return
+      }
+      const node = state.coordinationNodes.find(
+        (candidate) => candidate.id === nodeId,
+      )
+      if (!node) {
+        await nodeError(
+          404,
+          'coordination_node_not_found',
+          'coordination node was not found',
+        )
+        return
+      }
+      await route.fulfill({ json: node })
+      return
+    }
+    if (previewMatch && request.method() === 'GET') {
+      const nodeId = decodeURIComponent(previewMatch[1])
+      const node = state.coordinationNodes.find(
+        (candidate) => candidate.id === nodeId,
+      )
+      if (!node) {
+        await nodeError(
+          nodeVisibility(nodeId) === 'archived' ? 409 : 404,
+          nodeVisibility(nodeId) === 'archived'
+            ? 'coordination_node_archived'
+            : 'coordination_node_not_found',
+          'The workstream is no longer active',
+        )
+        return
+      }
+      const preview: CoordinationNodeDispositionPreview = {
+        node_id: node.id,
+        name: node.name,
+        kind: node.kind,
+        node_version: node.version,
+        supported: node.kind === 'workstream',
+        worker: node.worker
+          ? {
+              worker_id: node.worker.id,
+              worker_version: node.worker.version,
+              profile_name:
+                state.profiles.find(
+                  (candidate) => candidate.id === node.worker?.profile_id,
+                )?.name ?? null,
+              runtime_present: node.worker.runtime !== null,
+              will_end: node.worker.desired_state === 'running',
+            }
+          : null,
+        attached_projects: node.attached_project_ids.flatMap((projectId) => {
+          const project = state.projects.find(
+            (candidate) => candidate.id === projectId,
+          )
+          return project ? [{ project_id: project.id, name: project.name }] : []
+        }),
+        automations: state.automations
+          .filter(
+            (automation) =>
+              automation.scope.kind === 'workstream_coordination_node' &&
+              automation.scope.node_id === node.id,
+          )
+          .map((automation) => ({
+            automation_id: automation.id,
+            name: automation.name,
+            state: automation.state,
+          })),
+        blockers: state.coordinationNodeBlockers[node.id] ?? [],
+      }
+      await route.fulfill({ json: preview })
+      return
+    }
+    if (dispositionMatch && request.method() === 'POST') {
+      const nodeId = decodeURIComponent(dispositionMatch[1])
+      const mode = dispositionMatch[2] as 'archive' | 'delete'
+      const input = request.postDataJSON() as
+        | ArchiveCoordinationNodeInput
+        | DeleteCoordinationNodeInput
+      state.coordinationNodeDispositionAttempts.push({ mode, input })
+      if (state.coordinationNodeDispositionNetworkFailures > 0) {
+        state.coordinationNodeDispositionNetworkFailures -= 1
+        await route.abort('failed')
+        return
+      }
+      // Same replay rules as the server: an identical retry returns the
+      // stored result; any other body or verb under the ID conflicts.
+      const stored = state.coordinationNodeDispositionResults[input.command_id]
+      if (stored) {
+        if (
+          stored.mode !== mode ||
+          stored.response.node_id !== nodeId ||
+          JSON.stringify(stored.input) !== JSON.stringify(input)
+        ) {
+          await nodeError(
+            409,
+            'idempotency_conflict',
+            'Command ID is already associated with different input',
+          )
+          return
+        }
+        await route.fulfill({ json: { ...stored.response, replayed: true } })
+        return
+      }
+      const visibility = nodeVisibility(nodeId)
+      if (visibility === 'unknown') {
+        await nodeError(
+          404,
+          'coordination_node_not_found',
+          'coordination node was not found',
+        )
+        return
+      }
+      if (mode === 'archive' && visibility !== 'active') {
+        await nodeError(
+          409,
+          'coordination_node_already_archived',
+          'Workstream is already archived',
+        )
+        return
+      }
+      if (mode === 'delete' && visibility === 'deleted') {
+        await nodeError(
+          409,
+          'coordination_node_already_deleted',
+          'Workstream has already been deleted from the UI',
+        )
+        return
+      }
+      const activeIndex = state.coordinationNodes.findIndex(
+        (candidate) => candidate.id === nodeId,
+      )
+      const node =
+        state.coordinationNodes[activeIndex] ??
+        state.archivedCoordinationNodes.find(
+          (candidate) => candidate.id === nodeId,
+        )!
+      if (node.kind !== 'workstream') {
+        await nodeError(
+          409,
+          'coordination_node_kind_not_supported',
+          'Only workstreams can be archived or deleted',
+        )
+        return
+      }
+      let pausedAutomationIds: string[] = []
+      if (visibility === 'active') {
+        const preconditions =
+          mode === 'archive'
+            ? (input as ArchiveCoordinationNodeInput)
+            : (input as DeleteCoordinationNodeInput).archive
+        if (!preconditions) {
+          await nodeError(
+            409,
+            'coordination_node_not_archived',
+            "Include the workstream's archive preconditions to delete an active workstream",
+          )
+          return
+        }
+        if (preconditions.expected_node_version !== node.version) {
+          await nodeError(
+            409,
+            'coordination_node_version_conflict',
+            `Workstream changed concurrently; current version is ${node.version}`,
+          )
+          return
+        }
+        const blockers = state.coordinationNodeBlockers[node.id] ?? []
+        if (blockers.length > 0) {
+          await nodeError(
+            409,
+            'coordination_node_archive_blocked',
+            'Wait for pending workstream work to finish before archiving or deleting this workstream',
+          )
+          return
+        }
+        state.automations = state.automations.map((automation) => {
+          if (
+            automation.scope.kind !== 'workstream_coordination_node' ||
+            automation.scope.node_id !== node.id ||
+            automation.state !== 'active'
+          ) {
+            return automation
+          }
+          pausedAutomationIds.push(automation.id)
+          return {
+            ...automation,
+            state: 'paused',
+            next_run_at_unix_ms: null,
+            version: String(Number(automation.version) + 1),
+          }
+        })
+        pausedAutomationIds = pausedAutomationIds.sort()
+        state.coordinationNodes.splice(activeIndex, 1)
+        state.archivedCoordinationNodes.push({
+          ...node,
+          version: String(Number(node.version) + 1),
+        })
+        state.workerCandidates = state.workerCandidates.map((candidate) =>
+          candidate.worker.id === node.worker?.id
+            ? {
+                ...candidate,
+                availability: 'ended',
+                worker: {
+                  ...candidate.worker,
+                  desired_state: 'ended',
+                  runtime: null,
+                },
+              }
+            : candidate,
+        )
+      }
+      const common = {
+        command_id: input.command_id,
+        node_id: nodeId,
+        kind: node.kind,
+        worker_id: node.worker?.id ?? null,
+        paused_automation_ids: pausedAutomationIds,
+        cleanup_pending: node.worker?.runtime != null,
+        replayed: false,
+      }
+      let response: ArchivedCoordinationNode | DeletedCoordinationNode
+      if (mode === 'archive') {
+        state.coordinationNodeArchiveCommands.push(
+          input as ArchiveCoordinationNodeInput,
+        )
+        response = { ...common, archived_at_unix_ms: Date.now() }
+      } else {
+        state.coordinationNodeDeleteCommands.push(
+          input as DeleteCoordinationNodeInput,
+        )
+        state.deletedCoordinationNodeIds.push(nodeId)
+        state.workerCandidates = state.workerCandidates.filter(
+          (candidate) => candidate.worker.id !== node.worker?.id,
+        )
+        response = { ...common, deleted_at_unix_ms: Date.now() }
+      }
+      state.coordinationNodeDispositionResults[input.command_id] = {
+        mode,
+        input,
+        response,
+      }
+      if (state.coordinationNodeDispositionLostResponses > 0) {
+        state.coordinationNodeDispositionLostResponses -= 1
+        await route.abort('failed')
+        return
+      }
+      await route.fulfill({ json: response })
       return
     }
     if (nodeMatch && request.method() === 'PUT') {
@@ -1277,11 +1675,14 @@ async function mockApi(
             runtime_status: 'accepted',
             submitted_at_unix_ms: now,
             collected_at_unix_ms: null,
+            abandoned_at_unix_ms: null,
+            abandoned_reason: null,
           }
         }),
         progress: {
           completed: 0,
           total: node.attached_project_ids.length,
+          abandoned: 0,
         },
         requested_by: input.actor,
         created_at_unix_ms: now,
@@ -1438,18 +1839,51 @@ async function mockApi(
       (candidate) => candidate.worker.id === workerId,
     )
     const candidate = state.workerCandidates[index]
-    if (!candidate || candidate.worker.desired_state !== 'ended') {
-      await route.fulfill({ status: 409 })
+    if (!candidate) {
+      await route.fulfill({
+        status: 404,
+        json: {
+          error: { code: 'worker_not_found', message: 'Worker was not found' },
+        },
+      })
       return
     }
+    if (
+      candidate.availability !== 'ended' &&
+      candidate.worker.desired_state !== 'ended'
+    ) {
+      await route.fulfill({
+        status: 409,
+        json: {
+          error: {
+            code: 'worker_not_ended',
+            message: 'End the worker session before deleting it',
+          },
+        },
+      })
+      return
+    }
+    if (input.expected_worker_version !== candidate.worker.version) {
+      await route.fulfill({
+        status: 409,
+        json: {
+          error: {
+            code: 'worker_version_conflict',
+            message: 'Worker changed concurrently',
+          },
+        },
+      })
+      return
+    }
+    state.workerDeleteCommands.push(input)
     state.workerCandidates.splice(index, 1)
     await route.fulfill({
       json: {
-        cleanup_pending: false,
         command_id: input.command_id,
-        deleted_at_unix_ms: Date.now(),
-        replayed: false,
         worker_id: workerId,
+        deleted_at_unix_ms: Date.now(),
+        cleanup_pending: false,
+        replayed: false,
       },
     })
   })
@@ -1909,6 +2343,36 @@ async function mockApi(
     })
   })
 
+  await page.route('**/api/v1/archived', async (route) => {
+    state.archivedListRequests += 1
+    const deleted = new Set(
+      Object.values(state.projectDeleteResults).map(
+        (result) => result.response.project_id,
+      ),
+    )
+    await route.fulfill({
+      json: {
+        projects: state.archivedProjects
+          .filter((project) => !deleted.has(project.id))
+          .map((project) => {
+            const snapshot = state.archivedProjectSnapshots[project.id]
+            return {
+              project_id: project.id,
+              name: project.name,
+              archive_command_id:
+                snapshot?.archiveCommandId ?? `archive-${project.id}`,
+              orchestrator_worker_id: project.orchestrator.id,
+              archived_at_unix_ms: snapshot?.archivedAt ?? 0,
+              cancelled_assignment_ids: snapshot?.cancelledAssignmentIds ?? [],
+              cleanup_pending: true,
+              restorable:
+                Boolean(snapshot) && !state.projectArchiveNotRestorable,
+            }
+          }),
+      },
+    })
+  })
+
   await page.route('**/api/v1/projects**', async (route) => {
     const request = route.request()
     const url = new URL(request.url())
@@ -1917,6 +2381,12 @@ async function mockApi(
     )
     const archiveMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)\/archive$/,
+    )
+    const dispositionPreviewMatch = url.pathname.match(
+      /^\/api\/v1\/projects\/([^/]+)\/disposition-preview$/,
+    )
+    const deleteMatch = url.pathname.match(
+      /^\/api\/v1\/projects\/([^/]+)\/delete$/,
     )
     const orchestratorTransferMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)\/orchestrator$/,
@@ -1938,6 +2408,12 @@ async function mockApi(
     )
     const completionMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)\/assignments\/([^/]+)\/completion-receipts$/,
+    )
+    const dispositionMatch = url.pathname.match(
+      /^\/api\/v1\/projects\/([^/]+)\/assignments\/([^/]+)\/disposition$/,
+    )
+    const transcriptMatch = url.pathname.match(
+      /^\/api\/v1\/projects\/([^/]+)\/assignments\/([^/]+)\/transcript$/,
     )
     const artifactMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)\/assignments\/([^/]+)\/artifacts\/([^/]+)$/,
@@ -2234,6 +2710,8 @@ async function mockApi(
           attempt_id: active.attempt.id,
           outcome: 'completed',
           summary: 'Summary committed.',
+          detail_level: 'detailed',
+          objective_snapshot: null,
           artifact_refs: [],
           artifacts: [artifact],
           evidence_refs: [],
@@ -2299,9 +2777,41 @@ async function mockApi(
       return
     }
 
+    if (dispositionPreviewMatch && request.method() === 'GET') {
+      if (state.projectPreviewNetworkFailures > 0) {
+        state.projectPreviewNetworkFailures -= 1
+        await route.abort('failed')
+        return
+      }
+      const preview = mockProjectPreview(
+        state,
+        decodeURIComponent(dispositionPreviewMatch[1]),
+      )
+      await route.fulfill(
+        preview
+          ? { json: preview }
+          : {
+              status: 404,
+              json: {
+                error: {
+                  code: 'project_not_found',
+                  message: 'Yard project was not found',
+                },
+              },
+            },
+      )
+      return
+    }
+
     if (archiveMatch && request.method() === 'POST') {
       const projectId = decodeURIComponent(archiveMatch[1])
       const input = request.postDataJSON() as ArchiveProjectInput
+      state.projectArchiveAttempts.push(input)
+      if (state.projectArchiveNetworkFailures > 0) {
+        state.projectArchiveNetworkFailures -= 1
+        await route.abort('failed')
+        return
+      }
       const projectIndex = state.projects.findIndex(
         (candidate) => candidate.id === projectId,
       )
@@ -2318,47 +2828,49 @@ async function mockApi(
         await route.fulfill({ status: 409 })
         return
       }
-      const hasActiveAssignments = state.assignments.some(
-        (candidate) =>
-          candidate.project_id === projectId &&
-          ['allocating', 'active', 'handing_off'].includes(
-            candidate.lifecycle,
-          ),
-      )
-      if (hasActiveAssignments) {
+      if (options.archiveHandoffInFlight) {
         await route.fulfill({
           status: 409,
           json: {
             error: {
-              code: 'project_has_archive_dependencies',
+              code: 'project_archive_handoff_in_progress',
               message:
-                'Complete or hand off active assignments before archiving',
-            },
-          },
-        })
-        return
-      }
-      if (options.archiveDependency) {
-        await route.fulfill({
-          status: 409,
-          json: {
-            error: {
-              code:
-                options.archiveDependency === 'unfinished_handoff'
-                  ? 'project_archive_handoff_in_progress'
-                  : 'project_archive_snapshot_collection_pending',
-              message:
-                options.archiveDependency === 'unfinished_handoff'
-                  ? 'A worker handoff targeting this project is still in progress'
-                  : 'A coordination snapshot has not finished collecting this project',
+                'A worker handoff into or out of this project is still in progress',
             },
           },
         })
         return
       }
 
+      const refusal = mockActiveWorkRefusal(state, projectId, input)
+      if (refusal) {
+        await route.fulfill({ status: 409, json: { error: refusal } })
+        return
+      }
+
       state.projectArchiveCommands.push(input)
+      const cancelledAssignmentIds = mockCancelArchivedAssignments(
+        state,
+        projectId,
+        input.command_id,
+      )
+      const archivedAt = Date.now()
+      state.archivedProjectSnapshots[projectId] = {
+        archiveCommandId: input.command_id,
+        archivedAt,
+        cancelledAssignmentIds,
+        candidate:
+          state.workerCandidates.find(
+            (candidate) => candidate.worker.id === archived.orchestrator.id,
+          ) ?? null,
+        inventoryWorker:
+          state.runtimeInventory.workers.find(
+            (worker) =>
+              worker.terminal_id === archived.orchestrator.runtime?.terminal_id,
+          ) ?? null,
+      }
       state.projects.splice(projectIndex, 1)
+      state.archivedProjects.push(archived)
       state.projectRelationships = state.projectRelationships.filter(
         (relationship) =>
           relationship.source_project_id !== projectId &&
@@ -2398,11 +2910,258 @@ async function mockApi(
           command_id: input.command_id,
           project_id: projectId,
           orchestrator_worker_id: archived.orchestrator.id,
-          archived_at_unix_ms: Date.now(),
+          archived_at_unix_ms: archivedAt,
           cleanup_pending: true,
+          background: {
+            snapshots_pending: options.archiveSnapshotsPending ?? 0,
+            snapshots_abandoned: 0,
+          },
+          cancelled_assignment_ids: cancelledAssignmentIds,
+          restorable: !state.projectArchiveNotRestorable,
+          visibility: 'archived',
           replayed: false,
         },
       })
+      return
+    }
+
+    const restoreMatch = url.pathname.match(
+      /^\/api\/v1\/projects\/([^/]+)\/restore$/,
+    )
+    if (restoreMatch && request.method() === 'POST') {
+      const projectId = decodeURIComponent(restoreMatch[1])
+      const input = request.postDataJSON() as RestoreProjectInput
+      state.projectRestoreAttempts.push(input)
+      const conflict = async (
+        code: string,
+        message: string,
+        reason?: string,
+      ) =>
+        route.fulfill({
+          status: 409,
+          json: { error: { code, message, reason } },
+        })
+      // Same replay rules as the server.
+      const stored = state.projectRestoreResults[input.command_id]
+      if (stored) {
+        if (
+          stored.response.project_id !== projectId ||
+          JSON.stringify(stored.input) !== JSON.stringify(input)
+        ) {
+          await conflict(
+            'idempotency_conflict',
+            'Command ID is already associated with different input',
+          )
+          return
+        }
+        await route.fulfill({ json: { ...stored.response, replayed: true } })
+        return
+      }
+      if (state.projectRestoreRefusal) {
+        const { code, message, reason } = state.projectRestoreRefusal
+        state.projectRestoreRefusal = null
+        await conflict(code, message, reason)
+        return
+      }
+      if (state.projectRestoreHerdrFailures > 0) {
+        state.projectRestoreHerdrFailures -= 1
+        await conflict(
+          'project_restore_unavailable',
+          'Herdr is unreachable',
+          'herdr_unreachable',
+        )
+        return
+      }
+      const archivedIndex = state.archivedProjects.findIndex(
+        (candidate) => candidate.id === projectId,
+      )
+      const snapshot = state.archivedProjectSnapshots[projectId]
+      if (archivedIndex < 0 || !snapshot) {
+        if (state.projects.some((candidate) => candidate.id === projectId)) {
+          await conflict('project_not_archived', 'Yard project is not archived')
+          return
+        }
+        await route.fulfill({
+          status: 404,
+          json: {
+            error: {
+              code: 'project_not_found',
+              message: 'Yard project was not found',
+            },
+          },
+        })
+        return
+      }
+      if (snapshot.archiveCommandId !== input.expected_archive_command_id) {
+        await conflict(
+          'project_restore_unavailable',
+          'The project was restored or archived again since this view loaded',
+          'archive_changed',
+        )
+        return
+      }
+      const [restored] = state.archivedProjects.splice(archivedIndex, 1)
+      state.projects.push({
+        ...restored,
+        version: String(Number(restored.version) + 2),
+        orchestrator: {
+          ...restored.orchestrator,
+          version: String(Number(restored.orchestrator.version) + 2),
+        },
+      })
+      if (snapshot.candidate) {
+        const restoredCandidate = snapshot.candidate
+        state.workerCandidates = state.workerCandidates.map((candidate) =>
+          candidate.worker.id === restoredCandidate.worker.id
+            ? restoredCandidate
+            : candidate,
+        )
+      }
+      if (snapshot.inventoryWorker) {
+        state.runtimeInventory.workers.push(snapshot.inventoryWorker)
+      }
+      delete state.archivedProjectSnapshots[projectId]
+      const response: RestoredProject = {
+        command_id: input.command_id,
+        project_id: projectId,
+        archive_command_id: snapshot.archiveCommandId,
+        orchestrator_worker_id: restored.orchestrator.id,
+        orchestrator_runtime: snapshot.inventoryWorker ? 'rebound' : 'unbound',
+        cancelled_assignment_ids: snapshot.cancelledAssignmentIds,
+        restored_at_unix_ms: Date.now(),
+        visibility: 'active',
+        replayed: false,
+      }
+      state.projectRestoreResults[input.command_id] = { input, response }
+      await route.fulfill({ json: response })
+      return
+    }
+
+    if (deleteMatch && request.method() === 'POST') {
+      const projectId = decodeURIComponent(deleteMatch[1])
+      const input = request.postDataJSON() as DeleteProjectInput
+      const conflict = async (code: string, message: string) =>
+        route.fulfill({ status: 409, json: { error: { code, message } } })
+      state.projectDeleteAttempts.push(input)
+      if (state.projectDeleteNetworkFailures > 0) {
+        state.projectDeleteNetworkFailures -= 1
+        await route.abort('failed')
+        return
+      }
+      // Same replay rules as the server: the same command ID and body
+      // returns the stored result, any other body under it conflicts.
+      const stored = state.projectDeleteResults[input.command_id]
+      if (stored) {
+        if (
+          stored.response.project_id !== projectId ||
+          JSON.stringify(stored.input) !== JSON.stringify(input)
+        ) {
+          await conflict(
+            'idempotency_conflict',
+            'Command ID is already associated with different input',
+          )
+          return
+        }
+        await route.fulfill({ json: { ...stored.response, replayed: true } })
+        return
+      }
+      if (
+        Object.values(state.projectDeleteResults).some(
+          (result) => result.response.project_id === projectId,
+        )
+      ) {
+        await conflict(
+          'project_already_deleted',
+          'Yard project has already been deleted from the UI',
+        )
+        return
+      }
+      const activeIndex = state.projects.findIndex(
+        (candidate) => candidate.id === projectId,
+      )
+      const active = state.projects[activeIndex]
+      const target =
+        active ??
+        state.archivedProjects.find((candidate) => candidate.id === projectId)
+      if (!target) {
+        await route.fulfill({
+          status: 404,
+          json: {
+            error: {
+              code: 'project_not_found',
+              message: 'Yard project was not found',
+            },
+          },
+        })
+        return
+      }
+      if (active) {
+        if (!input.archive) {
+          await conflict(
+            'project_not_archived',
+            "Include the project's archive preconditions to delete an active project",
+          )
+          return
+        }
+        if (input.archive.expected_project_version !== active.version) {
+          await conflict(
+            'project_version_conflict',
+            `Project changed concurrently; current version is ${active.version}`,
+          )
+          return
+        }
+        if (
+          input.archive.expected_orchestrator_worker_id !==
+            active.orchestrator.id ||
+          input.archive.expected_orchestrator_worker_version !==
+            active.orchestrator.version ||
+          input.archive.expected_orchestrator_runtime_version !==
+            (active.orchestrator.runtime?.version ?? null)
+        ) {
+          await conflict(
+            'project_archive_conflict',
+            'The project orchestrator changed concurrently',
+          )
+          return
+        }
+        const refusal = mockActiveWorkRefusal(state, projectId, input.archive)
+        if (refusal) {
+          await route.fulfill({ status: 409, json: { error: refusal } })
+          return
+        }
+      }
+      state.projectDeleteCommands.push(input)
+      const cancelledAssignmentIds = active
+        ? mockCancelArchivedAssignments(state, projectId, input.command_id)
+        : []
+      if (active) state.projects.splice(activeIndex, 1)
+      state.archivedProjects = state.archivedProjects.filter(
+        (candidate) => candidate.id !== projectId,
+      )
+      state.projectRelationships = state.projectRelationships.filter(
+        (relationship) =>
+          relationship.source_project_id !== projectId &&
+          relationship.target_project_id !== projectId,
+      )
+      state.workerCandidates = state.workerCandidates.filter(
+        (candidate) => candidate.worker.id !== target.orchestrator.id,
+      )
+      state.runtimeInventory.workers = state.runtimeInventory.workers.filter(
+        (worker) =>
+          worker.terminal_id !== target.orchestrator.runtime?.terminal_id,
+      )
+      const response: DeletedProject = {
+        command_id: input.command_id,
+        project_id: projectId,
+        orchestrator_worker_id: target.orchestrator.id,
+        deleted_at_unix_ms: Date.now(),
+        cleanup_pending: true,
+        background: { snapshots_pending: 0, snapshots_abandoned: 0 },
+        cancelled_assignment_ids: cancelledAssignmentIds,
+        replayed: false,
+      }
+      state.projectDeleteResults[input.command_id] = { input, response }
+      await route.fulfill({ json: response })
       return
     }
 
@@ -3184,6 +3943,284 @@ async function mockApi(
       return
     }
 
+    if (transcriptMatch && request.method() === 'GET') {
+      const projectId = decodeURIComponent(transcriptMatch[1])
+      const assignmentId = decodeURIComponent(transcriptMatch[2])
+      state.transcriptRequests.push(assignmentId)
+      const current = state.assignments.find(
+        (candidate) =>
+          candidate.id === assignmentId && candidate.project_id === projectId,
+      )
+      if (!current) {
+        await route.fulfill({
+          status: 404,
+          json: {
+            error: {
+              code: 'assignment_not_found',
+              message: 'Assignment was not found in this Yard project',
+            },
+          },
+        })
+        return
+      }
+      const transcript: WorkerTranscript = state.transcripts[assignmentId] ?? {
+        worker_id: current.worker.id,
+        assignment_id: assignmentId,
+        status: 'unavailable',
+        unavailable_reason: 'not_captured',
+        terminal_id: current.worker.runtime?.terminal_id ?? null,
+        provider_session: current.worker.runtime?.provider_session ?? null,
+        source: null,
+        format: null,
+        text: null,
+        line_count: 0,
+        byte_count: 0,
+        truncated: false,
+        captured_at_unix_ms: null,
+        attempts: 0,
+        last_error: null,
+        next_attempt_at_unix_ms: null,
+      }
+      await route.fulfill({ json: transcript })
+      return
+    }
+
+    if (dispositionMatch && request.method() === 'POST') {
+      const projectId = decodeURIComponent(dispositionMatch[1])
+      const assignmentId = decodeURIComponent(dispositionMatch[2])
+      const input = request.postDataJSON() as DisposeAssignmentInput
+      state.dispositionRequestCommandIds.push(input.command_id)
+      const previous = state.dispositionResults[input.command_id]
+      if (previous) {
+        if (JSON.stringify(previous.input) === JSON.stringify(input)) {
+          await route.fulfill({
+            json: { ...previous.response, replayed: true },
+          })
+        } else {
+          await route.fulfill({
+            status: 409,
+            json: {
+              error: {
+                code: 'idempotency_conflict',
+                message: 'Command ID is already associated with different input',
+              },
+            },
+          })
+        }
+        return
+      }
+      if (state.dispositionNetworkFailures > 0) {
+        state.dispositionNetworkFailures -= 1
+        await route.abort('failed')
+        return
+      }
+      const index = state.assignments.findIndex(
+        (candidate) =>
+          candidate.id === assignmentId && candidate.project_id === projectId,
+      )
+      const current = state.assignments[index]
+      if (!current) {
+        await route.fulfill({ status: 404 })
+        return
+      }
+      if (current.lifecycle !== 'active') {
+        await route.fulfill({
+          status: 409,
+          json: {
+            error: {
+              code: 'assignment_not_active',
+              message: 'This assignment is no longer active',
+            },
+          },
+        })
+        return
+      }
+      if (
+        input.attempt_id !== current.attempt.id ||
+        input.expected_assignment_version !== current.version ||
+        input.expected_attempt_version !== current.attempt.version
+      ) {
+        await route.fulfill({
+          status: 409,
+          json: {
+            error: {
+              code: 'assignment_version_conflict',
+              message: 'Assignment or attempt changed concurrently',
+            },
+          },
+        })
+        return
+      }
+      if (
+        input.end_session
+          ? input.expected_worker_version !== current.worker.version ||
+            input.expected_runtime_version !== current.worker.runtime?.version
+          : input.expected_worker_version !== undefined ||
+            input.expected_runtime_version !== undefined
+      ) {
+        await route.fulfill({
+          status: 409,
+          json: {
+            error: {
+              code: 'worker_version_conflict',
+              message: 'Worker changed concurrently',
+            },
+          },
+        })
+        return
+      }
+      const now = Date.now()
+      const completed = input.outcome === 'completed'
+      const receipt: CompletionReceipt | null = completed
+        ? {
+            id: `${assignmentId}-receipt`,
+            assignment_id: assignmentId,
+            attempt_id: current.attempt.id,
+            outcome: 'completed',
+            detail_level: 'minimal',
+            objective_snapshot: current.objective,
+            summary: 'Completed without a detailed handoff.',
+            artifact_refs: [],
+            artifacts: [],
+            evidence_refs: [],
+            unresolved_blockers: [],
+            actor: input.actor,
+            created_at_unix_ms: now,
+          }
+        : null
+      const cancellation: AssignmentCancellation | null = completed
+        ? null
+        : {
+            assignment_id: assignmentId,
+            attempt_id: current.attempt.id,
+            command_id: input.command_id,
+            reason: 'ended_without_completion',
+            actor: input.actor,
+            request_origin: 'browser',
+            objective_snapshot: current.objective,
+            cancelled_at_unix_ms: now,
+          }
+      const worker: Worker = input.end_session
+        ? {
+            ...current.worker,
+            desired_state: 'ended',
+            runtime: null,
+            version: String(Number(current.worker.version) + 1),
+            updated_at_unix_ms: now,
+          }
+        : current.worker
+      const lifecycle = completed ? 'completed' : 'cancelled'
+      const disposed: Assignment = {
+        ...current,
+        worker,
+        lifecycle,
+        attempt: {
+          ...current.attempt,
+          lifecycle,
+          version: String(Number(current.attempt.version) + 1),
+          updated_at_unix_ms: now,
+        },
+        completion_receipt: receipt,
+        cancellation,
+        version: String(Number(current.version) + 1),
+        updated_at_unix_ms: now,
+      }
+      state.assignments[index] = disposed
+      const candidateIndex = state.workerCandidates.findIndex(
+        (candidate) => candidate.worker.id === worker.id,
+      )
+      const candidate: WorkerCandidate = input.end_session
+        ? {
+            worker,
+            profile_name: current.profile_name,
+            default_role: current.role,
+            availability: 'ended',
+            project_id: null,
+            assignment_id: null,
+            reason: 'Session ended by explicit user action',
+          }
+        : {
+            worker,
+            profile_name: current.profile_name,
+            default_role: current.role,
+            availability: 'resumable',
+            assignment_id: current.id,
+            reason: 'The previous assignment ended.',
+          }
+      if (candidateIndex >= 0) {
+        state.workerCandidates[candidateIndex] = candidate
+      } else {
+        state.workerCandidates.push(candidate)
+      }
+      if (input.end_session && current.worker.runtime) {
+        state.runtimeInventory.workers = state.runtimeInventory.workers.filter(
+          (observed) =>
+            observed.terminal_id !== current.worker.runtime?.terminal_id,
+        )
+      }
+      const transcriptText =
+        options.transcriptText ??
+        'Implemented the change.\nAll focused tests pass.\n'
+      state.transcripts[assignmentId] = options.transcriptUnavailable
+        ? {
+            worker_id: worker.id,
+            assignment_id: assignmentId,
+            status: 'unavailable',
+            unavailable_reason: 'runtime_closed',
+            terminal_id: current.worker.runtime?.terminal_id ?? null,
+            provider_session: {
+              source: 'herdr:codex',
+              provider: 'codex',
+              kind: 'rollout',
+              value: `${assignmentId}-rollout`,
+            },
+            source: null,
+            format: null,
+            text: null,
+            line_count: 0,
+            byte_count: 0,
+            truncated: false,
+            captured_at_unix_ms: null,
+            attempts: 1,
+            last_error: null,
+            next_attempt_at_unix_ms: null,
+          }
+        : {
+            worker_id: worker.id,
+            assignment_id: assignmentId,
+            status: 'captured',
+            unavailable_reason: null,
+            terminal_id: current.worker.runtime?.terminal_id ?? null,
+            provider_session: current.worker.runtime?.provider_session ?? null,
+            source: 'recent_unwrapped',
+            format: 'text',
+            text: transcriptText,
+            line_count: transcriptText.split('\n').filter(Boolean).length,
+            byte_count: transcriptText.length,
+            truncated: false,
+            captured_at_unix_ms: now,
+            attempts: 1,
+            last_error: null,
+            next_attempt_at_unix_ms: null,
+          }
+      const response: DisposedAssignment = {
+        command_id: input.command_id,
+        assignment: disposed,
+        receipt,
+        cancellation,
+        worker: input.end_session ? worker : null,
+        cleanup_pending: Boolean(
+          input.end_session && options.dispositionCleanupPending,
+        ),
+        transcript_pending: false,
+        replayed: false,
+      }
+      state.dispositionCommands.push(input)
+      state.dispositionResults[input.command_id] = { input, response }
+      await route.fulfill({ json: response })
+      return
+    }
+
     if (completionMatch && request.method() === 'POST') {
       const projectId = decodeURIComponent(completionMatch[1])
       const assignmentId = decodeURIComponent(completionMatch[2])
@@ -3220,6 +4257,23 @@ async function mockApi(
         await route.abort('failed')
         return
       }
+      if (
+        input.artifact_refs.length === 0 &&
+        input.artifact_ids.length === 0 &&
+        input.evidence_refs.length === 0
+      ) {
+        await route.fulfill({
+          status: 422,
+          json: {
+            error: {
+              code: 'invalid_completion_receipt',
+              message:
+                'completed receipts require at least one artifact or evidence reference',
+            },
+          },
+        })
+        return
+      }
 
       const now = Date.now()
       const receipt: CompletionReceipt = {
@@ -3227,6 +4281,8 @@ async function mockApi(
         assignment_id: assignmentId,
         attempt_id: current.attempt.id,
         outcome: 'completed',
+        detail_level: 'detailed',
+        objective_snapshot: null,
         summary: input.summary,
         artifact_refs: input.artifact_refs,
         artifacts: input.artifact_ids.map((id) => {
@@ -3686,7 +4742,18 @@ async function mockApi(
       request.method() === 'GET' &&
       url.pathname === '/api/v1/automations'
     ) {
-      await route.fulfill({ json: { automations: state.automations } })
+      // Like the server: an archived or deleted workstream's automations
+      // are no longer listed.
+      const automations = state.automations.filter(
+        (automation) =>
+          automation.scope.kind !== 'workstream_coordination_node' ||
+          !state.archivedCoordinationNodes.some(
+            (node) =>
+              automation.scope.kind === 'workstream_coordination_node' &&
+              node.id === automation.scope.node_id,
+          ),
+      )
+      await route.fulfill({ json: { automations } })
       return
     }
     if (
@@ -4585,6 +5652,137 @@ async function expectRuntimeLayout(page: Page) {
   expect(metrics.markerOverflowY).toBeLessThanOrEqual(60)
   expect(metrics.outsideProject).toEqual([])
   expect(metrics.overlaps).toEqual([])
+}
+
+async function openDetailedCompletion(page: Page) {
+  const inspector = page.locator('.inspector')
+  await inspector
+    .getByRole('button', { name: 'More worker actions', exact: true })
+    .click()
+  await inspector
+    .getByRole('button', { name: 'Complete with details…', exact: true })
+    .click()
+  return page.getByRole('dialog', { name: 'Complete with details' })
+}
+
+const ACTIVE_ASSIGNMENT_LIFECYCLES = ['allocating', 'active', 'handing_off']
+
+// The server's project disposition preview, from mock state.
+function mockProjectPreview(
+  state: MockState,
+  projectId: string,
+): ProjectDispositionPreview | null {
+  const project = state.projects.find((candidate) => candidate.id === projectId)
+  if (!project) return null
+  return {
+    project_id: project.id,
+    name: project.name,
+    project_version: project.version,
+    orchestrator_worker_id: project.orchestrator.id,
+    orchestrator_worker_version: project.orchestrator.version,
+    orchestrator_runtime_version: project.orchestrator.runtime?.version ?? null,
+    active_assignments: state.assignments
+      .filter(
+        (candidate) =>
+          candidate.project_id === projectId &&
+          ACTIVE_ASSIGNMENT_LIFECYCLES.includes(candidate.lifecycle),
+      )
+      .map((candidate) => ({
+        assignment_id: candidate.id,
+        assignment_version: candidate.version,
+        lifecycle: candidate.lifecycle,
+        objective: candidate.objective,
+        role: candidate.role,
+        profile_name: candidate.profile_name,
+        worker_id: candidate.worker.id,
+        runtime_present: candidate.worker.runtime !== null,
+      })),
+  }
+}
+
+// The server's active-work gate: null when the archive may proceed,
+// otherwise the 409 error body with a fresh preview.
+function mockActiveWorkRefusal(
+  state: MockState,
+  projectId: string,
+  input: Pick<
+    ArchiveProjectInput,
+    'active_work' | 'expected_active_assignments'
+  >,
+) {
+  const preview = mockProjectPreview(state, projectId)
+  if (!preview) return null
+  const live = preview.active_assignments
+    .map((entry) => `${entry.assignment_id}@${entry.assignment_version}`)
+    .sort()
+  if (input.active_work !== 'cancel') {
+    return live.length === 0
+      ? null
+      : {
+          code: 'project_has_active_work',
+          message: 'The project has active assignments',
+          preview,
+        }
+  }
+  const expected = (input.expected_active_assignments ?? [])
+    .map(
+      (entry) => `${entry.assignment_id}@${entry.expected_assignment_version}`,
+    )
+    .sort()
+  return JSON.stringify(live) === JSON.stringify(expected)
+    ? null
+    : {
+        code: 'project_archive_preview_stale',
+        message: "The project's active assignments changed since the preview",
+        preview,
+      }
+}
+
+// Record every active assignment of the project as cancelled by the archive
+// (never completed) and end its worker, as the server does.
+function mockCancelArchivedAssignments(
+  state: MockState,
+  projectId: string,
+  commandId: string,
+) {
+  const now = Date.now()
+  const cancelled: string[] = []
+  state.assignments = state.assignments.map((candidate) => {
+    if (
+      candidate.project_id !== projectId ||
+      !ACTIVE_ASSIGNMENT_LIFECYCLES.includes(candidate.lifecycle)
+    ) {
+      return candidate
+    }
+    cancelled.push(candidate.id)
+    return {
+      ...candidate,
+      lifecycle: 'cancelled',
+      version: String(Number(candidate.version) + 1),
+      attempt: {
+        ...candidate.attempt,
+        lifecycle: 'cancelled',
+        version: String(Number(candidate.attempt.version) + 1),
+      },
+      cancellation: {
+        assignment_id: candidate.id,
+        attempt_id: candidate.attempt.id,
+        command_id: commandId,
+        reason: 'project_archived',
+        actor: 'local-user',
+        request_origin: 'browser',
+        objective_snapshot: candidate.objective,
+        cancelled_at_unix_ms: now,
+      },
+      worker: {
+        ...candidate.worker,
+        desired_state: 'ended',
+        runtime: null,
+        version: String(Number(candidate.worker.version) + 1),
+      },
+    }
+  })
+  return cancelled.sort()
 }
 
 function seedActiveAssignment(
@@ -5898,6 +7096,8 @@ test('projects active assignments once and historical live workers as observed',
         assignment_id: historicalAssignment.id,
         attempt_id: historicalAssignment.attempt.id,
         outcome: 'completed',
+        detail_level: 'detailed',
+        objective_snapshot: null,
         summary: 'The assignment is complete while the terminal remains live.',
         artifact_refs: [],
         artifacts: [],
@@ -6443,7 +7643,7 @@ test('keeps exited assignment process state separate from runtime status', async
   ).toBeVisible()
   await expect(inspector.locator('.runtime-badge')).toContainText('active')
   await expect(
-    inspector.getByRole('button', { name: 'Record completion' }),
+    inspector.getByRole('button', { name: 'Complete', exact: true }),
   ).toBeVisible()
 })
 
@@ -7059,38 +8259,992 @@ test('archives a project and moves its orchestrator to worker history', async ({
   ).toBe('ended')
 })
 
-for (const dependency of [
-  'unfinished_handoff',
-  'snapshot_collection_pending',
-] as const) {
-  test(`keeps a project visible when archive is blocked by ${dependency}`, async ({
+test('keeps a project visible while a worker handoff is still in flight', async ({
+  page,
+}) => {
+  const state = await mockApi(page, { archiveHandoffInFlight: true })
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
+  await page
+    .getByRole('button', { name: 'Archive project', exact: true })
+    .click()
+  const dialog = page.getByRole('dialog', { name: 'Archive project' })
+  await dialog
+    .getByRole('button', { name: 'Archive project', exact: true })
+    .click()
+
+  await expect(dialog).toBeVisible()
+  await expect(dialog).toContainText(
+    'A worker handoff into or out of this project is still in progress',
+  )
+  await expect(page.locator('.project-region')).toHaveCount(2)
+  expect(state.projectArchiveCommands).toHaveLength(0)
+})
+
+test('archives a project while a knowledge snapshot is still collecting', async ({
+  page,
+}) => {
+  const state = await mockApi(page, { archiveSnapshotsPending: 1 })
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
+  await page
+    .getByRole('button', { name: 'Archive project', exact: true })
+    .click()
+  const dialog = page.getByRole('dialog', { name: 'Archive project' })
+  await dialog
+    .getByRole('button', { name: 'Archive project', exact: true })
+    .click()
+
+  await expect(dialog).toBeHidden()
+  await expect.poll(() => state.projectArchiveCommands.length).toBe(1)
+  await expect(page.locator('.project-region')).toHaveCount(1)
+  const notice = page.locator('.notice-banner')
+  await expect(notice).toHaveAttribute('role', 'status')
+  await expect(notice).toContainText(
+    'Snapshot pending: 1 knowledge snapshot can still collect this project.',
+  )
+  await expect(page.locator('.error-banner')).toHaveCount(0)
+})
+
+test('deletes an active project with one confirmation and one request', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
+  await page
+    .getByRole('button', { name: 'Delete project', exact: true })
+    .click()
+  const dialog = page.getByRole('dialog', { name: 'Delete project' })
+  await expect(dialog).toContainText(
+    'archives the project if it is still active and removes it and its orchestrator from Yard views in one step',
+  )
+  await dialog
+    .getByRole('button', { name: 'Delete project', exact: true })
+    .click()
+
+  await expect(dialog).toBeHidden()
+  await expect.poll(() => state.projectDeleteCommands.length).toBe(1)
+  expect(state.projectArchiveCommands).toHaveLength(0)
+  expect(state.projectDeleteCommands[0]).toMatchObject({
+    actor: 'local-user',
+    archive: {
+      expected_project_version: '1',
+      expected_orchestrator_worker_id: 'project-1-orchestrator',
+      expected_orchestrator_worker_version: '1',
+      expected_orchestrator_runtime_version: '1',
+    },
+  })
+  await expect(page.locator('.project-region')).toHaveCount(1)
+  await expect(
+    page.getByText(
+      'Project deleted from Yard. Runtime cleanup continues in the background.',
+    ),
+  ).toBeVisible()
+  expect(
+    state.workerCandidates.some(
+      (candidate) => candidate.worker.id === 'project-1-orchestrator',
+    ),
+  ).toBe(false)
+})
+
+test('deletes a project that another tab archived after the dialog opened', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
+  await page
+    .getByRole('button', { name: 'Delete project', exact: true })
+    .click()
+  const dialog = page.getByRole('dialog', { name: 'Delete project' })
+  // The confirmation is ready once its preview has loaded.
+  await expect(
+    dialog.getByRole('button', { name: 'Delete project', exact: true }),
+  ).toBeEnabled()
+  const archivedElsewhere = state.projects.findIndex(
+    (candidate) => candidate.id === 'project-1',
+  )
+  state.archivedProjects.push(
+    ...state.projects.splice(archivedElsewhere, 1).map((candidate) => ({
+      ...candidate,
+      version: String(Number(candidate.version) + 1),
+    })),
+  )
+
+  await dialog
+    .getByRole('button', { name: 'Delete project', exact: true })
+    .click()
+
+  await expect(dialog).toBeHidden()
+  await expect.poll(() => state.projectDeleteCommands.length).toBe(1)
+  expect(state.projectArchiveCommands).toHaveLength(0)
+  expect(state.archivedProjects).toHaveLength(0)
+  await expect(page.locator('.project-region')).toHaveCount(1)
+  await expect(page.getByText('Project deleted from Yard.')).toBeVisible()
+})
+
+test('deletes a project with an active worker after listing it in one confirmation', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const active = seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
+  await page
+    .getByRole('button', { name: 'Delete project', exact: true })
+    .click()
+  const dialog = page.getByRole('dialog', { name: 'Delete project' })
+  const workers = dialog.getByRole('list', { name: 'Active workers to end' })
+  await expect(workers.getByRole('listitem')).toHaveCount(1)
+  await expect(workers).toContainText(
+    `${active.profile_name} — Inspect and guide the active work.`,
+  )
+  await expect(dialog).toContainText(
+    'Its assignment is recorded as cancelled, not completed. The agent keeps running until you close its Herdr tab.',
+  )
+  expect(state.projectDeleteAttempts).toHaveLength(0)
+  await dialog
+    .getByRole('button', { name: 'Delete and end 1 active worker', exact: true })
+    .click()
+
+  await expect(dialog).toBeHidden()
+  expect(state.projectDeleteCommands).toHaveLength(1)
+  expect(state.projectDeleteCommands[0].archive).toMatchObject({
+    active_work: 'cancel',
+    expected_active_assignments: [
+      { assignment_id: active.id, expected_assignment_version: '2' },
+    ],
+  })
+  const cancelled = state.assignments.find(({ id }) => id === active.id)
+  expect(cancelled?.lifecycle).toBe('cancelled')
+  expect(cancelled?.cancellation?.reason).toBe('project_archived')
+  expect(cancelled?.completion_receipt).toBeNull()
+  await expect(
+    page.getByText(
+      'Project deleted from Yard. Ended 1 active worker; its assignment is recorded as cancelled.',
+    ),
+  ).toBeVisible()
+})
+
+test('archives a project with active workers after listing them in one confirmation', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const first = seedActiveAssignment(state)
+  const second = seedActiveAssignment(state, 'assignment-2')
+  second.objective = 'Review the parser change.'
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
+  await page
+    .getByRole('button', { name: 'Archive project', exact: true })
+    .click()
+  const dialog = page.getByRole('dialog', { name: 'Archive project' })
+  const workers = dialog.getByRole('list', { name: 'Active workers to end' })
+  await expect(workers.getByRole('listitem')).toHaveText([
+    `${first.profile_name} — Inspect and guide the active work.`,
+    `${second.profile_name} — Review the parser change.`,
+  ])
+  await expect(dialog).toContainText(
+    'Their assignments are recorded as cancelled, not completed. The agents keep running until you close their Herdr tabs.',
+  )
+  await page.screenshot({
+    path: test.info().outputPath('archive-active-workers-confirmation.png'),
+  })
+  await dialog
+    .getByRole('button', {
+      name: 'Archive and end 2 active workers',
+      exact: true,
+    })
+    .click()
+
+  await expect(dialog).toBeHidden()
+  expect(state.projectArchiveCommands).toHaveLength(1)
+  expect(state.projectArchiveCommands[0]).toMatchObject({
+    active_work: 'cancel',
+    expected_project_version: '1',
+    expected_active_assignments: [
+      { assignment_id: first.id, expected_assignment_version: '2' },
+      { assignment_id: second.id, expected_assignment_version: '2' },
+    ],
+  })
+  expect(
+    state.assignments
+      .filter(({ project_id }) => project_id === 'project-1')
+      .map(({ lifecycle, completion_receipt }) => [
+        lifecycle,
+        completion_receipt,
+      ]),
+  ).toEqual([
+    ['cancelled', null],
+    ['cancelled', null],
+  ])
+  await expect(page.locator('.project-region')).toHaveCount(1)
+  await expect(
+    page.getByText(
+      'Project archived. Ended 2 active workers; their assignments are recorded as cancelled.',
+    ),
+  ).toBeVisible()
+})
+
+async function archiveFirstProject(page: Page) {
+  await page
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
+  await page
+    .getByRole('button', { name: 'Archive project', exact: true })
+    .click()
+  await page
+    .getByRole('dialog', { name: 'Archive project' })
+    .getByRole('button', { name: 'Archive project', exact: true })
+    .click()
+  await expect(page.locator('.project-region')).toHaveCount(1)
+}
+
+test('undoes an archive from its toast and restores the project', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await archiveFirstProject(page)
+
+  const toast = page.getByRole('status', { name: 'Undo archive' })
+  await expect(toast).toContainText('Archived “API migration”.')
+  await toast.getByRole('button', { name: 'Undo', exact: true }).click()
+
+  await expect.poll(() => state.projectRestoreAttempts.length).toBe(1)
+  expect(state.projectRestoreAttempts[0]).toEqual({
+    command_id: expect.any(String),
+    actor: 'local-user',
+    expected_archive_command_id: state.projectArchiveCommands[0].command_id,
+  })
+  await expect(page.locator('.project-region')).toHaveCount(2)
+  await expect(toast).toHaveCount(0)
+  await expect(page.locator('.notice-banner')).toContainText(
+    'Restored “API migration”.',
+  )
+})
+
+test('retries an Undo refused while Herdr is down with the same restore command', async ({
+  page,
+}) => {
+  const state = await mockApi(page, { restoreHerdrFailures: 1 })
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await archiveFirstProject(page)
+
+  const toast = page.getByRole('status', { name: 'Undo archive' })
+  await toast.getByRole('button', { name: 'Undo', exact: true }).click()
+  await expect(toast).toContainText(
+    'Herdr is unreachable, so Yard cannot tell whether the orchestrator is still running.',
+  )
+  await expect(page.locator('.project-region')).toHaveCount(1)
+  await toast.getByRole('button', { name: 'Retry', exact: true }).click()
+
+  await expect(page.locator('.project-region')).toHaveCount(2)
+  expect(state.projectRestoreAttempts).toHaveLength(2)
+  expect(state.projectRestoreAttempts[1]).toEqual(
+    state.projectRestoreAttempts[0],
+  )
+  await expect(toast).toHaveCount(0)
+})
+
+// The Archived tab lives in mainline's resource shelf, behind Resources.
+async function openArchivedShelf(page: Page) {
+  await page.getByRole('button', { name: 'Resources', exact: true }).click()
+  await page.getByRole('tab', { name: 'Archived' }).click()
+}
+
+test('restores an archived project from the Archived shelf', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await archiveFirstProject(page)
+  await page
+    .getByRole('status', { name: 'Undo archive' })
+    .getByRole('button', { name: 'Dismiss undo' })
+    .click()
+
+  await openArchivedShelf(page)
+  const archived = page.getByRole('list', { name: 'Archived projects' })
+  const row = archived.getByRole('listitem').filter({ hasText: 'API migration' })
+  await expect(row).toContainText('Herdr tab cleanup pending')
+  await row.getByRole('button', { name: 'Restore API migration' }).click()
+
+  await expect(page.locator('.project-region')).toHaveCount(2)
+  await expect(archived.getByRole('listitem')).toHaveCount(0)
+  await expect(page.getByText('No archived projects.')).toBeVisible()
+  expect(state.projectRestoreAttempts).toHaveLength(1)
+  expect(state.projectRestoreAttempts[0].expected_archive_command_id).toBe(
+    state.projectArchiveCommands[0].command_id,
+  )
+})
+
+test('offers no Undo or Restore for an archive that cannot be restored', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  state.projectArchiveNotRestorable = true
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await archiveFirstProject(page)
+
+  await expect(page.locator('.notice-banner')).toContainText('Project archived.')
+  await expect(page.getByRole('status', { name: 'Undo archive' })).toHaveCount(
+    0,
+  )
+  await openArchivedShelf(page)
+  const row = page
+    .getByRole('list', { name: 'Archived projects' })
+    .getByRole('listitem')
+    .filter({ hasText: 'API migration' })
+  await expect(row).toContainText('Not restorable now')
+  await expect(
+    row.getByRole('button', { name: 'Restore API migration' }),
+  ).toBeDisabled()
+  expect(state.projectRestoreAttempts).toHaveLength(0)
+})
+
+test('hides the Undo toast when its 10 second window ends', async ({ page }) => {
+  await mockApi(page)
+  await page.clock.install()
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await archiveFirstProject(page)
+
+  const toast = page.getByRole('status', { name: 'Undo archive' })
+  await expect(toast).toBeVisible()
+  await page.clock.fastForward(9_000)
+  await expect(toast).toBeVisible()
+  await page.clock.fastForward(1_500)
+  await expect(toast).toHaveCount(0)
+  await expect(page.locator('.project-region')).toHaveCount(1)
+})
+
+test('shows an Undo refused for good without Retry and lets it expire', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  state.projectRestoreRefusal = {
+    code: 'project_restore_unavailable',
+    message: 'The project was restored or archived again since this view loaded',
+    reason: 'archive_changed',
+  }
+  await page.clock.install()
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await archiveFirstProject(page)
+
+  const toast = page.getByRole('status', { name: 'Undo archive' })
+  await toast.getByRole('button', { name: 'Undo', exact: true }).click()
+  await expect(toast).toContainText(
+    'This project was restored or archived again in another tab.',
+  )
+  await expect(toast.getByRole('button', { name: 'Retry' })).toHaveCount(0)
+  await expect(
+    toast.getByRole('button', { name: 'Undo', exact: true }),
+  ).toHaveCount(0)
+  await page.clock.fastForward(10_500)
+  await expect(toast).toHaveCount(0)
+  expect(state.projectRestoreAttempts).toHaveLength(1)
+})
+
+test('deletes a project that another tab archived before the dialog opened', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await expect(page.locator('.project-region')).toHaveCount(2)
+  const archivedElsewhere = state.projects.findIndex(
+    (candidate) => candidate.id === 'project-1',
+  )
+  state.archivedProjects.push(...state.projects.splice(archivedElsewhere, 1))
+
+  await page
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
+  await page
+    .getByRole('button', { name: 'Delete project', exact: true })
+    .click()
+  const dialog = page.getByRole('dialog', { name: 'Delete project' })
+  await expect(dialog).toContainText(
+    'This project was already archived elsewhere; Delete removes it permanently.',
+  )
+  await dialog
+    .getByRole('button', { name: 'Delete project', exact: true })
+    .click()
+
+  await expect(dialog).toBeHidden()
+  await expect.poll(() => state.projectDeleteCommands.length).toBe(1)
+  expect(state.projectDeleteCommands[0].archive).toBeNull()
+  expect(state.projectArchiveAttempts).toHaveLength(0)
+  expect(state.archivedProjects).toHaveLength(0)
+  await expect(page.getByText('Project deleted from Yard.')).toBeVisible()
+})
+
+test('checks the archive impact again after the preview failed to load', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  state.projectPreviewNetworkFailures = 1
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
+  await page
+    .getByRole('button', { name: 'Archive project', exact: true })
+    .click()
+  const dialog = page.getByRole('dialog', { name: 'Archive project' })
+  const confirm = dialog.getByRole('button', {
+    name: 'Archive project',
+    exact: true,
+  })
+  const checkAgain = dialog.getByRole('button', { name: 'Check again' })
+  await expect(checkAgain).toBeVisible()
+  await expect(confirm).toBeDisabled()
+  await checkAgain.click()
+
+  await expect(confirm).toBeEnabled()
+  await expect(checkAgain).toHaveCount(0)
+  await confirm.click()
+  await expect(dialog).toBeHidden()
+  expect(state.projectArchiveCommands).toHaveLength(1)
+})
+
+test('retries a failed archive with active workers with the same command and body', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const active = seedActiveAssignment(state)
+  state.projectArchiveNetworkFailures = 1
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
+  await page
+    .getByRole('button', { name: 'Archive project', exact: true })
+    .click()
+  const dialog = page.getByRole('dialog', { name: 'Archive project' })
+  const confirm = dialog.getByRole('button', {
+    name: 'Archive and end 1 active worker',
+    exact: true,
+  })
+  await confirm.click()
+  await expect(dialog.getByRole('alert')).toBeVisible()
+  expect(state.projectArchiveCommands).toHaveLength(0)
+
+  await confirm.click()
+  await expect(dialog).toBeHidden()
+  expect(state.projectArchiveAttempts).toHaveLength(2)
+  expect(state.projectArchiveAttempts[1]).toEqual(
+    state.projectArchiveAttempts[0],
+  )
+  expect(state.projectArchiveCommands).toHaveLength(1)
+  expect(state.projectArchiveCommands[0]).toMatchObject({
+    active_work: 'cancel',
+    expected_active_assignments: [
+      { assignment_id: active.id, expected_assignment_version: '2' },
+    ],
+  })
+  await expect(page.locator('.project-region')).toHaveCount(1)
+})
+
+test('shows the refreshed active workers when the archive preview went stale', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
+  await page
+    .getByRole('button', { name: 'Archive project', exact: true })
+    .click()
+  const dialog = page.getByRole('dialog', { name: 'Archive project' })
+  const confirmOne = dialog.getByRole('button', {
+    name: 'Archive and end 1 active worker',
+    exact: true,
+  })
+  await expect(confirmOne).toBeEnabled()
+  // Another worker starts after the preview was read.
+  const late = seedActiveAssignment(state, 'assignment-late')
+  late.objective = 'Started after the preview.'
+  await confirmOne.click()
+
+  await expect(dialog.getByRole('alert')).toContainText(
+    'The active workers changed while this dialog was open. Review the updated list, then confirm again.',
+  )
+  await expect(
+    dialog
+      .getByRole('list', { name: 'Active workers to end' })
+      .getByRole('listitem'),
+  ).toHaveCount(2)
+  await expect(dialog).toContainText('Started after the preview.')
+  expect(state.projectArchiveCommands).toHaveLength(0)
+  expect(state.projectArchiveAttempts).toHaveLength(1)
+
+  await dialog
+    .getByRole('button', {
+      name: 'Archive and end 2 active workers',
+      exact: true,
+    })
+    .click()
+  await expect(dialog).toBeHidden()
+  expect(state.projectArchiveAttempts).toHaveLength(2)
+  // The refreshed confirmation is a new command with the new list.
+  expect(state.projectArchiveAttempts[1].command_id).not.toBe(
+    state.projectArchiveAttempts[0].command_id,
+  )
+  expect(
+    state.projectArchiveCommands[0].expected_active_assignments?.map(
+      ({ assignment_id }) => assignment_id,
+    ),
+  ).toEqual(['assignment-1', 'assignment-late'])
+  await expect(page.locator('.project-region')).toHaveCount(1)
+})
+
+test('retries a failed delete with the same command and body', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  state.projectDeleteNetworkFailures = 1
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page
+    .locator('[data-id="project:project-1"]')
+    .dispatchEvent('click')
+  await page
+    .getByRole('button', { name: 'Delete project', exact: true })
+    .click()
+  const dialog = page.getByRole('dialog', { name: 'Delete project' })
+  const confirm = dialog.getByRole('button', {
+    name: 'Delete project',
+    exact: true,
+  })
+  await confirm.click()
+  await expect(dialog.getByRole('alert')).toBeVisible()
+  expect(state.projectDeleteCommands).toHaveLength(0)
+
+  await confirm.click()
+  await expect(dialog).toBeHidden()
+  expect(state.projectDeleteAttempts).toHaveLength(2)
+  expect(state.projectDeleteAttempts[1]).toEqual(
+    state.projectDeleteAttempts[0],
+  )
+  expect(state.projectDeleteCommands).toHaveLength(1)
+  await expect(page.locator('.project-region')).toHaveCount(1)
+})
+
+function seedWorkstream(state: MockState) {
+  const now = Date.now()
+  const coordinator = profile('profile-coordinator', 'Coordinator')
+  state.profiles.push(coordinator)
+  const node: CoordinationNode = {
+    id: 'workstream-bar-nexus',
+    name: 'BAR <-> Nexus',
+    kind: 'workstream',
+    placement: {
+      geometry: { x: 420, y: 24, width: 116, height: 116 },
+      version: '1',
+      updated_at_unix_ms: now,
+    },
+    attached_project_ids: ['project-1', 'project-2'],
+    worker: durableWorker(
+      'workstream-worker',
+      'workstream-terminal',
+      coordinator,
+      'coordination-workspace',
+      'yard-coordination',
+    ),
+    cwd: '/tmp/yard/coordination/workstream-bar-nexus',
+    folder_path: null,
+    version: '3',
+    created_by: 'local-user',
+    created_at_unix_ms: now,
+    updated_at_unix_ms: now,
+  }
+  state.coordinationNodes.push(node)
+  state.automations.push({
+    id: 'automation-workstream-daily',
+    name: 'Workstream status',
+    scope: { kind: 'workstream_coordination_node', node_id: node.id },
+    placement: {
+      geometry: { x: 250, y: 18, width: 168, height: 58 },
+      version: '1',
+      updated_at_unix_ms: now,
+    },
+    schedule: { hour: 8, minute: 30, timezone: 'UTC' },
+    selected_project_ids: ['project-1'],
+    prompt_template: 'Summarize workstream status.',
+    state: 'active',
+    next_run_at_unix_ms: now + 86_400_000,
+    latest_run: null,
+    version: '1',
+    created_by: 'local-user',
+    created_at_unix_ms: now,
+    updated_at_unix_ms: now,
+  })
+  return node
+}
+
+async function openWorkstreamDisposition(
+  page: Page,
+  node: CoordinationNode,
+  action: 'Archive workstream' | 'Delete workstream…',
+) {
+  await page
+    .locator(`[data-id="coordination-node:${node.id}"]`)
+    .dispatchEvent('click')
+  await page
+    .locator('.inspector')
+    .getByRole('button', { name: action, exact: true })
+    .click()
+  return page.getByRole('dialog', {
+    name: action === 'Archive workstream' ? 'Archive workstream' : 'Delete workstream',
+  })
+}
+
+test('archives a workstream from its inspector and ends its dedicated worker', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const node = seedWorkstream(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await expect(
+    page.locator('.coordination-map-node[data-kind="workstream"]'),
+  ).toHaveCount(1)
+  await expect(
+    page.locator('[data-id="automation:automation-workstream-daily"]'),
+  ).toHaveCount(1)
+
+  const dialog = await openWorkstreamDisposition(page, node, 'Archive workstream')
+  await expect(dialog).toContainText(
+    'Dedicated worker Coordinator will be ended — its Herdr tab stays open until you close it.',
+  )
+  await expect(dialog).toContainText(
+    '2 attached projects are not affected: API migration, Offline release.',
+  )
+  await expect(dialog).toContainText('1 automation will be paused and leave the map with it.')
+  await dialog
+    .getByRole('button', { name: 'Archive workstream', exact: true })
+    .click()
+
+  await expect(dialog).toBeHidden()
+  expect(state.coordinationNodeArchiveCommands).toHaveLength(1)
+  expect(state.coordinationNodeArchiveCommands[0]).toMatchObject({
+    actor: 'local-user',
+    expected_node_version: '3',
+  })
+  expect(state.coordinationNodeDeleteCommands).toHaveLength(0)
+  await expect(
+    page.locator('.coordination-map-node[data-kind="workstream"]'),
+  ).toHaveCount(0)
+  const notice = page.locator('.notice-banner')
+  await expect(notice).toHaveAttribute('role', 'status')
+  await expect(notice).toContainText(
+    'Workstream archived. Its worker was ended; cleanup is pending until you close its Herdr tab. Paused 1 automation and removed it from the map.',
+  )
+  await expect(page.locator('.error-banner')).toHaveCount(0)
+  await expect(page.locator('.project-region')).toHaveCount(2)
+  expect(state.projects.map((candidate) => candidate.id)).toEqual([
+    'project-1',
+    'project-2',
+  ])
+  expect(state.automations[0].state).toBe('paused')
+  // The paused automation leaves the map with its workstream: no orphan card.
+  await expect(
+    page.locator('[data-id="automation:automation-workstream-daily"]'),
+  ).toHaveCount(0)
+  await expect(page.locator('.automation-map-node')).toHaveCount(0)
+})
+
+test('deletes an active workstream with one confirmation and keeps its projects', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const node = seedWorkstream(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  const dialog = await openWorkstreamDisposition(page, node, 'Delete workstream…')
+  await expect(dialog).toContainText(
+    'Yard archives this workstream if it is still active and removes it from Yard views in one step.',
+  )
+  await expect(dialog).toContainText(
+    'Dedicated worker Coordinator will be ended — its Herdr tab stays open until you close it.',
+  )
+  await expect(dialog).toContainText(
+    '2 attached projects are not affected: API migration, Offline release.',
+  )
+  // One compact confirmation: no typed name, no second dialog.
+  await expect(dialog.getByRole('textbox')).toHaveCount(0)
+  await dialog
+    .getByRole('button', { name: 'Delete workstream', exact: true })
+    .click()
+
+  await expect(dialog).toBeHidden()
+  expect(state.coordinationNodeDispositionAttempts).toHaveLength(1)
+  expect(state.coordinationNodeArchiveCommands).toHaveLength(0)
+  expect(state.coordinationNodeDeleteCommands).toHaveLength(1)
+  expect(state.coordinationNodeDeleteCommands[0]).toMatchObject({
+    actor: 'local-user',
+    archive: { expected_node_version: '3' },
+  })
+  await expect(
+    page.locator('.coordination-map-node[data-kind="workstream"]'),
+  ).toHaveCount(0)
+  await expect(page.getByRole('dialog')).toHaveCount(0)
+  await expect(page.locator('.notice-banner')).toContainText(
+    'Workstream deleted from Yard. Its worker was ended; cleanup is pending until you close its Herdr tab. Paused 1 automation and removed it from the map.',
+  )
+  await expect(page.locator('.project-region')).toHaveCount(2)
+  expect(state.deletedCoordinationNodeIds).toEqual([node.id])
+  await expect(
+    page.locator('[data-id="automation:automation-workstream-daily"]'),
+  ).toHaveCount(0)
+})
+
+test('never swaps an unavailable automation target for another one', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedWorkstream(state)
+  // The automation's workstream is no longer listed (for example a tab that
+  // still shows it after another tab archived the workstream).
+  state.coordinationNodes = []
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page
+    .locator('[data-id="automation:automation-workstream-daily"]')
+    .dispatchEvent('click')
+  const inspector = page.locator('.inspector')
+  await expect(inspector).toContainText('Unavailable target')
+  await expect(
+    inspector.locator('#automation-edit-target option:checked'),
+  ).toHaveText('Unavailable target — choose one')
+  const save = inspector.getByRole('button', { name: 'Save automation' })
+  await expect(save).toBeDisabled()
+  await inspector.locator('#automation-edit-name').fill('Renamed status')
+  // Editing something else does not quietly retarget it.
+  await expect(save).toBeDisabled()
+  await inspector.locator('#automation-edit-target').selectOption('superintendent')
+  await expect(save).toBeEnabled()
+  expect(state.automationUpdateCommands).toHaveLength(0)
+})
+
+test('retries a failed workstream delete with the same command and body', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const node = seedWorkstream(state)
+  state.coordinationNodeDispositionNetworkFailures = 1
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  const dialog = await openWorkstreamDisposition(page, node, 'Delete workstream…')
+  const confirm = dialog.getByRole('button', {
+    name: 'Delete workstream',
+    exact: true,
+  })
+  await expect(confirm).toBeEnabled()
+  await confirm.click()
+  await expect(dialog.getByRole('alert')).toBeVisible()
+  expect(state.coordinationNodeDeleteCommands).toHaveLength(0)
+
+  await confirm.click()
+  await expect(dialog).toBeHidden()
+  expect(state.coordinationNodeDispositionAttempts).toHaveLength(2)
+  expect(state.coordinationNodeDispositionAttempts[1]).toEqual(
+    state.coordinationNodeDispositionAttempts[0],
+  )
+  expect(state.coordinationNodeDeleteCommands).toHaveLength(1)
+  await expect(
+    page.locator('.coordination-map-node[data-kind="workstream"]'),
+  ).toHaveCount(0)
+})
+
+for (const mode of ['archive', 'delete'] as const) {
+  test(`reconciles a workstream ${mode} whose response was lost after it committed`, async ({
     page,
   }) => {
-    const state = await mockApi(page, { archiveDependency: dependency })
+    const state = await mockApi(page)
+    const node = seedWorkstream(state)
+    state.coordinationNodeDispositionLostResponses = 1
     await page.setViewportSize({ width: 1280, height: 800 })
     await page.goto('/')
 
-    await page
-      .locator('[data-id="project:project-1"]')
-      .dispatchEvent('click')
-    await page
-      .getByRole('button', { name: 'Archive project', exact: true })
-      .click()
-    const dialog = page.getByRole('dialog', { name: 'Archive project' })
+    const action = mode === 'archive' ? 'Archive workstream' : 'Delete workstream…'
+    const dialog = await openWorkstreamDisposition(page, node, action)
     await dialog
-      .getByRole('button', { name: 'Archive project', exact: true })
+      .getByRole('button', {
+        name: mode === 'archive' ? 'Archive workstream' : 'Delete workstream',
+        exact: true,
+      })
       .click()
 
-    await expect(dialog).toBeVisible()
-    await expect(dialog).toContainText(
-      dependency === 'unfinished_handoff'
-        ? 'A worker handoff targeting this project is still in progress'
-        : 'A coordination snapshot has not finished collecting this project',
+    // The command committed; only its response was lost. Reading the node
+    // back (409 archived / 404 not found) settles it as done, not failed.
+    await expect(dialog).toBeHidden()
+    expect(state.coordinationNodeDispositionAttempts).toHaveLength(1)
+    await expect(page.locator('.dialog-error')).toHaveCount(0)
+    await expect(
+      page.locator('.coordination-map-node[data-kind="workstream"]'),
+    ).toHaveCount(0)
+    const notice = page.locator('.notice-banner')
+    await expect(notice).toHaveAttribute('role', 'status')
+    await expect(notice).toContainText(
+      `${mode === 'archive' ? 'Workstream archived.' : 'Workstream deleted from Yard.'} Its worker was ended; cleanup is pending until you close its Herdr tab. Paused 1 automation and removed it from the map.`,
     )
-    await expect(page.locator('.project-region')).toHaveCount(2)
-    expect(state.projectArchiveCommands).toHaveLength(0)
   })
 }
+
+test('removes an archived workstream at once and keeps its notice over a Herdr error', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const node = seedWorkstream(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  const dialog = await openWorkstreamDisposition(page, node, 'Archive workstream')
+  const confirm = dialog.getByRole('button', {
+    name: 'Archive workstream',
+    exact: true,
+  })
+  await expect(confirm).toBeEnabled()
+  // After the archive commits, the node list reload fails and Herdr is down.
+  await page.route('**/api/v1/coordination-nodes', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    await route.fulfill({
+      status: 500,
+      json: { code: 'internal', message: 'coordination list unavailable' },
+    })
+  })
+  await page.route(
+    '**/api/v1/runtimes/herdr/sessions/*/lens',
+    async (route) => {
+      await route.fulfill({
+        status: 502,
+        json: {
+          code: 'herdr_unavailable',
+          message: 'failed to execute Herdr session discovery',
+        },
+      })
+    },
+  )
+  await confirm.click()
+
+  await expect(dialog).toBeHidden()
+  expect(state.coordinationNodeArchiveCommands).toHaveLength(1)
+  // Removed from the map by the result itself, not by the failed reload.
+  await expect(
+    page.locator('.coordination-map-node[data-kind="workstream"]'),
+  ).toHaveCount(0)
+  await expect(page.locator('.error-banner')).toBeVisible()
+  await expect(page.locator('.notice-banner')).toContainText(
+    'Workstream archived. Its worker was ended; cleanup is pending until you close its Herdr tab.',
+  )
+})
+
+test('re-checks a workstream that changed before archive and confirms under a new command', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const node = seedWorkstream(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  const dialog = await openWorkstreamDisposition(page, node, 'Archive workstream')
+  const confirm = dialog.getByRole('button', {
+    name: 'Archive workstream',
+    exact: true,
+  })
+  await expect(confirm).toBeEnabled()
+  // Another tab changes the workstream after this preview loaded.
+  const current = state.coordinationNodes.find(
+    (candidate) => candidate.id === node.id,
+  )!
+  current.version = String(Number(current.version) + 1)
+  await confirm.click()
+  await expect(dialog.getByRole('alert')).toContainText(
+    'This workstream changed while the dialog was open.',
+  )
+  await expect(confirm).toBeEnabled()
+
+  await confirm.click()
+  await expect(dialog).toBeHidden()
+  const attempts = state.coordinationNodeDispositionAttempts
+  expect(attempts).toHaveLength(2)
+  expect(attempts[0].input).toMatchObject({ expected_node_version: '3' })
+  expect(attempts[1].input).toMatchObject({ expected_node_version: '4' })
+  expect(attempts[1].input.command_id).not.toBe(attempts[0].input.command_id)
+  expect(state.coordinationNodeArchiveCommands).toHaveLength(1)
+  await expect(
+    page.locator('.coordination-map-node[data-kind="workstream"]'),
+  ).toHaveCount(0)
+})
+
+test('keeps Archive workstream disabled while a workstream route is in flight', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const node = seedWorkstream(state)
+  state.coordinationNodeBlockers[node.id] = [
+    { kind: 'route', command_id: 'route-in-flight', started_at_unix_ms: 1 },
+  ]
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  const dialog = await openWorkstreamDisposition(page, node, 'Archive workstream')
+  await expect(dialog).toContainText(
+    'Wait for 1 pending route to finish, then reopen this dialog.',
+  )
+  await expect(
+    dialog.getByRole('button', { name: 'Archive workstream', exact: true }),
+  ).toBeDisabled()
+  expect(state.coordinationNodeDispositionAttempts).toHaveLength(0)
+  await expect(
+    page.locator('.coordination-map-node[data-kind="workstream"]'),
+  ).toHaveCount(1)
+})
 
 test('renders central cleanup and Superintendent despite a project workspace collision', async ({
   page,
@@ -9220,6 +11374,8 @@ test('provisions a dedicated Superintendent and shows project updates', async ({
     assignment_id: completed.id,
     attempt_id: completed.attempt.id,
     outcome: 'completed',
+    detail_level: 'detailed',
+    objective_snapshot: null,
     summary: 'Published the signed offline release bundle.',
     artifact_refs: [],
     artifacts: [],
@@ -10502,6 +12658,8 @@ test('uses reported workflow status on the canvas and keeps runtime state distin
     assignment_id: completedAssignment.id,
     attempt_id: completedAssignment.attempt.id,
     outcome: 'completed',
+    detail_level: 'detailed',
+    objective_snapshot: null,
     summary: 'Prepared the documentation refresh.',
     artifact_refs: [],
     artifacts: [],
@@ -10836,7 +12994,11 @@ test('keeps automatic summaries isolated while manual actions remain available',
   await expect(
     dialog.getByText(/Summaries must run in isolated ephemeral workers/),
   ).toBeVisible()
-  await expect(dialog.getByRole('button', { name: 'Off' })).toBeDisabled()
+  await expect(
+    dialog
+      .getByLabel('Automatic coordination', { exact: true })
+      .getByRole('button', { name: 'Off' }),
+  ).toBeDisabled()
   await expect(dialog.getByRole('switch')).toHaveCount(0)
   expect(state.tokenSpendSettingsUpdates).toHaveLength(0)
 
@@ -11192,6 +13354,12 @@ test('creates an attached knowledge store and requests a source-linked snapshot'
   await expect(
     page.getByText('Knowledge snapshots', { exact: true }),
   ).toBeVisible()
+  // Archive and delete are workstream-only; the server rejects them here.
+  for (const action of ['Archive workstream', 'Delete workstream…']) {
+    await expect(
+      page.locator('.inspector').getByRole('button', { name: action }),
+    ).toHaveCount(0)
+  }
   await page
     .getByRole('button', { name: 'Request knowledge snapshot' })
     .click()
@@ -14015,12 +16183,16 @@ test('records a durable manual completion receipt', async ({ page }) => {
   await page.reload()
   await page.locator('.assigned-worker-marker').click()
 
-  await expect(page.getByText('Completion review')).toBeVisible()
   await expect(
-    page.getByText('Agent reports done. Evidence-backed receipt required.'),
+    page.locator('.inspector').getByText('Ready to complete'),
   ).toBeVisible()
   await expect(
-    page.locator('.assigned-worker-marker').getByText('Review completion'),
+    page.getByText(
+      'Agent reports done. Complete it, or add details to the receipt.',
+    ),
+  ).toBeVisible()
+  await expect(
+    page.locator('.assigned-worker-marker').getByText('Ready to complete'),
   ).toBeVisible()
 
   await page
@@ -14033,25 +16205,21 @@ test('records a durable manual completion receipt', async ({ page }) => {
   )
   await page.getByRole('button', { name: 'Back to Map' }).click()
 
-  await page
-    .getByRole('button', { name: 'Record completion', exact: true })
-    .click()
-  let dialog = page.getByRole('dialog', { name: 'Record completion' })
+  await openDetailedCompletion(page)
+  let dialog = page.getByRole('dialog', { name: 'Complete with details' })
   await expect(dialog).toBeVisible()
   await dialog.getByRole('button', { name: 'Close completion' }).click()
   await expect(dialog).toHaveCount(0)
 
-  await page
-    .getByRole('button', { name: 'Record completion', exact: true })
-    .click()
-  dialog = page.getByRole('dialog', { name: 'Record completion' })
+  await openDetailedCompletion(page)
+  dialog = page.getByRole('dialog', { name: 'Complete with details' })
   await expect(dialog.getByLabel('Outcome')).toBeDisabled()
   await expect(dialog.getByLabel('Outcome')).toHaveValue('completed')
   await dialog
     .getByLabel('Summary')
     .fill('Implementation and verification are complete.')
   const submit = dialog.getByRole('button', {
-    name: 'Record completion',
+    name: 'Complete with details',
     exact: true,
   })
   await expect(submit).toBeDisabled()
@@ -14090,7 +16258,9 @@ test('records a durable manual completion receipt', async ({ page }) => {
   await expect(page.getByText('Monitor the staged rollout')).toBeVisible()
   await expect(page.getByText('local-user', { exact: true })).toBeVisible()
   await expect(
-    page.getByRole('button', { name: 'Record completion', exact: true }),
+    page
+      .locator('.inspector')
+      .getByRole('button', { name: 'Complete', exact: true }),
   ).toHaveCount(0)
 
   expect(state.completionCommands).toHaveLength(1)
@@ -14219,11 +16389,9 @@ test('uploads and safely inspects a typed HTML artifact', async ({
   await page
     .getByRole('button', { name: 'Create worker', exact: true })
     .click()
-  await page
-    .getByRole('button', { name: 'Record completion', exact: true })
-    .click()
+  await openDetailedCompletion(page)
 
-  const completion = page.getByRole('dialog', { name: 'Record completion' })
+  const completion = page.getByRole('dialog', { name: 'Complete with details' })
   await completion
     .getByLabel('Summary')
     .fill('Published the release report.')
@@ -14234,7 +16402,7 @@ test('uploads and safely inspects a typed HTML artifact', async ({
   })
   await expect(completion.getByText('release-report.html')).toBeVisible()
   await completion
-    .getByRole('button', { name: 'Record completion', exact: true })
+    .getByRole('button', { name: 'Complete with details', exact: true })
     .click()
 
   await expect(page.getByText('Completion receipt', { exact: true })).toBeVisible()
@@ -14397,15 +16565,13 @@ test('retries completion with the same command ID after a network failure', asyn
   await page
     .getByRole('button', { name: 'Create worker', exact: true })
     .click()
-  await page
-    .getByRole('button', { name: 'Record completion', exact: true })
-    .click()
+  await openDetailedCompletion(page)
 
-  const dialog = page.getByRole('dialog', { name: 'Record completion' })
+  const dialog = page.getByRole('dialog', { name: 'Complete with details' })
   await dialog.getByLabel('Summary').fill('Retry-safe completion.')
   await dialog.getByLabel('Evidence references').fill('test://retry')
   const submit = dialog.getByRole('button', {
-    name: 'Record completion',
+    name: 'Complete with details',
     exact: true,
   })
   await submit.click()
@@ -14421,6 +16587,532 @@ test('retries completion with the same command ID after a network failure', asyn
   expect(state.completionRequestCommandIds[0]).toBe(
     state.completionRequestCommandIds[1],
   )
+})
+
+async function openAssignedWorker(page: Page) {
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await page.locator('.assigned-worker-marker').click()
+  const inspector = page.locator('.inspector')
+  await expect(
+    inspector.getByRole('button', { name: 'Complete', exact: true }),
+  ).toBeVisible()
+  return inspector
+}
+
+async function openWorkerSheet(
+  page: Page,
+  action: 'End session' | 'Delete worker',
+) {
+  const inspector = page.locator('.inspector')
+  await inspector
+    .getByRole('button', { name: 'More worker actions', exact: true })
+    .click()
+  await inspector.getByRole('button', { name: action, exact: true }).click()
+  const sheet = page.getByRole('dialog', { name: action })
+  await expect(sheet).toBeVisible()
+  return sheet
+}
+
+test('completes an active worker with one click after a short undo window', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const active = seedAssignedCandidateAssignment(state)
+  const inspector = await openAssignedWorker(page)
+
+  const complete = inspector.getByRole('button', {
+    name: 'Complete',
+    exact: true,
+  })
+  await expect(complete).toHaveAccessibleDescription(
+    /Continue the active implementation\..*ends the session/,
+  )
+  await complete.click()
+  await expect(inspector.locator('.quick-complete-pending')).toContainText(
+    'Completing…',
+  )
+  await expect(
+    inspector.getByRole('button', { name: 'Undo', exact: true }),
+  ).toBeVisible()
+  expect(state.dispositionRequestCommandIds).toHaveLength(0)
+
+  await expect
+    .poll(() => state.dispositionCommands.length, { timeout: 10_000 })
+    .toBe(1)
+  expect(state.dispositionCommands[0]).toEqual({
+    command_id: expect.any(String),
+    actor: 'local-user',
+    attempt_id: active.attempt.id,
+    expected_assignment_version: active.version,
+    expected_attempt_version: active.attempt.version,
+    outcome: 'completed',
+    end_session: true,
+    expected_worker_version: active.worker.version,
+    expected_runtime_version: active.worker.runtime?.version,
+  })
+  expect(state.completionCommands).toHaveLength(0)
+
+  const receipt = inspector.getByRole('region', { name: 'Completion receipt' })
+  await expect(receipt).toContainText('Minimal — no detailed handoff')
+  await expect(receipt).toContainText('Continue the active implementation.')
+  await expect(receipt).toContainText('Completed without a detailed handoff.')
+  await expect(page.locator('.notice-banner')).toContainText(
+    'Completed. Yard ended the session; the agent keeps running until its Herdr tab is closed.',
+  )
+  await expect(
+    inspector.getByLabel('Retained terminal transcript'),
+  ).toContainText('All focused tests pass.')
+  await expect(
+    inspector.getByRole('button', { name: 'Complete', exact: true }),
+  ).toHaveCount(0)
+  await expect(page.locator('.assigned-worker-marker')).toHaveCount(0)
+})
+
+test('undoing a quick completion inside its window sends nothing', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const active = seedAssignedCandidateAssignment(state)
+  const inspector = await openAssignedWorker(page)
+
+  await inspector.getByRole('button', { name: 'Complete', exact: true }).click()
+  await inspector.getByRole('button', { name: 'Undo', exact: true }).click()
+  await expect(
+    inspector.getByRole('button', { name: 'Complete', exact: true }),
+  ).toBeVisible()
+  await expect(inspector.locator('.quick-complete-pending')).toHaveCount(0)
+  await page.waitForTimeout(6_000)
+
+  expect(state.dispositionRequestCommandIds).toHaveLength(0)
+  expect(
+    state.assignments.find((candidate) => candidate.id === active.id)
+      ?.lifecycle,
+  ).toBe('active')
+  await expect(page.locator('.assigned-worker-marker')).toHaveCount(1)
+})
+
+test('keeps the session open when Complete and end session is off', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const active = seedAssignedCandidateAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  const settings = await openSettings(page)
+  const preference = settings.getByRole('group', {
+    name: 'Complete and end session',
+  })
+  await expect(
+    preference.getByRole('button', { name: 'On', exact: true }),
+  ).toHaveAttribute('aria-pressed', 'true')
+  await preference.getByRole('button', { name: 'Off', exact: true }).click()
+  await expect(
+    preference.getByRole('button', { name: 'Off', exact: true }),
+  ).toHaveAttribute('aria-pressed', 'true')
+  expect(
+    await page.evaluate(() =>
+      localStorage.getItem('yard:complete-and-end-session:v1'),
+    ),
+  ).toBe('false')
+  await settings.getByRole('button', { name: 'Close settings' }).click()
+
+  await page.locator('.assigned-worker-marker').click()
+  const inspector = page.locator('.inspector')
+  const complete = inspector.getByRole('button', {
+    name: 'Complete',
+    exact: true,
+  })
+  await expect(complete).toHaveAccessibleDescription(/session stays open/)
+  await complete.click()
+  await expect
+    .poll(() => state.dispositionCommands.length, { timeout: 10_000 })
+    .toBe(1)
+  expect(state.dispositionCommands[0]).toEqual({
+    command_id: expect.any(String),
+    actor: 'local-user',
+    attempt_id: active.attempt.id,
+    expected_assignment_version: active.version,
+    expected_attempt_version: active.attempt.version,
+    outcome: 'completed',
+    end_session: false,
+  })
+  await expect(page.locator('.notice-banner')).toContainText(
+    'Completed. The worker stays available for new work.',
+  )
+  expect(
+    state.workerCandidates.find(
+      (candidate) => candidate.worker.id === 'worker-assigned',
+    )?.availability,
+  ).toBe('resumable')
+})
+
+test('ends an active worker without completion from one compact sheet and keeps its transcript', async ({
+  page,
+}) => {
+  const state = await mockApi(page, { dispositionCleanupPending: true })
+  const active = seedAssignedCandidateAssignment(state)
+  const inspector = await openAssignedWorker(page)
+
+  const sheet = await openWorkerSheet(page, 'End session')
+  await expect(sheet).toContainText('Continue the active implementation.')
+  await expect(sheet).toContainText(
+    'The agent keeps running until its Herdr tab is closed.',
+  )
+  await expect(
+    sheet.getByRole('button', { name: 'Complete and end session' }),
+  ).toBeVisible()
+  await expect(
+    sheet.getByRole('button', { name: 'End without completion' }),
+  ).toHaveAccessibleDescription('Records the work as cancelled, not completed.')
+  await sheet.getByRole('button', { name: 'End without completion' }).click()
+  await expect(sheet).toBeHidden()
+
+  expect(state.dispositionCommands).toHaveLength(1)
+  expect(state.dispositionCommands[0]).toMatchObject({
+    outcome: 'cancelled',
+    end_session: true,
+    expected_worker_version: active.worker.version,
+    expected_runtime_version: active.worker.runtime?.version,
+  })
+  expect(state.completionCommands).toHaveLength(0)
+  await expect(page.locator('.notice-banner')).toContainText(
+    'Yard stopped tracking this worker. The agent keeps running until its Herdr tab is closed. Runtime cleanup continues in the background.',
+  )
+  const cancellation = inspector.getByRole('region', { name: 'Cancellation' })
+  await expect(cancellation).toContainText('Ended without completion')
+  await expect(
+    inspector.getByRole('region', { name: 'Completion receipt' }),
+  ).toHaveCount(0)
+  await expect(inspector.locator('.runtime-badge')).toHaveText(
+    'ended without completion',
+  )
+  await expect(
+    inspector.getByLabel('Retained terminal transcript'),
+  ).toContainText('Implemented the change.')
+
+  await openResources(page, 'Workers')
+  await page
+    .getByLabel('Filter workers')
+    .getByRole('button', { name: 'History', exact: true })
+    .click()
+  const ended = page.locator(
+    '.worker-row[data-worker-id="worker-assigned"][data-availability="ended"]',
+  )
+  await expect(ended).toBeVisible()
+  await ended.press('Enter')
+  await expect(
+    page.locator('.inspector').getByRole('heading', { name: 'Implementer' }),
+  ).toBeVisible()
+  await expect(
+    page.locator('.inspector').getByLabel('Retained terminal transcript'),
+  ).toContainText('All focused tests pass.')
+})
+
+test('completes and ends an active worker from the End session sheet', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedAssignedCandidateAssignment(state)
+  await openAssignedWorker(page)
+
+  const sheet = await openWorkerSheet(page, 'End session')
+  await sheet
+    .getByRole('button', { name: 'Complete and end session', exact: true })
+    .click()
+  await expect(sheet).toBeHidden()
+  expect(state.dispositionCommands).toHaveLength(1)
+  expect(state.dispositionCommands[0]).toMatchObject({
+    outcome: 'completed',
+    end_session: true,
+  })
+  await expect(
+    page
+      .locator('.inspector')
+      .getByRole('region', { name: 'Completion receipt' }),
+  ).toContainText('Minimal — no detailed handoff')
+})
+
+test('ends an active worker without completion from the Delete sheet and then deletes it', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const active = seedAssignedCandidateAssignment(state)
+  await openAssignedWorker(page)
+
+  const sheet = await openWorkerSheet(page, 'Delete worker')
+  await sheet
+    .getByRole('button', { name: 'End without completion', exact: true })
+    .click()
+  await expect(sheet).toBeHidden()
+
+  expect(state.dispositionCommands).toHaveLength(1)
+  expect(state.dispositionCommands[0]).toMatchObject({
+    outcome: 'cancelled',
+    end_session: true,
+    expected_worker_version: active.worker.version,
+  })
+  expect(state.completionCommands).toHaveLength(0)
+  await expect
+    .poll(() => state.workerDeleteCommands.length)
+    .toBe(1)
+  expect(state.workerDeleteCommands[0]).toEqual({
+    command_id: expect.any(String),
+    actor: 'local-user',
+    expected_worker_version: String(Number(active.worker.version) + 1),
+  })
+  expect(state.workerDeleteCommands[0].command_id).not.toBe(
+    state.dispositionCommands[0].command_id,
+  )
+  await expect(page.locator('.notice-banner')).toContainText(
+    'Worker deleted from Yard.',
+  )
+  await openResources(page, 'Workers')
+  await page
+    .getByLabel('Filter workers')
+    .getByRole('button', { name: 'History', exact: true })
+    .click()
+  await expect(
+    page.locator('.worker-row[data-worker-id="worker-assigned"]'),
+  ).toHaveCount(0)
+})
+
+test('completes and deletes an active worker with one confirmation', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const active = seedAssignedCandidateAssignment(state)
+  await openAssignedWorker(page)
+
+  const sheet = await openWorkerSheet(page, 'Delete worker')
+  await expect(sheet.getByRole('textbox')).toHaveCount(0)
+  await sheet
+    .getByRole('button', { name: 'Complete and delete', exact: true })
+    .click()
+  await expect(sheet).toBeHidden()
+
+  expect(state.dispositionCommands).toHaveLength(1)
+  expect(state.dispositionCommands[0]).toMatchObject({
+    outcome: 'completed',
+    end_session: true,
+    expected_worker_version: active.worker.version,
+  })
+  expect(state.workerDeleteCommands).toHaveLength(1)
+  expect(state.workerDeleteCommands[0]).toEqual({
+    command_id: expect.any(String),
+    actor: 'local-user',
+    expected_worker_version: String(Number(active.worker.version) + 1),
+  })
+  expect(state.workerDeleteCommands[0].command_id).not.toBe(
+    state.dispositionCommands[0].command_id,
+  )
+  expect(
+    state.workerCandidates.some(
+      (candidate) => candidate.worker.id === 'worker-assigned',
+    ),
+  ).toBe(false)
+  await expect(page.locator('.notice-banner')).toContainText(
+    'Worker deleted from Yard.',
+  )
+  await openResources(page, 'Workers')
+  await page
+    .getByLabel('Filter workers')
+    .getByRole('button', { name: 'History', exact: true })
+    .click()
+  await expect(
+    page.locator('.worker-row[data-worker-id="worker-assigned"]'),
+  ).toHaveCount(0)
+})
+
+test('retries a quick completion with the same command ID after a network failure', async ({
+  page,
+}) => {
+  const state = await mockApi(page, { dispositionNetworkFailures: 1 })
+  seedAssignedCandidateAssignment(state)
+  const inspector = await openAssignedWorker(page)
+
+  await inspector.getByRole('button', { name: 'Complete', exact: true }).click()
+  const retry = inspector.getByRole('button', { name: 'Retry', exact: true })
+  await expect(retry).toBeVisible({ timeout: 10_000 })
+  await expect(inspector.locator('.assignment-action-error')).toBeVisible()
+  expect(state.dispositionRequestCommandIds).toHaveLength(1)
+  expect(state.dispositionCommands).toHaveLength(0)
+
+  await retry.click()
+  await expect.poll(() => state.dispositionCommands.length).toBe(1)
+  expect(state.dispositionRequestCommandIds).toHaveLength(2)
+  expect(state.dispositionRequestCommandIds[0]).toBe(
+    state.dispositionRequestCommandIds[1],
+  )
+  await expect(
+    inspector.getByRole('region', { name: 'Completion receipt' }),
+  ).toBeVisible()
+})
+
+// Herdr status changes bump the worker and runtime versions that guard
+// end_session, without changing the assignment the user decided on.
+function bumpSessionVersions(state: MockState, assignmentId: string) {
+  const index = state.assignments.findIndex(
+    (candidate) => candidate.id === assignmentId,
+  )
+  const current = state.assignments[index]
+  const runtime = current.worker.runtime
+  if (!runtime) throw new Error('Assigned worker fixture needs a runtime')
+  const worker = {
+    ...current.worker,
+    version: `${current.worker.version}-status`,
+    runtime: { ...runtime, version: `${runtime.version}-status` },
+  }
+  state.assignments[index] = { ...current, worker }
+  return worker
+}
+
+test('a failed sheet disposition leaves no inspector Retry after the sheet is cancelled', async ({
+  page,
+}) => {
+  const state = await mockApi(page, { dispositionNetworkFailures: 1 })
+  seedAssignedCandidateAssignment(state)
+  const inspector = await openAssignedWorker(page)
+
+  const sheet = await openWorkerSheet(page, 'End session')
+  await sheet.getByRole('button', { name: 'End without completion' }).click()
+  await expect(sheet.getByRole('alert')).toBeVisible()
+  expect(state.dispositionRequestCommandIds).toHaveLength(1)
+  await sheet.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await expect(sheet).toBeHidden()
+
+  await expect(inspector.locator('.assignment-action-error')).toHaveCount(0)
+  await expect(
+    inspector.getByRole('button', { name: 'Retry', exact: true }),
+  ).toHaveCount(0)
+  expect(state.dispositionCommands).toHaveLength(0)
+})
+
+test('a sheet disposition sends the latest session versions after Herdr status changes', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const active = seedAssignedCandidateAssignment(state)
+  await openAssignedWorker(page)
+
+  const sheet = await openWorkerSheet(page, 'End session')
+  const worker = bumpSessionVersions(state, active.id)
+  await sheet.getByRole('button', { name: 'End without completion' }).click()
+  await expect(sheet).toBeHidden()
+  expect(state.dispositionCommands).toHaveLength(1)
+  expect(state.dispositionCommands[0]).toMatchObject({
+    outcome: 'cancelled',
+    expected_assignment_version: active.version,
+    expected_worker_version: worker.version,
+    expected_runtime_version: worker.runtime?.version,
+  })
+})
+
+test('a quick completion sends the latest session versions after its Undo window', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const active = seedAssignedCandidateAssignment(state)
+  const inspector = await openAssignedWorker(page)
+
+  await inspector.getByRole('button', { name: 'Complete', exact: true }).click()
+  const worker = bumpSessionVersions(state, active.id)
+  await expect
+    .poll(() => state.dispositionCommands.length, { timeout: 10_000 })
+    .toBe(1)
+  expect(state.dispositionCommands[0]).toMatchObject({
+    outcome: 'completed',
+    end_session: true,
+    expected_worker_version: worker.version,
+    expected_runtime_version: worker.runtime?.version,
+  })
+  await expect(
+    inspector.getByRole('region', { name: 'Completion receipt' }),
+  ).toBeVisible()
+})
+
+test('keeps Undo for a quick completion after its worker leaves the inspector', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const active = seedAssignedCandidateAssignment(state)
+  const inspector = await openAssignedWorker(page)
+
+  await inspector.getByRole('button', { name: 'Complete', exact: true }).click()
+  const pending = page.getByRole('region', { name: 'Pending completions' })
+  await expect(pending).toHaveCount(0)
+  await page.getByRole('button', { name: 'Close details' }).click()
+  await expect(pending).toContainText(
+    'Completing “Continue the active implementation.”…',
+  )
+  await pending.getByRole('button', { name: 'Undo', exact: true }).click()
+  await expect(pending).toHaveCount(0)
+  await page.waitForTimeout(6_000)
+
+  expect(state.dispositionRequestCommandIds).toHaveLength(0)
+  expect(
+    state.assignments.find((candidate) => candidate.id === active.id)
+      ?.lifecycle,
+  ).toBe('active')
+})
+
+test('reports when another action already ended the work instead of claiming completion', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const active = seedAssignedCandidateAssignment(state)
+  const inspector = await openAssignedWorker(page)
+
+  await inspector.getByRole('button', { name: 'Complete', exact: true }).click()
+  const index = state.assignments.findIndex(
+    (candidate) => candidate.id === active.id,
+  )
+  const current = state.assignments[index]
+  state.assignments[index] = {
+    ...current,
+    lifecycle: 'cancelled',
+    attempt: { ...current.attempt, lifecycle: 'cancelled', version: '3' },
+    cancellation: {
+      assignment_id: current.id,
+      attempt_id: current.attempt.id,
+      command_id: 'another-tab',
+      reason: 'ended_without_completion',
+      actor: 'local-user',
+      request_origin: 'browser',
+      objective_snapshot: current.objective,
+      cancelled_at_unix_ms: Date.now(),
+    },
+    version: '3',
+  }
+
+  await expect(page.locator('.notice-banner')).toContainText(
+    'Already cancelled by another action.',
+    { timeout: 12_000 },
+  )
+  expect(state.dispositionCommands).toHaveLength(0)
+  expect(state.dispositionRequestCommandIds).toHaveLength(1)
+  await expect(
+    page.locator('.inspector').getByRole('region', { name: 'Completion receipt' }),
+  ).toHaveCount(0)
+})
+
+test('names the provider session when no transcript could be kept', async ({
+  page,
+}) => {
+  const state = await mockApi(page, { transcriptUnavailable: true })
+  seedAssignedCandidateAssignment(state)
+  const inspector = await openAssignedWorker(page)
+
+  const sheet = await openWorkerSheet(page, 'End session')
+  await sheet.getByRole('button', { name: 'End without completion' }).click()
+  await expect(sheet).toBeHidden()
+  const transcript = inspector.getByRole('region', { name: 'Transcript' })
+  await expect(transcript).toContainText('Transcript unavailable')
+  await expect(transcript).toContainText(
+    'The Herdr tab closed before Yard could read it.',
+  )
+  await expect(transcript).toContainText('assignment-active-rollout')
 })
 
 test('creates and edits a reusable worker profile', async ({ page }) => {

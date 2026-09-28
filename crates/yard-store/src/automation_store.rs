@@ -21,9 +21,16 @@ pub(super) async fn list_automations(
 ) -> Result<Automations, ProjectStoreError> {
     store
         .run(|connection| {
+            // An archived or deleted workstream's automations leave the map
+            // with it. They stay paused and keep their runs; the archive
+            // records which ones it paused.
             let mut statement = connection.prepare(
                 "SELECT id
-                   FROM automations
+                   FROM automations automation
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM archived_coordination_nodes archived
+                         WHERE archived.node_id = automation.scope_node_id
+                  )
                   ORDER BY created_at_unix_ms, id",
             )?;
             let ids = statement
@@ -496,6 +503,9 @@ pub(super) async fn set_automation_paused(
                     current_version: current.version,
                 });
             }
+            if !command.paused {
+                reject_archived_scope_node(&transaction, &current.scope)?;
+            }
             let next_version = current
                 .version
                 .checked_add(1)
@@ -619,6 +629,7 @@ pub(super) async fn create_manual_automation_run(
                     current_version: automation.version,
                 });
             }
+            reject_archived_scope_node(&transaction, &automation.scope)?;
             validate_new_run_identity(&transaction, &run_id, &dispatch_command_id)?;
             reject_pending_run(&transaction, &command.automation_id)?;
             let now = unix_time_ms()?;
@@ -1225,6 +1236,7 @@ fn validate_scope_and_projects(
             if kind != "workstream" {
                 return Err(ProjectStoreError::AutomationScopeNodeKindMismatch);
             }
+            reject_archived_scope_node(connection, scope)?;
         }
     }
     for project_id in selected_project_ids {
@@ -1249,6 +1261,27 @@ fn validate_scope_and_projects(
         }
     }
     Ok(())
+}
+
+/// An archived workstream's automations stay paused: they cannot be created,
+/// retargeted onto it, resumed, or run.
+fn reject_archived_scope_node(
+    connection: &Connection,
+    scope: &AutomationScope,
+) -> Result<(), ProjectStoreError> {
+    match scope {
+        AutomationScope::WorkstreamCoordinationNode { node_id } => {
+            super::coordination_node_store::reject_inactive_node(connection, node_id).map_err(
+                |error| match error {
+                    ProjectStoreError::CoordinationNodeNotFound => {
+                        ProjectStoreError::AutomationScopeNodeNotFound
+                    }
+                    error => error,
+                },
+            )
+        }
+        AutomationScope::YardOrchestrator | AutomationScope::ProjectOrchestrator { .. } => Ok(()),
+    }
 }
 
 fn validate_next_run(

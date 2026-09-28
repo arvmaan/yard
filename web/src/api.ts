@@ -1,6 +1,9 @@
 import type {
+  ArchiveCoordinationNodeInput,
   ArchiveProjectInput,
+  ArchivedCoordinationNode,
   ArchivedProject,
+  ArchivedProjects,
   Artifact,
   ArtifactContent,
   Automation,
@@ -15,7 +18,9 @@ import type {
   ConfirmedProjectCreation,
   ConfirmedWorkerHandoff,
   ConfiguredYardOrchestrator,
+  CoordinationNode,
   CoordinationNodeCommandResult,
+  CoordinationNodeDispositionPreview,
   CoordinationNodePromptAcknowledgement,
   CoordinationNodeRoute,
   CoordinationNodeRoutes,
@@ -35,12 +40,16 @@ import type {
   CreateWorkerProfileInput,
   ProfileLaunchPlan,
   CreateWorkspaceProjectFromProfileInput,
+  DeleteCoordinationNodeInput,
+  DeletedCoordinationNode,
   DeletedProject,
   DeletedProjectRelationship,
   DeletedWorker,
   DeleteProjectInput,
   DeleteProjectRelationshipInput,
   DeleteWorkerInput,
+  DisposeAssignmentInput,
+  DisposedAssignment,
   EndedWorkerSession,
   EndWorkerSessionInput,
   ExternalTerminalLaunch,
@@ -52,6 +61,7 @@ import type {
   PaneManagementBatchResult,
   PaneManagementPreview,
   Project,
+  ProjectDispositionPreview,
   ProjectRepositories,
   ProjectRepository,
   Projects,
@@ -65,6 +75,8 @@ import type {
   ReplacedProjectOrchestrator,
   ReplaceProjectOrchestratorInput,
   ResetOrchestratorWorkflowProfileInput,
+  RestoredProject,
+  RestoreProjectInput,
   ProvisionCoordinationNodeInput,
   PromptAcknowledgement,
   RecordedCompletionReceipt,
@@ -102,6 +114,7 @@ import type {
   WorkerCandidates,
   WorkerProfile,
   WorkerProfiles,
+  WorkerTranscript,
   YardOrchestrator,
   YardOrchestratorPromptAcknowledgement,
   YardOrchestratorRoute,
@@ -116,6 +129,8 @@ interface ApiErrorEnvelope {
     message?: string
     attempted_session_count?: unknown
     failed_session_count?: unknown
+    preview?: unknown
+    reason?: string
   }
 }
 
@@ -123,18 +138,27 @@ export class YardApiError extends Error {
   code: string
   attemptedSessions: number | null
   failedSessions: number | null
+  // A fresh disposition preview sent with some 409s (for example
+  // project_archive_preview_stale), so the dialog can re-confirm.
+  preview: unknown
+  // Why a recoverable refusal happened (project_restore_unavailable).
+  reason: string | null
 
   constructor(
     code: string,
     message: string,
     attemptedSessions: number | null = null,
     failedSessions: number | null = null,
+    preview: unknown = null,
+    reason: string | null = null,
   ) {
     super(message)
     this.name = 'YardApiError'
     this.code = code
     this.attemptedSessions = attemptedSessions
     this.failedSessions = failedSessions
+    this.preview = preview
+    this.reason = reason
   }
 }
 
@@ -172,6 +196,8 @@ async function requestJson<T>(
         failedSessions >= 0
         ? failedSessions
         : null,
+      body.error?.preview ?? null,
+      body.error?.reason ?? null,
     )
   }
 
@@ -344,6 +370,16 @@ export function fetchRepositoryDiff(
   )
 }
 
+export function fetchProjectDispositionPreview(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ProjectDispositionPreview> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/disposition-preview`,
+    { signal },
+  )
+}
+
 export function archiveProject(
   projectId: string,
   command: ArchiveProjectInput,
@@ -358,6 +394,28 @@ export function archiveProject(
       signal,
     },
   )
+}
+
+export function restoreProject(
+  projectId: string,
+  command: RestoreProjectInput,
+  signal?: AbortSignal,
+): Promise<RestoredProject> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/restore`,
+    {
+      body: JSON.stringify(command),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal,
+    },
+  )
+}
+
+export function fetchArchivedProjects(
+  signal?: AbortSignal,
+): Promise<ArchivedProjects> {
+  return requestJson('/api/v1/archived', { signal })
 }
 
 export function deleteProject(
@@ -618,6 +676,58 @@ export function updateCoordinationNodePlacement(
       body: JSON.stringify(command),
       headers: { 'Content-Type': 'application/json' },
       method: 'PUT',
+      signal,
+    },
+  )
+}
+
+export function fetchCoordinationNode(
+  nodeId: string,
+  signal?: AbortSignal,
+): Promise<CoordinationNode> {
+  return requestJson(
+    `/api/v1/coordination-nodes/${encodeURIComponent(nodeId)}`,
+    { signal },
+  )
+}
+
+export function fetchCoordinationNodeDispositionPreview(
+  nodeId: string,
+  signal?: AbortSignal,
+): Promise<CoordinationNodeDispositionPreview> {
+  return requestJson(
+    `/api/v1/coordination-nodes/${encodeURIComponent(nodeId)}/disposition-preview`,
+    { signal },
+  )
+}
+
+export function archiveCoordinationNode(
+  nodeId: string,
+  command: ArchiveCoordinationNodeInput,
+  signal?: AbortSignal,
+): Promise<ArchivedCoordinationNode> {
+  return requestJson(
+    `/api/v1/coordination-nodes/${encodeURIComponent(nodeId)}/archive`,
+    {
+      body: JSON.stringify(command),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal,
+    },
+  )
+}
+
+export function deleteCoordinationNode(
+  nodeId: string,
+  command: DeleteCoordinationNodeInput,
+  signal?: AbortSignal,
+): Promise<DeletedCoordinationNode> {
+  return requestJson(
+    `/api/v1/coordination-nodes/${encodeURIComponent(nodeId)}/delete`,
+    {
+      body: JSON.stringify(command),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
       signal,
     },
   )
@@ -1037,6 +1147,39 @@ export function recordCompletionReceipt(
       method: 'POST',
       signal,
     },
+  )
+}
+
+/**
+ * Complete (minimal receipt) or cancel an assignment in one durable command,
+ * optionally ending the worker's session. Retries must reuse `command_id`.
+ */
+export function disposeAssignment(
+  projectId: string,
+  assignmentId: string,
+  command: DisposeAssignmentInput,
+  signal?: AbortSignal,
+): Promise<DisposedAssignment> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/assignments/${encodeURIComponent(assignmentId)}/disposition`,
+    {
+      body: JSON.stringify(command),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal,
+    },
+  )
+}
+
+/** The read-only transcript Yard retained when the assignment ended. */
+export function fetchAssignmentTranscript(
+  projectId: string,
+  assignmentId: string,
+  signal?: AbortSignal,
+): Promise<WorkerTranscript> {
+  return requestJson(
+    `/api/v1/projects/${encodeURIComponent(projectId)}/assignments/${encodeURIComponent(assignmentId)}/transcript`,
+    { signal },
   )
 }
 

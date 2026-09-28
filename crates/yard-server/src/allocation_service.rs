@@ -20,6 +20,7 @@ use crate::inventory_service::{InventoryServiceError, InventorySource};
 use crate::profile_runtime::{compile_profile_launch, materialize_profile_launch};
 use crate::runtime_cleanup_service::RuntimeCleanupService;
 use crate::status_protocol::{with_orchestrator_status_contract, with_orchestrator_workflow};
+use crate::transcript_capture_service::TranscriptCaptureService;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeProvisionRequest {
@@ -204,6 +205,7 @@ pub struct AllocationService {
     intervention: Arc<dyn RuntimeIntervention>,
     store: Arc<dyn YardStore>,
     cleanup: RuntimeCleanupService,
+    transcripts: TranscriptCaptureService,
 }
 
 impl AllocationService {
@@ -215,12 +217,18 @@ impl AllocationService {
         store: Arc<dyn YardStore>,
     ) -> Self {
         let cleanup = RuntimeCleanupService::new(Arc::clone(&runtime), Arc::clone(&store));
+        let transcripts = TranscriptCaptureService::new(
+            Arc::clone(&source),
+            Arc::clone(&intervention),
+            Arc::clone(&store),
+        );
         Self {
             source,
             runtime,
             intervention,
             store,
             cleanup,
+            transcripts,
         }
     }
 
@@ -1192,10 +1200,22 @@ impl AllocationService {
         assignment_id: &str,
         command: RecordCompletionReceipt,
     ) -> Result<RecordedCompletionReceipt, AllocationServiceError> {
-        self.store
+        let recorded = self
+            .store
             .record_completion_receipt(project_id, assignment_id, command)
-            .await
-            .map_err(Into::into)
+            .await?;
+        if !recorded.replayed {
+            // Completion revokes live terminal access, so read the transcript
+            // now. A failure only leaves the durable job to retry.
+            if let Err(error) = self.transcripts.process_command(&recorded.command_id).await {
+                tracing::warn!(
+                    command_id = %recorded.command_id,
+                    error = %error,
+                    "Immediate transcript capture failed; the durable job will retry"
+                );
+            }
+        }
+        Ok(recorded)
     }
 
     async fn prepare_profile_launch(

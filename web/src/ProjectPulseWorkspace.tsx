@@ -6,6 +6,7 @@ import {
   Network,
   X,
 } from 'lucide-react'
+import { snapshotProgressLabel } from './backgroundStatus'
 import { YardOrchestratorOverview } from './YardOrchestratorOverview'
 import type { ProjectStatusReports } from './projectUpdates'
 import type {
@@ -212,7 +213,7 @@ export function ProjectPulseWorkspace({
                                   : 'needs worker'
                               }`
                             : latestSnapshot
-                              ? `${latestSnapshot.progress.completed}/${latestSnapshot.progress.total} collected`
+                              ? snapshotProgressLabel(latestSnapshot.progress)
                               : `${node.attached_project_ids.length} projects / no snapshot`}
                         </small>
                       </span>

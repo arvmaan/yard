@@ -127,8 +127,8 @@ export function CompletionDialog({
       >
         <header className="dialog-heading">
           <div>
-            <p className="eyebrow">Assignment receipt</p>
-            <h2 id="completion-title">Record completion</h2>
+            <p className="eyebrow">Detailed receipt</p>
+            <h2 id="completion-title">Complete with details</h2>
           </div>
           <button
             aria-label="Close completion"
@@ -260,7 +260,7 @@ export function CompletionDialog({
               ) : (
                 <CircleCheck aria-hidden="true" size={16} />
               )}
-              Record completion
+              Complete with details
             </button>
           </footer>
         </form>

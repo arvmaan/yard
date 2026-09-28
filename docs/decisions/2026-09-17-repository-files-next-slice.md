@@ -43,9 +43,10 @@ selected checkout, and relinks to a different Git common directory.
 
 Repository reads and mutations are scoped to an active owning project.
 Cross-project IDs and repositories belonging to archived or deleted projects
-are inaccessible. Project archive and delete transactions explicitly purge
-repository associations, including stale associations encountered during an
-idempotent lifecycle replay. Every Files response includes the selected
+are inaccessible. Project archive keeps repository associations (they stay
+inaccessible while the project is archived, so a later restore is lossless);
+project delete explicitly purges them, including stale associations
+encountered during an idempotent delete replay. Every Files response includes the selected
 repository ID and root explicitly.
 
 ### Metadata-only file lists

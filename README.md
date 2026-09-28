@@ -227,14 +227,44 @@ with Herdr before continuing.
    work across project orchestrators.
 7. Right-click empty map space to add a workstream orchestrator or knowledge
    store. Automations are attached to the orchestrator whose scope they serve.
-8. When work claims to be finished, review the evidence and record a manual
-   completion receipt. Runtime state alone is never treated as proof.
+8. When work is finished, select the worker and choose **Complete**. Yard waits
+   five seconds (with **Undo**) before it records a minimal receipt: who
+   completed it, when, and the objective, with no artifacts or evidence. Use
+   **Complete with details…** for an evidence-backed receipt. Runtime state
+   alone is never treated as proof.
 
 ## Projects and workers
 
 Projects are persistent territories on a free-form map. Their boundaries,
 placement, color, orchestrator, assignments, and relationships survive runtime
-restarts.
+restarts. Archive and delete each take one confirmation, which first reads
+`GET /api/v1/projects/{id}/disposition-preview`. When the project still has
+active workers, the confirmation lists each one and reads **Archive and end N
+active workers** (or **Delete and end N active workers**): their assignments
+are recorded as cancelled with reason `project_archived`, never completed, and
+their sessions end, while the agents keep running until their Herdr tabs are
+closed. The request lists exactly the previewed assignments
+(`active_work: "cancel"`, `expected_active_assignments`); if the set changed,
+Yard answers 409 `project_archive_preview_stale` with a fresh preview and the
+dialog asks again. A request without `active_work` is still refused with 409
+`project_has_active_work`. Yard also refuses archive and delete while the
+project has unresolved allocations, in-flight orchestrator prompts, routes,
+replacements, or handoffs, or automations that scope or select it or have a
+pending run (a selection held by an archived workstream's automation does not
+count). Archive and delete accept only loopback `Host` and `Origin` headers,
+like the other lifecycle commands. Runtime cleanup, transcript capture, and
+knowledge snapshot collection continue in the background.
+
+Archive can be undone; delete cannot. For 10 seconds after an archive the
+map offers **Undo**, and the **Archived** shelf lists archived projects with
+**Restore** while each is restorable (`GET /api/v1/archived`). Restore
+(`POST /api/v1/projects/{id}/restore` with `expected_archive_command_id`)
+re-binds the workspace and resumes the orchestrator: if its Herdr tab is still
+the same pane it is bound again, otherwise the orchestrator comes back without
+a runtime, as after a crash. Assignments the archive cancelled stay cancelled.
+Restore refuses with 409 `project_restore_unavailable` and a `reason` when
+Herdr is unreachable (retry later), another project or pending job holds the
+workspace, the archive changed, or the project was deleted.
 
 Workers can be:
 
@@ -245,6 +275,26 @@ Workers can be:
 - resumed under the same Yard identity, with a replacement runtime when needed;
 - opened in Ghostty using the exact bound terminal;
 - ended explicitly when their session is no longer needed.
+
+Completion and cancellation are recorded differently. **Complete** writes a
+completion receipt marked `minimal`; the detailed form writes one marked
+`detailed`, which still needs at least one artifact or evidence reference.
+**End without completion** records the assignment as `cancelled` with a reason
+and never writes a receipt. With **Complete and end session** on (the default,
+stored in this browser), Complete also ends Yard's session for the worker and
+queues runtime cleanup. Yard never closes the Herdr tab, so the agent keeps
+running until you close its tab. Ending or deleting a worker that still has
+active work asks once how the work ended (**Complete and end session** or
+**Complete and delete**, **End without completion**, or **Cancel**).
+
+When an assignment ends, Yard reads the worker's terminal once and keeps up to
+10,000 recent lines (1 MiB) as a read-only transcript in the inspector. The
+read is guarded by the runtime identity before and after, so a reused pane is
+never recorded. If Herdr is unreachable the capture retries in the background;
+if no text can be kept, the inspector shows **Transcript unavailable** and names
+the provider session. Transcripts are stored as captured, without redaction.
+The disposition request accepts only a loopback `Host` and, from a browser, a
+loopback `Origin`; this is provenance, not authentication.
 
 Live Codex and Claude subagents are shown as children connected to their parent
 terminal. Exited subagents are removed from the active tree.
@@ -259,6 +309,16 @@ Every project has exactly one project orchestrator. Yard can also provision:
 - structured project updates that separate the last action, remaining work,
   current state, and required owner action.
 
+A workstream can be archived or deleted from its inspector with one
+confirmation that lists what changes. Archive hides it from the map, ends its
+dedicated worker (Yard does not close the worker's Herdr tab; runtime cleanup
+finishes after you close it), and pauses its automations, which leave the map
+with it (Yard keeps them, paused, for audit; they cannot be resumed or run while
+the workstream is archived). Delete also removes
+it and its dedicated worker from Yard views, archiving it first if needed.
+Neither changes attached projects, and both wait only for in-flight workstream
+prompts and routes. Knowledge stores cannot be archived yet.
+
 Connection paths reflect observed communication state: idle links remain
 neutral, active exchanges turn green, and failed exchanges turn red. The
 visual state follows persisted routing attempts; it is not decorative activity.
@@ -268,7 +328,8 @@ visual state follows persisted routing attempts; it is not decorative activity.
 A knowledge store is a map node attached to one or more projects. Its
 orchestrator asks those projects for standardized context, stores immutable
 source snapshots, and records the combined revision without overwriting the
-inputs.
+inputs. A project snapshot still uncollected 24 hours after its prompt is shown
+as expired; files that arrive later still collect it.
 
 Automations are recurring prompts attached to an orchestration scope:
 

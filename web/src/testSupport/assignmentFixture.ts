@@ -1,0 +1,62 @@
+import type { Assignment } from '../types'
+
+/** An active assignment with a live runtime, for unit and component tests. */
+export function activeAssignmentFixture(
+  overrides: Partial<Assignment> = {},
+): Assignment {
+  return {
+    id: 'assignment-1',
+    project_id: 'project-1',
+    allocation_id: 'allocation-1',
+    worker: {
+      id: 'worker-1',
+      profile_id: 'profile-1',
+      profile_version: '1',
+      desired_state: 'running',
+      ownership_kind: 'yard_owned',
+      runtime: {
+        adapter: 'herdr',
+        session: 'default',
+        workspace_id: 'workspace-1',
+        terminal_id: 'terminal-1',
+        tab_id: 'tab-1',
+        pane_id: 'pane-1',
+        provider_session: null,
+        owns_tab: true,
+        observation_state: 'observed',
+        process_state: 'running',
+        status: 'done',
+        state_change_sequence: '1',
+        revision: '1',
+        version: '3',
+        last_observed_at_unix_ms: 1,
+      },
+      version: '5',
+      created_at_unix_ms: 1,
+      updated_at_unix_ms: 1,
+    },
+    profile_id: 'profile-1',
+    profile_version: '1',
+    profile_name: 'Implementer',
+    objective: 'Ship the API.',
+    role: 'implementer',
+    isolation_policy: 'project_workspace',
+    lifecycle: 'active',
+    attempt: {
+      id: 'attempt-1',
+      assignment_id: 'assignment-1',
+      ordinal: 1,
+      lifecycle: 'active',
+      error: null,
+      version: '2',
+      created_at_unix_ms: 1,
+      updated_at_unix_ms: 1,
+    },
+    completion_receipt: null,
+    cancellation: null,
+    version: '2',
+    created_at_unix_ms: 1,
+    updated_at_unix_ms: 1,
+    ...overrides,
+  }
+}

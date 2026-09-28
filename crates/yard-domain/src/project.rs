@@ -2,13 +2,15 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
 
-use crate::{ObservedStatus, ProviderSessionRef, WorkerDesiredState};
+use crate::{AssignmentLifecycle, ObservedStatus, ProviderSessionRef, WorkerDesiredState};
 
 const MAX_PROJECT_NAME_BYTES: usize = 120;
 const MAX_PROJECT_COMMAND_BYTES: usize = 120;
 const MAX_PROJECT_CWD_BYTES: usize = 4_096;
 const MAX_PROJECT_REPOSITORY_PATH_BYTES: usize = 4_096;
 const MAX_PROJECT_OBJECTIVE_BYTES: usize = 16_000;
+/// Upper bound on the active assignments one archive may end.
+const MAX_EXPECTED_ACTIVE_ASSIGNMENTS: usize = 500;
 const MIN_PROJECT_WIDTH: f64 = 322.0;
 const MAX_PROJECT_WIDTH: f64 = 2_400.0;
 const MIN_PROJECT_HEIGHT: f64 = 180.0;
@@ -237,6 +239,14 @@ pub struct ArchiveProject {
     pub expected_orchestrator_worker_version: u64,
     #[serde(default, with = "crate::serde_u64::option")]
     pub expected_orchestrator_runtime_version: Option<u64>,
+    /// What to do with assignments that are still allocating, active, or
+    /// handing off. Old clients omit it and keep the reject behavior.
+    #[serde(default)]
+    pub active_work: ProjectArchiveActiveWork,
+    /// The exact active assignments the caller saw in the disposition
+    /// preview. Required with `active_work = cancel`, rejected otherwise.
+    #[serde(default)]
+    pub expected_active_assignments: Option<Vec<ExpectedActiveAssignment>>,
 }
 
 impl ArchiveProject {
@@ -261,8 +271,212 @@ impl ArchiveProject {
         {
             return Err(ProjectValidationError::InvalidVersion);
         }
+        self.expected_active_assignments =
+            normalize_active_work(self.active_work, self.expected_active_assignments)?;
         Ok(self)
     }
+
+    #[must_use]
+    pub fn preconditions(&self) -> ProjectArchivePreconditions {
+        ProjectArchivePreconditions {
+            expected_project_version: self.expected_project_version,
+            expected_orchestrator_worker_id: self.expected_orchestrator_worker_id.clone(),
+            expected_orchestrator_worker_version: self.expected_orchestrator_worker_version,
+            expected_orchestrator_runtime_version: self.expected_orchestrator_runtime_version,
+            active_work: self.active_work,
+            expected_active_assignments: self.expected_active_assignments.clone(),
+        }
+    }
+}
+
+/// How an archive treats assignments that are still allocating, active, or
+/// handing off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectArchiveActiveWork {
+    /// Refuse the archive while any such assignment exists.
+    #[default]
+    Reject,
+    /// Record exactly the previewed assignments as cancelled (never
+    /// completed) and end their worker sessions in the archive transaction.
+    Cancel,
+}
+
+impl ProjectArchiveActiveWork {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reject => "reject",
+            Self::Cancel => "cancel",
+        }
+    }
+}
+
+/// One active assignment, at the version the caller saw, that an archive
+/// with `active_work = cancel` may end.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ExpectedActiveAssignment {
+    pub assignment_id: String,
+    #[serde(with = "crate::serde_u64")]
+    pub expected_assignment_version: u64,
+}
+
+/// Validate the active-work choice and put the expected set in canonical
+/// (sorted) order, so replay compares sets rather than request order.
+fn normalize_active_work(
+    active_work: ProjectArchiveActiveWork,
+    expected: Option<Vec<ExpectedActiveAssignment>>,
+) -> Result<Option<Vec<ExpectedActiveAssignment>>, ProjectValidationError> {
+    match (active_work, expected) {
+        (ProjectArchiveActiveWork::Reject, None) => Ok(None),
+        (ProjectArchiveActiveWork::Reject, Some(_)) => {
+            Err(ProjectValidationError::UnexpectedActiveAssignments)
+        }
+        (ProjectArchiveActiveWork::Cancel, None) => Err(ProjectValidationError::Required(
+            "expected_active_assignments",
+        )),
+        (ProjectArchiveActiveWork::Cancel, Some(expected)) => {
+            if expected.len() > MAX_EXPECTED_ACTIVE_ASSIGNMENTS {
+                return Err(ProjectValidationError::TooManyExpectedAssignments {
+                    max: MAX_EXPECTED_ACTIVE_ASSIGNMENTS,
+                });
+            }
+            let mut normalized = expected
+                .into_iter()
+                .map(|assignment| {
+                    if assignment.expected_assignment_version == 0 {
+                        return Err(ProjectValidationError::InvalidVersion);
+                    }
+                    Ok(ExpectedActiveAssignment {
+                        assignment_id: bounded_required(
+                            "expected_active_assignments.assignment_id",
+                            &assignment.assignment_id,
+                            MAX_PROJECT_COMMAND_BYTES,
+                        )?,
+                        expected_assignment_version: assignment.expected_assignment_version,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            normalized.sort();
+            if normalized
+                .windows(2)
+                .any(|pair| pair[0].assignment_id == pair[1].assignment_id)
+            {
+                return Err(ProjectValidationError::DuplicateExpectedAssignment);
+            }
+            Ok(Some(normalized))
+        }
+    }
+}
+
+/// The optimistic versions a caller saw before archiving a project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectArchivePreconditions {
+    #[serde(with = "crate::serde_u64")]
+    pub expected_project_version: u64,
+    pub expected_orchestrator_worker_id: String,
+    #[serde(with = "crate::serde_u64")]
+    pub expected_orchestrator_worker_version: u64,
+    #[serde(default, with = "crate::serde_u64::option")]
+    pub expected_orchestrator_runtime_version: Option<u64>,
+    #[serde(default)]
+    pub active_work: ProjectArchiveActiveWork,
+    #[serde(default)]
+    pub expected_active_assignments: Option<Vec<ExpectedActiveAssignment>>,
+}
+
+impl ProjectArchivePreconditions {
+    /// Normalize and validate archive preconditions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectValidationError`] when the orchestrator identifier is
+    /// blank or oversized, an optimistic version is zero, or the expected
+    /// active assignments do not fit the active-work choice.
+    pub fn normalize(mut self) -> Result<Self, ProjectValidationError> {
+        self.expected_orchestrator_worker_id = bounded_required(
+            "expected_orchestrator_worker_id",
+            &self.expected_orchestrator_worker_id,
+            MAX_PROJECT_COMMAND_BYTES,
+        )?;
+        if self.expected_project_version == 0
+            || self.expected_orchestrator_worker_version == 0
+            || self.expected_orchestrator_runtime_version == Some(0)
+        {
+            return Err(ProjectValidationError::InvalidVersion);
+        }
+        self.expected_active_assignments =
+            normalize_active_work(self.active_work, self.expected_active_assignments)?;
+        Ok(self)
+    }
+}
+
+/// What archiving or deleting an active project would do, read before the
+/// confirmation. The versions are the ones an archive must send back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectDispositionPreview {
+    pub project_id: String,
+    pub name: String,
+    #[serde(with = "crate::serde_u64")]
+    pub project_version: u64,
+    pub orchestrator_worker_id: String,
+    #[serde(with = "crate::serde_u64")]
+    pub orchestrator_worker_version: u64,
+    #[serde(default, with = "crate::serde_u64::option")]
+    pub orchestrator_runtime_version: Option<u64>,
+    /// Assignments still allocating, active, or handing off, other than
+    /// summary workers. An archive with `active_work = cancel` must echo this
+    /// set and `summary_worker_assignments` back together as
+    /// `expected_active_assignments`.
+    pub active_assignments: Vec<ProjectDispositionAssignment>,
+    /// Active assignments of Yard's own ephemeral summary workers, listed
+    /// separately. An archive with `active_work = cancel` ends them too and
+    /// marks their summary command failed (`project_archived`).
+    #[serde(default)]
+    pub summary_worker_assignments: Vec<ProjectDispositionAssignment>,
+}
+
+/// One active assignment and the worker an archive would end with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectDispositionAssignment {
+    pub assignment_id: String,
+    #[serde(with = "crate::serde_u64")]
+    pub assignment_version: u64,
+    pub lifecycle: AssignmentLifecycle,
+    pub objective: String,
+    pub role: String,
+    pub profile_name: String,
+    pub worker_id: String,
+    /// Whether the worker still has a bound Herdr runtime (its tab stays
+    /// open after the archive until someone closes it).
+    pub runtime_present: bool,
+}
+
+impl ProjectDispositionPreview {
+    /// The expected set an archive that ends every listed assignment sends.
+    #[must_use]
+    pub fn expected_active_assignments(&self) -> Vec<ExpectedActiveAssignment> {
+        let mut expected = self
+            .active_assignments
+            .iter()
+            .chain(&self.summary_worker_assignments)
+            .map(|assignment| ExpectedActiveAssignment {
+                assignment_id: assignment.assignment_id.clone(),
+                expected_assignment_version: assignment.assignment_version,
+            })
+            .collect::<Vec<_>>();
+        expected.sort();
+        expected
+    }
+}
+
+/// Background work that continues after a project archive or delete commits.
+/// It never blocks the disposition; runtime cleanup is reported separately by
+/// the result's `cleanup_pending`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectBackgroundStatus {
+    pub snapshots_pending: u64,
+    pub snapshots_abandoned: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,17 +486,49 @@ pub struct ArchivedProject {
     pub orchestrator_worker_id: String,
     pub archived_at_unix_ms: u64,
     pub cleanup_pending: bool,
+    #[serde(default)]
+    pub background: ProjectBackgroundStatus,
+    /// Assignments this archive recorded as cancelled (`project_archived`).
+    #[serde(default)]
+    pub cancelled_assignment_ids: Vec<String>,
+    /// Whether `restore` can currently undo this archive: the project is not
+    /// deleted, this archive is its current one, and its Herdr workspace is
+    /// not reserved by anything else. Herdr reachability is checked only
+    /// when Restore runs.
+    #[serde(default)]
+    pub restorable: bool,
+    /// The project's visibility now; a replay after Restore reports `active`.
+    #[serde(default = "ProjectVisibility::archived")]
+    pub visibility: ProjectVisibility,
     pub replayed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeleteProject {
-    pub command_id: String,
-    pub actor: String,
+/// Derived from the tombstones, never stored separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectVisibility {
+    Active,
+    Archived,
+    Deleted,
 }
 
-impl DeleteProject {
-    /// Normalize and validate an irreversible project visibility deletion.
+impl ProjectVisibility {
+    const fn archived() -> Self {
+        Self::Archived
+    }
+}
+
+/// Undo a project archive while it is restorable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreProject {
+    pub command_id: String,
+    pub actor: String,
+    /// The archive the caller saw; a newer archive (or none) refuses.
+    pub expected_archive_command_id: String,
+}
+
+impl RestoreProject {
+    /// Normalize and validate a project restore command.
     ///
     /// # Errors
     ///
@@ -292,6 +538,133 @@ impl DeleteProject {
         self.command_id =
             bounded_required("command_id", &self.command_id, MAX_PROJECT_COMMAND_BYTES)?;
         self.actor = bounded_required("actor", &self.actor, MAX_PROJECT_COMMAND_BYTES)?;
+        self.expected_archive_command_id = bounded_required(
+            "expected_archive_command_id",
+            &self.expected_archive_command_id,
+            MAX_PROJECT_COMMAND_BYTES,
+        )?;
+        Ok(self)
+    }
+}
+
+/// What Restore did with the orchestrator's runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoredOrchestratorRuntime {
+    /// The archived Herdr tab was still running and is bound again.
+    Rebound,
+    /// No runtime to re-bind (none at archive time, closed since, or its
+    /// identity now belongs to another pane): the orchestrator is restored
+    /// unbound, as after a crash.
+    Unbound,
+}
+
+impl RestoredOrchestratorRuntime {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rebound => "rebound",
+            Self::Unbound => "unbound",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoredProject {
+    pub command_id: String,
+    pub project_id: String,
+    pub archive_command_id: String,
+    pub orchestrator_worker_id: String,
+    pub orchestrator_runtime: RestoredOrchestratorRuntime,
+    /// Assignments the archive cancelled. Restore never reopens them.
+    pub cancelled_assignment_ids: Vec<String>,
+    pub restored_at_unix_ms: u64,
+    /// The project's visibility now (a replay after a re-archive reports
+    /// `archived`).
+    pub visibility: ProjectVisibility,
+    pub replayed: bool,
+}
+
+/// Why Restore cannot run right now. Every refusal is 409
+/// `project_restore_unavailable` with one of these reasons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectRestoreUnavailableReason {
+    /// Herdr could not be inventoried, so a still-running orchestrator could
+    /// be orphaned by restoring it unbound.
+    HerdrUnreachable,
+    /// Another project, claim, quarantine, or cleanup job holds the
+    /// project's Herdr workspace.
+    WorkspaceReserved,
+    /// The orchestrator's archived runtime is bound, claimed, or reserved by
+    /// something else.
+    RuntimeReserved,
+    /// The project's current archive is not the one the caller saw.
+    ArchiveChanged,
+    /// The project was deleted; deletion is permanent.
+    ProjectDeleted,
+    /// The orchestrator worker was deleted or is no longer the one the
+    /// archive ended.
+    OrchestratorUnavailable,
+}
+
+impl ProjectRestoreUnavailableReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HerdrUnreachable => "herdr_unreachable",
+            Self::WorkspaceReserved => "workspace_reserved",
+            Self::RuntimeReserved => "runtime_reserved",
+            Self::ArchiveChanged => "archive_changed",
+            Self::ProjectDeleted => "project_deleted",
+            Self::OrchestratorUnavailable => "orchestrator_unavailable",
+        }
+    }
+}
+
+/// One archived (not deleted) project, for the Archived view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedProjectSummary {
+    pub project_id: String,
+    pub name: String,
+    pub archive_command_id: String,
+    pub orchestrator_worker_id: String,
+    pub archived_at_unix_ms: u64,
+    pub cancelled_assignment_ids: Vec<String>,
+    pub cleanup_pending: bool,
+    pub restorable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedProjects {
+    pub projects: Vec<ArchivedProjectSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteProject {
+    pub command_id: String,
+    pub actor: String,
+    /// Required when the project is still active: delete then archives it in
+    /// the same transaction. Ignored when the project is already archived.
+    #[serde(default)]
+    pub archive: Option<ProjectArchivePreconditions>,
+}
+
+impl DeleteProject {
+    /// Normalize and validate an irreversible project visibility deletion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectValidationError`] when a required identifier is blank
+    /// or oversized, or an archive precondition is invalid.
+    pub fn normalize(mut self) -> Result<Self, ProjectValidationError> {
+        self.command_id =
+            bounded_required("command_id", &self.command_id, MAX_PROJECT_COMMAND_BYTES)?;
+        self.actor = bounded_required("actor", &self.actor, MAX_PROJECT_COMMAND_BYTES)?;
+        self.archive = self
+            .archive
+            .map(ProjectArchivePreconditions::normalize)
+            .transpose()?;
         Ok(self)
     }
 }
@@ -303,6 +676,11 @@ pub struct DeletedProject {
     pub orchestrator_worker_id: String,
     pub deleted_at_unix_ms: u64,
     pub cleanup_pending: bool,
+    #[serde(default)]
+    pub background: ProjectBackgroundStatus,
+    /// Assignments the embedded archive recorded as cancelled.
+    #[serde(default)]
+    pub cancelled_assignment_ids: Vec<String>,
     pub replayed: bool,
 }
 
@@ -515,6 +893,12 @@ pub enum ProjectValidationError {
     RuntimeBindingMismatch,
     #[error("repository root must be an absolute path")]
     InvalidRepositoryRoot,
+    #[error("expected_active_assignments is accepted only with active_work = cancel")]
+    UnexpectedActiveAssignments,
+    #[error("expected_active_assignments lists an assignment more than once")]
+    DuplicateExpectedAssignment,
+    #[error("expected_active_assignments must list at most {max} assignments")]
+    TooManyExpectedAssignments { max: usize },
 }
 
 fn required(field: &'static str, value: &str) -> Result<String, ProjectValidationError> {
@@ -545,10 +929,12 @@ fn bounded_required(
 #[cfg(test)]
 mod tests {
     use super::{
-        ArchiveProject, CanvasPlacement, CreateProject, CreateProjectFromProfile,
-        CreateWorkspaceProjectFromProfile, MAX_PROJECT_CWD_BYTES, ProjectRuntimeBinding,
-        ProjectValidationError, SetProjectRepository, UpdateProjectPlacement,
-        UpdateProjectWorkflowProfile, Worker, WorkerOwnershipKind,
+        ArchiveProject, ArchivedProject, CanvasPlacement, CreateProject, CreateProjectFromProfile,
+        CreateWorkspaceProjectFromProfile, DeleteProject, ExpectedActiveAssignment,
+        MAX_EXPECTED_ACTIVE_ASSIGNMENTS, MAX_PROJECT_CWD_BYTES, ProjectArchiveActiveWork,
+        ProjectArchivePreconditions, ProjectRestoreUnavailableReason, ProjectRuntimeBinding,
+        ProjectValidationError, ProjectVisibility, RestoreProject, SetProjectRepository,
+        UpdateProjectPlacement, UpdateProjectWorkflowProfile, Worker, WorkerOwnershipKind,
     };
 
     fn placement() -> CanvasPlacement {
@@ -569,6 +955,8 @@ mod tests {
             expected_orchestrator_worker_id: " worker-1 ".to_owned(),
             expected_orchestrator_worker_version: 4,
             expected_orchestrator_runtime_version: Some(2),
+            active_work: ProjectArchiveActiveWork::Reject,
+            expected_active_assignments: None,
         }
         .normalize()
         .unwrap();
@@ -576,6 +964,197 @@ mod tests {
         assert_eq!(command.command_id, "archive-1");
         assert_eq!(command.actor, "local-user");
         assert_eq!(command.expected_orchestrator_worker_id, "worker-1");
+    }
+
+    fn expected(assignment_id: &str, version: u64) -> ExpectedActiveAssignment {
+        ExpectedActiveAssignment {
+            assignment_id: assignment_id.to_owned(),
+            expected_assignment_version: version,
+        }
+    }
+
+    fn cancel_archive(expected: Option<Vec<ExpectedActiveAssignment>>) -> ArchiveProject {
+        ArchiveProject {
+            command_id: "archive-1".to_owned(),
+            actor: "local-user".to_owned(),
+            expected_project_version: 3,
+            expected_orchestrator_worker_id: "worker-1".to_owned(),
+            expected_orchestrator_worker_version: 4,
+            expected_orchestrator_runtime_version: None,
+            active_work: ProjectArchiveActiveWork::Cancel,
+            expected_active_assignments: expected,
+        }
+    }
+
+    #[test]
+    fn archive_active_work_defaults_to_reject_and_cancel_needs_the_previewed_set() {
+        let legacy: ArchiveProject = serde_json::from_str(
+            r#"{"command_id":"a","actor":"u","expected_project_version":"1",
+                "expected_orchestrator_worker_id":"w",
+                "expected_orchestrator_worker_version":"1"}"#,
+        )
+        .unwrap();
+        let legacy = legacy.normalize().unwrap();
+        assert_eq!(legacy.active_work, ProjectArchiveActiveWork::Reject);
+        assert_eq!(legacy.expected_active_assignments, None);
+
+        let parsed: ArchiveProject = serde_json::from_str(
+            r#"{"command_id":"a","actor":"u","expected_project_version":"1",
+                "expected_orchestrator_worker_id":"w",
+                "expected_orchestrator_worker_version":"1","active_work":"cancel",
+                "expected_active_assignments":[
+                    {"assignment_id":" b ","expected_assignment_version":"2"},
+                    {"assignment_id":"a","expected_assignment_version":"5"}]}"#,
+        )
+        .unwrap();
+        let parsed = parsed.normalize().unwrap();
+        assert_eq!(
+            parsed.expected_active_assignments,
+            Some(vec![expected("a", 5), expected("b", 2)]),
+            "trimmed and sorted"
+        );
+        assert_eq!(
+            parsed.preconditions().expected_active_assignments,
+            parsed.expected_active_assignments
+        );
+        assert_eq!(
+            cancel_archive(Some(Vec::new()))
+                .normalize()
+                .unwrap()
+                .expected_active_assignments,
+            Some(Vec::new())
+        );
+
+        assert_eq!(
+            cancel_archive(None).normalize().unwrap_err(),
+            ProjectValidationError::Required("expected_active_assignments")
+        );
+        let mut reject_with_set = cancel_archive(Some(Vec::new()));
+        reject_with_set.active_work = ProjectArchiveActiveWork::Reject;
+        assert_eq!(
+            reject_with_set.normalize().unwrap_err(),
+            ProjectValidationError::UnexpectedActiveAssignments
+        );
+        assert_eq!(
+            cancel_archive(Some(vec![expected("a", 1), expected(" a", 2)]))
+                .normalize()
+                .unwrap_err(),
+            ProjectValidationError::DuplicateExpectedAssignment
+        );
+        assert_eq!(
+            cancel_archive(Some(vec![expected("a", 0)]))
+                .normalize()
+                .unwrap_err(),
+            ProjectValidationError::InvalidVersion
+        );
+        assert_eq!(
+            cancel_archive(Some(vec![expected(" ", 1)]))
+                .normalize()
+                .unwrap_err(),
+            ProjectValidationError::Required("expected_active_assignments.assignment_id")
+        );
+        let too_many = (0..=MAX_EXPECTED_ACTIVE_ASSIGNMENTS)
+            .map(|index| expected(&format!("assignment-{index}"), 1))
+            .collect();
+        assert_eq!(
+            cancel_archive(Some(too_many)).normalize().unwrap_err(),
+            ProjectValidationError::TooManyExpectedAssignments {
+                max: MAX_EXPECTED_ACTIVE_ASSIGNMENTS
+            }
+        );
+
+        // Delete carries the same choice inside its archive preconditions.
+        let delete: DeleteProject = serde_json::from_str(
+            r#"{"command_id":"d","actor":"u","archive":{"expected_project_version":"1",
+                "expected_orchestrator_worker_id":"w",
+                "expected_orchestrator_worker_version":"1","active_work":"cancel"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            delete.normalize().unwrap_err(),
+            ProjectValidationError::Required("expected_active_assignments")
+        );
+    }
+
+    #[test]
+    fn normalizes_project_delete_archive_preconditions() {
+        let legacy: DeleteProject =
+            serde_json::from_str(r#"{"command_id":"delete-1","actor":"local-user"}"#).unwrap();
+        assert_eq!(legacy.normalize().unwrap().archive, None);
+
+        let command = DeleteProject {
+            command_id: " delete-1 ".to_owned(),
+            actor: " local-user ".to_owned(),
+            archive: Some(ProjectArchivePreconditions {
+                expected_project_version: 3,
+                expected_orchestrator_worker_id: " worker-1 ".to_owned(),
+                expected_orchestrator_worker_version: 4,
+                expected_orchestrator_runtime_version: None,
+                active_work: ProjectArchiveActiveWork::Reject,
+                expected_active_assignments: None,
+            }),
+        }
+        .normalize()
+        .unwrap();
+        assert_eq!(command.command_id, "delete-1");
+        assert_eq!(
+            command.archive.unwrap().expected_orchestrator_worker_id,
+            "worker-1"
+        );
+
+        let zero_version = DeleteProject {
+            command_id: "delete-2".to_owned(),
+            actor: "local-user".to_owned(),
+            archive: Some(ProjectArchivePreconditions {
+                expected_project_version: 0,
+                expected_orchestrator_worker_id: "worker-1".to_owned(),
+                expected_orchestrator_worker_version: 4,
+                expected_orchestrator_runtime_version: None,
+                active_work: ProjectArchiveActiveWork::Reject,
+                expected_active_assignments: None,
+            }),
+        };
+        assert_eq!(
+            zero_version.normalize().unwrap_err(),
+            ProjectValidationError::InvalidVersion
+        );
+    }
+
+    #[test]
+    fn normalizes_project_restore_and_reads_pre_restore_archive_results() {
+        let command = RestoreProject {
+            command_id: " restore-1 ".to_owned(),
+            actor: " local-user ".to_owned(),
+            expected_archive_command_id: " archive-1 ".to_owned(),
+        }
+        .normalize()
+        .unwrap();
+        assert_eq!(command.command_id, "restore-1");
+        assert_eq!(command.actor, "local-user");
+        assert_eq!(command.expected_archive_command_id, "archive-1");
+        let blank = RestoreProject {
+            command_id: "restore-2".to_owned(),
+            actor: "local-user".to_owned(),
+            expected_archive_command_id: "  ".to_owned(),
+        };
+        assert_eq!(
+            blank.normalize().unwrap_err(),
+            ProjectValidationError::Required("expected_archive_command_id")
+        );
+
+        // An archive result stored or sent before Restore existed.
+        let legacy: ArchivedProject = serde_json::from_str(
+            r#"{"command_id":"archive-1","project_id":"project-1",
+                "orchestrator_worker_id":"worker-1","archived_at_unix_ms":1,
+                "cleanup_pending":false,"replayed":false}"#,
+        )
+        .unwrap();
+        assert!(!legacy.restorable);
+        assert_eq!(legacy.visibility, ProjectVisibility::Archived);
+        assert_eq!(
+            serde_json::to_value(ProjectRestoreUnavailableReason::HerdrUnreachable).unwrap(),
+            serde_json::json!(ProjectRestoreUnavailableReason::HerdrUnreachable.as_str())
+        );
     }
 
     #[test]

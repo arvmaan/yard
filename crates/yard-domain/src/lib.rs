@@ -17,6 +17,7 @@ pub mod serde_u64;
 mod status_report;
 mod summary_worker;
 mod token_spend;
+mod transcript;
 mod worker;
 mod worker_cleanup;
 mod yard_orchestrator;
@@ -36,12 +37,14 @@ pub use artifact::{
     ArtifactValidationError, MAX_ARTIFACT_CONTENT_BYTES, UploadArtifact,
 };
 pub use assignment::{
-    AllocationContext, AllocationMode, Assignment, AssignmentAttempt, AssignmentLifecycle,
-    AssignmentValidationError, Assignments, AttemptLifecycle, CompletionOutcome, CompletionReceipt,
-    CompletionValidationError, ConfirmProfileAllocation, ConfirmWorkerAllocation,
-    ConfirmWorkerHandoff, ConfirmedAllocation, ConfirmedWorkerHandoff, HandoffTargetRole,
-    IsolationPolicy, RecordCompletionReceipt, RecordedCompletionReceipt, WorkerAllocation,
-    WorkerDesiredState,
+    AllocationContext, AllocationMode, Assignment, AssignmentAttempt, AssignmentCancellation,
+    AssignmentLifecycle, AssignmentValidationError, Assignments, AttemptLifecycle,
+    CancellationReason, CompletionOutcome, CompletionReceipt, CompletionValidationError,
+    ConfirmProfileAllocation, ConfirmWorkerAllocation, ConfirmWorkerHandoff, ConfirmedAllocation,
+    ConfirmedWorkerHandoff, DisposeAssignment, DisposedAssignment, DispositionOutcome,
+    DispositionValidationError, HandoffTargetRole, IsolationPolicy, MINIMAL_RECEIPT_SUMMARY,
+    ReceiptDetailLevel, RecordCompletionReceipt, RecordedCompletionReceipt, RequestOrigin,
+    WorkerAllocation, WorkerDesiredState,
 };
 pub use automation::{
     Automation, AutomationCommandResult, AutomationPlacement, AutomationRun,
@@ -57,14 +60,19 @@ pub use coordination::{
     YardOrchestratorRoute, YardOrchestratorRoutes,
 };
 pub use coordination_node::{
-    CoordinationDeliveryStatus, CoordinationNode, CoordinationNodeCommandResult,
-    CoordinationNodeKind, CoordinationNodePlacement, CoordinationNodePromptAcknowledgement,
-    CoordinationNodeRoute, CoordinationNodeRoutes, CoordinationNodeTerminalOutput,
-    CoordinationNodeValidationError, CoordinationNodes, CoordinationSnapshot,
-    CoordinationSnapshots, CreateCoordinationNode, ProvisionCoordinationNode,
+    ArchiveCoordinationNode, ArchivedCoordinationNode, CoordinationDeliveryStatus,
+    CoordinationNode, CoordinationNodeArchivePreconditions, CoordinationNodeCommandResult,
+    CoordinationNodeDispositionAutomation, CoordinationNodeDispositionBlocker,
+    CoordinationNodeDispositionBlockerKind, CoordinationNodeDispositionPreview,
+    CoordinationNodeDispositionProject, CoordinationNodeDispositionWorker, CoordinationNodeKind,
+    CoordinationNodePlacement, CoordinationNodePromptAcknowledgement, CoordinationNodeRoute,
+    CoordinationNodeRoutes, CoordinationNodeTerminalOutput, CoordinationNodeValidationError,
+    CoordinationNodes, CoordinationSnapshot, CoordinationSnapshots, CreateCoordinationNode,
+    DeleteCoordinationNode, DeletedCoordinationNode, ProvisionCoordinationNode,
     RequestCoordinationSnapshot, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
-    SnapshotCollectionProgress, SnapshotCollectionStatus, SnapshotProjectCollection,
-    UpdateCoordinationNode, UpdateCoordinationNodePlacement, canonical_coordination_uuid,
+    SnapshotAbandonmentReason, SnapshotCollectionProgress, SnapshotCollectionStatus,
+    SnapshotProjectCollection, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
+    canonical_coordination_uuid,
 };
 pub use intervention::{
     InterventionValidationError, OrchestratorPromptAcknowledgement, OrchestratorTerminalOutput,
@@ -104,12 +112,16 @@ pub use profile::{
     WorkerProfileSpec, WorkerProfiles, herdr_agent_name,
 };
 pub use project::{
-    ArchiveProject, ArchivedProject, CanvasPlacement, ConfirmedProjectCreation, CreateProject,
-    CreateProjectFromProfile, CreateWorkspaceProjectFromProfile, DeleteProject, DeletedProject,
-    Project, ProjectPlacement, ProjectRepositories, ProjectRepository, ProjectRuntimeBinding,
-    ProjectValidationError, ProjectWorkflowProfilePin, Projects, RuntimeObservationState,
-    RuntimeProcessState, SetProjectRepository, UpdateProjectPlacement,
-    UpdateProjectWorkflowProfile, Worker, WorkerOwnershipKind, WorkerRuntimeBinding,
+    ArchiveProject, ArchivedProject, ArchivedProjectSummary, ArchivedProjects, CanvasPlacement,
+    ConfirmedProjectCreation, CreateProject, CreateProjectFromProfile,
+    CreateWorkspaceProjectFromProfile, DeleteProject, DeletedProject, ExpectedActiveAssignment,
+    Project, ProjectArchiveActiveWork, ProjectArchivePreconditions, ProjectBackgroundStatus,
+    ProjectDispositionAssignment, ProjectDispositionPreview, ProjectPlacement, ProjectRepositories,
+    ProjectRepository, ProjectRestoreUnavailableReason, ProjectRuntimeBinding,
+    ProjectValidationError, ProjectVisibility, ProjectWorkflowProfilePin, Projects, RestoreProject,
+    RestoredOrchestratorRuntime, RestoredProject, RuntimeObservationState, RuntimeProcessState,
+    SetProjectRepository, UpdateProjectPlacement, UpdateProjectWorkflowProfile, Worker,
+    WorkerOwnershipKind, WorkerRuntimeBinding,
 };
 pub use repository_files::{
     RepositoryDiff, RepositoryDiffHunk, RepositoryDiffLine, RepositoryDiffLineKind, RepositoryFile,
@@ -127,6 +139,10 @@ pub use summary_worker::{
 pub use token_spend::{
     AutomaticSummaryRequestKind, TokenSpendSettings, TokenSpendSettingsValidationError,
     UpdateTokenSpendSettings,
+};
+pub use transcript::{
+    BoundedTranscript, MAX_TRANSCRIPT_BYTES, MAX_TRANSCRIPT_LINES, TranscriptStatus,
+    TranscriptUnavailableReason, WorkerTranscript, bound_transcript_text,
 };
 pub use worker::{
     CompletedRuntimeCleanupCandidate, CompletedRuntimeCleanupPreview,

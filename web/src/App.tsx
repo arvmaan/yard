@@ -7,7 +7,9 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type Dispatch,
   type FormEvent,
+  type SetStateAction,
 } from 'react'
 import {
   ArrowRightLeft,
@@ -31,6 +33,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  RotateCcw,
   Server,
   Trash2,
   Unlink,
@@ -40,6 +43,7 @@ import {
 } from 'lucide-react'
 import {
   YardApiError,
+  archiveCoordinationNode,
   archiveProject,
   changeProjectOrchestrator,
   confirmWorkerHandoff,
@@ -51,6 +55,7 @@ import {
   createProjectRelationship,
   createProjectWithWorkspace,
   createWorkerProfile,
+  deleteCoordinationNode,
   deleteProject,
   deleteProjectRelationship,
   deleteWorker,
@@ -61,6 +66,8 @@ import {
   fetchAutomations,
   fetchInventory,
   fetchRuntimeLens,
+  fetchCoordinationNode,
+  fetchCoordinationNodeDispositionPreview,
   fetchCoordinationNodeRoutes,
   fetchCoordinationNodes,
   fetchCoordinationSnapshots,
@@ -68,8 +75,10 @@ import {
   fetchOrchestratorStatusOutput,
   fetchProject,
   fetchProjectAssignments,
+  fetchProjectDispositionPreview,
   fetchSummaryWorkers,
   fetchProjectRelationships,
+  fetchArchivedProjects,
   fetchProjects,
   fetchSessions,
   fetchTokenSpendSettings,
@@ -82,6 +91,7 @@ import {
   recoverYardOrchestrator,
   replaceProjectOrchestrator,
   resetOrchestratorWorkflowProfile,
+  restoreProject,
   provisionCoordinationNode,
   recordCompletionReceipt,
   requestCoordinationSnapshot,
@@ -219,24 +229,67 @@ import {
   type MapVisualMode,
 } from './mapVisualMode'
 import { useModalDialog } from './useModalDialog'
+import {
+  ARCHIVE_UNDO_WINDOW_MS,
+  PROJECT_PREVIEW_REFRESH_CODES,
+  PROJECT_VERSION_REFRESH_CODES,
+  projectArchivePreconditions,
+  projectDispositionEndedAssignments,
+  projectDispositionNotice,
+  projectRestoreErrorMessage,
+  projectRestoreRetryable,
+  projectRestoreNotice,
+  workstreamDispositionNotice,
+} from './backgroundStatus'
+import {
+  ArchivedProjectsPanel,
+  type ProjectRestoreState,
+} from './ArchivedProjectsPanel'
+import { WorkstreamDispositionDialog } from './WorkstreamDispositionDialog'
+import { AssignmentActions } from './AssignmentActions'
+import { AssignmentTranscript } from './AssignmentTranscript'
+import {
+  WorkerDispositionSheet,
+  type WorkerDispositionChoice,
+  type WorkerDispositionMode,
+} from './WorkerDispositionSheet'
+import {
+  DispositionCommandIds,
+  dispositionNotice,
+  submitDisposition,
+  withLatestSessionVersions,
+  type DispositionResult,
+} from './assignmentDisposition'
+import {
+  readCompleteAndEndSession,
+  writeCompleteAndEndSession,
+} from './completionPreference'
+import { useQuickCompletionWindow } from './useQuickCompletionWindow'
 import type {
   Artifact,
   Assignment,
+  AssignmentCancellation,
+  AssignmentLifecycle,
   Automation,
   AutomationRun,
   AutomationScope,
   CanvasPlacement,
   CompletedRuntimeCleanupPreview,
   CoordinationNode,
+  CoordinationNodeDispositionPreview,
   CoordinationNodeKind,
   CoordinationNodeRoute,
   CoordinationSnapshot,
   CreateWorkerProfileInput,
+  DispositionOutcome,
   ObservedChildAgent,
   ObservedStatus,
   ObservedWorker,
   OrchestratorWorkflowProfile,
   Project,
+  ArchivedProjectSummary,
+  ProjectBackgroundStatus,
+  ProjectDispositionPreview,
   ProjectRelationship,
   RuntimeInventory,
   RuntimeLensEntry,
@@ -276,6 +329,28 @@ type Filter =
   | 'attention'
   | 'stale'
   | 'history'
+
+interface ProjectDispositionProposal {
+  commandId: string
+  preview: ProjectDispositionPreview | null
+  previewError: string | null
+  // The preview found no active project because it is already archived
+  // (for example by another tab); Delete can still remove it.
+  alreadyArchived?: boolean
+  project: Project
+  returnFocus: HTMLButtonElement | null
+}
+
+function isProjectDispositionPreview(
+  value: unknown,
+): value is ProjectDispositionPreview {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'project_id' in value &&
+    Array.isArray((value as { active_assignments?: unknown }).active_assignments)
+  )
+}
 type ProjectCreationDetails =
   | {
       mode: 'existing'
@@ -351,16 +426,31 @@ const OBSERVATION_ICONS = {
   observed: Wifi,
 } satisfies Record<RuntimeObservationState, typeof CircleAlert>
 
+function withoutKey<T>(record: Record<string, T>, key: string) {
+  if (!(key in record)) return record
+  const next = { ...record }
+  delete next[key]
+  return next
+}
+
 function matchesFilter(
   candidate: WorkerCandidate,
   filter: Filter,
   snapshotCurrent: boolean,
   inventory: RuntimeInventory | null,
+  latestAssignmentLifecycle: AssignmentLifecycle | null = null,
 ) {
   if (filter === 'current') return candidate.availability !== 'ended'
   if (filter === 'history') return candidate.availability === 'ended'
   if (filter === 'stale') {
-    return workerAttentionState(candidate, snapshotCurrent, inventory) === 'stale'
+    return (
+      workerAttentionState(
+        candidate,
+        snapshotCurrent,
+        inventory,
+        latestAssignmentLifecycle,
+      ) === 'stale'
+    )
   }
   if (filter === 'available') {
     return (
@@ -378,8 +468,12 @@ function matchesFilter(
   }
   if (filter === 'attention') {
     return (
-      workerAttentionState(candidate, snapshotCurrent, inventory) ===
-      'actionable'
+      workerAttentionState(
+        candidate,
+        snapshotCurrent,
+        inventory,
+        latestAssignmentLifecycle,
+      ) === 'actionable'
     )
   }
   return false
@@ -909,6 +1003,7 @@ function ProviderChildInspector({ agent }: { agent: ObservedChildAgent }) {
 
 function WorkerCandidateInspector({
   activeAssignment,
+  activeControls,
   candidate,
   completedAssignment,
   hideOnly,
@@ -922,6 +1017,7 @@ function WorkerCandidateInspector({
   snapshotCurrent,
 }: {
   activeAssignment: Assignment | undefined
+  activeControls: AssignmentDispositionControls | null
   candidate: WorkerCandidate
   completedAssignment: Assignment | undefined
   hideOnly: boolean
@@ -1003,6 +1099,12 @@ function WorkerCandidateInspector({
           target={{ kind: 'assignment', assignment: activeAssignment }}
         />
       ) : null}
+      {activeAssignment && activeControls ? (
+        <ActiveAssignmentActions
+          assignment={activeAssignment}
+          controls={activeControls}
+        />
+      ) : null}
       {completedAssignment &&
       candidate.worker.desired_state === 'running' ? (
         <div className="awaiting-disposition" role="status">
@@ -1010,11 +1112,18 @@ function WorkerCandidateInspector({
           <span>
             <strong>Awaiting disposition</strong>
             <small>
-              Work is complete. This session remains available for inspection
-              or reassignment until you end it.
+              {completedAssignment.lifecycle === 'cancelled'
+                ? 'Work ended without completion. This session remains available for inspection or reassignment until you end it.'
+                : 'Work is complete. This session remains available for inspection or reassignment until you end it.'}
             </small>
           </span>
         </div>
+      ) : null}
+      {!activeAssignment && completedAssignment ? (
+        <AssignmentTranscript
+          assignment={completedAssignment}
+          key={`${completedAssignment.id}:${completedAssignment.version}`}
+        />
       ) : null}
       {isActionable ? (
         <div className="inspector-actions">
@@ -2193,22 +2302,82 @@ function ProfileInspector({
   )
 }
 
+/** Everything an inspector needs to complete or end an active assignment. */
+interface AssignmentDispositionControls {
+  busy: boolean
+  completeAndEndSession: boolean
+  error: string | null
+  onComplete: () => void
+  onCompleteAndEndSessionChange: (enabled: boolean) => void
+  onCompleteWithDetails: () => void
+  onDelete: (trigger: HTMLElement | null) => void
+  onEndSession: (trigger: HTMLElement | null) => void
+  onRetry?: () => void
+  onUndo: () => void
+  pending: boolean
+}
+
+function ActiveAssignmentActions({
+  assignment,
+  controls,
+}: {
+  assignment: Assignment
+  controls: AssignmentDispositionControls
+}) {
+  return (
+    <AssignmentActions
+      assignment={assignment}
+      busy={controls.busy}
+      completeAndEndSession={controls.completeAndEndSession}
+      error={controls.error}
+      onComplete={controls.onComplete}
+      onCompleteAndEndSessionChange={controls.onCompleteAndEndSessionChange}
+      onCompleteWithDetails={controls.onCompleteWithDetails}
+      onDelete={() =>
+        controls.onDelete(
+          document.activeElement instanceof HTMLElement
+            ? document.activeElement
+            : null,
+        )
+      }
+      onEndSession={() =>
+        controls.onEndSession(
+          document.activeElement instanceof HTMLElement
+            ? document.activeElement
+            : null,
+        )
+      }
+      onRetry={controls.onRetry}
+      onUndo={controls.onUndo}
+      pending={controls.pending}
+    />
+  )
+}
+
+const CANCELLATION_REASON_LABELS: Record<
+  AssignmentCancellation['reason'],
+  string
+> = {
+  ended_without_completion: 'Ended without completion',
+  project_archived: 'Project archived',
+}
+
 function AssignmentInspector({
   assignment,
+  controls,
   inventory,
   label,
   onDelete,
   onEndSession,
-  onRecordCompletion,
   onRefresh,
   snapshotCurrent,
 }: {
   assignment: Assignment
+  controls: AssignmentDispositionControls
   inventory: RuntimeInventory | null
   label: string
   onDelete?: () => void
   onEndSession?: () => void
-  onRecordCompletion: () => void
   onRefresh: () => void
   snapshotCurrent: boolean
 }) {
@@ -2222,6 +2391,7 @@ function AssignmentInspector({
   )
   const { status } = resolvedRuntimeState(runtime, capabilities)
   const receipt = assignment.completion_receipt
+  const cancellation = assignment.cancellation
 
   return (
     <>
@@ -2234,7 +2404,11 @@ function AssignmentInspector({
           <h2>{label}</h2>
         </div>
       </div>
-      <span className="runtime-badge">{assignment.lifecycle}</span>
+      <span className="runtime-badge" data-lifecycle={assignment.lifecycle}>
+        {assignment.lifecycle === 'cancelled'
+          ? 'ended without completion'
+          : assignment.lifecycle}
+      </span>
       <RuntimeStateSummary
         inventory={inventory}
         runtime={runtime}
@@ -2266,6 +2440,7 @@ function AssignmentInspector({
         key={[
           assignment.id,
           assignment.attempt.id,
+          assignment.lifecycle,
           runtime?.terminal_id,
           runtime?.pane_id,
           runtime?.provider_session?.value,
@@ -2279,8 +2454,10 @@ function AssignmentInspector({
         <div className="awaiting-disposition" role="status">
           <CircleCheck aria-hidden="true" size={16} />
           <span>
-            <strong>Completion review</strong>
-            <small>Agent reports done. Evidence-backed receipt required.</small>
+            <strong>Ready to complete</strong>
+            <small>
+              Agent reports done. Complete it, or add details to the receipt.
+            </small>
           </span>
         </div>
       ) : null}
@@ -2288,41 +2465,60 @@ function AssignmentInspector({
         <section
           aria-label="Completion receipt"
           className="completion-receipt"
+          data-detail-level={receipt.detail_level}
         >
           <p className="eyebrow">Completion receipt</p>
           <dl className="detail-list">
             <DetailRow label="Summary" value={receipt.summary} />
             <DetailRow label="Outcome" value={receipt.outcome} />
-            <div className="detail-row">
-              <dt>Evidence</dt>
-              <dd>
-                <ReceiptValues values={receipt.evidence_refs} />
-              </dd>
-            </div>
-            <div className="detail-row">
-              <dt>Artifacts</dt>
-              <dd>
-                <ReceiptArtifacts
-                  artifacts={receipt.artifacts}
-                  onOpen={(artifact, trigger) => {
-                    artifactTrigger.current = trigger
-                    setSelectedArtifact(artifact)
-                  }}
-                />
-              </dd>
-            </div>
-            <div className="detail-row">
-              <dt>References</dt>
-              <dd>
-                <ReceiptValues values={receipt.artifact_refs} />
-              </dd>
-            </div>
-            <div className="detail-row">
-              <dt>Blockers</dt>
-              <dd>
-                <ReceiptValues values={receipt.unresolved_blockers} />
-              </dd>
-            </div>
+            <DetailRow
+              label="Detail"
+              value={
+                receipt.detail_level === 'minimal'
+                  ? 'Minimal — no detailed handoff'
+                  : 'Detailed'
+              }
+            />
+            {receipt.objective_snapshot ? (
+              <DetailRow
+                label="Objective at completion"
+                value={receipt.objective_snapshot}
+              />
+            ) : null}
+            {receipt.detail_level === 'detailed' ? (
+              <>
+                <div className="detail-row">
+                  <dt>Evidence</dt>
+                  <dd>
+                    <ReceiptValues values={receipt.evidence_refs} />
+                  </dd>
+                </div>
+                <div className="detail-row">
+                  <dt>Artifacts</dt>
+                  <dd>
+                    <ReceiptArtifacts
+                      artifacts={receipt.artifacts}
+                      onOpen={(artifact, trigger) => {
+                        artifactTrigger.current = trigger
+                        setSelectedArtifact(artifact)
+                      }}
+                    />
+                  </dd>
+                </div>
+                <div className="detail-row">
+                  <dt>References</dt>
+                  <dd>
+                    <ReceiptValues values={receipt.artifact_refs} />
+                  </dd>
+                </div>
+                <div className="detail-row">
+                  <dt>Blockers</dt>
+                  <dd>
+                    <ReceiptValues values={receipt.unresolved_blockers} />
+                  </dd>
+                </div>
+              </>
+            ) : null}
             <DetailRow label="Actor" value={receipt.actor} mono />
             <DetailRow
               label="Recorded"
@@ -2332,15 +2528,40 @@ function AssignmentInspector({
           </dl>
         </section>
       ) : null}
-      {receipt && (onEndSession || onDelete) ? (
+      {cancellation ? (
+        <section
+          aria-label="Cancellation"
+          className="completion-receipt assignment-cancellation"
+        >
+          <p className="eyebrow">Not completed</p>
+          <dl className="detail-list">
+            <DetailRow
+              label="Outcome"
+              value={CANCELLATION_REASON_LABELS[cancellation.reason]}
+            />
+            <DetailRow
+              label="Objective"
+              value={cancellation.objective_snapshot}
+            />
+            <DetailRow label="Actor" value={cancellation.actor} mono />
+            <DetailRow
+              label="Recorded"
+              value={new Date(cancellation.cancelled_at_unix_ms).toISOString()}
+              mono
+            />
+          </dl>
+        </section>
+      ) : null}
+      {(receipt || cancellation) && (onEndSession || onDelete) ? (
         <div className="inspector-actions disposition-actions">
           <div className="awaiting-disposition" role="status">
             <CircleCheck aria-hidden="true" size={16} />
             <span>
               <strong>Awaiting disposition</strong>
               <small>
-                The completion receipt is retained whether this session is
-                reassigned or ended.
+                {receipt
+                  ? 'The completion receipt is retained whether this session is reassigned or ended.'
+                  : 'The cancellation is retained whether this session is reassigned or ended.'}
               </small>
             </span>
           </div>
@@ -2367,19 +2588,7 @@ function AssignmentInspector({
         </div>
       ) : null}
       {assignment.lifecycle === 'active' ? (
-        <div className="inspector-actions">
-          <small className="inspector-action-note">
-            Record completion before ending or deleting this worker.
-          </small>
-          <button
-            className="command-button"
-            onClick={onRecordCompletion}
-            type="button"
-          >
-            <CircleCheck aria-hidden="true" size={16} />
-            Record completion
-          </button>
-        </div>
+        <ActiveAssignmentActions assignment={assignment} controls={controls} />
       ) : null}
       {selectedArtifact ? (
         <Suspense fallback={null}>
@@ -3010,28 +3219,87 @@ function App() {
   } | null>(null)
   const [staleHideBusy, setStaleHideBusy] = useState(false)
   const [staleHideError, setStaleHideError] = useState<string | null>(null)
-  const [projectArchiveProposal, setProjectArchiveProposal] = useState<{
-    commandId: string
-    project: Project
-    returnFocus: HTMLButtonElement | null
+  // One-click Complete waits QUICK_COMPLETE_UNDO_MS before it is sent, so
+  // Undo simply never sends it. Nothing is durable during the window.
+  const [completeAndEndSession, setCompleteAndEndSession] = useState(
+    readCompleteAndEndSession,
+  )
+  const [dispositionBusy, setDispositionBusy] = useState<
+    Record<string, boolean>
+  >({})
+  const [dispositionErrors, setDispositionErrors] = useState<
+    Record<string, { endSession: boolean; message: string; outcome: DispositionOutcome }>
+  >({})
+  // A disposition command ID is created when the action starts and reused
+  // on every retry of the identical request until it settles.
+  const dispositionCommands = useRef(new DispositionCommandIds())
+  const [workerDispositionProposal, setWorkerDispositionProposal] = useState<{
+    assignment: Assignment
+    deleteCommandId: string
+    mode: WorkerDispositionMode
+    returnFocus: HTMLElement | null
   } | null>(null)
+  const [workerDispositionBusy, setWorkerDispositionBusy] =
+    useState<WorkerDispositionChoice | null>(null)
+  const [workerDispositionError, setWorkerDispositionError] = useState<
+    string | null
+  >(null)
+  // One confirmation per project archive or delete. The command ID belongs
+  // to one preview and is reused on every retry of it, so a retry sends the
+  // identical body; a refreshed preview gets a new command ID.
+  const [projectArchiveProposal, setProjectArchiveProposal] =
+    useState<ProjectDispositionProposal | null>(null)
   const [projectArchiveBusy, setProjectArchiveBusy] = useState(false)
   const [projectArchiveError, setProjectArchiveError] = useState<
     string | null
   >(null)
-  const [projectDeleteProposal, setProjectDeleteProposal] = useState<{
-    archiveCommandId: string
-    deleteCommandId: string
-    project: Project
-    returnFocus: HTMLButtonElement | null
-  } | null>(null)
+  const [projectDeleteProposal, setProjectDeleteProposal] =
+    useState<ProjectDispositionProposal | null>(null)
   const [projectDeleteBusy, setProjectDeleteBusy] = useState(false)
   const [projectDeleteError, setProjectDeleteError] = useState<string | null>(
     null,
   )
+  // One sheet per workstream archive or delete. The command ID is created
+  // with each preview and reused on every retry of that preview, so a retry
+  // sends the identical body. A version conflict commits nothing, so the
+  // sheet then loads a fresh preview under a new command ID.
+  const [workstreamDispositionProposal, setWorkstreamDispositionProposal] =
+    useState<{
+      commandId: string
+      mode: 'archive' | 'delete'
+      node: CoordinationNode
+      preview: CoordinationNodeDispositionPreview | null
+      previewError: string | null
+      returnFocus: HTMLButtonElement | null
+    } | null>(null)
+  const [workstreamDispositionBusy, setWorkstreamDispositionBusy] =
+    useState(false)
+  const [workstreamDispositionError, setWorkstreamDispositionError] = useState<
+    string | null
+  >(null)
   const [runtimeError, setRuntimeError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [actionNotice, setActionNotice] = useState<string | null>(null)
+  // Archived (not deleted) projects for the Archived shelf; null until read.
+  const [archivedProjects, setArchivedProjects] = useState<
+    ArchivedProjectSummary[] | null
+  >(null)
+  const [archivedProjectsError, setArchivedProjectsError] = useState<
+    string | null
+  >(null)
+  // Restore state per archive command. The restore command ID is created
+  // with the first attempt and reused on every retry until it succeeds.
+  const [projectRestores, setProjectRestores] = useState<
+    Record<string, ProjectRestoreState>
+  >({})
+  const restoreCommandIds = useRef<Record<string, string>>({})
+  // The Undo offered for ARCHIVE_UNDO_WINDOW_MS after a restorable archive.
+  const [archiveUndo, setArchiveUndo] = useState<{
+    archiveCommandId: string
+    projectId: string
+    projectName: string
+    shownAt: number
+  } | null>(null)
   const placementUpdates = useRef(new Set<string>())
   const pendingPlacements = useRef(new Map<string, CanvasPlacement>())
   const projectsRef = useRef<Project[]>([])
@@ -3157,6 +3425,21 @@ function App() {
     },
     [loadAssignments, loadSummaryWorkers],
   )
+
+  const loadArchivedProjects = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const result = await fetchArchivedProjects(signal)
+      setArchivedProjects(result.projects)
+      setArchivedProjectsError(null)
+    } catch (caught) {
+      if (signal?.aborted) return
+      setArchivedProjectsError(
+        caught instanceof Error
+          ? caught.message
+          : 'Archived projects could not be loaded',
+      )
+    }
+  }, [])
 
   const loadYardOrchestrator = useCallback(
     async (signal?: AbortSignal) => {
@@ -3783,12 +4066,44 @@ function App() {
     projects,
     workerCandidates,
   ])
+  // The lifecycle of each worker's most recent assignment: work ended
+  // without completion keeps its worker quiet instead of stale.
+  const latestAssignmentLifecycles = useMemo(() => {
+    const latest = new Map<string, Assignment>()
+    for (const assignment of assignments) {
+      const current = latest.get(assignment.worker.id)
+      if (
+        !current ||
+        assignment.created_at_unix_ms > current.created_at_unix_ms
+      ) {
+        latest.set(assignment.worker.id, assignment)
+      }
+    }
+    return new Map(
+      [...latest].map(([workerId, assignment]) => [
+        workerId,
+        assignment.lifecycle,
+      ]),
+    )
+  }, [assignments])
   const visibleCandidates = useMemo(
     () =>
       workerCandidates.filter((candidate) =>
-        matchesFilter(candidate, filter, inventoryCurrent, inventory),
+        matchesFilter(
+          candidate,
+          filter,
+          inventoryCurrent,
+          inventory,
+          latestAssignmentLifecycles.get(candidate.worker.id) ?? null,
+        ),
       ),
-    [filter, inventory, inventoryCurrent, workerCandidates],
+    [
+      filter,
+      inventory,
+      inventoryCurrent,
+      latestAssignmentLifecycles,
+      workerCandidates,
+    ],
   )
   const attentionCount = useMemo(
     () =>
@@ -3798,16 +4113,23 @@ function App() {
           'attention',
           inventoryCurrent,
           inventory,
+          latestAssignmentLifecycles.get(candidate.worker.id) ?? null,
         ),
       ).length,
-    [inventory, inventoryCurrent, workerCandidates],
+    [inventory, inventoryCurrent, latestAssignmentLifecycles, workerCandidates],
   )
   const staleCandidates = useMemo(
     () =>
       workerCandidates.filter((candidate) =>
-        matchesFilter(candidate, 'stale', inventoryCurrent, inventory),
+        matchesFilter(
+          candidate,
+          'stale',
+          inventoryCurrent,
+          inventory,
+          latestAssignmentLifecycles.get(candidate.worker.id) ?? null,
+        ),
       ),
-    [inventory, inventoryCurrent, workerCandidates],
+    [inventory, inventoryCurrent, latestAssignmentLifecycles, workerCandidates],
   )
   const hideableStaleCandidates = useMemo(
     () =>
@@ -3914,6 +4236,8 @@ function App() {
         selectedWorkerCandidate,
         inventoryCurrent,
         inventory,
+        latestAssignmentLifecycles.get(selectedWorkerCandidate.worker.id) ??
+          null,
       )
     : 'quiet'
   const selectedWorkspace =
@@ -3926,24 +4250,6 @@ function App() {
     selection?.kind === 'project'
       ? projects.find((project) => project.id === selection.id)
       : undefined
-  const projectArchiveActiveAssignmentCount = projectArchiveProposal
-    ? assignments.filter(
-        (assignment) =>
-          assignment.project_id === projectArchiveProposal.project.id &&
-          ['allocating', 'active', 'handing_off'].includes(
-            assignment.lifecycle,
-          ),
-      ).length
-    : 0
-  const projectDeleteActiveAssignmentCount = projectDeleteProposal
-    ? assignments.filter(
-        (assignment) =>
-          assignment.project_id === projectDeleteProposal.project.id &&
-          ['allocating', 'active', 'handing_off'].includes(
-            assignment.lifecycle,
-          ),
-      ).length
-    : 0
   const selectedProjectOrchestrator =
     selection?.kind === 'orchestrator'
       ? projects.find((project) => project.id === selection.projectId)
@@ -4118,7 +4424,8 @@ function App() {
         .filter(
           (assignment) =>
             assignment.worker.id === selectedWorkerCandidate.worker.id &&
-            assignment.lifecycle === 'completed',
+            (assignment.lifecycle === 'completed' ||
+              assignment.lifecycle === 'cancelled'),
         )
         .sort(
           (left, right) =>
@@ -5116,28 +5423,500 @@ function App() {
     selectedSession,
     staleHideProposal,
   ])
+  useEffect(() => {
+    writeCompleteAndEndSession(completeAndEndSession)
+  }, [completeAndEndSession])
+
+  const reloadAssignment = useCallback(
+    async (assignmentId: string) => {
+      const loaded = await loadProjects()
+      return loaded.find((assignment) => assignment.id === assignmentId)
+    },
+    [loadProjects],
+  )
+
+  const runDisposition = useCallback(
+    async (
+      assignment: Assignment,
+      outcome: DispositionOutcome,
+      endSession: boolean,
+      // The compact sheet shows its own error and is the confirmation for
+      // its outcome, so its failures must not leave an inspector Retry that
+      // would resend them without it.
+      { inlineError = true }: { inlineError?: boolean } = {},
+    ): Promise<DispositionResult> => {
+      setDispositionBusy((current) => ({ ...current, [assignment.id]: true }))
+      setDispositionErrors((current) => withoutKey(current, assignment.id))
+      setActionError(null)
+      try {
+        // The user decided on this assignment a while ago (Undo window,
+        // open sheet, earlier failure). Ending the session is guarded by
+        // worker and runtime versions that move with every Herdr status
+        // change, so send the latest ones.
+        const sent = endSession
+          ? withLatestSessionVersions(
+              assignment,
+              await reloadAssignment(assignment.id).catch(() => undefined),
+            )
+          : assignment
+        const result = await submitDisposition({
+          assignment: sent,
+          commands: dispositionCommands.current,
+          endSession,
+          outcome,
+          reload: () => reloadAssignment(assignment.id),
+        })
+        if (result.kind === 'failed') {
+          if (inlineError) {
+            setDispositionErrors((current) => ({
+              ...current,
+              [assignment.id]: { endSession, message: result.message, outcome },
+            }))
+          }
+          return result
+        }
+        setAssignments((current) =>
+          current.map((candidate) =>
+            candidate.id === result.assignment.id
+              ? result.assignment
+              : candidate,
+          ),
+        )
+        if (result.kind === 'committed') {
+          const endedSession = result.disposed
+            ? result.disposed.worker !== null
+            : result.assignment.worker.desired_state === 'ended'
+          setActionNotice(
+            dispositionNotice(outcome, endedSession, result.disposed),
+          )
+        } else {
+          setActionNotice(result.message)
+        }
+        await Promise.all([
+          loadWorkers(),
+          loadInventory(selectedSession),
+        ]).catch(() => undefined)
+        return result
+      } finally {
+        setDispositionBusy((current) => withoutKey(current, assignment.id))
+      }
+    },
+    [loadInventory, loadWorkers, reloadAssignment, selectedSession],
+  )
+
+  const quickCompletion = useQuickCompletionWindow({
+    onDropped: () =>
+      setActionNotice(
+        'Completion was not sent because the page was hidden. The work is still active.',
+      ),
+    onSend: (pending) =>
+      void runDisposition(pending.assignment, 'completed', pending.endSession),
+  })
+  const { start: startQuickCompletionWindow, undo: undoQuickCompletion } =
+    quickCompletion
+  // The inspector shows its own "Completing… Undo"; any other pending quick
+  // completion keeps its Undo in the notice area.
+  const inspectorAssignmentId =
+    selectedAgentGroup.length > 1
+      ? null
+      : (selectedAssignment?.id ?? selectedCandidateActiveAssignment?.id ?? null)
+  const offscreenQuickCompletions = quickCompletion.pendingCompletions.filter(
+    ({ assignment }) => assignment.id !== inspectorAssignmentId,
+  )
+
+  const startQuickCompletion = useCallback(
+    (assignment: Assignment) => {
+      setDispositionErrors((current) => withoutKey(current, assignment.id))
+      setActionNotice(null)
+      startQuickCompletionWindow(assignment, completeAndEndSession)
+    },
+    [completeAndEndSession, startQuickCompletionWindow],
+  )
+
+  const retryDisposition = useCallback(
+    (assignment: Assignment) => {
+      const failed = dispositionErrors[assignment.id]
+      if (!failed) return
+      void runDisposition(assignment, failed.outcome, failed.endSession)
+    },
+    [dispositionErrors, runDisposition],
+  )
+
+  const proposeWorkerDisposition = useCallback(
+    (
+      assignment: Assignment,
+      mode: WorkerDispositionMode,
+      returnFocus: HTMLElement | null,
+    ) => {
+      setWorkerDispositionError(null)
+      setActionNotice(null)
+      undoQuickCompletion(assignment.id)
+      setWorkerDispositionProposal({
+        assignment,
+        deleteCommandId: crypto.randomUUID(),
+        mode,
+        returnFocus,
+      })
+    },
+    [undoQuickCompletion],
+  )
+
+  const confirmWorkerDisposition = useCallback(
+    async (choice: WorkerDispositionChoice) => {
+      if (!workerDispositionProposal) return
+      const { assignment, deleteCommandId, mode } = workerDispositionProposal
+      const outcome: DispositionOutcome =
+        choice === 'complete' ? 'completed' : 'cancelled'
+      setWorkerDispositionBusy(choice)
+      setWorkerDispositionError(null)
+      try {
+        const result = await runDisposition(assignment, outcome, true, {
+          inlineError: false,
+        })
+        if (result.kind === 'failed') {
+          setWorkerDispositionError(result.message)
+          return
+        }
+        if (result.kind === 'other_outcome' || mode === 'end') {
+          setWorkerDispositionProposal(null)
+          return
+        }
+        const workerId = assignment.worker.id
+        const deleted = () => {
+          setWorkerCandidates((current) =>
+            current.filter(({ worker }) => worker.id !== workerId),
+          )
+          setSelection(null)
+          setWorkerDispositionProposal(null)
+        }
+        let workerVersion = result.disposed?.worker?.version
+        if (!workerVersion) {
+          const workers = await loadWorkers()
+          const candidate = workers.find(({ worker }) => worker.id === workerId)
+          if (!candidate) {
+            deleted()
+            setActionNotice('Worker deleted from Yard.')
+            return
+          }
+          workerVersion = candidate.worker.version
+        }
+        try {
+          const removed = await deleteWorker(workerId, {
+            command_id: deleteCommandId,
+            actor: 'local-user',
+            expected_worker_version: workerVersion,
+          })
+          deleted()
+          setActionNotice(
+            removed.cleanup_pending
+              ? 'Worker deleted from Yard. Runtime cleanup continues in the background; the agent keeps running until its Herdr tab is closed.'
+              : 'Worker deleted from Yard.',
+          )
+        } catch (caught) {
+          const workers = await loadWorkers().catch(() => null)
+          if (workers && !workers.some(({ worker }) => worker.id === workerId)) {
+            deleted()
+            setActionNotice(
+              'Worker deleted from Yard. Runtime cleanup continues in the background if needed.',
+            )
+          } else {
+            setWorkerDispositionError(
+              caught instanceof Error ? caught.message : 'Delete worker failed',
+            )
+          }
+        }
+      } finally {
+        setWorkerDispositionBusy(null)
+      }
+    },
+    [loadWorkers, runDisposition, workerDispositionProposal],
+  )
+
+  const assignmentControls = useCallback(
+    (assignment: Assignment): AssignmentDispositionControls => ({
+      busy: Boolean(dispositionBusy[assignment.id]),
+      completeAndEndSession,
+      error: dispositionErrors[assignment.id]?.message ?? null,
+      onComplete: () => startQuickCompletion(assignment),
+      onCompleteAndEndSessionChange: setCompleteAndEndSession,
+      onCompleteWithDetails: () =>
+        setCompletionProposal({
+          assignment,
+          commandId: crypto.randomUUID(),
+        }),
+      onDelete: (trigger) =>
+        proposeWorkerDisposition(assignment, 'delete', trigger),
+      onEndSession: (trigger) =>
+        proposeWorkerDisposition(assignment, 'end', trigger),
+      onRetry: dispositionErrors[assignment.id]
+        ? () => retryDisposition(assignment)
+        : undefined,
+      onUndo: () => undoQuickCompletion(assignment.id),
+      pending: quickCompletion.isPending(assignment.id),
+    }),
+    [
+      completeAndEndSession,
+      dispositionBusy,
+      dispositionErrors,
+      proposeWorkerDisposition,
+      quickCompletion,
+      retryDisposition,
+      startQuickCompletion,
+      undoQuickCompletion,
+    ],
+  )
+
+  // Fetches a preview for an open project confirmation and returns the new
+  // command ID it is tied to; a result for an older command ID is ignored.
+  const loadProjectDispositionPreview = useCallback(
+    (
+      projectId: string,
+      setProposal: Dispatch<SetStateAction<ProjectDispositionProposal | null>>,
+    ) => {
+      const commandId = crypto.randomUUID()
+      const settle = (
+        update: Partial<{
+          alreadyArchived: boolean
+          preview: ProjectDispositionPreview
+          previewError: string
+        }>,
+      ) =>
+        setProposal((current) =>
+          current?.commandId === commandId ? { ...current, ...update } : current,
+        )
+      fetchProjectDispositionPreview(projectId).then(
+        (preview) => settle({ preview }),
+        async (caught: unknown) => {
+          const previewError =
+            caught instanceof Error
+              ? caught.message
+              : 'Yard could not check what this affects'
+          // The preview only covers active projects. One archived elsewhere
+          // after this map loaded can still be deleted (not archived again).
+          if (
+            caught instanceof YardApiError &&
+            caught.code === 'project_not_found'
+          ) {
+            const archived = await fetchArchivedProjects().catch(() => null)
+            if (
+              archived?.projects.some(
+                (summary) => summary.project_id === projectId,
+              )
+            ) {
+              settle({
+                alreadyArchived: true,
+                previewError: 'This project was already archived elsewhere.',
+              })
+              return
+            }
+          }
+          settle({ previewError })
+        },
+      )
+      return commandId
+    },
+    [],
+  )
+
+  // "Check again" after a preview could not be read.
+  const recheckProjectDispositionPreview = useCallback(
+    (
+      proposal: ProjectDispositionProposal,
+      setProposal: Dispatch<SetStateAction<ProjectDispositionProposal | null>>,
+    ) => {
+      const commandId = loadProjectDispositionPreview(
+        proposal.project.id,
+        setProposal,
+      )
+      setProposal((current) =>
+        current?.commandId === proposal.commandId
+          ? {
+              ...current,
+              alreadyArchived: false,
+              commandId,
+              preview: null,
+              previewError: null,
+            }
+          : current,
+      )
+    },
+    [loadProjectDispositionPreview],
+  )
+
+  // After a refusal that committed nothing: show the fresh preview the
+  // server sent (or re-read it) under a new command ID, and ask again.
+  const refreshProjectDispositionProposal = useCallback(
+    (
+      proposal: ProjectDispositionProposal,
+      caught: YardApiError,
+      setProposal: Dispatch<SetStateAction<ProjectDispositionProposal | null>>,
+      setError: (message: string) => void,
+    ) => {
+      const fresh = isProjectDispositionPreview(caught.preview)
+        ? caught.preview
+        : null
+      const commandId = fresh
+        ? crypto.randomUUID()
+        : loadProjectDispositionPreview(proposal.project.id, setProposal)
+      setProposal((current) =>
+        current?.commandId === proposal.commandId
+          ? {
+              ...current,
+              alreadyArchived: false,
+              commandId,
+              preview: fresh,
+              previewError: null,
+            }
+          : current,
+      )
+      setError(
+        PROJECT_PREVIEW_REFRESH_CODES.has(caught.code)
+          ? 'The active workers changed while this dialog was open. Review the updated list, then confirm again.'
+          : 'This project changed while the dialog was open. Review the updated impact, then confirm again.',
+      )
+    },
+    [loadProjectDispositionPreview],
+  )
 
   const proposeProjectArchive = useCallback(
     (project: Project, returnFocus: HTMLButtonElement) => {
       setProjectArchiveError(null)
       setActionNotice(null)
       setProjectArchiveProposal({
-        commandId: crypto.randomUUID(),
+        commandId: loadProjectDispositionPreview(
+          project.id,
+          setProjectArchiveProposal,
+        ),
+        preview: null,
+        previewError: null,
         project,
         returnFocus,
       })
     },
-    [],
+    [loadProjectDispositionPreview],
   )
 
+  // Undo an archive from its toast or the Archived shelf. Restore never
+  // reopens cancelled assignments; the notice says so.
+  const restoreArchive = useCallback(
+    async (target: {
+      archiveCommandId: string
+      projectId: string
+      projectName: string
+    }) => {
+      const key = target.archiveCommandId
+      const commandId = (restoreCommandIds.current[key] ??=
+        crypto.randomUUID())
+      setProjectRestores((current) => ({
+        ...current,
+        [key]: { busy: true, error: null, retryable: false },
+      }))
+      setActionError(null)
+      try {
+        const result = await restoreProject(target.projectId, {
+          command_id: commandId,
+          actor: 'local-user',
+          expected_archive_command_id: key,
+        })
+        delete restoreCommandIds.current[key]
+        setProjectRestores((current) => {
+          const next = { ...current }
+          delete next[key]
+          return next
+        })
+        setArchiveUndo((current) =>
+          current?.archiveCommandId === key ? null : current,
+        )
+        setArchivedProjects(
+          (current) =>
+            current?.filter((summary) => summary.archive_command_id !== key) ??
+            current,
+        )
+        setActionNotice(projectRestoreNotice(target.projectName, result))
+        await Promise.all([
+          loadProjects(),
+          loadCoordination(),
+          loadWorkers(),
+          loadInventory(selectedSession),
+          loadArchivedProjects(),
+        ]).catch(() => undefined)
+      } catch (caught) {
+        const retryable = projectRestoreRetryable(caught)
+        setProjectRestores((current) => ({
+          ...current,
+          [key]: {
+            busy: false,
+            error: projectRestoreErrorMessage(caught),
+            retryable,
+          },
+        }))
+        // Only Herdr being down is worth retrying unchanged. Any other
+        // refusal is shown for a full Undo window and then expires.
+        if (!retryable) {
+          setArchiveUndo((current) =>
+            current?.archiveCommandId === key
+              ? { ...current, shownAt: Date.now() }
+              : current,
+          )
+        }
+        // Show the current archive state.
+        void loadArchivedProjects()
+        if (
+          caught instanceof YardApiError &&
+          caught.code === 'project_not_archived'
+        ) {
+          void loadProjects().catch(() => undefined)
+        }
+      }
+    },
+    [
+      loadArchivedProjects,
+      loadCoordination,
+      loadInventory,
+      loadProjects,
+      loadWorkers,
+      selectedSession,
+    ],
+  )
+
+  const archiveUndoRestore = archiveUndo
+    ? projectRestores[archiveUndo.archiveCommandId]
+    : undefined
+  // A retryable failure keeps the toast (with Retry) until dismissed.
+  const archiveUndoHeld =
+    archiveUndoRestore?.busy ||
+    (Boolean(archiveUndoRestore?.error) && archiveUndoRestore?.retryable)
+  useEffect(() => {
+    if (!archiveUndo || archiveUndoHeld) {
+      return
+    }
+    const timer = window.setTimeout(
+      () => setArchiveUndo(null),
+      Math.max(0, archiveUndo.shownAt + ARCHIVE_UNDO_WINDOW_MS - Date.now()),
+    )
+    return () => window.clearTimeout(timer)
+  }, [archiveUndo, archiveUndoHeld])
+
+  useEffect(() => {
+    if (!resourceShelfOpen || railView !== 'archived') return
+    const controller = new AbortController()
+    void loadArchivedProjects(controller.signal)
+    return () => controller.abort()
+  }, [loadArchivedProjects, railView, resourceShelfOpen])
+
   const archiveSelectedProject = useCallback(async () => {
-    if (!projectArchiveProposal) return
-    const { commandId, project } = projectArchiveProposal
+    if (!projectArchiveProposal?.preview) return
+    const { commandId, preview, project } = projectArchiveProposal
     setProjectArchiveBusy(true)
     setProjectArchiveError(null)
     setActionError(null)
 
-    const reconcileArchivedProject = async (cleanupPending: boolean) => {
+    const reconcileArchivedProject = async (result: {
+      cleanup_pending: boolean
+      background?: ProjectBackgroundStatus
+      cancelled_assignment_ids?: string[]
+      restorable?: boolean
+    }) => {
       setProjects((current) =>
         current.filter((candidate) => candidate.id !== project.id),
       )
@@ -5161,16 +5940,24 @@ function App() {
       clearProjectTransferContext(project.id)
       setSelection(null)
       setProjectArchiveProposal(null)
-      setActionNotice(
-        cleanupPending
-          ? 'Project archived. Verified orchestrator cleanup is queued.'
-          : 'Project archived.',
+      setActionNotice(projectDispositionNotice('archived', result))
+      // Undo only when the server says this archive can be restored.
+      setArchiveUndo(
+        result.restorable
+          ? {
+              archiveCommandId: commandId,
+              projectId: project.id,
+              projectName: project.name,
+              shownAt: Date.now(),
+            }
+          : null,
       )
       await Promise.all([
         loadProjects(),
         loadCoordination(),
         loadWorkers(),
         loadInventory(selectedSession),
+        loadArchivedProjects(),
       ]).catch(() => undefined)
     }
 
@@ -5178,17 +5965,25 @@ function App() {
       const result = await archiveProject(project.id, {
         command_id: commandId,
         actor: 'local-user',
-        expected_project_version: project.version,
-        expected_orchestrator_worker_id: project.orchestrator.id,
-        expected_orchestrator_worker_version:
-          project.orchestrator.version,
-        expected_orchestrator_runtime_version:
-          project.orchestrator.runtime?.version ?? null,
+        ...projectArchivePreconditions(preview),
       })
-      await reconcileArchivedProject(result.cleanup_pending)
+      await reconcileArchivedProject(result)
     } catch (caught) {
       const message =
         caught instanceof Error ? caught.message : 'Project archive failed'
+      if (
+        caught instanceof YardApiError &&
+        (PROJECT_PREVIEW_REFRESH_CODES.has(caught.code) ||
+          PROJECT_VERSION_REFRESH_CODES.has(caught.code))
+      ) {
+        refreshProjectDispositionProposal(
+          projectArchiveProposal,
+          caught,
+          setProjectArchiveProposal,
+          setProjectArchiveError,
+        )
+        return
+      }
       const activeProjects = await fetchProjects().catch(() => null)
       if (
         activeProjects &&
@@ -5196,7 +5991,12 @@ function App() {
           (candidate) => candidate.id === project.id,
         )
       ) {
-        await reconcileArchivedProject(true)
+        await reconcileArchivedProject({
+          cleanup_pending: true,
+          cancelled_assignment_ids: projectDispositionEndedAssignments(
+            preview,
+          ).map((assignment) => assignment.assignment_id),
+        })
       } else {
         setProjectArchiveError(message)
       }
@@ -5205,11 +6005,13 @@ function App() {
     }
   }, [
     clearProjectTransferContext,
+    loadArchivedProjects,
     loadCoordination,
     loadInventory,
     loadProjects,
     loadWorkers,
     projectArchiveProposal,
+    refreshProjectDispositionProposal,
     selectedSession,
   ])
 
@@ -5218,24 +6020,36 @@ function App() {
       setProjectDeleteError(null)
       setActionNotice(null)
       setProjectDeleteProposal({
-        archiveCommandId: crypto.randomUUID(),
-        deleteCommandId: crypto.randomUUID(),
+        commandId: loadProjectDispositionPreview(
+          project.id,
+          setProjectDeleteProposal,
+        ),
+        preview: null,
+        previewError: null,
         project,
         returnFocus,
       })
     },
-    [],
+    [loadProjectDispositionPreview],
   )
 
   const deleteSelectedProject = useCallback(async () => {
-    if (!projectDeleteProposal) return
-    const { archiveCommandId, deleteCommandId, project } =
-      projectDeleteProposal
+    if (
+      !projectDeleteProposal?.preview &&
+      !projectDeleteProposal?.alreadyArchived
+    ) {
+      return
+    }
+    const { commandId, preview, project } = projectDeleteProposal
     setProjectDeleteBusy(true)
     setProjectDeleteError(null)
     setActionError(null)
 
-    const reconcileDeletedProject = async (cleanupPending: boolean) => {
+    const reconcileDeletedProject = async (result: {
+      cleanup_pending: boolean
+      background?: ProjectBackgroundStatus
+      cancelled_assignment_ids?: string[]
+    }) => {
       setProjects((current) =>
         current.filter((candidate) => candidate.id !== project.id),
       )
@@ -5264,10 +6078,15 @@ function App() {
       clearProjectTransferContext(project.id)
       setSelection(null)
       setProjectDeleteProposal(null)
-      setActionNotice(
-        cleanupPending
-          ? 'Project deleted from Yard. Runtime cleanup continues in the background.'
-          : 'Project deleted from Yard.',
+      setActionNotice(projectDispositionNotice('deleted', result))
+      // Deletion is permanent, so its archive can no longer be undone.
+      setArchiveUndo((current) =>
+        current?.projectId === project.id ? null : current,
+      )
+      setArchivedProjects(
+        (current) =>
+          current?.filter((summary) => summary.project_id !== project.id) ??
+          current,
       )
       await Promise.all([
         loadProjects(),
@@ -5278,24 +6097,31 @@ function App() {
     }
 
     try {
-      await archiveProject(project.id, {
-        command_id: archiveCommandId,
-        actor: 'local-user',
-        expected_project_version: project.version,
-        expected_orchestrator_worker_id: project.orchestrator.id,
-        expected_orchestrator_worker_version:
-          project.orchestrator.version,
-        expected_orchestrator_runtime_version:
-          project.orchestrator.runtime?.version ?? null,
-      })
+      // One request archives the project if it is still active; a retry
+      // reuses the command ID, so it replays even if another tab archived it.
       const result = await deleteProject(project.id, {
-        command_id: deleteCommandId,
+        command_id: commandId,
         actor: 'local-user',
+        // Already archived: the server ignores archive preconditions.
+        archive: preview ? projectArchivePreconditions(preview) : null,
       })
-      await reconcileDeletedProject(result.cleanup_pending)
+      await reconcileDeletedProject(result)
     } catch (caught) {
       const message =
         caught instanceof Error ? caught.message : 'Delete project failed'
+      if (
+        caught instanceof YardApiError &&
+        (PROJECT_PREVIEW_REFRESH_CODES.has(caught.code) ||
+          PROJECT_VERSION_REFRESH_CODES.has(caught.code))
+      ) {
+        refreshProjectDispositionProposal(
+          projectDeleteProposal,
+          caught,
+          setProjectDeleteProposal,
+          setProjectDeleteError,
+        )
+        return
+      }
       const [activeProjects, workers] = await Promise.all([
         fetchProjects().catch(() => null),
         loadWorkers().catch(() => null),
@@ -5311,7 +6137,12 @@ function App() {
           ({ worker }) => worker.id === project.orchestrator.id,
         )
       if (projectMissing && orchestratorMissing) {
-        await reconcileDeletedProject(true)
+        await reconcileDeletedProject({
+          cleanup_pending: true,
+          cancelled_assignment_ids: projectDispositionEndedAssignments(
+            preview,
+          ).map((assignment) => assignment.assignment_id),
+        })
       } else {
         setProjectDeleteError(message)
       }
@@ -5325,7 +6156,196 @@ function App() {
     loadProjects,
     loadWorkers,
     projectDeleteProposal,
+    refreshProjectDispositionProposal,
     selectedSession,
+  ])
+
+  // Fetches a preview for the open sheet and returns the new command ID it is
+  // tied to; a result for an older command ID is ignored.
+  const loadWorkstreamDispositionPreview = useCallback((nodeId: string) => {
+    const commandId = crypto.randomUUID()
+    const settle = (
+      update: Partial<{
+        preview: CoordinationNodeDispositionPreview
+        previewError: string
+      }>,
+    ) =>
+      setWorkstreamDispositionProposal((current) =>
+        current?.commandId === commandId ? { ...current, ...update } : current,
+      )
+    fetchCoordinationNodeDispositionPreview(nodeId).then(
+      (preview) => settle({ preview }),
+      (caught: unknown) =>
+        settle({
+          previewError:
+            caught instanceof Error
+              ? caught.message
+              : 'Yard could not check what this affects',
+        }),
+    )
+    return commandId
+  }, [])
+
+  const proposeWorkstreamDisposition = useCallback(
+    (
+      mode: 'archive' | 'delete',
+      node: CoordinationNode,
+      returnFocus: HTMLButtonElement,
+    ) => {
+      setWorkstreamDispositionError(null)
+      setActionNotice(null)
+      setWorkstreamDispositionProposal({
+        commandId: loadWorkstreamDispositionPreview(node.id),
+        mode,
+        node,
+        preview: null,
+        previewError: null,
+        returnFocus,
+      })
+    },
+    [loadWorkstreamDispositionPreview],
+  )
+
+  const confirmWorkstreamDisposition = useCallback(async () => {
+    const proposal = workstreamDispositionProposal
+    if (!proposal?.preview) return
+    const { commandId, mode, node, preview } = proposal
+    setWorkstreamDispositionBusy(true)
+    setWorkstreamDispositionError(null)
+    setActionError(null)
+
+    const reconcileDisposition = async (result: {
+      worker_id: string | null
+      cleanup_pending: boolean
+      paused_automation_ids: string[]
+    }) => {
+      setCoordinationNodes((current) => {
+        const next = current.filter((candidate) => candidate.id !== node.id)
+        coordinationNodesRef.current = next
+        return next
+      })
+      setCoordinationNodeRoutes((current) =>
+        current.filter((route) => route.node_id !== node.id),
+      )
+      setCoordinationSnapshots((current) => {
+        const next = { ...current }
+        delete next[node.id]
+        return next
+      })
+      if (mode === 'delete' && result.worker_id) {
+        setWorkerCandidates((current) =>
+          current.filter(({ worker }) => worker.id !== result.worker_id),
+        )
+      }
+      // The workstream's automations leave the map with it (the server stops
+      // listing them); they stay paused and durable for a later restore.
+      const scopedToNode = (automation: Automation) =>
+        automation.scope.kind === 'workstream_coordination_node' &&
+        automation.scope.node_id === node.id
+      const hiddenAutomationIds = new Set(
+        automationsRef.current.filter(scopedToNode).map(({ id }) => id),
+      )
+      setAutomations((current) =>
+        current.filter((automation) => !scopedToNode(automation)),
+      )
+      setSelection((current) =>
+        (current?.kind === 'coordination-node' && current.id === node.id) ||
+        (current?.kind === 'automation' && hiddenAutomationIds.has(current.id))
+          ? null
+          : current,
+      )
+      setWorkstreamDispositionProposal(null)
+      setActionNotice(
+        workstreamDispositionNotice(
+          mode === 'archive' ? 'archived' : 'deleted',
+          result,
+        ),
+      )
+      await Promise.all([
+        loadCoordination(),
+        loadWorkers(),
+        loadAutomations(),
+        loadInventory(selectedSession),
+      ]).catch(() => undefined)
+    }
+
+    // Only the node version is sent: it pins the dedicated worker, whose own
+    // version moves with every runtime status change. Member projects are
+    // not part of the request; archive and delete leave them untouched.
+    const preconditions = { expected_node_version: preview.node_version }
+    try {
+      const result =
+        mode === 'archive'
+          ? await archiveCoordinationNode(node.id, {
+              command_id: commandId,
+              actor: 'local-user',
+              ...preconditions,
+            })
+          : await deleteCoordinationNode(node.id, {
+              command_id: commandId,
+              actor: 'local-user',
+              archive: preconditions,
+            })
+      await reconcileDisposition(result)
+    } catch (caught) {
+      const message =
+        caught instanceof Error
+          ? caught.message
+          : `Workstream ${mode === 'archive' ? 'archive' : 'delete'} failed`
+      if (
+        caught instanceof YardApiError &&
+        caught.code === 'coordination_node_version_conflict'
+      ) {
+        // Nothing committed under this command ID. Resending the same stale
+        // version would fail the same way, so re-check the impact under a
+        // new command ID and let the user confirm again.
+        const refreshedCommandId = loadWorkstreamDispositionPreview(node.id)
+        setWorkstreamDispositionProposal((current) =>
+          current?.commandId === commandId
+            ? {
+                ...current,
+                commandId: refreshedCommandId,
+                preview: null,
+                previewError: null,
+              }
+            : current,
+        )
+        setWorkstreamDispositionError(
+          'This workstream changed while the dialog was open. Review the updated impact, then confirm again.',
+        )
+        return
+      }
+      // The response may have been lost after the command committed: an
+      // archived node reads as a conflict, a deleted one as not found.
+      const committed = await fetchCoordinationNode(node.id).then(
+        () => false,
+        (error: unknown) =>
+          error instanceof YardApiError &&
+          (error.code === 'coordination_node_not_found' ||
+            (mode === 'archive' && error.code === 'coordination_node_archived')),
+      )
+      if (committed) {
+        await reconcileDisposition({
+          worker_id: preview.worker?.worker_id ?? null,
+          cleanup_pending: preview.worker?.runtime_present ?? false,
+          paused_automation_ids: preview.automations
+            .filter((automation) => automation.state === 'active')
+            .map((automation) => automation.automation_id),
+        })
+      } else {
+        setWorkstreamDispositionError(message)
+      }
+    } finally {
+      setWorkstreamDispositionBusy(false)
+    }
+  }, [
+    loadAutomations,
+    loadCoordination,
+    loadInventory,
+    loadWorkers,
+    loadWorkstreamDispositionPreview,
+    selectedSession,
+    workstreamDispositionProposal,
   ])
 
   const createWorkspaceProject = useCallback(
@@ -6750,6 +7770,7 @@ function App() {
               profiles: profiles.length,
               workers: workerCandidates.length,
               workspaces: availableWorkspaces.length,
+              archived: archivedProjects?.length ?? null,
             }}
             onChange={setRailView}
             value={railView}
@@ -6977,6 +7998,19 @@ function App() {
               ) : null}
             </div>
           </div>
+        ) : railView === 'archived' ? (
+          <ArchivedProjectsPanel
+            archived={archivedProjects}
+            error={archivedProjectsError}
+            onRestore={(summary) =>
+              void restoreArchive({
+                archiveCommandId: summary.archive_command_id,
+                projectId: summary.project_id,
+                projectName: summary.name,
+              })
+            }
+            restores={projectRestores}
+          />
         ) : (
           <div className="rail-section rail-section--resources" role="tabpanel">
             <div className="section-heading">
@@ -7081,6 +8115,9 @@ function App() {
           </div>
         ) : null}
 
+        {/* A background error never hides a fresh action notice: an action
+            that committed during a Herdr outage still reports its result. */}
+        <div className="canvas-banners">
         {displayedError ? (
           <div className="error-banner" role="alert">
             <CircleAlert aria-hidden="true" size={18} />
@@ -7098,7 +8135,76 @@ function App() {
               <X aria-hidden="true" size={16} />
             </button>
           </div>
-        ) : actionNotice ? (
+        ) : null}
+        {offscreenQuickCompletions.length > 0 ? (
+          // A quick Complete stays undoable after its worker is no longer
+          // in the inspector, for example while completing several in a row.
+          <div
+            aria-label="Pending completions"
+            className="quick-complete-toasts"
+            role="region"
+          >
+            {offscreenQuickCompletions.map(({ assignment }) => (
+              <div
+                className="notice-banner quick-complete-toast"
+                key={assignment.id}
+                role="status"
+              >
+                <LoaderCircle
+                  aria-hidden="true"
+                  className="status-spin"
+                  size={18}
+                />
+                <span>Completing “{assignment.objective}”…</span>
+                <button
+                  className="secondary-button"
+                  onClick={() => undoQuickCompletion(assignment.id)}
+                  type="button"
+                >
+                  Undo
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {archiveUndo ? (
+          <div
+            aria-label="Undo archive"
+            className="archive-undo-toast"
+            data-error={Boolean(archiveUndoRestore?.error)}
+            role="status"
+          >
+            <RotateCcw aria-hidden="true" size={18} />
+            <span>
+              {archiveUndoRestore?.error ??
+                `Archived “${archiveUndo.projectName}”.`}
+            </span>
+            {archiveUndoRestore?.error && !archiveUndoRestore.retryable ? null : (
+              <button
+                className="secondary-button"
+                disabled={archiveUndoRestore?.busy}
+                onClick={() => void restoreArchive(archiveUndo)}
+                type="button"
+              >
+                {archiveUndoRestore?.busy
+                  ? 'Restoring…'
+                  : archiveUndoRestore?.error
+                    ? 'Retry'
+                    : 'Undo'}
+              </button>
+            )}
+            <button
+              aria-label="Dismiss undo"
+              className="icon-button"
+              onClick={() => setArchiveUndo(null)}
+              title="Dismiss"
+              type="button"
+            >
+              <X aria-hidden="true" size={16} />
+            </button>
+          </div>
+        ) : null}
+        {actionNotice ? (
           <div className="notice-banner" role="status">
             <CircleAlert aria-hidden="true" size={18} />
             <span>{actionNotice}</span>
@@ -7113,6 +8219,7 @@ function App() {
             </button>
           </div>
         ) : null}
+        </div>
         {selection || workspaceProjectOpen ? (
           <aside className="inspector has-selection">
           <button
@@ -7180,6 +8287,12 @@ function App() {
             busy={coordinationNodeBusy}
             inventory={inventory}
             node={selectedCoordinationNode}
+            onArchive={(node, trigger) =>
+              proposeWorkstreamDisposition('archive', node, trigger)
+            }
+            onDelete={(node, trigger) =>
+              proposeWorkstreamDisposition('delete', node, trigger)
+            }
             onProvision={(node, profile) =>
               void provisionMapNode(node, profile)
             }
@@ -7325,12 +8438,7 @@ function App() {
                 ? () => proposeEndSession(selectedAssignmentCandidate)
                 : undefined
             }
-            onRecordCompletion={() =>
-              setCompletionProposal({
-                assignment: selectedAssignment,
-                commandId: crypto.randomUUID(),
-              })
-            }
+            controls={assignmentControls(selectedAssignment)}
             onRefresh={() => void refresh()}
             snapshotCurrent={inventoryCurrent}
           />
@@ -7349,6 +8457,11 @@ function App() {
         ) : selectedWorkerCandidate ? (
           <WorkerCandidateInspector
             activeAssignment={selectedCandidateActiveAssignment}
+            activeControls={
+              selectedCandidateActiveAssignment
+                ? assignmentControls(selectedCandidateActiveAssignment)
+                : null
+            }
             candidate={selectedWorkerCandidate}
             completedAssignment={selectedCandidateCompletion}
             hideOnly={selectedWorkerAttentionState === 'stale'}
@@ -7413,9 +8526,11 @@ function App() {
           automaticCoordinationBusy={tokenSpendSettingsBusy}
           automaticCoordinationError={tokenSpendSettingsError}
           automaticCoordinationSettings={tokenSpendSettings}
+          completeAndEndSession={completeAndEndSession}
           initialFocus={settingsInitialFocus}
           mapVisualMode={mapVisualMode}
           onClose={() => setSettingsOpen(false)}
+          onCompleteAndEndSessionChange={setCompleteAndEndSession}
           onMapVisualModeChange={setMapVisualMode}
           onOpenOrchestratorWorkflow={() => {
             setSettingsOpen(false)
@@ -7641,7 +8756,6 @@ function App() {
       ) : null}
       {projectArchiveProposal ? (
         <ArchiveProjectDialog
-          activeAssignmentCount={projectArchiveActiveAssignmentCount}
           busy={projectArchiveBusy}
           error={projectArchiveError}
           onClose={() => {
@@ -7649,14 +8763,19 @@ function App() {
             setProjectArchiveError(null)
             setProjectArchiveProposal(null)
           }}
+          alreadyArchived={projectArchiveProposal.alreadyArchived ?? false}
+          onCheckAgain={() =>
+            recheckProjectDispositionPreview(projectArchiveProposal, setProjectArchiveProposal)
+          }
           onConfirm={archiveSelectedProject}
+          preview={projectArchiveProposal.preview}
+          previewError={projectArchiveProposal.previewError}
           project={projectArchiveProposal.project}
           returnFocus={projectArchiveProposal.returnFocus}
         />
       ) : null}
       {projectDeleteProposal ? (
         <DeleteProjectDialog
-          activeAssignmentCount={projectDeleteActiveAssignmentCount}
           busy={projectDeleteBusy}
           error={projectDeleteError}
           onClose={() => {
@@ -7664,7 +8783,13 @@ function App() {
             setProjectDeleteError(null)
             setProjectDeleteProposal(null)
           }}
+          alreadyArchived={projectDeleteProposal.alreadyArchived ?? false}
+          onCheckAgain={() =>
+            recheckProjectDispositionPreview(projectDeleteProposal, setProjectDeleteProposal)
+          }
           onConfirm={deleteSelectedProject}
+          preview={projectDeleteProposal.preview}
+          previewError={projectDeleteProposal.previewError}
           project={projectDeleteProposal.project}
           returnFocus={projectDeleteProposal.returnFocus}
         />
@@ -7678,6 +8803,23 @@ function App() {
           returnFocus={completedRuntimeCleanupPreviewTrigger.current}
         />
       ) : null}
+      {workstreamDispositionProposal ? (
+        <WorkstreamDispositionDialog
+          busy={workstreamDispositionBusy}
+          error={workstreamDispositionError}
+          mode={workstreamDispositionProposal.mode}
+          node={workstreamDispositionProposal.node}
+          onClose={() => {
+            if (workstreamDispositionBusy) return
+            setWorkstreamDispositionError(null)
+            setWorkstreamDispositionProposal(null)
+          }}
+          onConfirm={confirmWorkstreamDisposition}
+          preview={workstreamDispositionProposal.preview}
+          previewError={workstreamDispositionProposal.previewError}
+          returnFocus={workstreamDispositionProposal.returnFocus}
+        />
+      ) : null}
       {endSessionProposal ? (
         <EndWorkerSessionDialog
           busy={endSessionBusy}
@@ -7689,6 +8831,21 @@ function App() {
             setEndSessionProposal(null)
           }}
           onConfirm={endSession}
+        />
+      ) : null}
+      {workerDispositionProposal ? (
+        <WorkerDispositionSheet
+          assignment={workerDispositionProposal.assignment}
+          busy={workerDispositionBusy}
+          error={workerDispositionError}
+          mode={workerDispositionProposal.mode}
+          onClose={() => {
+            if (workerDispositionBusy) return
+            setWorkerDispositionError(null)
+            setWorkerDispositionProposal(null)
+          }}
+          onConfirm={confirmWorkerDisposition}
+          returnFocus={workerDispositionProposal.returnFocus}
         />
       ) : null}
       {workerDeleteProposal ? (

@@ -15,6 +15,45 @@ a release is tagged.
   its durable Yard identity.
 - Added a worker History filter while hiding ended workers from operational
   views by default.
+- Added one-click **Complete** for workers: after a five-second Undo window it
+  records a minimal receipt (actor, time, and the objective copied on the
+  server, with no artifacts or evidence) and, with **Complete and end session**
+  on, ends Yard's session in the same request. The evidence-backed form stays
+  available as **Complete with details…**, and an empty untyped receipt is still
+  rejected.
+- Added **End without completion**, which records a `cancelled` assignment and
+  its reason instead of a receipt, and one compact sheet for ending or deleting
+  a worker that still has active work. The disposition API can also cancel
+  the work of a worker stranded by an ambiguous handoff; the web UI does not
+  offer that exit yet. Retries replay by command ID.
+- Added read-only retained transcripts: when an assignment ends, Yard captures
+  the worker's recent terminal output under an identity guard and keeps it
+  after the runtime closes, retrying in the background while Herdr is
+  unreachable.
+- Added workstream archive and delete with one preview-driven confirmation.
+  Archive ends the dedicated worker without closing its Herdr tab and pauses
+  the workstream's automations; delete archives an active workstream in the
+  same request. Neither changes attached projects, and both replay by command
+  ID.
+- Project archive and delete can now end active workers: the one
+  confirmation lists them from a new disposition preview, and each listed
+  assignment is recorded as cancelled (`project_archived`) with its session
+  ended, its allocation closed, and its transcript captured in the background.
+  A changed set returns 409 `project_archive_preview_stale` with a fresh
+  preview; retries replay by command ID.
+  Running summary workers are listed separately (`summary_worker_assignments`)
+  and end with the archive; their summary command is marked failed
+  (`project_archived`). While a summary worker is still being allocated the
+  archive returns 409 `project_summary_worker_allocating`.
+- Project archive can be undone: a 10 s **Undo** toast after a restorable
+  archive and an **Archived** shelf with **Restore** call the new
+  `POST /api/v1/projects/{id}/restore` (listing: `GET /api/v1/archived`).
+  Restore re-binds the orchestrator's Herdr tab when it is still the same pane,
+  otherwise restores it unbound, cancels its archive cleanup job, and never
+  reopens cancelled assignments. Refusals are 409
+  `project_restore_unavailable` with a `reason` (for example
+  `herdr_unreachable`); retries replay by command ID. A restored project can be
+  archived again.
 
 ### Changed
 
@@ -30,6 +69,14 @@ a release is tagged.
 - Added latest-question markers to chat and terminal context views, and moved
   prior terminal history into an overlay that does not resize the live
   terminal.
+- Project delete now archives an active project in the same request after one
+  confirmation, and a retry replays even if another tab archived it first.
+  Upgrading repairs databases created by the first version-28 schema, where
+  every delete failed with a storage error.
+- Archive and delete are no longer refused for knowledge snapshot collection,
+  ambiguous handoffs, or ambiguous automation runs; they report pending
+  snapshots as background status, and a snapshot still uncollected 24 hours
+  after its prompt is marked expired until its files arrive.
 
 ### Hardened
 

@@ -14,6 +14,7 @@ import {
   type AgentWorkspaceTarget,
 } from './AgentWorkspaceContext'
 import { YardApiError, openTerminalInGhostty } from './api'
+import { AssignmentTranscript } from './AssignmentTranscript'
 import {
   resolveRuntimeCapabilities,
   runtimeBindingReason,
@@ -148,6 +149,15 @@ export function WorkerInterventions({
     message: string
     state: 'error' | 'launched' | 'fallback'
   } | null>(null)
+  // Ending an assignment revokes live terminal access, so its retained
+  // transcript is shown read-only instead.
+  if (
+    assignment &&
+    (assignment.lifecycle === 'completed' ||
+      assignment.lifecycle === 'cancelled')
+  ) {
+    return <AssignmentTranscript assignment={assignment} />
+  }
 
   if (!runtime || !terminalTarget || !terminalId || !runtimeSession) {
     return null

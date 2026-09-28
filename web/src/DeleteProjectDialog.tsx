@@ -1,29 +1,44 @@
 import { useRef } from 'react'
 import { CircleAlert, LoaderCircle, Trash2, X } from 'lucide-react'
-import type { Project } from './types'
+import {
+  projectDispositionBlocker,
+  projectDispositionConfirmLabel,
+} from './backgroundStatus'
+import { ProjectActiveWorkers } from './ProjectActiveWorkers'
+import type { Project, ProjectDispositionPreview } from './types'
 import { useModalDialog } from './useModalDialog'
 
 interface DeleteProjectDialogProps {
-  activeAssignmentCount: number
+  alreadyArchived: boolean
   busy: boolean
   error: string | null
+  onCheckAgain: () => void
   onClose: () => void
   onConfirm: () => Promise<void>
+  preview: ProjectDispositionPreview | null
+  previewError: string | null
   project: Project
   returnFocus: HTMLElement | null
 }
 
 export function DeleteProjectDialog({
-  activeAssignmentCount,
+  alreadyArchived,
   busy,
   error,
+  onCheckAgain,
   onClose,
   onConfirm,
+  preview,
+  previewError,
   project,
   returnFocus,
 }: DeleteProjectDialogProps) {
   const dialogRef = useRef<HTMLElement>(null)
-  const blocked = activeAssignmentCount > 0
+  // Nothing is sent until the preview has listed what the command ends. An
+  // already archived project has no active workers left to list.
+  const blocker = projectDispositionBlocker(preview)
+  const ready = alreadyArchived || (preview !== null && blocker === null)
+  const confirmLabel = projectDispositionConfirmLabel('delete', preview)
   useModalDialog({
     canClose: !busy,
     dialogRef,
@@ -67,16 +82,50 @@ export function DeleteProjectDialog({
         </div>
         <div className="end-session-impact">
           <CircleAlert aria-hidden="true" size={17} />
-          <p>
-            {blocked
-              ? `Complete or hand off ${activeAssignmentCount} active assignment${activeAssignmentCount === 1 ? '' : 's'} before deleting.`
-              : 'This first archives the project, then permanently removes the project and its orchestrator from Yard views. Durable audit and cleanup records remain, but this UI deletion cannot be undone.'}
-          </p>
+          <div>
+            <p>
+              {'Yard archives the project if it is still active and removes it and its orchestrator from Yard views in one step. Durable audit and cleanup records remain, and runtime cleanup continues in the background. This cannot be undone.'}
+            </p>
+            {preview ? <ProjectActiveWorkers preview={preview} /> : null}
+            {alreadyArchived ? (
+              <p className="disposition-impact-loading" role="status">
+                This project was already archived elsewhere; Delete removes
+                it permanently.
+              </p>
+            ) : null}
+            {!preview && !previewError ? (
+              <p className="disposition-impact-loading">
+                Checking what this affects…
+              </p>
+            ) : null}
+          </div>
         </div>
+        {blocker && !error ? (
+          <p className="dialog-error" role="alert">
+            <CircleAlert aria-hidden="true" size={16} />
+            <span>{blocker}</span>
+          </p>
+        ) : null}
         {error ? (
           <p className="dialog-error" role="alert">
             <CircleAlert aria-hidden="true" size={16} />
             <span>{error}</span>
+          </p>
+        ) : null}
+        {previewError && !alreadyArchived ? (
+          <p className="dialog-error" role="alert">
+            <CircleAlert aria-hidden="true" size={16} />
+            <span>{previewError}</span>
+            {alreadyArchived ? null : (
+              <button
+                className="secondary-button"
+                disabled={busy}
+                onClick={onCheckAgain}
+                type="button"
+              >
+                Check again
+              </button>
+            )}
           </p>
         ) : null}
         <footer className="end-session-actions">
@@ -89,9 +138,9 @@ export function DeleteProjectDialog({
             Keep project
           </button>
           <button
-            autoFocus={!blocked}
+            autoFocus={ready}
             className="destructive-button"
-            disabled={busy || blocked}
+            disabled={busy || !ready}
             onClick={() => void onConfirm()}
             type="button"
           >
@@ -104,7 +153,7 @@ export function DeleteProjectDialog({
             ) : (
               <Trash2 aria-hidden="true" size={16} />
             )}
-            Delete project
+            {confirmLabel}
           </button>
         </footer>
       </section>

@@ -106,4 +106,29 @@ describe('workerAttentionState', () => {
       }),
     ).toBe('actionable')
   })
+
+  it('keeps cancelled and ended workers quiet instead of stale', () => {
+    // Unobserved external workers are stale, unless their latest work was
+    // ended without completion or their session has ended.
+    expect(
+      workerAttentionState(candidate('external'), true, inventory, 'completed'),
+    ).toBe('stale')
+    expect(
+      workerAttentionState(candidate('external'), true, inventory, 'cancelled'),
+    ).toBe('quiet')
+    expect(
+      workerAttentionState(
+        candidate('yard_owned'),
+        true,
+        inventory,
+        'cancelled',
+      ),
+    ).toBe('quiet')
+    expect(
+      workerAttentionState(candidate('external', 'ended'), true, inventory),
+    ).toBe('quiet')
+    const ended = candidate('external')
+    ended.worker.desired_state = 'ended'
+    expect(workerAttentionState(ended, true, inventory)).toBe('quiet')
+  })
 })

@@ -141,6 +141,178 @@ pub struct CoordinationNodeCommandResult {
     pub replayed: bool,
 }
 
+/// The optimistic versions a caller saw before archiving a coordination node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinationNodeArchivePreconditions {
+    #[serde(with = "crate::serde_u64")]
+    pub expected_node_version: u64,
+    /// Checked only when present. The node version already pins which
+    /// dedicated worker is attached, and a live worker's version moves with
+    /// every runtime status change.
+    #[serde(default, with = "crate::serde_u64::option")]
+    pub expected_worker_version: Option<u64>,
+}
+
+impl CoordinationNodeArchivePreconditions {
+    /// Normalize and validate node archive preconditions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinationNodeValidationError`] when a version is zero.
+    pub fn normalize(self) -> Result<Self, CoordinationNodeValidationError> {
+        require_version(self.expected_node_version)?;
+        if self.expected_worker_version == Some(0) {
+            return Err(CoordinationNodeValidationError::InvalidVersion);
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveCoordinationNode {
+    pub command_id: String,
+    pub actor: String,
+    #[serde(with = "crate::serde_u64")]
+    pub expected_node_version: u64,
+    #[serde(default, with = "crate::serde_u64::option")]
+    pub expected_worker_version: Option<u64>,
+}
+
+impl ArchiveCoordinationNode {
+    /// Normalize a durable coordination-node archive command.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinationNodeValidationError`] for invalid text or a zero
+    /// optimistic version.
+    pub fn normalize(mut self) -> Result<Self, CoordinationNodeValidationError> {
+        self.command_id = required("command_id", &self.command_id, MAX_COMMAND_ID_BYTES)?;
+        self.actor = required("actor", &self.actor, MAX_ACTOR_BYTES)?;
+        self.preconditions().normalize()?;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn preconditions(&self) -> CoordinationNodeArchivePreconditions {
+        CoordinationNodeArchivePreconditions {
+            expected_node_version: self.expected_node_version,
+            expected_worker_version: self.expected_worker_version,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedCoordinationNode {
+    pub command_id: String,
+    pub node_id: String,
+    pub kind: CoordinationNodeKind,
+    /// The dedicated worker this archive ended, if the node had one.
+    pub worker_id: Option<String>,
+    /// Node-scoped automations this archive paused.
+    pub paused_automation_ids: Vec<String>,
+    pub archived_at_unix_ms: u64,
+    pub cleanup_pending: bool,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteCoordinationNode {
+    pub command_id: String,
+    pub actor: String,
+    /// Required when the node is still active: delete then archives it in the
+    /// same transaction. Ignored when the node is already archived.
+    #[serde(default)]
+    pub archive: Option<CoordinationNodeArchivePreconditions>,
+}
+
+impl DeleteCoordinationNode {
+    /// Normalize an irreversible coordination-node visibility deletion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinationNodeValidationError`] for invalid text or an
+    /// invalid archive precondition.
+    pub fn normalize(mut self) -> Result<Self, CoordinationNodeValidationError> {
+        self.command_id = required("command_id", &self.command_id, MAX_COMMAND_ID_BYTES)?;
+        self.actor = required("actor", &self.actor, MAX_ACTOR_BYTES)?;
+        self.archive = self
+            .archive
+            .map(CoordinationNodeArchivePreconditions::normalize)
+            .transpose()?;
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedCoordinationNode {
+    pub command_id: String,
+    pub node_id: String,
+    pub kind: CoordinationNodeKind,
+    pub worker_id: Option<String>,
+    /// Automations paused by the archive this delete performed; empty when
+    /// the node was already archived.
+    pub paused_automation_ids: Vec<String>,
+    pub deleted_at_unix_ms: u64,
+    pub cleanup_pending: bool,
+    pub replayed: bool,
+}
+
+/// What archiving or deleting a node would do, read before confirmation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinationNodeDispositionPreview {
+    pub node_id: String,
+    pub name: String,
+    pub kind: CoordinationNodeKind,
+    #[serde(with = "crate::serde_u64")]
+    pub node_version: u64,
+    /// Whether this kind can be archived and deleted.
+    pub supported: bool,
+    pub worker: Option<CoordinationNodeDispositionWorker>,
+    /// Active attached projects. Archive and delete leave them untouched.
+    pub attached_projects: Vec<CoordinationNodeDispositionProject>,
+    /// Automations scoped to the node; active ones are paused by archive.
+    pub automations: Vec<CoordinationNodeDispositionAutomation>,
+    /// In-flight commands that make archive and delete wait.
+    pub blockers: Vec<CoordinationNodeDispositionBlocker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinationNodeDispositionWorker {
+    pub worker_id: String,
+    #[serde(with = "crate::serde_u64")]
+    pub worker_version: u64,
+    pub profile_name: Option<String>,
+    pub runtime_present: bool,
+    pub will_end: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinationNodeDispositionProject {
+    pub project_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinationNodeDispositionAutomation {
+    pub automation_id: String,
+    pub name: String,
+    pub state: crate::AutomationState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationNodeDispositionBlockerKind {
+    Prompt,
+    Route,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinationNodeDispositionBlocker {
+    pub kind: CoordinationNodeDispositionBlockerKind,
+    pub command_id: String,
+    pub started_at_unix_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProvisionCoordinationNode {
     pub command_id: String,
@@ -320,6 +492,15 @@ impl RequestCoordinationSnapshot {
 pub enum SnapshotCollectionStatus {
     Pending,
     Collected,
+    /// Yard stopped waiting for the project's files. The folder is still
+    /// checked, so files that arrive later still mark it collected.
+    Abandoned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotAbandonmentReason {
+    Expired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,12 +516,18 @@ pub struct SnapshotProjectCollection {
     pub runtime_status: Option<String>,
     pub submitted_at_unix_ms: Option<u64>,
     pub collected_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub abandoned_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub abandoned_reason: Option<SnapshotAbandonmentReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotCollectionProgress {
     pub completed: usize,
     pub total: usize,
+    #[serde(default)]
+    pub abandoned: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,7 +664,8 @@ fn required(
 #[cfg(test)]
 mod tests {
     use super::{
-        CoordinationNodeKind, CoordinationNodeValidationError, CreateCoordinationNode,
+        ArchiveCoordinationNode, CoordinationNodeArchivePreconditions, CoordinationNodeKind,
+        CoordinationNodeValidationError, CreateCoordinationNode, DeleteCoordinationNode,
         SendCoordinationNodeRoute, UpdateCoordinationNode,
     };
     use crate::CanvasPlacement;
@@ -580,5 +768,52 @@ mod tests {
         .normalize()
         .unwrap();
         assert_eq!(route.target_project_id, PROJECT_A);
+    }
+
+    #[test]
+    fn normalizes_node_archive_and_delete_commands() {
+        let archive: ArchiveCoordinationNode = serde_json::from_value(serde_json::json!({
+            "command_id": " archive-node ",
+            "actor": " local-user ",
+            "expected_node_version": "3"
+        }))
+        .unwrap();
+        let archive = archive.normalize().unwrap();
+        assert_eq!(archive.command_id, "archive-node");
+        assert_eq!(
+            archive.preconditions(),
+            CoordinationNodeArchivePreconditions {
+                expected_node_version: 3,
+                expected_worker_version: None,
+            }
+        );
+        assert_eq!(
+            ArchiveCoordinationNode {
+                expected_worker_version: Some(0),
+                ..archive
+            }
+            .normalize()
+            .unwrap_err(),
+            CoordinationNodeValidationError::InvalidVersion
+        );
+
+        let legacy: DeleteCoordinationNode = serde_json::from_value(serde_json::json!({
+            "command_id": "delete-node",
+            "actor": "local-user"
+        }))
+        .unwrap();
+        assert_eq!(legacy.normalize().unwrap().archive, None);
+        let zero = DeleteCoordinationNode {
+            command_id: "delete-node".to_owned(),
+            actor: "local-user".to_owned(),
+            archive: Some(CoordinationNodeArchivePreconditions {
+                expected_node_version: 0,
+                expected_worker_version: None,
+            }),
+        };
+        assert_eq!(
+            zero.normalize().unwrap_err(),
+            CoordinationNodeValidationError::InvalidVersion
+        );
     }
 }
