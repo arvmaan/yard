@@ -159,7 +159,6 @@ impl PaneManagementService {
                 .source
                 .acquire_pane_lease(AcquirePaneLeaseRequest {
                     request_id: acquisition_request_id.clone(),
-                    acquisition_request_id: acquisition_request_id.clone(),
                     session: candidate.public.session.clone(),
                     pane_id: worker.pane_id.clone(),
                     pane_instance_id: worker.pane_instance_id.clone().unwrap_or_default(),
@@ -191,7 +190,11 @@ impl PaneManagementService {
                     results.push(item(
                         candidate_key,
                         PaneManagementOutcome::Failed,
-                        &error.to_string(),
+                        if matches!(error, PaneManagementRpcError::InvalidDuration) {
+                            "Yard requested an invalid pane lease duration."
+                        } else {
+                            "Herdr could not acquire the pane management lease."
+                        },
                         None,
                     ));
                     continue;
@@ -201,9 +204,24 @@ impl PaneManagementService {
                 || Some(lease.pane_instance_id.as_str()) != worker.pane_instance_id.as_deref()
                 || lease.owner_id != owner_id
             {
+                let rollback = self
+                    .source
+                    .release_pane_lease(ReleasePaneLeaseRequest {
+                        request_id: format!("yard:{}:{request_suffix}:release", command.command_id),
+                        session: candidate.public.session.clone(),
+                        pane_id: lease.pane_id,
+                        pane_instance_id: lease.pane_instance_id,
+                        owner_id: lease.owner_id,
+                        token: lease.token,
+                    })
+                    .await;
                 results.push(item(
                     candidate_key,
-                    PaneManagementOutcome::Failed,
+                    if rollback.is_ok() {
+                        PaneManagementOutcome::Failed
+                    } else {
+                        PaneManagementOutcome::RollbackFailed
+                    },
                     "Herdr returned a lease for a different pane identity.",
                     None,
                 ));
@@ -336,7 +354,11 @@ impl PaneManagementService {
                         .await?;
                 }
                 Err(error) => {
-                    warn!(worker_id = %lease.worker_id, %error, "Pane lease renewal failed; retrying before expiry")
+                    warn!(
+                        worker_id = %lease.worker_id,
+                        error_code = error_code(&error),
+                        "Pane lease renewal failed; retrying before expiry"
+                    )
                 }
             }
         }
@@ -478,15 +500,17 @@ fn classify_inventory(
                 false,
             )
         } else if let Some(lease) = lease {
+            let recovery_required =
+                lease.recovery_required || lease.expires_at_unix_ms <= now_unix_ms();
             (
                 PaneManagementCategory::AlreadyManaged,
-                if lease.recovery_required {
+                if recovery_required {
                     "Yard lost the pane lease; recovery is required."
                 } else {
                     "Pane is already managed by Yard."
                 },
-                lease.recovery_required,
-                !lease.recovery_required,
+                recovery_required,
+                !recovery_required,
             )
         } else if existing.is_some() {
             (
@@ -621,6 +645,7 @@ const fn error_code(error: &PaneManagementRpcError) -> &'static str {
         PaneManagementRpcError::Expired => "expired",
         PaneManagementRpcError::OwnerMismatch => "owner_mismatch",
         PaneManagementRpcError::TokenMismatch => "token_mismatch",
+        PaneManagementRpcError::InvalidDuration => "invalid_duration",
         PaneManagementRpcError::PaneInstanceMismatch => "pane_instance_mismatch",
         PaneManagementRpcError::ReplayConflict => "replay_conflict",
         PaneManagementRpcError::Decode(_) | PaneManagementRpcError::Runtime(_) => "runtime_error",
@@ -637,19 +662,31 @@ fn now_unix_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     use async_trait::async_trait;
     use tempfile::TempDir;
     use yard_domain::{
-        CanvasPlacement, FocusObservation, ManageAllAgents, ObservedStatus, PaneObservation,
-        ProjectPlacement, ProjectRuntimeBinding, ProjectWorkflowProfilePin,
+        CanvasPlacement, CreateProject, FocusObservation, ManageAllAgents, ObservedStatus,
+        PaneObservation, ProjectPlacement, ProjectRuntimeBinding, ProjectWorkflowProfilePin,
         RuntimeObservationState, RuntimeProcessState, RuntimeSession, RuntimeSessions,
         TabObservation, Worker, WorkerAvailability, WorkerDesiredState, WorkerRuntimeBinding,
         WorkspaceObservation,
     };
-    use yard_herdr::{AcquirePaneLeaseRequest, PaneLease};
-    use yard_store::{BeginPaneManagementBatch, SqliteProjectStore, YardStore};
+    use yard_herdr::{
+        AcquirePaneLeaseRequest, LeaseToken, PaneLease, PaneLeaseOperationResult,
+        PaneManagementCapability, ReleasePaneLeaseRequest,
+    };
+    use yard_store::{
+        BeginPaneManagementBatch, SqliteProjectStore, StoredLeaseToken, StoredPaneManagementLease,
+        YardStore,
+    };
 
     use super::*;
     use crate::inventory_service::{InventoryServiceError, InventorySource};
@@ -948,6 +985,137 @@ mod tests {
                 .unwrap(),
             BeginPaneManagementBatch::Started
         ));
+    }
+
+    struct MismatchedLeaseInventory {
+        released: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl InventorySource for MismatchedLeaseInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            Herdr090Inventory.sessions().await
+        }
+
+        async fn inventory(
+            &self,
+            _session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            Ok(inventory(2))
+        }
+
+        async fn pane_management_capability(
+            &self,
+            _session_name: &str,
+        ) -> Result<PaneManagementCapability, PaneManagementRpcError> {
+            Ok(capability(true))
+        }
+
+        async fn acquire_pane_lease(
+            &self,
+            request: AcquirePaneLeaseRequest,
+        ) -> Result<PaneLease, PaneManagementRpcError> {
+            Ok(PaneLease {
+                pane_id: "wrong-pane".to_owned(),
+                pane_instance_id: request.pane_instance_id,
+                owner_id: request.owner_id,
+                token: LeaseToken::from_secret("secret".to_owned()),
+                expires_at_unix_ms: u64::MAX,
+            })
+        }
+
+        async fn release_pane_lease(
+            &self,
+            request: ReleasePaneLeaseRequest,
+        ) -> Result<PaneLeaseOperationResult, PaneManagementRpcError> {
+            assert_eq!(request.pane_id, "wrong-pane");
+            self.released.store(true, Ordering::SeqCst);
+            Ok(PaneLeaseOperationResult {
+                expires_at_unix_ms: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mismatched_acquired_identity_is_released() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        store
+            .create_project(
+                CreateProject {
+                    name: "Project one".to_owned(),
+                    runtime: ProjectRuntimeBinding {
+                        adapter: "herdr".to_owned(),
+                        session: "alpha".to_owned(),
+                        workspace_id: "workspace-1".to_owned(),
+                    },
+                    orchestrator_observed_worker_id: "terminal-0".to_owned(),
+                    placement: CanvasPlacement {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 400.0,
+                        height: 300.0,
+                    },
+                },
+                runtime("terminal-0", "pane-0"),
+            )
+            .await
+            .unwrap();
+        let released = Arc::new(AtomicBool::new(false));
+        let service = PaneManagementService::new(
+            Arc::new(MismatchedLeaseInventory {
+                released: released.clone(),
+            }),
+            store,
+        );
+        let preview = service.preview().await.unwrap();
+        let candidate = preview
+            .candidates
+            .iter()
+            .find(|candidate| candidate.category == PaneManagementCategory::Eligible)
+            .unwrap();
+        let result = service
+            .manage_all_agents(ManageAllAgents {
+                command_id: "mismatch".to_owned(),
+                actor: "test".to_owned(),
+                confirmed: true,
+                candidate_keys: vec![candidate.candidate_key.clone()],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.results[0].outcome, PaneManagementOutcome::Failed);
+        assert!(released.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn expired_lease_fails_closed() {
+        let mut candidates = Vec::new();
+        classify_inventory(
+            &inventory(1),
+            &[project()],
+            &[],
+            &[StoredPaneManagementLease {
+                worker_id: "managed-worker".to_owned(),
+                project_id: "project-1".to_owned(),
+                session: "alpha".to_owned(),
+                pane_id: "pane-0".to_owned(),
+                pane_instance_id: "instance-0".to_owned(),
+                owner_id: "yard:installation".to_owned(),
+                token: StoredLeaseToken::from_secret("secret".to_owned()),
+                expires_at_unix_ms: 1,
+                recovery_required: false,
+            }],
+            &capability(true),
+            &mut candidates,
+        );
+
+        assert!(candidates[0].public.recovery_required);
+        assert!(!candidates[0].public.management_controls_enabled);
     }
 
     #[test]

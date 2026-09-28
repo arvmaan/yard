@@ -6,7 +6,13 @@ use thiserror::Error;
 
 use crate::{HerdrConfig, HerdrError, discovery::discover_sessions, socket::request_command};
 
-pub const PANE_MANAGEMENT_ENDPOINT: &str = "pane_management_lease_v1";
+pub const PANE_MANAGEMENT_CAPABILITY_V1: &str = "pane_management_lease_v1";
+
+const ACQUIRE_METHOD: &str = "pane.management_lease.acquire";
+const RENEW_METHOD: &str = "pane.management_lease.renew";
+const RELEASE_METHOD: &str = "pane.management_lease.release";
+const STATUS_METHOD: &str = "pane.management_lease.status";
+const CLOSE_METHOD: &str = "pane.close_if_management_leased";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct LeaseToken(String);
@@ -63,7 +69,6 @@ impl PaneManagementCapability {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcquirePaneLeaseRequest {
     pub request_id: String,
-    pub acquisition_request_id: String,
     pub session: String,
     pub pane_id: String,
     pub pane_instance_id: String,
@@ -98,7 +103,6 @@ pub struct PaneLeaseStatusRequest {
     pub session: String,
     pub pane_id: String,
     pub pane_instance_id: String,
-    pub owner_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,21 +122,22 @@ pub struct PaneLease {
     pub owner_id: String,
     pub token: LeaseToken,
     pub expires_at_unix_ms: u64,
-    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneLeaseOperationResult {
     pub expires_at_unix_ms: Option<u64>,
-    pub replayed: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaneLeaseStatus {
     Available,
-    Owned,
-    Conflict,
-    Expired,
+    Leased {
+        pane_id: String,
+        pane_instance_id: String,
+        owner_id: String,
+        expires_at_unix_ms: u64,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -149,6 +154,8 @@ pub enum PaneManagementRpcError {
     OwnerMismatch,
     #[error("the pane management lease token did not match")]
     TokenMismatch,
+    #[error("the pane management lease duration was invalid")]
+    InvalidDuration,
     #[error("the pane instance changed")]
     PaneInstanceMismatch,
     #[error("the pane management request ID was replayed with different input")]
@@ -167,91 +174,82 @@ struct CapabilityFlags {
     pane_management_lease_v1: bool,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct Endpoints {
-    #[serde(default)]
-    pane_management_lease: Option<String>,
-    #[serde(default)]
-    pane_management_lease_v1: Option<String>,
-}
-
 #[derive(Debug, Deserialize)]
 struct Pong {
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
     capabilities: CapabilityFlags,
-    #[serde(default)]
-    endpoints: Endpoints,
 }
 
-#[derive(Debug, Deserialize)]
-struct LeaseWire {
+#[derive(Deserialize)]
+struct LeaseResultWire {
     #[serde(rename = "type")]
     kind: String,
+    lease: LeaseWire,
+}
+
+#[derive(Deserialize)]
+struct LeaseWire {
     pane_id: String,
     pane_instance_id: String,
     owner_id: String,
     token: String,
     #[serde(deserialize_with = "deserialize_u64")]
     expires_at_unix_ms: u64,
-    #[serde(default)]
-    replayed: bool,
 }
 
 #[derive(Debug, Deserialize)]
-struct OperationWire {
+struct OkWire {
     #[serde(rename = "type")]
     kind: String,
-    #[serde(default, deserialize_with = "deserialize_optional_u64")]
-    expires_at_unix_ms: Option<u64>,
-    #[serde(default)]
-    replayed: bool,
 }
 
 #[derive(Debug, Deserialize)]
-struct StatusWire {
+struct StatusResultWire {
     #[serde(rename = "type")]
     kind: String,
-    status: String,
+    lease: Option<StatusLeaseWire>,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(tag = "operation", rename_all = "snake_case")]
-enum PaneManagementRequest<'a> {
-    Acquire {
-        acquisition_request_id: &'a str,
-        pane_id: &'a str,
-        pane_instance_id: &'a str,
-        owner_id: &'a str,
-        #[serde(serialize_with = "serialize_u64")]
-        ttl_ms: u64,
-    },
-    Renew {
-        pane_id: &'a str,
-        pane_instance_id: &'a str,
-        owner_id: &'a str,
-        token: &'a str,
-        #[serde(serialize_with = "serialize_u64")]
-        ttl_ms: u64,
-    },
-    Release {
-        pane_id: &'a str,
-        pane_instance_id: &'a str,
-        owner_id: &'a str,
-        token: &'a str,
-    },
-    Status {
-        pane_id: &'a str,
-        pane_instance_id: &'a str,
-        owner_id: &'a str,
-    },
-    CloseIfLeased {
-        pane_id: &'a str,
-        pane_instance_id: &'a str,
-        owner_id: &'a str,
-        token: &'a str,
-    },
+#[derive(Debug, Deserialize)]
+struct StatusLeaseWire {
+    pane_id: String,
+    pane_instance_id: String,
+    owner_id: String,
+    #[serde(deserialize_with = "deserialize_u64")]
+    expires_at_unix_ms: u64,
+}
+
+#[derive(Serialize)]
+struct AcquireParams<'a> {
+    pane_id: &'a str,
+    expected_pane_instance_id: &'a str,
+    owner_id: &'a str,
+    lease_duration_ms: u64,
+}
+
+#[derive(Serialize)]
+struct RenewParams<'a> {
+    pane_id: &'a str,
+    expected_pane_instance_id: &'a str,
+    owner_id: &'a str,
+    token: &'a str,
+    lease_duration_ms: u64,
+}
+
+#[derive(Serialize)]
+struct AuthenticatedParams<'a> {
+    pane_id: &'a str,
+    expected_pane_instance_id: &'a str,
+    owner_id: &'a str,
+    token: &'a str,
+}
+
+#[derive(Serialize)]
+struct StatusParams<'a> {
+    pane_id: &'a str,
+    expected_pane_instance_id: &'a str,
 }
 
 pub(crate) async fn capability(
@@ -279,12 +277,12 @@ pub(crate) async fn acquire(
         config,
         &request.session,
         &request.request_id,
-        &PaneManagementRequest::Acquire {
-            acquisition_request_id: &request.acquisition_request_id,
+        ACQUIRE_METHOD,
+        &AcquireParams {
             pane_id: &request.pane_id,
-            pane_instance_id: &request.pane_instance_id,
+            expected_pane_instance_id: &request.pane_instance_id,
             owner_id: &request.owner_id,
-            ttl_ms: request.ttl_ms,
+            lease_duration_ms: request.ttl_ms,
         },
     )
     .await?;
@@ -299,16 +297,17 @@ pub(crate) async fn renew(
         config,
         &request.session,
         &request.request_id,
-        &PaneManagementRequest::Renew {
+        RENEW_METHOD,
+        &RenewParams {
             pane_id: &request.pane_id,
-            pane_instance_id: &request.pane_instance_id,
+            expected_pane_instance_id: &request.pane_instance_id,
             owner_id: &request.owner_id,
             token: request.token.expose_secret(),
-            ttl_ms: request.ttl_ms,
+            lease_duration_ms: request.ttl_ms,
         },
     )
     .await?;
-    decode_operation(result, "pane_management_lease_renewed")
+    decode_renewed_lease(result)
 }
 
 pub(crate) async fn release(
@@ -319,15 +318,16 @@ pub(crate) async fn release(
         config,
         &request.session,
         &request.request_id,
-        &PaneManagementRequest::Release {
+        RELEASE_METHOD,
+        &AuthenticatedParams {
             pane_id: &request.pane_id,
-            pane_instance_id: &request.pane_instance_id,
+            expected_pane_instance_id: &request.pane_instance_id,
             owner_id: &request.owner_id,
             token: request.token.expose_secret(),
         },
     )
     .await?;
-    decode_operation(result, "pane_management_lease_released")
+    decode_ok(result)
 }
 
 pub(crate) async fn status(
@@ -338,10 +338,10 @@ pub(crate) async fn status(
         config,
         &request.session,
         &request.request_id,
-        &PaneManagementRequest::Status {
+        STATUS_METHOD,
+        &StatusParams {
             pane_id: &request.pane_id,
-            pane_instance_id: &request.pane_instance_id,
-            owner_id: &request.owner_id,
+            expected_pane_instance_id: &request.pane_instance_id,
         },
     )
     .await?;
@@ -356,39 +356,42 @@ pub(crate) async fn close_if_leased(
         config,
         &request.session,
         &request.request_id,
-        &PaneManagementRequest::CloseIfLeased {
+        CLOSE_METHOD,
+        &AuthenticatedParams {
             pane_id: &request.pane_id,
-            pane_instance_id: &request.pane_instance_id,
+            expected_pane_instance_id: &request.pane_instance_id,
             owner_id: &request.owner_id,
             token: request.token.expose_secret(),
         },
     )
     .await?;
-    decode_operation(result, "pane_closed_if_leased")
+    decode_ok(result)
 }
 
-async fn rpc(
+async fn rpc<T: Serialize>(
     config: &HerdrConfig,
     session: &str,
     request_id: &str,
-    request: &PaneManagementRequest<'_>,
+    method: &str,
+    params: &T,
 ) -> Result<serde_json::Value, PaneManagementRpcError> {
     let socket = running_socket(config, session).await?;
-    rpc_at_socket(config, &socket, request_id, request).await
+    rpc_at_socket(config, &socket, request_id, method, params).await
 }
 
-async fn rpc_at_socket(
+async fn rpc_at_socket<T: Serialize>(
     config: &HerdrConfig,
     socket: &std::path::Path,
     request_id: &str,
-    request: &PaneManagementRequest<'_>,
+    method: &str,
+    params: &T,
 ) -> Result<serde_json::Value, PaneManagementRpcError> {
     request_command(
         config,
         socket,
         request_id,
-        PANE_MANAGEMENT_ENDPOINT,
-        serde_json::to_value(request).map_err(PaneManagementRpcError::Decode)?,
+        method,
+        serde_json::to_value(params).map_err(PaneManagementRpcError::Decode)?,
         config.request_timeout,
     )
     .await
@@ -413,64 +416,64 @@ fn decode_capability(
     let pong: Pong = serde_json::from_value(value).map_err(PaneManagementRpcError::Decode)?;
     let advertised =
         pong.capabilities.pane_management_lease || pong.capabilities.pane_management_lease_v1;
-    let endpoint = [
-        pong.endpoints.pane_management_lease,
-        pong.endpoints.pane_management_lease_v1,
-    ]
-    .into_iter()
-    .flatten()
-    .find(|endpoint| endpoint == PANE_MANAGEMENT_ENDPOINT);
-    if pong.kind != "pong" || !advertised || endpoint.is_none() {
+    if pong.kind != "pong" || !advertised {
         return Ok(PaneManagementCapability::unsupported());
     }
     Ok(PaneManagementCapability {
         supported: true,
-        endpoint,
+        endpoint: Some(PANE_MANAGEMENT_CAPABILITY_V1.to_owned()),
     })
 }
 
 fn decode_lease(value: serde_json::Value) -> Result<PaneLease, PaneManagementRpcError> {
-    let lease: LeaseWire = serde_json::from_value(value).map_err(PaneManagementRpcError::Decode)?;
-    if lease.kind != "pane_management_lease_acquired" {
-        return Err(unexpected_result(&lease.kind));
+    let result: LeaseResultWire =
+        serde_json::from_value(value).map_err(PaneManagementRpcError::Decode)?;
+    if result.kind != "pane_management_lease" {
+        return Err(unexpected_result(&result.kind));
     }
+    let lease = result.lease;
     Ok(PaneLease {
         pane_id: lease.pane_id,
         pane_instance_id: lease.pane_instance_id,
         owner_id: lease.owner_id,
         token: LeaseToken::from_secret(lease.token),
         expires_at_unix_ms: lease.expires_at_unix_ms,
-        replayed: lease.replayed,
     })
 }
 
-fn decode_operation(
+fn decode_renewed_lease(
     value: serde_json::Value,
-    expected: &'static str,
 ) -> Result<PaneLeaseOperationResult, PaneManagementRpcError> {
-    let result: OperationWire =
-        serde_json::from_value(value).map_err(PaneManagementRpcError::Decode)?;
-    if result.kind != expected {
+    let lease = decode_lease(value)?;
+    Ok(PaneLeaseOperationResult {
+        expires_at_unix_ms: Some(lease.expires_at_unix_ms),
+    })
+}
+
+fn decode_ok(value: serde_json::Value) -> Result<PaneLeaseOperationResult, PaneManagementRpcError> {
+    let result: OkWire = serde_json::from_value(value).map_err(PaneManagementRpcError::Decode)?;
+    if result.kind != "ok" {
         return Err(unexpected_result(&result.kind));
     }
     Ok(PaneLeaseOperationResult {
-        expires_at_unix_ms: result.expires_at_unix_ms,
-        replayed: result.replayed,
+        expires_at_unix_ms: None,
     })
 }
 
 fn decode_status(value: serde_json::Value) -> Result<PaneLeaseStatus, PaneManagementRpcError> {
-    let status: StatusWire =
+    let result: StatusResultWire =
         serde_json::from_value(value).map_err(PaneManagementRpcError::Decode)?;
-    if status.kind != "pane_management_lease_status" {
-        return Err(unexpected_result(&status.kind));
+    if result.kind != "pane_management_lease_status" {
+        return Err(unexpected_result(&result.kind));
     }
-    match status.status.as_str() {
-        "available" => Ok(PaneLeaseStatus::Available),
-        "owned" => Ok(PaneLeaseStatus::Owned),
-        "conflict" => Ok(PaneLeaseStatus::Conflict),
-        "expired" => Ok(PaneLeaseStatus::Expired),
-        _ => Err(unexpected_result(&status.status)),
+    match result.lease {
+        None => Ok(PaneLeaseStatus::Available),
+        Some(lease) => Ok(PaneLeaseStatus::Leased {
+            pane_id: lease.pane_id,
+            pane_instance_id: lease.pane_instance_id,
+            owner_id: lease.owner_id,
+            expires_at_unix_ms: lease.expires_at_unix_ms,
+        }),
     }
 }
 
@@ -479,23 +482,24 @@ fn map_runtime_error(error: HerdrError) -> PaneManagementRpcError {
         return PaneManagementRpcError::Runtime(error);
     };
     match code.as_str() {
-        "method_not_found" | "pane_management_lease_unsupported" => {
+        "method_not_found" | "METHOD_NOT_FOUND" | "PANE_MANAGEMENT_LEASE_UNSUPPORTED" => {
             PaneManagementRpcError::Unsupported
         }
-        "pane_management_lease_conflict" => PaneManagementRpcError::Conflict,
-        "pane_management_lease_not_found" => PaneManagementRpcError::NotFound,
-        "pane_management_lease_expired" => PaneManagementRpcError::Expired,
-        "pane_management_lease_owner_mismatch" => PaneManagementRpcError::OwnerMismatch,
-        "pane_management_lease_token_mismatch" => PaneManagementRpcError::TokenMismatch,
-        "pane_instance_mismatch" => PaneManagementRpcError::PaneInstanceMismatch,
-        "idempotency_conflict" => PaneManagementRpcError::ReplayConflict,
+        "LEASE_DURATION_INVALID" => PaneManagementRpcError::InvalidDuration,
+        "LEASE_CONFLICT" => PaneManagementRpcError::Conflict,
+        "LEASE_NOT_FOUND" | "PANE_NOT_FOUND" => PaneManagementRpcError::NotFound,
+        "LEASE_EXPIRED" => PaneManagementRpcError::Expired,
+        "LEASE_OWNER_MISMATCH" => PaneManagementRpcError::OwnerMismatch,
+        "LEASE_TOKEN_INVALID" => PaneManagementRpcError::TokenMismatch,
+        "PANE_INSTANCE_MISMATCH" => PaneManagementRpcError::PaneInstanceMismatch,
+        "REQUEST_REPLAY_MISMATCH" => PaneManagementRpcError::ReplayConflict,
         _ => PaneManagementRpcError::Runtime(error),
     }
 }
 
 fn unexpected_result(actual: &str) -> PaneManagementRpcError {
     PaneManagementRpcError::Runtime(HerdrError::UnexpectedResult {
-        expected: "pane_management_lease_v1 result",
+        expected: "pane management result",
         actual: actual.to_owned(),
     })
 }
@@ -511,30 +515,6 @@ where
             .ok_or_else(|| serde::de::Error::custom("expected a non-negative integer")),
         _ => Err(serde::de::Error::custom("expected an integer string")),
     }
-}
-
-fn deserialize_optional_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    match Option::<serde_json::Value>::deserialize(deserializer)? {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(value)) => {
-            value.parse().map(Some).map_err(serde::de::Error::custom)
-        }
-        Some(serde_json::Value::Number(value)) => value
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| serde::de::Error::custom("expected a non-negative integer")),
-        Some(_) => Err(serde::de::Error::custom("expected an integer string")),
-    }
-}
-
-fn serialize_u64<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_str(&value.to_string())
 }
 
 #[cfg(test)]
@@ -585,39 +565,32 @@ mod tests {
     }
 
     #[test]
-    fn negotiates_only_the_exact_capability_and_endpoint() {
+    fn negotiates_either_capability_alias() {
         let supported = fixture("supported")["ping_result"].clone();
         assert!(decode_capability(supported.clone()).unwrap().supported);
         let mut legacy_only = supported.clone();
         legacy_only["capabilities"]["pane_management_lease_v1"] = json!(false);
-        legacy_only["endpoints"]["pane_management_lease_v1"] = serde_json::Value::Null;
         assert!(decode_capability(legacy_only).unwrap().supported);
         let mut versioned_only = supported;
         versioned_only["capabilities"]["pane_management_lease"] = json!(false);
-        versioned_only["endpoints"]["pane_management_lease"] = serde_json::Value::Null;
         assert!(decode_capability(versioned_only).unwrap().supported);
         assert!(
             !decode_capability(fixture("unsupported")["ping_result"].clone())
                 .unwrap()
                 .supported
         );
-        let mut spoofed = fixture("supported")["ping_result"].clone();
-        spoofed["endpoints"]["pane_management_lease"] = json!("pane_management_lease_v2");
-        spoofed["endpoints"]["pane_management_lease_v1"] = json!("pane_management_lease_v2");
-        assert!(!decode_capability(spoofed).unwrap().supported);
     }
 
     #[test]
-    fn decodes_replay_and_status_contract() {
+    fn decodes_lease_and_status_contract() {
         let fixture: RpcFixtures =
             serde_json::from_value(fixture("rpc")).expect("typed RPC fixture");
         let lease = decode_lease(fixture.calls[0].result.clone()).unwrap();
-        assert!(lease.replayed);
         assert_eq!(lease.expires_at_unix_ms, 1_790_000_060_000);
-        assert_eq!(
+        assert!(matches!(
             decode_status(fixture.calls[3].result.clone()).unwrap(),
-            PaneLeaseStatus::Conflict
-        );
+            PaneLeaseStatus::Leased { owner_id, .. } if owner_id == "other-owner"
+        ));
     }
 
     #[test]
@@ -625,6 +598,7 @@ mod tests {
         let fixture: RpcFixtures =
             serde_json::from_value(fixture("rpc")).expect("typed RPC fixture");
         let expected = [
+            PaneManagementRpcError::InvalidDuration,
             PaneManagementRpcError::Conflict,
             PaneManagementRpcError::NotFound,
             PaneManagementRpcError::Expired,
@@ -632,6 +606,7 @@ mod tests {
             PaneManagementRpcError::TokenMismatch,
             PaneManagementRpcError::PaneInstanceMismatch,
             PaneManagementRpcError::ReplayConflict,
+            PaneManagementRpcError::NotFound,
         ];
         for (wire, expected) in fixture.errors.iter().zip(expected) {
             let mapped = map_runtime_error(HerdrError::Api {
@@ -689,48 +664,66 @@ mod tests {
         });
         let token = LeaseToken::from_secret("fixture-secret-never-expose".to_owned());
         let requests = [
-            PaneManagementRequest::Acquire {
-                acquisition_request_id: "yard:manage:batch:pane",
-                pane_id: "pane-1",
-                pane_instance_id: "pane-instance-1",
-                owner_id: "yard:installation-1",
-                ttl_ms: 60_000,
-            },
-            PaneManagementRequest::Renew {
-                pane_id: "pane-1",
-                pane_instance_id: "pane-instance-1",
-                owner_id: "yard:installation-1",
-                token: token.expose_secret(),
-                ttl_ms: 60_000,
-            },
-            PaneManagementRequest::Release {
-                pane_id: "pane-1",
-                pane_instance_id: "pane-instance-1",
-                owner_id: "yard:installation-1",
-                token: token.expose_secret(),
-            },
-            PaneManagementRequest::Status {
-                pane_id: "pane-1",
-                pane_instance_id: "pane-instance-1",
-                owner_id: "yard:installation-1",
-            },
-            PaneManagementRequest::CloseIfLeased {
-                pane_id: "pane-1",
-                pane_instance_id: "pane-instance-1",
-                owner_id: "yard:installation-1",
-                token: token.expose_secret(),
-            },
+            (
+                ACQUIRE_METHOD,
+                serde_json::to_value(AcquireParams {
+                    pane_id: "pane-1",
+                    expected_pane_instance_id: "pane-instance-1",
+                    owner_id: "yard:installation-1",
+                    lease_duration_ms: 60_000,
+                })
+                .unwrap(),
+            ),
+            (
+                RENEW_METHOD,
+                serde_json::to_value(RenewParams {
+                    pane_id: "pane-1",
+                    expected_pane_instance_id: "pane-instance-1",
+                    owner_id: "yard:installation-1",
+                    token: token.expose_secret(),
+                    lease_duration_ms: 60_000,
+                })
+                .unwrap(),
+            ),
+            (
+                RELEASE_METHOD,
+                serde_json::to_value(AuthenticatedParams {
+                    pane_id: "pane-1",
+                    expected_pane_instance_id: "pane-instance-1",
+                    owner_id: "yard:installation-1",
+                    token: token.expose_secret(),
+                })
+                .unwrap(),
+            ),
+            (
+                STATUS_METHOD,
+                serde_json::to_value(StatusParams {
+                    pane_id: "pane-1",
+                    expected_pane_instance_id: "pane-instance-1",
+                })
+                .unwrap(),
+            ),
+            (
+                CLOSE_METHOD,
+                serde_json::to_value(AuthenticatedParams {
+                    pane_id: "pane-1",
+                    expected_pane_instance_id: "pane-instance-1",
+                    owner_id: "yard:installation-1",
+                    token: token.expose_secret(),
+                })
+                .unwrap(),
+            ),
         ];
         let config = HerdrConfig {
             request_timeout: Duration::from_secs(1),
             ..HerdrConfig::default()
         };
-        for (request, call) in requests.iter().zip(&fixture.calls) {
+        for ((method, params), call) in requests.iter().zip(&fixture.calls) {
             let id = call.request["id"].as_str().unwrap();
-            let first = rpc_at_socket(&config, &socket_path, id, request)
+            let first = rpc_at_socket(&config, &socket_path, id, method, params)
                 .await
                 .unwrap();
-            let replay = rpc_at_socket(&config, &socket_path, id, request)
+            let replay = rpc_at_socket(&config, &socket_path, id, method, params)
                 .await
                 .unwrap();
             assert_eq!(first, replay);
