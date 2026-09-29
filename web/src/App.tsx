@@ -1987,6 +1987,7 @@ function ProjectInspector({
       <ProjectRepositoriesSection
         onChanged={onRefresh}
         project={project}
+        suggestedRoot={workspace?.worktree?.checkout_path}
       />
       <section
         aria-label="Orchestrator runtime"

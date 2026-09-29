@@ -62,9 +62,11 @@ function errorMessage(error: unknown, fallback: string) {
 export function ProjectRepositoriesSection({
   onChanged,
   project,
+  suggestedRoot,
 }: {
   onChanged: () => void
   project: Project
+  suggestedRoot?: string
 }) {
   const [repositories, setRepositories] = useState<ProjectRepository[]>([])
   const [rootPath, setRootPath] = useState('')
@@ -94,7 +96,15 @@ export function ProjectRepositoriesSection({
   const submit = async (event: FormEvent) => {
     event.preventDefault()
     const path = rootPath.trim()
-    if (!path || busy) return
+    if (busy) return
+    if (!path) {
+      setError('Enter an absolute Git checkout path before linking a repository.')
+      return
+    }
+    if (!path.startsWith('/')) {
+      setError('Repository checkout path must be absolute.')
+      return
+    }
     setBusy(true)
     setError(null)
     try {
@@ -190,6 +200,19 @@ export function ProjectRepositoriesSection({
         </article>
       ))}
       <form className="project-repository-form" onSubmit={submit}>
+        {suggestedRoot && !editingId && rootPath.trim() !== suggestedRoot ? (
+          <button
+            className="secondary-button project-repository-form__suggestion"
+            onClick={() => {
+              setRootPath(suggestedRoot)
+              setError(null)
+            }}
+            type="button"
+          >
+            Use project checkout
+            <code>{suggestedRoot}</code>
+          </button>
+        ) : null}
         <label>
           <span>{editingId ? 'New checkout path' : 'Absolute checkout path'}</span>
           <input
@@ -202,7 +225,16 @@ export function ProjectRepositoriesSection({
           />
         </label>
         <div>
-          <button className="command-button" disabled={busy} type="submit">
+          <button
+            className="command-button"
+            disabled={busy || !rootPath.trim().startsWith('/')}
+            title={
+              rootPath.trim().startsWith('/')
+                ? undefined
+                : 'Enter an absolute Git checkout path first'
+            }
+            type="submit"
+          >
             <Link aria-hidden="true" size={14} />
             {editingId ? 'Save relink' : 'Link repository'}
           </button>
