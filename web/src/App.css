@@ -2725,7 +2725,8 @@ html[data-yard-allocation-dragging="true"]
   margin-bottom: 14px;
 }
 
-.durable-runtime-section {
+.durable-runtime-section,
+.ephemeral-summary-section {
   min-width: 0;
   margin-top: 18px;
   padding-top: 14px;

@@ -1819,7 +1819,7 @@ function ProjectOrchestratorInspector({
           target={{ kind: 'orchestrator', project }}
         />
       ) : null}
-      <section aria-label="Ephemeral summary workers" className="durable-runtime-section">
+      <section aria-label="Ephemeral summary workers" className="ephemeral-summary-section">
         <p className="eyebrow">Ephemeral summary</p>
         <p className="project-orchestrator-transfer-status">
           This user-initiated action creates and prompts a short-lived worker,
