@@ -48,23 +48,7 @@ fn project(
     session_name: &str,
     observed_at_unix_ms: u64,
 ) -> RuntimeInventory {
-    // Herdr's agent-list payload is terminal-centric and may omit the pane
-    // instance identity that is present on the matching pane. Carry that exact
-    // identity across only after terminal and pane ancestry agree; topology
-    // validation runs before this projection.
-    let pane_instances = snapshot
-        .panes
-        .iter()
-        .map(|pane| (pane.pane_id.as_str(), pane.pane_instance_id.clone()))
-        .collect::<HashMap<_, _>>();
-    for agent in &mut snapshot.agents {
-        if agent.pane_instance_id.is_none() {
-            agent.pane_instance_id = pane_instances
-                .get(agent.pane_id.as_str())
-                .cloned()
-                .flatten();
-        }
-    }
+    correlate_agent_pane_instances(&mut snapshot);
 
     RuntimeInventory {
         adapter: "herdr".to_owned(),
@@ -159,6 +143,26 @@ fn project(
             })
             .collect(),
         child_agents: Vec::new(),
+    }
+}
+
+fn correlate_agent_pane_instances(snapshot: &mut SessionSnapshot) {
+    // Herdr's agent-list payload is terminal-centric and may omit the pane
+    // instance identity that is present on the matching pane. Carry that exact
+    // identity across only after terminal and pane ancestry agree; topology
+    // validation runs before this projection.
+    let pane_instances = snapshot
+        .panes
+        .iter()
+        .map(|pane| (pane.pane_id.as_str(), pane.pane_instance_id.clone()))
+        .collect::<HashMap<_, _>>();
+    for agent in &mut snapshot.agents {
+        if agent.pane_instance_id.is_none() {
+            agent.pane_instance_id = pane_instances
+                .get(agent.pane_id.as_str())
+                .cloned()
+                .flatten();
+        }
     }
 }
 
