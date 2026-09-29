@@ -76,12 +76,6 @@ impl UpdateTokenSpendSettings {
         if self.expected_version == 0 {
             return Err(TokenSpendSettingsValidationError::InvalidVersion);
         }
-        if self.superintendent_auto_requests_project_summaries
-            || self.project_orchestrators_auto_request_worker_summaries
-            || self.scheduled_automatic_summaries
-        {
-            return Err(TokenSpendSettingsValidationError::AutomaticSummaryIsolationRequired);
-        }
         self.actor = actor.to_owned();
         Ok(self)
     }
@@ -93,8 +87,6 @@ pub enum TokenSpendSettingsValidationError {
     ActorRequired,
     #[error("actor exceeds {MAX_ACTOR_BYTES} bytes")]
     ActorTooLong,
-    #[error("automatic summaries require an isolated ephemeral summary worker")]
-    AutomaticSummaryIsolationRequired,
     #[error("expected version must be greater than zero")]
     InvalidVersion,
 }
@@ -125,24 +117,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(update.actor, "local-user");
-    }
-
-    #[test]
-    fn rejects_legacy_automatic_summary_delivery_to_main_agents() {
-        let error = UpdateTokenSpendSettings {
-            actor: "local-user".to_owned(),
-            expected_version: 1,
-            superintendent_auto_requests_project_summaries: true,
-            project_orchestrators_auto_request_worker_summaries: false,
-            scheduled_automatic_summaries: false,
-        }
-        .normalize()
-        .unwrap_err();
-
-        assert_eq!(
-            error,
-            TokenSpendSettingsValidationError::AutomaticSummaryIsolationRequired
-        );
     }
 
     #[test]

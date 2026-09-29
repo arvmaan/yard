@@ -66,6 +66,12 @@ impl AutomationService {
         command: UpdateTokenSpendSettings,
     ) -> Result<TokenSpendSettings, AutomationServiceError> {
         let _operation = self.operation.lock().await;
+        if command.superintendent_auto_requests_project_summaries
+            || command.project_orchestrators_auto_request_worker_summaries
+            || command.scheduled_automatic_summaries
+        {
+            return Err(AutomationServiceError::AutomaticSummaryIsolationRequired);
+        }
         self.store
             .update_token_spend_settings(command)
             .await
@@ -587,6 +593,8 @@ pub enum AutomationServiceError {
     InvalidCommand(#[from] yard_domain::AutomationValidationError),
     #[error(transparent)]
     Store(#[from] ProjectStoreError),
+    #[error("automatic summaries require an isolated ephemeral summary worker")]
+    AutomaticSummaryIsolationRequired,
     #[error("automation schedule timezone is invalid")]
     InvalidTimezone,
     #[error("automation schedule timestamp is outside the supported range")]

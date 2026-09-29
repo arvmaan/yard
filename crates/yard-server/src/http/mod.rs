@@ -2448,6 +2448,11 @@ impl From<AutomationServiceError> for ApiError {
                 code: "invalid_automation_schedule",
                 message: error.to_string(),
             },
+            AutomationServiceError::AutomaticSummaryIsolationRequired => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "automatic_summary_isolation_required",
+                message: error.to_string(),
+            },
             AutomationServiceError::MissingNextRun => Self {
                 status: StatusCode::CONFLICT,
                 code: "automation_schedule_unavailable",
@@ -4961,7 +4966,7 @@ mod tests {
             session_name: &str,
         ) -> Result<RuntimeInventory, InventoryServiceError> {
             let mut inventory = HandoffInventory.inventory(session_name).await?;
-            if self.calls.fetch_add(1, Ordering::SeqCst) == 2 {
+            if self.calls.fetch_add(1, Ordering::SeqCst) >= 2 {
                 inventory
                     .workspaces
                     .retain(|workspace| workspace.runtime_id != "workspace-2");
@@ -14568,21 +14573,19 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let error = response_json(response).await;
         assert_eq!(
-            response.headers()[header::CACHE_CONTROL].to_str().unwrap(),
-            "no-store"
-        );
-        let updated = response_json(response).await;
-        assert_eq!(
-            updated["superintendent_auto_requests_project_summaries"],
-            true
+            error["error"]["code"],
+            "automatic_summary_isolation_required"
         );
         assert_eq!(
-            updated["project_orchestrators_auto_request_worker_summaries"],
-            false
+            error["error"]["message"],
+            "automatic summaries require an isolated ephemeral summary worker"
         );
-        assert_eq!(updated["scheduled_automatic_summaries"], false);
+
+        let unchanged = get_json(&app, "/api/v1/token-spend-settings").await;
+        assert_eq!(unchanged, defaults);
 
         let conflict = app
             .oneshot(
@@ -14595,450 +14598,71 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(conflict.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let conflict = response_json(conflict).await;
-        assert_eq!(conflict["error"]["code"], "token_spend_settings_conflict");
+        assert_eq!(
+            conflict["error"]["code"],
+            "automatic_summary_isolation_required"
+        );
     }
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn scheduler_enforces_independent_automatic_layers_and_preserves_manual_dispatch() {
-        let temp = TempDir::new().unwrap();
-        let store = Arc::new(
-            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
-                .await
-                .unwrap(),
-        );
-        let source = Arc::new(FakeInventory);
-        let control = Arc::new(FakeRuntime);
-        let reporting = Arc::new(ReportingRuntime::default());
-        let terminal = Arc::new(FakeRuntime);
-        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
-        let app = router(
-            source.clone(),
-            control.clone(),
-            reporting.clone(),
-            terminal,
-            store.clone(),
-            artifacts,
-        );
-        let (project_id, assignment_id) = create_active_assignment(&app).await;
-        let snapshot = source.inventory("default").await.unwrap();
-        seed_inventory_workers(
-            &temp.path().join("yard.sqlite3"),
-            &snapshot,
-            &["terminal-yard-allocat-b3e512e61b8af4f5"],
-        );
-
-        let inventory_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/runtimes/herdr/sessions/default/inventory")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(inventory_response.status(), StatusCode::OK);
-        let candidates = get_json(&app, "/api/v1/workers").await;
-        let yard_candidate = candidates["workers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|candidate| {
-                candidate["worker"]["runtime"]["terminal_id"]
-                    == "terminal-yard-allocat-b3e512e61b8af4f5"
-            })
-            .unwrap();
-        let initial_yard = get_json(&app, "/api/v1/yard/orchestrator").await;
-        let configure = serde_json::json!({
-            "command_id": "configure-automatic-summary-yard",
+        let (app, _temp) = test_router().await;
+        let defaults = get_json(&app, "/api/v1/token-spend-settings").await;
+        let update = serde_json::json!({
             "actor": "local-user",
-            "worker_id": yard_candidate["worker"]["id"],
-            "expected_worker_version": yard_candidate["worker"]["version"],
-            "expected_orchestrator_version": initial_yard["version"]
+            "expected_version": defaults["version"],
+            "superintendent_auto_requests_project_summaries": true,
+            "project_orchestrators_auto_request_worker_summaries": true,
+            "scheduled_automatic_summaries": true
         });
-        let configured_response = app
-            .clone()
+        let response = app
             .oneshot(
                 Request::builder()
                     .method(Method::PUT)
-                    .uri("/api/v1/yard/orchestrator")
+                    .uri("/api/v1/token-spend-settings")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(configure.to_string()))
+                    .body(Body::from(update.to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(configured_response.status(), StatusCode::OK);
-        {
-            let mut prompts = reporting.prompts.lock().unwrap();
-            assert_eq!(prompts.len(), 1);
-            assert_eq!(prompts[0].command_id, "configure-automatic-summary-yard");
-            assert!(
-                prompts[0]
-                    .text
-                    .contains("Assume ownership of central Yard orchestration")
-            );
-            assert!(prompts[0].text.contains("Allocate independent workers"));
-            prompts.clear();
-        }
-
-        let reconciliation = ReconciliationService::new(source.clone(), store.clone());
-        let coordination_nodes = CoordinationNodeService::new(
-            source.clone(),
-            control,
-            reporting.clone(),
-            store.clone(),
-            reconciliation,
-            temp.path().join("coordination"),
-            temp.path().join("knowledge"),
-        );
-        let interventions = InterventionService::new(source, reporting.clone(), store.clone());
-        let scheduler = AutomationService::new(store.clone(), interventions, coordination_nodes);
-
-        let automation_id = uuid::Uuid::now_v7().to_string();
-        let automation = store
-            .create_automation(
-                CreateAutomation {
-                    command_id: "create-due-summary-automation".to_owned(),
-                    actor: "local-user".to_owned(),
-                    automation_id: automation_id.clone(),
-                    name: "Due project summary".to_owned(),
-                    scope: AutomationScope::ProjectOrchestrator {
-                        project_id: project_id.clone(),
-                    },
-                    placement: CanvasPlacement {
-                        x: 220.0,
-                        y: 180.0,
-                        width: 168.0,
-                        height: 58.0,
-                    },
-                    schedule: DailySchedule {
-                        hour: 9,
-                        minute: 0,
-                        timezone: "UTC".to_owned(),
-                    },
-                    selected_project_ids: vec![project_id.clone()],
-                    prompt_template: "Summarize current project status.".to_owned(),
-                },
-                1,
-            )
-            .await
-            .unwrap()
-            .automation;
-
-        scheduler.run_due_once().await.unwrap();
-        assert!(reporting.prompts.lock().unwrap().is_empty());
-        let count_rows = |table: &str| {
-            let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
-            connection
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap()
-        };
-        let set_worker_status = |worker_id: &str, status: &str| {
-            let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
-            assert_eq!(
-                connection
-                    .execute(
-                        "UPDATE worker_runtime_bindings
-                            SET observed_status = ?1
-                          WHERE worker_id = ?2",
-                        rusqlite::params![status, worker_id],
-                    )
-                    .unwrap(),
-                1
-            );
-        };
-        assert_eq!(count_rows("yard_orchestrator_route_commands"), 0);
-        assert_eq!(count_rows("assignment_prompt_commands"), 0);
-        assert_eq!(count_rows("automation_runs"), 0);
-
-        let project_orchestrator_worker_id = store
-            .get_project(&project_id)
-            .await
-            .unwrap()
-            .orchestrator
-            .id;
-        let assignment = store
-            .list_project_assignments(&project_id)
-            .await
-            .unwrap()
-            .assignments
-            .into_iter()
-            .find(|assignment| assignment.id == assignment_id)
-            .unwrap();
-        let assignment_worker_id = assignment.worker.id.clone();
-        let manual_prompt = serde_json::json!({
-            "command_id": "manual-prompt-with-automatic-settings-off",
-            "actor": "local-user",
-            "attempt_id": assignment.attempt.id,
-            "expected_assignment_version": assignment.version.to_string(),
-            "expected_attempt_version": assignment.attempt.version.to_string(),
-            "text": "Manual status request."
-        });
-        let manual_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(format!(
-                        "/api/v1/projects/{project_id}/assignments/{assignment_id}/prompts"
-                    ))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(manual_prompt.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(manual_response.status(), StatusCode::OK);
-        assert_eq!(reporting.prompts.lock().unwrap().len(), 1);
-
-        let manual_run = scheduler
-            .run_now(RunAutomationNow {
-                command_id: "manual-run-with-schedule-off".to_owned(),
-                actor: "local-user".to_owned(),
-                automation_id: automation_id.clone(),
-                expected_version: automation.version,
-            })
-            .await
-            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
-            manual_run.run.trigger,
-            yard_domain::AutomationRunTrigger::Manual
-        );
-        assert_eq!(
-            manual_run.run.status,
-            yard_domain::AutomationRunStatus::Submitted
-        );
-        assert_eq!(reporting.prompts.lock().unwrap().len(), 2);
-
-        let defaults = store.get_token_spend_settings().await.unwrap();
-        let superintendent_only = store
-            .update_token_spend_settings(UpdateTokenSpendSettings {
-                actor: "local-user".to_owned(),
-                expected_version: defaults.version,
-                superintendent_auto_requests_project_summaries: true,
-                project_orchestrators_auto_request_worker_summaries: false,
-                scheduled_automatic_summaries: false,
-            })
-            .await
-            .unwrap();
-        for status in ["working", "blocked", "unknown"] {
-            set_worker_status(&project_orchestrator_worker_id, status);
-            scheduler.run_due_once().await.unwrap();
-            assert_eq!(reporting.prompts.lock().unwrap().len(), 2);
-            assert_eq!(count_rows("yard_orchestrator_route_commands"), 0);
-            assert_eq!(count_rows("automatic_summary_request_watermarks"), 0);
-        }
-        set_worker_status(&project_orchestrator_worker_id, "idle");
-        scheduler.run_due_once().await.unwrap();
-        assert_eq!(reporting.prompts.lock().unwrap().len(), 3);
-        assert_eq!(count_rows("yard_orchestrator_route_commands"), 1);
-        assert_eq!(count_rows("assignment_prompt_commands"), 1);
-        assert_eq!(count_rows("automatic_summary_request_watermarks"), 1);
-        assert_eq!(count_rows("automation_runs"), 1);
-
-        let workers_only = store
-            .update_token_spend_settings(UpdateTokenSpendSettings {
-                actor: "local-user".to_owned(),
-                expected_version: superintendent_only.version,
-                superintendent_auto_requests_project_summaries: false,
-                project_orchestrators_auto_request_worker_summaries: true,
-                scheduled_automatic_summaries: false,
-            })
-            .await
-            .unwrap();
-        for status in ["working", "blocked", "unknown"] {
-            set_worker_status(&assignment_worker_id, status);
-            scheduler.run_due_once().await.unwrap();
-            assert_eq!(reporting.prompts.lock().unwrap().len(), 3);
-            assert_eq!(count_rows("assignment_prompt_commands"), 1);
-            assert_eq!(count_rows("automatic_summary_request_watermarks"), 1);
-        }
-        set_worker_status(&assignment_worker_id, "done");
-        scheduler.run_due_once().await.unwrap();
-        assert_eq!(reporting.prompts.lock().unwrap().len(), 4);
-        assert_eq!(count_rows("yard_orchestrator_route_commands"), 1);
-        assert_eq!(count_rows("assignment_prompt_commands"), 2);
-        assert_eq!(count_rows("automatic_summary_request_watermarks"), 2);
-        assert_eq!(count_rows("automation_runs"), 1);
-
-        store
-            .update_token_spend_settings(UpdateTokenSpendSettings {
-                actor: "local-user".to_owned(),
-                expected_version: workers_only.version,
-                superintendent_auto_requests_project_summaries: false,
-                project_orchestrators_auto_request_worker_summaries: false,
-                scheduled_automatic_summaries: true,
-            })
-            .await
-            .unwrap();
-        scheduler.run_due_once().await.unwrap();
-        assert_eq!(reporting.prompts.lock().unwrap().len(), 5);
-        assert_eq!(count_rows("yard_orchestrator_route_commands"), 1);
-        assert_eq!(count_rows("assignment_prompt_commands"), 2);
-        assert_eq!(count_rows("automation_runs"), 2);
-        let runs = store
-            .list_automation_runs(&automation_id, 10)
-            .await
-            .unwrap();
-        assert_eq!(
-            runs.runs
-                .iter()
-                .filter(|run| { run.trigger == yard_domain::AutomationRunTrigger::Scheduled })
-                .count(),
-            1
+            response_json(response).await["error"]["code"],
+            "automatic_summary_isolation_required"
         );
     }
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn disabling_automatic_spend_waits_for_in_flight_dispatch_and_blocks_later_ticks() {
-        let temp = TempDir::new().unwrap();
-        let store = Arc::new(
-            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
-                .await
-                .unwrap(),
-        );
-        let source = Arc::new(FakeInventory);
-        let control = Arc::new(FakeRuntime);
-        let (reporting, prompt_entered, release_prompt) = ReportingRuntime::blocked();
-        let reporting = Arc::new(reporting);
-        let terminal = Arc::new(FakeRuntime);
-        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
-        let app = router(
-            source.clone(),
-            control.clone(),
-            reporting.clone(),
-            terminal,
-            store.clone(),
-            artifacts,
-        );
-        let (project_id, _) = create_active_assignment(&app).await;
-        let reconciliation = ReconciliationService::new(source.clone(), store.clone());
-        let coordination_nodes = CoordinationNodeService::new(
-            source.clone(),
-            control,
-            reporting.clone(),
-            store.clone(),
-            reconciliation,
-            temp.path().join("coordination"),
-            temp.path().join("knowledge"),
-        );
-        let interventions = InterventionService::new(source, reporting.clone(), store.clone());
-        let scheduler = AutomationService::new(store.clone(), interventions, coordination_nodes);
-
-        let automation_id = uuid::Uuid::now_v7().to_string();
-        store
-            .create_automation(
-                CreateAutomation {
-                    command_id: "create-blocked-scheduled-summary".to_owned(),
-                    actor: "local-user".to_owned(),
-                    automation_id: automation_id.clone(),
-                    name: "Blocked scheduled summary".to_owned(),
-                    scope: AutomationScope::ProjectOrchestrator {
-                        project_id: project_id.clone(),
-                    },
-                    placement: CanvasPlacement {
-                        x: 220.0,
-                        y: 180.0,
-                        width: 168.0,
-                        height: 58.0,
-                    },
-                    schedule: DailySchedule {
-                        hour: 9,
-                        minute: 0,
-                        timezone: "UTC".to_owned(),
-                    },
-                    selected_project_ids: vec![project_id.clone()],
-                    prompt_template: "Summarize current project status.".to_owned(),
-                },
-                1,
-            )
-            .await
-            .unwrap();
-        let defaults = scheduler.token_spend_settings().await.unwrap();
-        let enabled = scheduler
-            .update_token_spend_settings(UpdateTokenSpendSettings {
-                actor: "local-user".to_owned(),
-                expected_version: defaults.version,
-                superintendent_auto_requests_project_summaries: false,
-                project_orchestrators_auto_request_worker_summaries: false,
-                scheduled_automatic_summaries: true,
-            })
-            .await
-            .unwrap();
-
-        let running_scheduler = scheduler.clone();
-        let tick = tokio::spawn(async move { running_scheduler.run_due_once().await });
-        prompt_entered.notified().await;
-
-        let disabling_scheduler = scheduler.clone();
-        let mut disable = tokio::spawn(async move {
-            disabling_scheduler
-                .update_token_spend_settings(UpdateTokenSpendSettings {
-                    actor: "local-user".to_owned(),
-                    expected_version: enabled.version,
-                    superintendent_auto_requests_project_summaries: false,
-                    project_orchestrators_auto_request_worker_summaries: false,
-                    scheduled_automatic_summaries: false,
-                })
-                .await
+        let (app, _temp) = test_router().await;
+        let defaults = get_json(&app, "/api/v1/token-spend-settings").await;
+        let update = serde_json::json!({
+            "actor": "local-user",
+            "expected_version": defaults["version"],
+            "superintendent_auto_requests_project_summaries": false,
+            "project_orchestrators_auto_request_worker_summaries": false,
+            "scheduled_automatic_summaries": true
         });
-        assert!(
-            timeout(Duration::from_millis(50), &mut disable)
-                .await
-                .is_err()
-        );
-
-        release_prompt.notify_one();
-        tick.await.unwrap().unwrap();
-        let disabled = disable.await.unwrap().unwrap();
-        assert!(!disabled.scheduled_automatic_summaries);
-        assert_eq!(reporting.prompts.lock().unwrap().len(), 1);
-
-        let later_automation_id = uuid::Uuid::now_v7().to_string();
-        store
-            .create_automation(
-                CreateAutomation {
-                    command_id: "create-later-disabled-summary".to_owned(),
-                    actor: "local-user".to_owned(),
-                    automation_id: later_automation_id.clone(),
-                    name: "Later disabled summary".to_owned(),
-                    scope: AutomationScope::ProjectOrchestrator {
-                        project_id: project_id.clone(),
-                    },
-                    placement: CanvasPlacement {
-                        x: 420.0,
-                        y: 180.0,
-                        width: 168.0,
-                        height: 58.0,
-                    },
-                    schedule: DailySchedule {
-                        hour: 9,
-                        minute: 0,
-                        timezone: "UTC".to_owned(),
-                    },
-                    selected_project_ids: vec![project_id],
-                    prompt_template: "This must remain disabled.".to_owned(),
-                },
-                1,
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/v1/token-spend-settings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(update.to_string()))
+                    .unwrap(),
             )
             .await
             .unwrap();
-        scheduler.run_due_once().await.unwrap();
-        assert_eq!(reporting.prompts.lock().unwrap().len(), 1);
-        assert!(
-            store
-                .list_automation_runs(&later_automation_id, 10)
-                .await
-                .unwrap()
-                .runs
-                .is_empty()
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "automatic_summary_isolation_required"
         );
     }
 }
