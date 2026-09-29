@@ -15380,10 +15380,11 @@ test('total refresh failure replaces prior per-session errors', async ({ page })
 })
 
 test('shows immutable duplicate session ids and searchable unattached evidence', async ({ page }) => {
-  const state = await mockApi(page, {
+  const options = {
     fleetEdgeEvidence: true,
-    fleetPartialAfterFirst: true,
-  })
+    fleetPartialAfterFirst: false,
+  }
+  const state = await mockApi(page, options)
   state.runtimeInventory.workers[0].status = 'working'
   state.runtimeInventory.workers[1].status = 'idle'
   state.runtimeInventory.workers[2].status = 'blocked'
@@ -15446,6 +15447,7 @@ test('shows immutable duplicate session ids and searchable unattached evidence',
   )
   await page.unroute('**/api/v1/runtimes/herdr/inventory', totalFailure)
 
+  options.fleetPartialAfterFirst = true
   await inventory.getByRole('button', { name: 'Refresh Herdr inventory' }).click()
   await expect(inventory.getByText('shared · session-beta · stale')).toBeVisible()
   const staleRuntime = inventory.getByRole('button', {
