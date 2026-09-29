@@ -1238,6 +1238,52 @@ select:focus-visible {
   font-size: 9px;
 }
 
+.city-silhouette {
+  position: absolute;
+  right: 18px;
+  bottom: 14px;
+  left: 18px;
+  z-index: 0;
+  display: flex;
+  height: calc(100% - 78px);
+  min-height: 40px;
+  align-items: flex-end;
+  justify-content: center;
+  gap: clamp(3px, 1.4%, 8px);
+  pointer-events: none;
+  opacity: 0.28;
+}
+
+.city-silhouette::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--project-accent);
+  content: "";
+  opacity: 0.55;
+}
+
+.city-silhouette span {
+  width: var(--building-width);
+  max-width: 46px;
+  min-width: 10px;
+  height: var(--building-height);
+  min-height: 18px;
+  border: 1px solid
+    color-mix(in srgb, var(--project-accent) 72%, var(--ink));
+  border-bottom: 0;
+  border-radius: 2px 2px 0 0;
+  background:
+    repeating-linear-gradient(
+      to bottom,
+      color-mix(in srgb, var(--project-accent) 75%, var(--paper)) 0 5px,
+      color-mix(in srgb, var(--project-accent) 35%, transparent) 5px 7px
+    );
+}
+
 .worker-marker {
   position: relative;
   display: flex;
@@ -8713,53 +8759,6 @@ html[data-yard-allocation-dragging="true"]
   pointer-events: none;
 }
 
-.projected-territory__districts,
-.projected-district {
-  pointer-events: none;
-}
-
-.projected-district__outline {
-  fill: color-mix(in srgb, var(--paper) 10%, transparent);
-  stroke: color-mix(in srgb, var(--project-accent) 42%, var(--line));
-  stroke-dasharray: 4 3;
-  stroke-width: 1;
-}
-
-.projected-district[data-status="error"] .projected-district__outline,
-.projected-district[data-status="partial"] .projected-district__outline {
-  stroke: var(--vermilion);
-}
-
-.projected-district[data-status="unsupported"] .projected-district__outline {
-  stroke: var(--muted);
-}
-
-.projected-district__label,
-.projected-territory__empty,
-.projected-territory__scan-status {
-  fill: var(--ink);
-  font-family: "IBM Plex Mono", monospace;
-  paint-order: stroke fill;
-  pointer-events: none;
-  stroke: var(--paper);
-  stroke-linejoin: round;
-  stroke-width: 3px;
-}
-
-.projected-district__label {
-  font-size: 9px;
-  font-weight: 600;
-}
-
-.projected-territory__empty {
-  font-size: 11px;
-}
-
-.projected-territory__scan-status {
-  fill: var(--muted);
-  font-size: 8px;
-}
-
 /* Structures show three faces: a flat lighter top and two darker sides, all
    flat tonal steps of the project's own accent, with a crisp dark outline
    and a diagonal hatch on both side faces. A single side face (the original
@@ -8803,6 +8802,27 @@ html[data-yard-allocation-dragging="true"]
 .projected-building__hatch-line {
   stroke: var(--line-strong);
   stroke-width: 0.9;
+}
+
+.projected-building.is-completed .projected-building__face--top {
+  fill: color-mix(in srgb, var(--project-accent) 48%, var(--paper));
+}
+
+/* Real observed token usage on the skyline's tallest building — see
+   RuntimeCanvas.tsx's projectTokenTotal. The stroke-then-fill paint order
+   gives it a legible halo against whatever the roof's own tint happens to
+   be, without needing a background rect that would have its own theme and
+   projection concerns. */
+.projected-building__token-label {
+  fill: var(--ink);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  font-weight: 600;
+  paint-order: stroke fill;
+  stroke: var(--paper);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  pointer-events: none;
 }
 
 .projected-anchor__pad {
@@ -9265,6 +9285,10 @@ html[data-yard-allocation-dragging="true"]
   }
 }
 
+.runtime-canvas[data-visual-mode="depth"] .city-silhouette {
+  display: none;
+}
+
 .runtime-canvas[data-visual-mode="depth"] .workspace-region__meta {
   display: none;
 }
@@ -9358,7 +9382,6 @@ html[data-yard-allocation-dragging="true"]
 @media (forced-colors: active) {
   .projected-ground,
   .territory-polygon,
-  .projected-district__outline,
   .projected-building__face--top,
   .projected-building__face--side,
   .projected-building__face--side-b,

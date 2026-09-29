@@ -1,5 +1,4 @@
 pub mod allocation_service;
-pub mod architecture_service;
 pub mod artifact_service;
 pub mod automation_service;
 pub mod cleanup_retirement;

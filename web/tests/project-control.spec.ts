@@ -31,7 +31,6 @@ import type {
   ObservedStatus,
   ObservedWorker,
   OrchestratorWorkflowProfile,
-  ProjectArchitecture,
   ProjectRepository,
   ProjectRelationship,
   ProvisionYardOrchestratorInput,
@@ -320,72 +319,6 @@ function initialProjects() {
   ]
 }
 
-function initialArchitectures(): Record<string, ProjectArchitecture> {
-  return {
-    'project-1': {
-      project_id: 'project-1',
-      repositories: [
-        {
-          repository_id: 'repository-cargo',
-          name: 'control-plane',
-          status: 'ready',
-          nodes: [
-            {
-              id: 'repository-cargo:cargo:Cargo.toml',
-              kind: 'application',
-              name: 'yard-server',
-              manifest_path: 'Cargo.toml',
-              ecosystem: 'cargo',
-            },
-            {
-              id: 'repository-cargo:cargo:crates/domain/Cargo.toml',
-              kind: 'library',
-              name: 'yard-domain',
-              manifest_path: 'crates/domain/Cargo.toml',
-              ecosystem: 'cargo',
-            },
-          ],
-          edges: [
-            {
-              from: 'repository-cargo:cargo:Cargo.toml',
-              to: 'repository-cargo:cargo:crates/domain/Cargo.toml',
-            },
-          ],
-          errors: [],
-          truncated: false,
-        },
-        {
-          repository_id: 'repository-web',
-          name: 'web',
-          status: 'ready',
-          nodes: [
-            {
-              id: 'repository-web:npm:package.json',
-              kind: 'package',
-              name: 'yard-web',
-              manifest_path: 'package.json',
-              ecosystem: 'npm',
-            },
-          ],
-          edges: [],
-          errors: [],
-          truncated: false,
-        },
-      ],
-      scanned_at_unix_ms: 1_786_400_000_000,
-      stale: false,
-      truncated: false,
-    },
-    'project-2': {
-      project_id: 'project-2',
-      repositories: [],
-      scanned_at_unix_ms: 1_786_400_000_000,
-      stale: false,
-      truncated: false,
-    },
-  }
-}
-
 function initialWorkerCandidates(
   projects: ReturnType<typeof initialProjects>,
   profiles: ReturnType<typeof profile>[],
@@ -509,7 +442,6 @@ interface MockState {
   projectRelationshipCommands: CreateProjectRelationshipInput[]
   projectRelationships: ProjectRelationship[]
   projects: ReturnType<typeof initialProjects>
-  projectArchitectures: Record<string, ProjectArchitecture>
   projectRepositories: Record<string, ProjectRepository[]>
   repositoryMutations: Array<{
     method: 'POST' | 'PUT' | 'DELETE'
@@ -834,7 +766,6 @@ async function mockApi(
     projectRelationshipCommands: [],
     projectRelationships: [],
     projects: initialProjectState,
-    projectArchitectures: initialArchitectures(),
     projectRepositories: {},
     repositoryMutations: [],
     projectRequests: 0,
@@ -1980,9 +1911,6 @@ async function mockApi(
     const projectDetailMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)$/,
     )
-    const architectureMatch = url.pathname.match(
-      /^\/api\/v1\/projects\/([^/]+)\/architecture$/,
-    )
     const repositoryCollectionMatch = url.pathname.match(
       /^\/api\/v1\/projects\/([^/]+)\/repositories$/,
     )
@@ -2200,20 +2128,6 @@ async function mockApi(
               ],
             },
           ],
-        },
-      })
-      return
-    }
-
-    if (architectureMatch && request.method() === 'GET') {
-      const projectId = decodeURIComponent(architectureMatch[1])
-      await route.fulfill({
-        json: state.projectArchitectures[projectId] ?? {
-          project_id: projectId,
-          repositories: [],
-          scanned_at_unix_ms: Date.now(),
-          stale: false,
-          truncated: false,
         },
       })
       return
@@ -11437,35 +11351,6 @@ test('renders communication paths by durable activity state', async ({
   await expect(
     relationship.locator('.react-flow__edge-path'),
   ).toHaveCSS('stroke-dasharray', '6px, 5px')
-})
-
-test('projects one district per repository and one building per architecture node', async ({
-  page,
-}) => {
-  await mockApi(page)
-  await page.goto('/')
-
-  const territory = page.locator(
-    '.projected-territory[data-node-id="project:project-1"]',
-  )
-  await expect(territory.locator('.projected-district')).toHaveCount(2)
-  await expect(territory.locator('.projected-building')).toHaveCount(3)
-  await expect(
-    territory.locator(
-      '[data-architecture-node-id="repository-cargo:cargo:Cargo.toml"]',
-    ),
-  ).toHaveAttribute('aria-label', /yard-server, application, cargo/)
-  await expect(
-    territory.locator(
-      '[data-architecture-node-id="repository-web:npm:package.json"]',
-    ),
-  ).toHaveAttribute('aria-label', /yard-web, package, npm/)
-  await expect(page.locator('.projected-building__token-label')).toHaveCount(0)
-  await expect(
-    page
-      .locator('.projected-territory[data-node-id="project:project-2"]')
-      .getByText('No repositories linked'),
-  ).toBeVisible()
 })
 
 test('renders the map as one projected world and persists the view mode', async ({

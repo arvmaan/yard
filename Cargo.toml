@@ -42,7 +42,6 @@ tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-toml = "=0.9.12"
 uuid = { version = "1", features = ["v7"] }
 
 [workspace.lints.rust]

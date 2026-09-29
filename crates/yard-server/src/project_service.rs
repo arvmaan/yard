@@ -903,21 +903,6 @@ struct RepositoryIdentity {
     git_common_dir: String,
 }
 
-pub(crate) async fn validate_repository_identity_for_read(
-    repository: &ProjectRepository,
-) -> Result<(), ProjectServiceError> {
-    let identity = resolve_repository_identity(SetProjectRepository {
-        root_path: repository.root_path.clone(),
-    })
-    .await?;
-    if identity.root_path != repository.root_path
-        || identity.git_common_dir != repository.git_common_dir
-    {
-        return Err(ProjectServiceError::RepositoryIdentityChanged);
-    }
-    Ok(())
-}
-
 async fn resolve_repository_identity(
     repository: SetProjectRepository,
 ) -> Result<RepositoryIdentity, ProjectServiceError> {

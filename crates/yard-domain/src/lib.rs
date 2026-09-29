@@ -1,5 +1,4 @@
 mod agent_profile;
-mod architecture;
 mod artifact;
 mod assignment;
 mod automation;
@@ -31,10 +30,6 @@ pub use agent_profile::{
     CapabilityNegotiationReport, CapabilityRequest, CapabilityRequirement, CapabilitySupportStatus,
     CreateAgentProfile, CredentialSlot, CredentialSlotKind, HERDR_EXTENSION_KEY,
     PreparedAgentProfile, UpdateAgentProfile, WORKER_PROFILE_EXTENSION_KEY,
-};
-pub use architecture::{
-    ArchitectureEcosystem, ArchitectureEdge, ArchitectureNode, ArchitectureNodeKind,
-    ArchitectureRepositoryStatus, ProjectArchitecture, RepositoryArchitecture,
 };
 pub use artifact::{
     Artifact, ArtifactContent, ArtifactKind, ArtifactRegistration, ArtifactSource,

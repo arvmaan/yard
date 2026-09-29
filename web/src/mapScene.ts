@@ -8,12 +8,6 @@
  */
 
 import type { WorldPoint, WorldRect } from './mapProjection'
-import type {
-  ArchitectureEcosystem,
-  ArchitectureNodeKind,
-  ArchitectureRepositoryStatus,
-  RepositoryArchitecture,
-} from './types'
 
 export type ProjectedRouteState = 'active' | 'failed' | 'idle'
 
@@ -34,33 +28,15 @@ export type ProjectedAnchorKind =
 
 export interface ProjectedBuilding {
   colorSeed: number
-  ecosystem: ArchitectureEcosystem
+  completed: boolean
   footprint: WorldRect
   height: number
-  id: string
-  kind: ArchitectureNodeKind
-  manifestPath: string
-  name: string
-}
-
-export interface ProjectedDistrict {
-  error: string | null
-  id: string
-  label: string
-  rect: WorldRect
-  status: ArchitectureRepositoryStatus
-  truncated: boolean
 }
 
 export interface ProjectedTerritory {
   accent: string
   allocationTarget: boolean
-  architectureScannedAt?: number
-  architectureStale?: boolean
-  architectureTruncated?: boolean
   buildings: ProjectedBuilding[]
-  districts: ProjectedDistrict[]
-  emptyLabel?: string
   kind: 'project' | 'workspace'
   label: string
   nodeId: string
@@ -68,6 +44,25 @@ export interface ProjectedTerritory {
   runtime: string
   selected: boolean
   status: string
+  tokenTotal?: number
+}
+
+/**
+ * Compact token-count label for a building — real observed usage rounded to
+ * the precision a small map label can actually show, not a precise counter.
+ * Returns null below 1000 tokens: a bare one- or two-digit number reads as
+ * noise on a skyline, not as a meaningful figure.
+ */
+export function formatTokenCount(total: number): string | null {
+  if (total >= 1_000_000) {
+    const millions = total / 1_000_000
+    return `${millions >= 10 ? Math.round(millions) : Math.round(millions * 10) / 10}M`
+  }
+  if (total >= 1_000) {
+    const thousands = total / 1_000
+    return `${thousands >= 10 ? Math.round(thousands) : Math.round(thousands * 10) / 10}K`
+  }
+  return null
 }
 
 export interface ProjectedAnchor {
@@ -109,81 +104,145 @@ export function stableHash(value: string) {
   return hash >>> 0
 }
 
+const BUILDING_INSET = 0.09
+const BUILDING_MAX_HEIGHT = 230
+// Narrower than before (was 0.92): still close enough to read as a cluster
+// standing shoulder to shoulder, but leaves each footprint's base visibly
+// slimmer relative to the height it now reaches, for skyscraper proportions
+// rather than blocky ones.
+const BUILDING_FOOTPRINT_RATIO = 0.8
+
 /**
- * Project architecture laid out as one district per linked repository and one
- * building per detected manifest node. A building's geometry depends only on
- * its stable node identity and district rectangle, so adding another node does
- * not move existing buildings.
+ * Square-spiral cell offsets, center outward: index 0 is the center cell,
+ * then each ring of 8*k cells surrounds the previous one. Paired with
+ * height-descending placement below, this is what makes a skyline's tallest
+ * buildings cluster at its core and shorter ones spread outward as more are
+ * added — the opposite of a plain row-major grid, which has no center to
+ * grow outward from.
  */
-export function architectureLayout(
-  repositories: RepositoryArchitecture[],
+function spiralOffsets(count: number): { col: number; row: number }[] {
+  const offsets: { col: number; row: number }[] = [{ col: 0, row: 0 }]
+  let col = 0
+  let row = 0
+  let steps = 1
+  let direction = 0
+  const deltaCol = [1, 0, -1, 0]
+  const deltaRow = [0, 1, 0, -1]
+  while (offsets.length < count) {
+    for (let leg = 0; leg < 2 && offsets.length < count; leg += 1) {
+      for (let step = 0; step < steps && offsets.length < count; step += 1) {
+        col += deltaCol[direction]
+        row += deltaRow[direction]
+        offsets.push({ col, row })
+      }
+      direction = (direction + 1) % 4
+    }
+    steps += 1
+  }
+  return offsets
+}
+
+/**
+ * Deterministic building footprints for a project territory.
+ *
+ * Reuses the identity hash and the height curve the flat city silhouette used,
+ * so a project's skyline is recognisably the same city before and after the
+ * move to projected geometry — only the geometry it is expressed in changed.
+ * Footprints are laid out on a world-space grid inside the territory, which is
+ * what keeps every building standing on the ground plane its territory lies on.
+ * Footprints stay narrow relative to height — skyscraper massing, not
+ * warehouse massing. `Territory` in ProjectedMap.tsx paints these back-to-
+ * front by world depth, which is what keeps a packed, spiraled cluster like
+ * this one from having a tall building blot out a shorter neighbor's face.
+ */
+export function territoryBuildings(
+  projectId: string,
+  buildingCount: number,
+  completedBuildingCount: number,
   rect: WorldRect,
-): { buildings: ProjectedBuilding[]; districts: ProjectedDistrict[] } {
-  const sorted = [...repositories].sort((a, b) =>
-    a.repository_id.localeCompare(b.repository_id),
-  )
-  if (sorted.length === 0) return { buildings: [], districts: [] }
-  const inset = Math.max(12, Math.min(rect.width, rect.height) * 0.06)
-  const gap = Math.max(8, Math.min(rect.width, rect.height) * 0.025)
-  const columns = Math.ceil(Math.sqrt(sorted.length))
-  const rows = Math.ceil(sorted.length / columns)
-  const width = Math.max(1, (rect.width - inset * 2 - gap * (columns - 1)) / columns)
-  const height = Math.max(1, (rect.height - inset * 2 - gap * (rows - 1)) / rows)
-  const districts = sorted.map((repository, index): ProjectedDistrict => ({
-    error: repository.errors[0] ?? null,
-    id: repository.repository_id,
-    label: repository.name,
-    rect: {
-      x: rect.x + inset + (index % columns) * (width + gap),
-      y: rect.y + inset + Math.floor(index / columns) * (height + gap),
-      width,
-      height,
-    },
-    status: repository.status,
-    truncated: repository.truncated,
-  }))
-  const buildings = sorted.flatMap((repository, index) => {
-    const district = districts[index].rect
-    const labelBand = Math.min(28, district.height * 0.2)
-    const usableHeight = Math.max(1, district.height - labelBand)
-    const footprintBase = Math.max(
-      10,
-      Math.min(30, Math.min(district.width, usableHeight) * 0.12),
+): ProjectedBuilding[] {
+  if (buildingCount <= 0) return []
+  const insetX = rect.width * BUILDING_INSET
+  const insetY = rect.height * BUILDING_INSET
+  const fieldWidth = Math.max(1, rect.width - insetX * 2)
+  const fieldHeight = Math.max(1, rect.height - insetY * 2)
+
+  const buildings = Array.from({ length: buildingCount }, (_, index) => {
+    const hash = stableHash(`${projectId}:building:${index}`)
+    const completed =
+      index >= Math.max(1, buildingCount - completedBuildingCount)
+    const height = Math.min(
+      BUILDING_MAX_HEIGHT,
+      70 +
+        (hash % 110) +
+        Math.round(buildingCount * 2.4) +
+        (completed ? 32 : 0),
     )
-    return [...repository.nodes]
-      .sort((a, b) => a.id.localeCompare(b.id))
-      .map((node): ProjectedBuilding => {
-        const hash = stableHash(node.id)
-        const widthRatio = 0.72 + ((hash >>> 8) % 18) / 100
-        const depthRatio = 0.72 + ((hash >>> 14) % 18) / 100
-        const footprintWidth = footprintBase * widthRatio
-        const footprintHeight = footprintBase * depthRatio
-        const xRange = Math.max(0, district.width - footprintWidth)
-        const yRange = Math.max(0, usableHeight - footprintHeight)
-        return {
-          colorSeed: (hash >>> 20) % 100,
-          ecosystem: node.ecosystem,
-          footprint: {
-            x: district.x + ((hash & 0xffff) / 0xffff) * xRange,
-            y:
-              district.y +
-              labelBand +
-              (((hash >>> 16) & 0xffff) / 0xffff) * yRange,
-            width: footprintWidth,
-            height: footprintHeight,
-          },
-          height:
-            44 +
-            (hash % 76) +
-            (node.kind === 'application' || node.kind === 'service' ? 24 : 0),
-          id: node.id,
-          kind: node.kind,
-          manifestPath: node.manifest_path,
-          name: node.name,
-        }
-      })
+    const widthRatio = BUILDING_FOOTPRINT_RATIO - ((hash >>> 8) % 10) / 100
+    const depthRatio = BUILDING_FOOTPRINT_RATIO - ((hash >>> 14) % 10) / 100
+    // Seeds a small per-building tint variance in ProjectedMap.tsx, so a
+    // skyline reads as individually-colored buildings in related tones of
+    // the project's accent rather than one flat repeated color.
+    const colorSeed = (hash >>> 20) % 100
+    return { colorSeed, completed, depthRatio, height, widthRatio }
   })
-  return { buildings, districts }
+
+  const tallestFirst = [...buildings].sort((a, b) => b.height - a.height)
+  const positions = spiralOffsets(buildingCount)
+  const cols = positions.map((point) => point.col)
+  const rows = positions.map((point) => point.row)
+  const minCol = Math.min(...cols)
+  const maxCol = Math.max(...cols)
+  const minRow = Math.min(...rows)
+  const maxRow = Math.max(...rows)
+
+  // Positions ordered front-to-back, not by spiral generation order: world
+  // depth here is (col + row) — the same combination the projection's v-axis
+  // uses — so the position with the highest col+row is the one closest to
+  // the camera, with nothing else in the cluster in front of it. Pairing
+  // that with the tallest building first (below) means the tallest building
+  // always lands where nothing can paint over it. Placing it at the spiral's
+  // geometric center instead — the first version of this — surrounded it
+  // with touching neighbors on every side, and neighbors positioned in front
+  // painted over most of its side face: pixel-sampled, roughly two-thirds of
+  // the tallest building's own side color was replaced by a neighbor's top
+  // face. A shorter building losing part of its face to something taller in
+  // front of it reads as normal skyline occlusion; a tall building
+  // half-erased by a short building in front of it reads as broken.
+  const frontToBack = [...positions].sort(
+    (a, b) => b.col + b.row - (a.col + a.row),
+  )
+
+  // A fixed cell span rather than one sized to fit exactly buildingCount
+  // cells: the spiral needs equal room to grow in every direction from its
+  // center, and constraining the cell size to the field's smaller dimension
+  // is what keeps buildings touching as the count grows, instead of the
+  // spiral's footprint just expanding to fill whatever space exists.
+  const span = Math.max(maxCol - minCol + 1, maxRow - minRow + 1, 1)
+  const cellSize = Math.min(fieldWidth, fieldHeight) / span
+  const clusterWidth = (maxCol - minCol + 1) * cellSize
+  const clusterHeight = (maxRow - minRow + 1) * cellSize
+  const originX = rect.x + insetX + (fieldWidth - clusterWidth) / 2
+  const originY = rect.y + insetY + (fieldHeight - clusterHeight) / 2
+
+  return tallestFirst.map((building, rank) => {
+    const { col, row } = frontToBack[rank]
+    const footprintWidth = cellSize * building.widthRatio
+    const footprintHeight = cellSize * building.depthRatio
+    const cellX = originX + (col - minCol) * cellSize
+    const cellY = originY + (row - minRow) * cellSize
+    return {
+      colorSeed: building.colorSeed,
+      completed: building.completed,
+      footprint: {
+        x: cellX + (cellSize - footprintWidth) / 2,
+        y: cellY + (cellSize - footprintHeight) / 2,
+        width: footprintWidth,
+        height: footprintHeight,
+      },
+      height: building.height,
+    }
+  })
 }
 
 /**

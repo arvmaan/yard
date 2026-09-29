@@ -25,8 +25,7 @@ use yard_domain::{
     DeletedWorker, EndWorkerSession, EndedWorkerSession, ManageAllAgents,
     OrchestratorPromptAcknowledgement, OrchestratorTerminalOutput, OrchestratorWorkflowProfile,
     OrchestratorWorkflowProfiles, PaneManagementBatchResult, PaneManagementPreview, Project,
-    ProjectArchitecture, ProjectRelationships, ProjectRepositories, ProjectRepository, Projects,
-    PromptAcknowledgement, ProvisionCoordinationNode, ProvisionYardOrchestrator,
+    ProjectRelationships, ProjectRepositories, ProjectRepository, Projects, PromptAcknowledgement, ProvisionCoordinationNode, ProvisionYardOrchestrator,
     ReceiveSummaryWorker, RecordCompletionReceipt, RecordedCompletionReceipt,
     RecoverYardOrchestrator, RecoveredYardOrchestrator, ReplaceProjectOrchestrator,
     ReplacedProjectOrchestrator, RepositoryDiff, RepositoryFileContent, RepositoryFileMode,
@@ -50,7 +49,6 @@ use yard_store::{MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT, ProjectStoreError,
 
 use crate::ConnectionTracker;
 use crate::allocation_service::{AllocationService, AllocationServiceError, RuntimeControl};
-use crate::architecture_service::{ArchitectureService, ArchitectureServiceError};
 use crate::artifact_service::{ArtifactService, ArtifactServiceError, StoredArtifact};
 use crate::automation_service::{AutomationService, AutomationServiceError};
 use crate::coordination_node_service::{CoordinationNodeService, CoordinationNodeServiceError};
@@ -90,7 +88,6 @@ struct AppState {
     source: Arc<dyn InventorySource>,
     reconciliation: ReconciliationService,
     projects: ProjectService,
-    architecture: ArchitectureService,
     repository_files: RepositoryFilesService,
     profiles: ProfileService,
     orchestrator_workflow_profiles: OrchestratorWorkflowProfileService,
@@ -238,7 +235,6 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         Arc::clone(&runtime),
         Arc::clone(&store),
     );
-    let architecture = ArchitectureService::new(Arc::clone(&store));
     let repository_files = RepositoryFilesService::new(projects.clone());
     let profiles = ProfileService::new(Arc::clone(&store));
     let orchestrator_workflow_profiles =
@@ -482,10 +478,6 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         )
         .route("/api/v1/projects/{project_id}", get(get_project))
         .route(
-            "/api/v1/projects/{project_id}/architecture",
-            get(get_project_architecture),
-        )
-        .route(
             "/api/v1/projects/{project_id}/repositories",
             get(list_project_repositories).post(link_project_repository),
         )
@@ -611,7 +603,6 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             source,
             reconciliation,
             projects,
-            architecture,
             repository_files,
             profiles,
             orchestrator_workflow_profiles,
@@ -1420,18 +1411,6 @@ async fn get_project(
 ) -> Result<NoStoreJson<Project>, ApiError> {
     state
         .projects
-        .get(&project_id)
-        .await
-        .map(NoStoreJson)
-        .map_err(ApiError::from)
-}
-
-async fn get_project_architecture(
-    State(state): State<AppState>,
-    Path(project_id): Path<String>,
-) -> Result<NoStoreJson<ProjectArchitecture>, ApiError> {
-    state
-        .architecture
         .get(&project_id)
         .await
         .map(NoStoreJson)
@@ -2414,23 +2393,6 @@ impl From<ArtifactServiceError> for ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "artifact_storage_error",
                 message: "Yard artifact storage is unavailable".to_owned(),
-            },
-        }
-    }
-}
-
-impl From<ArchitectureServiceError> for ApiError {
-    fn from(error: ArchitectureServiceError) -> Self {
-        match error {
-            ArchitectureServiceError::Store(ProjectStoreError::ProjectNotFound) => Self {
-                status: StatusCode::NOT_FOUND,
-                code: "project_not_found",
-                message: "Yard project was not found".to_owned(),
-            },
-            ArchitectureServiceError::Store(_) | ArchitectureServiceError::ScanTask(_) => Self {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                code: "architecture_unavailable",
-                message: "Project architecture is unavailable".to_owned(),
             },
         }
     }
@@ -9574,91 +9536,6 @@ mod tests {
         let projects = response_json(response).await;
 
         assert_eq!(projects["projects"][0]["id"], created["id"]);
-    }
-
-    #[tokio::test]
-    async fn projects_linked_repository_architecture_as_bounded_json() {
-        let temp = TempDir::new().unwrap();
-        let store = Arc::new(
-            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
-                .await
-                .unwrap(),
-        );
-        let runtime = Arc::new(FakeRuntime);
-        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
-        let app = router(
-            Arc::new(FakeInventory),
-            runtime.clone(),
-            runtime.clone(),
-            runtime,
-            store.clone(),
-            artifacts,
-        );
-        let created = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/v1/projects")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(create_body("terminal-1")))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let project = response_json(created).await;
-        let project_id = project["id"].as_str().unwrap();
-
-        let repository = temp.path().join("architecture-repository");
-        std::fs::create_dir_all(repository.join("src")).unwrap();
-        std::fs::write(
-            repository.join("Cargo.toml"),
-            "[package]\nname = \"fixture-app\"\nversion = \"0.1.0\"\n[[bin]]\nname = \"fixture-app\"\n",
-        )
-        .unwrap();
-        assert!(
-            Command::new("git")
-                .args(["init", "--quiet"])
-                .current_dir(&repository)
-                .status()
-                .unwrap()
-                .success()
-        );
-        let root = std::fs::canonicalize(&repository).unwrap();
-        let git_common_dir = std::fs::canonicalize(repository.join(".git")).unwrap();
-        store
-            .create_project_repository(
-                project_id,
-                "repository-1",
-                root.to_str().unwrap(),
-                git_common_dir.to_str().unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/v1/projects/{project_id}/architecture"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-        let architecture = response_json(response).await;
-        assert_eq!(architecture["project_id"], project_id);
-        assert_eq!(architecture["repositories"][0]["status"], "ready");
-        assert_eq!(
-            architecture["repositories"][0]["nodes"][0]["name"],
-            "fixture-app"
-        );
-        assert_eq!(
-            architecture["repositories"][0]["nodes"][0]["kind"],
-            "application"
-        );
     }
 
     #[allow(clippy::too_many_lines)]
