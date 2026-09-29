@@ -9792,11 +9792,7 @@ html[data-yard-allocation-dragging="true"]
   }
 
   .global-workspace-switcher button {
-    width: 25px;
-  }
-
-  .global-workspace-switcher__files {
-    display: none !important;
+    width: 23px;
   }
 
   .agent-workspace-toolbar {

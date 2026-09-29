@@ -5397,6 +5397,11 @@ test('keeps Slice 1 chrome visible and motion-safe at mobile widths', async ({
       name: /Runtime health: alpha, Herdr observed/,
     })
     await expect(healthTrigger).toBeVisible()
+    for (const view of ['Map', 'Chat', 'Terminal', 'Files']) {
+      await expect(
+        commandBar.getByRole('tab', { name: `${view} view` }),
+      ).toBeVisible()
+    }
     await expect(page.locator('.resource-shelf')).toHaveCount(0)
     await expect(page.locator('.react-flow__minimap')).toBeHidden()
     expect((await commandBar.boundingBox())?.height).toBeLessThanOrEqual(46)
