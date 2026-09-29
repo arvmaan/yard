@@ -719,28 +719,24 @@ export function AgentWorkspaceShell({
                           <TargetIcon target={target} />
                           <i aria-hidden="true" />
                         </span>
-                        <span className="agent-window-row__body">
-                          <span className="agent-window-row__identity">
-                            <strong>{target.label}</strong>
-                            <small>
+                          <span className="agent-window-row__body">
+                            <span className="agent-window-row__identity">
+                              <strong>{target.label}</strong>
+                            </span>
+                            <small className="agent-window-row__connection">
                               {!target.interactive
                                 ? target.capabilityDetail ??
                                   runtimeCapabilityLabel(
                                     targetCapabilities(target),
                                   )
                                 : target.observation === 'stale'
-                                ? 'Connection status stale'
-                                : target.observation === 'observed'
-                                  ? target.interactive
+                                  ? 'Connection status stale'
+                                  : target.observation === 'observed'
                                     ? target.chatAvailable
                                       ? `Runtime ${target.status}`
                                       : 'Observed · terminal only'
-                                    : runtimeCapabilityLabel(
-                                        targetCapabilities(target),
-                                      )
-                                  : 'Connection status unknown'}
+                                    : 'Connection status unknown'}
                             </small>
-                          </span>
                           <small className="agent-window-row__context">
                             {target.roleLabel} · {target.contextLabel}
                           </small>

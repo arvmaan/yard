@@ -54,7 +54,7 @@ use yard_domain::{
     UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
     UpdateProjectWorkflowProfile, UpdateTokenSpendSettings, UpdateWorkerProfile, Worker,
     WorkerAllocation, WorkerAvailability, WorkerCandidate, WorkerCandidates, WorkerDesiredState,
-    WorkerProfile, WorkerProfileSpec, WorkerProfiles, WorkerRuntimeBinding,
+    WorkerOwnershipKind, WorkerProfile, WorkerProfileSpec, WorkerProfiles, WorkerRuntimeBinding,
     YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator, YardOrchestratorPromptAcknowledgement,
     YardOrchestratorRoute, YardOrchestratorRoutes, herdr_agent_name,
 };
@@ -11717,7 +11717,8 @@ const PROJECT_SELECT: &str = "
            wrb.runtime_revision, wrb.version,
            wrb.last_observed_at_unix_ms,
            pwpp.profile_id, pwpp.profile_version,
-           pwpp.pinned_by, pwpp.pinned_at_unix_ms
+           pwpp.pinned_by, pwpp.pinned_at_unix_ms,
+           w.ownership_kind
       FROM projects p
       JOIN project_workspace_bindings pwb ON pwb.project_id = p.id
       JOIN project_placements pp ON pp.project_id = p.id
@@ -11758,7 +11759,8 @@ const ASSIGNMENT_SELECT: &str = "
            wrb.runtime_revision, wrb.version, wrb.last_observed_at_unix_ms,
            aa.id, aa.ordinal, aa.lifecycle, aa.error_message, aa.version,
            aa.created_at_unix_ms, aa.updated_at_unix_ms,
-           wa.mode, wa.started_by_command_id, wa.started_at_unix_ms
+           wa.mode, wa.started_by_command_id, wa.started_at_unix_ms,
+           w.ownership_kind
       FROM assignments a
       JOIN worker_allocations wa ON wa.id = a.allocation_id
       JOIN workers w ON w.id = a.worker_id
@@ -11830,7 +11832,8 @@ const WORKER_CANDIDATE_SELECT: &str = "
                  FROM worker_cleanup_run_items cleanup
                 WHERE cleanup.worker_id = w.id
                   AND cleanup.status = 'pending'
-           )
+           ),
+           w.ownership_kind
       FROM workers w
       LEFT JOIN worker_profile_revisions pr
         ON pr.profile_id = w.profile_id AND pr.version = w.profile_version
@@ -14932,6 +14935,7 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
             id: row.get(14)?,
             profile_id: row.get(15)?,
             profile_version: row_optional_u64(row, 16)?,
+            ownership_kind: worker_ownership_kind(row, 43)?,
             desired_state,
             runtime,
             version: row_u64(row, 18)?,
@@ -17523,6 +17527,7 @@ fn worker_candidate_from_row(row: &Row<'_>) -> rusqlite::Result<WorkerCandidate>
             id: row.get(0)?,
             profile_id,
             profile_version: row_optional_u64(row, 2)?,
+            ownership_kind: worker_ownership_kind(row, 33)?,
             desired_state,
             runtime,
             version: row_u64(row, 4)?,
@@ -17822,6 +17827,7 @@ fn assignment_record_from_row(row: &Row<'_>) -> rusqlite::Result<AssignmentRecor
                 id: worker_id,
                 profile_id: row.get(14)?,
                 profile_version: row_optional_u64(row, 15)?,
+                ownership_kind: worker_ownership_kind(row, 48)?,
                 desired_state,
                 runtime,
                 version: row_u64(row, 17)?,
@@ -18836,6 +18842,15 @@ fn handoff_target_role_from_row(
     }
 }
 
+fn worker_ownership_kind(row: &Row<'_>, index: usize) -> rusqlite::Result<WorkerOwnershipKind> {
+    match row.get::<_, String>(index)?.as_str() {
+        "external" => Ok(WorkerOwnershipKind::External),
+        "yard_owned" => Ok(WorkerOwnershipKind::YardOwned),
+        "system_ephemeral" => Ok(WorkerOwnershipKind::SystemEphemeral),
+        value => Err(enum_conversion_error(index, "worker ownership kind", value)),
+    }
+}
+
 fn old_session_disposition_from_row(
     row: &Row<'_>,
     index: usize,
@@ -19548,8 +19563,8 @@ mod tests {
         UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
         UpdateProjectWorkflowProfile, UpdateTokenSpendSettings, UpdateWorkerProfile,
         WorkerAvailability, WorkerCleanupItemStatus, WorkerCleanupRunStatus,
-        WorkerCleanupRunTrigger, WorkerProfile, WorkerProfileSpec, WorkerRuntimeBinding,
-        YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator,
+        WorkerCleanupRunTrigger, WorkerOwnershipKind, WorkerProfile, WorkerProfileSpec,
+        WorkerRuntimeBinding, YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator,
     };
 
     use super::{
@@ -30444,6 +30459,19 @@ mod tests {
         let store = open_store(&temp).await;
         let (_, assignment, _) = create_eligible_cleanup_candidate(&store, "ownership").await;
         let worker_id = assignment.worker.id.clone();
+        assert_eq!(
+            store
+                .list_worker_candidates()
+                .await
+                .unwrap()
+                .workers
+                .into_iter()
+                .find(|candidate| candidate.worker.id == worker_id)
+                .unwrap()
+                .worker
+                .ownership_kind,
+            WorkerOwnershipKind::YardOwned
+        );
         store
             .run({
                 let worker_id = worker_id.clone();
@@ -30463,6 +30491,19 @@ mod tests {
                 .retained_reasons
                 .contains(&CompletedRuntimeRetentionReason::NotYardOwned)
         );
+        assert_eq!(
+            store
+                .list_worker_candidates()
+                .await
+                .unwrap()
+                .workers
+                .into_iter()
+                .find(|candidate| candidate.worker.id == worker_id)
+                .unwrap()
+                .worker
+                .ownership_kind,
+            WorkerOwnershipKind::External
+        );
 
         store
             .run(move |connection| {
@@ -30480,6 +30521,19 @@ mod tests {
         let reasons = &advisor.preview.candidates[0].retained_reasons;
         assert!(reasons.contains(&CompletedRuntimeRetentionReason::ParentOwnershipMismatch));
         assert!(reasons.contains(&CompletedRuntimeRetentionReason::CleanupAdvisorArtifactMissing));
+        assert_eq!(
+            store
+                .list_worker_candidates()
+                .await
+                .unwrap()
+                .workers
+                .into_iter()
+                .find(|candidate| candidate.worker.id == assignment.worker.id)
+                .unwrap()
+                .worker
+                .ownership_kind,
+            WorkerOwnershipKind::SystemEphemeral
+        );
     }
 
     #[tokio::test]

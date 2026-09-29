@@ -51,6 +51,7 @@ function worker(id: string, workerRuntime: WorkerRuntimeBinding): Worker {
     id,
     profile_id: null,
     profile_version: null,
+    ownership_kind: 'external',
     desired_state: 'running',
     runtime: workerRuntime,
     version: '1',

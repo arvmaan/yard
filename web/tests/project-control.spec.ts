@@ -26,6 +26,7 @@ import type {
   ConfirmWorkerHandoffInput,
   CreateProjectFromProfileInput,
   CreateWorkspaceProjectFromProfileInput,
+  DeleteWorkerInput,
   EndWorkerSessionInput,
   ObservedChildAgent,
   ObservedStatus,
@@ -215,6 +216,7 @@ function durableWorker(
     id,
     profile_id: workerProfile?.id ?? null,
     profile_version: workerProfile?.version ?? null,
+    ownership_kind: 'external',
     desired_state: 'running',
     runtime: terminalId
       ? {
@@ -341,18 +343,21 @@ function initialWorkerCandidates(
       reason: 'Live worker is not assigned to a project.',
     },
     {
-      worker: durableWorker(
-        'worker-resumable',
-        'terminal-7',
-        profiles[0],
-        'workspace-2',
-        'alpha',
-        true,
-        {
-          process_state: 'exited',
-          status: 'idle',
-        },
-      ),
+      worker: {
+        ...durableWorker(
+          'worker-resumable',
+          'terminal-7',
+          profiles[0],
+          'workspace-2',
+          'alpha',
+          true,
+          {
+            process_state: 'exited',
+            status: 'idle',
+          },
+        ),
+        ownership_kind: 'yard_owned',
+      },
       profile_name: profiles[0].name,
       default_role: profiles[0].default_role,
       availability: 'resumable',
@@ -360,7 +365,10 @@ function initialWorkerCandidates(
       reason: 'The previous assignment is complete.',
     },
     {
-      worker: durableWorker('worker-assigned', 'terminal-3', profiles[0]),
+      worker: {
+        ...durableWorker('worker-assigned', 'terminal-3', profiles[0]),
+        ownership_kind: 'yard_owned',
+      },
       profile_name: profiles[0].name,
       default_role: profiles[0].default_role,
       availability: 'assigned',
@@ -387,19 +395,22 @@ function initialWorkerCandidates(
       reason: 'Runtime binding is unavailable.',
     },
     {
-      worker: durableWorker(
-        'worker-ambiguous',
-        'terminal-ambiguous',
-        null,
-        'workspace-1',
-        'alpha',
-        true,
-        {
-          observation_state: 'ambiguous',
-          process_state: 'unknown',
-          status: 'unknown',
-        },
-      ),
+      worker: {
+        ...durableWorker(
+          'worker-ambiguous',
+          'terminal-ambiguous',
+          null,
+          'workspace-1',
+          'alpha',
+          true,
+          {
+            observation_state: 'ambiguous',
+            process_state: 'unknown',
+            status: 'unknown',
+          },
+        ),
+        ownership_kind: 'yard_owned',
+      },
       availability: 'ambiguous',
       reason: 'Worker ownership could not be reconciled.',
     },
@@ -491,6 +502,14 @@ interface MockState {
   handoffCommands: ConfirmWorkerHandoffInput[]
   handoffRequestCommandIds: string[]
   endSessionCommands: EndWorkerSessionInput[]
+  workerEndSessionRequests: Array<{
+    input: EndWorkerSessionInput
+    workerId: string
+  }>
+  workerDeleteRequests: Array<{
+    input: DeleteWorkerInput
+    workerId: string
+  }>
   profileProjectCommands: CreateProjectFromProfileInput[]
   workspaceProjectCommands: CreateWorkspaceProjectFromProfileInput[]
   promptCommands: SendAssignmentPromptInput[]
@@ -815,6 +834,8 @@ async function mockApi(
     handoffCommands: [],
     handoffRequestCommandIds: [],
     endSessionCommands: [],
+    workerEndSessionRequests: [],
+    workerDeleteRequests: [],
     profileProjectCommands: [],
     workspaceProjectCommands: [],
     promptCommands: [],
@@ -1365,6 +1386,7 @@ async function mockApi(
     )
     const input = request.postDataJSON() as EndWorkerSessionInput
     state.endSessionCommands.push(input)
+    state.workerEndSessionRequests.push({ input, workerId })
     const index = state.workerCandidates.findIndex(
       (candidate) => candidate.worker.id === workerId,
     )
@@ -1401,6 +1423,33 @@ async function mockApi(
         worker: endedWorker,
         cleanup_pending: options.endSessionCleanupPending ?? false,
         replayed: false,
+      },
+    })
+  })
+
+  await page.route('**/api/v1/workers/*/delete', async (route) => {
+    const request = route.request()
+    const workerId = decodeURIComponent(
+      new URL(request.url()).pathname.split('/')[4],
+    )
+    const input = request.postDataJSON() as DeleteWorkerInput
+    state.workerDeleteRequests.push({ input, workerId })
+    const index = state.workerCandidates.findIndex(
+      (candidate) => candidate.worker.id === workerId,
+    )
+    const candidate = state.workerCandidates[index]
+    if (!candidate || candidate.worker.desired_state !== 'ended') {
+      await route.fulfill({ status: 409 })
+      return
+    }
+    state.workerCandidates.splice(index, 1)
+    await route.fulfill({
+      json: {
+        cleanup_pending: false,
+        command_id: input.command_id,
+        deleted_at_unix_ms: Date.now(),
+        replayed: false,
+        worker_id: workerId,
       },
     })
   })
@@ -4947,10 +4996,15 @@ test('keeps worker filters visible and scrolls resources inside the shelf', asyn
     const filters = page
       .getByLabel('Filter workers')
       .getByRole('button')
-    await expect(filters).toHaveCount(5)
+    await expect(filters).toHaveCount(6)
+    await expect(
+      page.getByLabel('Filter workers').getByRole('button', {
+        name: /^Stale/,
+      }),
+    ).toBeVisible()
     const shelfBounds = await shelf.boundingBox()
     expect(shelfBounds).not.toBeNull()
-    for (let index = 0; index < 5; index += 1) {
+    for (let index = 0; index < 6; index += 1) {
       const filterBounds = await filters.nth(index).boundingBox()
       expect(filterBounds).not.toBeNull()
       expect(filterBounds?.y ?? -1).toBeGreaterThanOrEqual(
@@ -4962,6 +5016,28 @@ test('keeps worker filters visible and scrolls resources inside the shelf', asyn
         (shelfBounds?.y ?? 0) + (shelfBounds?.height ?? 0),
       )
     }
+    const headingBounds = await shelf
+      .locator('.worker-shelf-controls .section-heading')
+      .boundingBox()
+    const filterGroupBounds = await shelf
+      .getByLabel('Filter workers')
+      .boundingBox()
+    const headingBottom =
+      (headingBounds?.y ?? 0) + (headingBounds?.height ?? 0)
+    expect((filterGroupBounds?.y ?? 0) - headingBottom)
+      .toBeGreaterThanOrEqual(0)
+    expect((filterGroupBounds?.y ?? Infinity) - headingBottom)
+      .toBeLessThanOrEqual(8)
+    const filterRows = await filters.evaluateAll((buttons) =>
+      Array.from(
+        new Set(
+          buttons.map((button) =>
+            Math.round(button.getBoundingClientRect().top),
+          ),
+        ),
+      ),
+    )
+    expect(filterRows).toHaveLength(2)
     expect(shelfBounds?.height ?? Infinity).toBeLessThanOrEqual(
       Math.min(
         viewport.width <= 760 ? viewport.height * 0.44 : viewport.height * 0.4,
@@ -4999,7 +5075,7 @@ test('keeps worker filters visible and scrolls resources inside the shelf', asyn
     }
 
     await page.screenshot({
-      path: `/tmp/yard-lane2-evidence/rev4-shelf-${viewport.width}.png`,
+      path: `/tmp/yard-lane2-evidence/rev5-shelf-${viewport.width}.png`,
       fullPage: true,
     })
   }
@@ -5036,7 +5112,7 @@ test('shows only actionable conditional chrome and routes attention to workers',
   const attention = commandBar.getByRole('button', {
     name: /workers need attention/,
   })
-  await expect(attention).toBeVisible()
+  await expect(attention).toHaveAccessibleName('2 workers need attention')
   await attention.click()
   await expect(page.getByRole('tab', { name: 'Workers' })).toHaveAttribute(
     'aria-selected',
@@ -5047,8 +5123,152 @@ test('shows only actionable conditional chrome and routes attention to workers',
       name: 'Attention',
     }),
   ).toHaveAttribute('aria-pressed', 'true')
+  await expect(
+    page.locator('.worker-row[data-worker-id="worker-unavailable"]'),
+  ).toHaveCount(0)
+  await page
+    .getByLabel('Filter workers')
+    .getByRole('button', { name: /^Stale/ })
+    .click()
+  await expect(
+    page.locator('.worker-row[data-worker-id="worker-unavailable"]'),
+  ).toBeVisible()
+  await expect(
+    page.getByLabel('Filter workers').getByRole('button', { name: /^Stale/ }),
+  ).toContainText('1')
   await page.keyboard.press('Escape')
   await expect(attention).toBeFocused()
+})
+
+test('hides only explicitly confirmed stale external workers', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const staleA = state.workerCandidates.find(
+    ({ worker }) => worker.id === 'worker-unavailable',
+  )
+  const observed = state.workerCandidates.find(
+    ({ worker }) => worker.id === 'worker-unassigned',
+  )
+  if (!staleA || !observed) throw new Error('Stale worker fixtures are missing')
+  const staleB: WorkerCandidate = {
+    ...staleA,
+    worker: {
+      ...staleA.worker,
+      id: 'worker-stale-b',
+      runtime: {
+        ...staleA.worker.runtime!,
+        pane_id: 'workspace-1:pane-stale-b',
+        tab_id: 'workspace-1:tab-stale-b',
+        terminal_id: 'terminal-stale-b',
+      },
+    },
+  }
+  const owned: WorkerCandidate = {
+    ...staleA,
+    worker: {
+      ...staleA.worker,
+      id: 'worker-owned-missing',
+      ownership_kind: 'yard_owned',
+      runtime: {
+        ...staleA.worker.runtime!,
+        pane_id: 'workspace-1:pane-owned',
+        tab_id: 'workspace-1:tab-owned',
+        terminal_id: 'terminal-owned',
+      },
+    },
+  }
+  const ephemeral: WorkerCandidate = {
+    ...staleA,
+    worker: {
+      ...staleA.worker,
+      id: 'worker-system-missing',
+      ownership_kind: 'system_ephemeral',
+      runtime: {
+        ...staleA.worker.runtime!,
+        pane_id: 'workspace-1:pane-system',
+        tab_id: 'workspace-1:tab-system',
+        terminal_id: 'terminal-system',
+      },
+    },
+  }
+  state.workerCandidates = [staleA, staleB, observed, owned, ephemeral]
+
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.goto('/')
+  await openResources(page, 'Workers')
+  await page
+    .getByLabel('Filter workers')
+    .getByRole('button', { name: /^Stale/ })
+    .click()
+  const rows = page.locator('.worker-list .worker-row')
+  await expect(rows).toHaveCount(2)
+  await expect(
+    page.getByLabel('Filter workers').getByRole('button', { name: /^Stale/ }),
+  ).toContainText('2')
+  await expect(
+    page.locator('.worker-row[data-worker-id="worker-owned-missing"]'),
+  ).toHaveCount(0)
+  await expect(
+    page.locator('.worker-row[data-worker-id="worker-system-missing"]'),
+  ).toHaveCount(0)
+
+  await page
+    .locator('.worker-row[data-worker-id="worker-unavailable"]')
+    .click()
+  await page
+    .locator('.inspector')
+    .getByRole('button', { name: 'Hide stale', exact: true })
+    .click()
+  const singleDialog = page.getByRole('dialog', {
+    name: 'Hide stale worker',
+  })
+  await expect(singleDialog).toContainText('worker-unavailable')
+  await singleDialog
+    .getByRole('button', { name: 'Hide stale', exact: true })
+    .click()
+
+  const bulk = page.getByRole('button', {
+    name: 'Hide stale (1)',
+    exact: true,
+  })
+  await expect(bulk).toBeVisible()
+  await bulk.click()
+  const bulkDialog = page.getByRole('dialog', {
+    name: 'Hide 1 stale worker',
+  })
+  await expect(bulkDialog).toContainText('worker-stale-b')
+  await expect(bulkDialog).not.toContainText('worker-owned-missing')
+  await expect(bulkDialog).not.toContainText('worker-system-missing')
+  await page.screenshot({
+    path: '/tmp/yard-lane2-evidence/rev5-stale-confirmation.png',
+    fullPage: true,
+  })
+  await bulkDialog
+    .getByRole('button', { name: 'Hide stale', exact: true })
+    .click()
+  await expect(bulkDialog).toHaveCount(0)
+
+  expect(
+    state.workerEndSessionRequests.map(({ workerId }) => workerId),
+  ).toEqual(['worker-unavailable', 'worker-stale-b'])
+  expect(
+    state.workerDeleteRequests.map(({ workerId }) => workerId),
+  ).toEqual(['worker-unavailable', 'worker-stale-b'])
+  expect(state.workerEndSessionRequests.map(({ input }) => input)).toEqual([
+    expect.objectContaining({
+      expected_runtime_version: '1',
+      expected_worker_version: '1',
+    }),
+    expect.objectContaining({
+      expected_runtime_version: '1',
+      expected_worker_version: '1',
+    }),
+  ])
+  expect(state.workerDeleteRequests.map(({ input }) => input)).toEqual([
+    expect.objectContaining({ expected_worker_version: '2' }),
+    expect.objectContaining({ expected_worker_version: '2' }),
+  ])
 })
 
 test('provides one-click runtime health and persistent appearance settings', async ({
@@ -5589,33 +5809,36 @@ test('keeps exactly one durable orchestrator visible across selected sessions', 
 
   await offlineOrchestrator.click()
   const inspector = page.locator('.inspector')
-  const runtimeSection = inspector.getByRole('region', {
-    name: 'Orchestrator runtime',
-  })
-  await expect(runtimeSection).toBeVisible()
+  const runtimeSummary = inspector.locator('.runtime-state-summary--compact')
+  await expect(runtimeSummary).toBeVisible()
+  await expect(runtimeSummary).toHaveAttribute(
+    'data-current-observation',
+    'false',
+  )
   await expect(
-    runtimeSection.locator(
-      '.runtime-state-summary[data-current-observation="false"] .status-badge[data-status="unknown"]',
-    ),
+    runtimeSummary.locator('.status-badge[data-status="unknown"]'),
   ).toBeVisible()
   await expect(
-    runtimeSection.locator(
+    runtimeSummary.locator(
       '.process-state-badge[data-process-state="unknown"]',
     ),
   ).toBeVisible()
   await expect(
-    runtimeSection.locator(
+    runtimeSummary.locator(
       '.observation-state-badge[data-observation-state="missing"]',
     ),
   ).toBeVisible()
+  const details = inspector.locator('details.worker-inspector-details')
+  await expect(details).not.toHaveAttribute('open', '')
+  await details.locator('summary').click()
   await expect(
-    runtimeSection.locator('.detail-row').filter({ hasText: 'Worker ID' }),
+    details.locator('.detail-row').filter({ hasText: 'Worker ID' }),
   ).toContainText('project-2-orchestrator')
   await expect(
-    runtimeSection.locator('.detail-row').filter({ hasText: 'Herdr session' }),
+    details.locator('.detail-row').filter({ hasText: 'Herdr session' }),
   ).toContainText('gamma')
   await expect(
-    runtimeSection.locator('.detail-row').filter({ hasText: 'Terminal' }),
+    details.locator('.detail-row').filter({ hasText: 'Terminal' }),
   ).toContainText('terminal-offline')
 
   await page.screenshot({
@@ -6061,9 +6284,31 @@ test('explains a replaced project pane and uses the replacement endpoint', async
   await page.getByRole('tab', { name: 'Chat view' }).click()
 
   const target = page.locator('[data-target-key="orchestrator:project-1"]')
+  const targetName = target.locator('.agent-window-row__identity strong')
+  const targetConnection = target.locator('.agent-window-row__connection')
+  await expect(targetName).toHaveText('API migration orchestrator')
   await expect(target).toContainText(
     `Pane ${runtime.pane_id} now runs a different terminal.`,
   )
+  await expect(targetConnection).toHaveText(
+    `Pane ${runtime.pane_id} now runs a different terminal.`,
+  )
+  expect(
+    await targetName.evaluate(
+      (element) => element.scrollWidth - element.clientWidth,
+    ),
+  ).toBeLessThanOrEqual(0)
+  const [nameBounds, connectionBounds] = await Promise.all([
+    targetName.boundingBox(),
+    targetConnection.boundingBox(),
+  ])
+  expect(connectionBounds?.y ?? 0).toBeGreaterThanOrEqual(
+    (nameBounds?.y ?? 0) + (nameBounds?.height ?? 0),
+  )
+  await page.screenshot({
+    path: '/tmp/yard-lane2-evidence/rev5-picker-1440.png',
+    fullPage: true,
+  })
   await target.click()
   await expect(
     page.getByText(
@@ -6094,17 +6339,55 @@ test('explains a replaced project pane and uses the replacement endpoint', async
   await expect(inspector).toContainText(
     `Pane ${runtime.pane_id} now runs a different terminal.`,
   )
-  await inspector
-    .getByRole('button', {
-      name: 'Replace orchestrator',
-      exact: true,
-    })
-    .click()
+  await expect(
+    inspector.getByText(
+      `Pane ${runtime.pane_id} now runs a different terminal.`,
+      { exact: true },
+    ),
+  ).toHaveCount(1)
+  await expect(
+    inspector.locator('.runtime-state-summary--compact'),
+  ).toBeVisible()
+  await expect(inspector.locator('.durable-runtime-section')).toHaveCount(0)
+  const replace = inspector.getByRole('button', {
+    name: 'Replace orchestrator',
+    exact: true,
+  })
+  const change = inspector.getByRole('button', {
+    name: 'Change orchestrator',
+    exact: true,
+  })
+  const details = inspector.locator('details.worker-inspector-details')
+  const [replaceBounds, changeBounds] = await Promise.all([
+    replace.boundingBox(),
+    change.boundingBox(),
+  ])
+  expect(replaceBounds?.y ?? Infinity).toBeLessThan(changeBounds?.y ?? 0)
+  await expect(details).not.toHaveAttribute('open', '')
+  await expect(inspector.getByText('Worker ID', { exact: true })).toBeHidden()
+  await expect(change).toBeVisible()
+  await details.locator('summary').click()
+  for (const detail of ['Worker ID', 'Herdr session', 'Terminal']) {
+    await expect(
+      details.locator('.detail-row').filter({ hasText: detail }),
+    ).toBeVisible()
+  }
+  await page.screenshot({
+    path: '/tmp/yard-lane2-evidence/rev5-project-orchestrator-1440.png',
+    fullPage: true,
+  })
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.screenshot({
+    path: '/tmp/yard-lane2-evidence/rev5-project-orchestrator-390.png',
+    fullPage: true,
+  })
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await replace.click()
 
   const dialog = page.getByRole('dialog', { name: 'Replace orchestrator' })
   await expect(dialog).toBeVisible()
   await page.screenshot({
-    path: '/tmp/yard-lane2-evidence/rev4-binding-recovery.png',
+    path: '/tmp/yard-lane2-evidence/rev5-binding-recovery.png',
     fullPage: true,
   })
   await dialog
@@ -10419,9 +10702,16 @@ test('uses reported workflow status on the canvas and keeps runtime state distin
   await expect(
     page.getByRole('region', { name: 'Reported workflow status' }),
   ).toHaveCount(0)
+  const orchestratorRuntime = page.locator(
+    '.inspector .runtime-state-summary--compact',
+  )
+  await expect(orchestratorRuntime).toHaveAttribute(
+    'data-current-observation',
+    'true',
+  )
   await expect(
-    page.getByRole('region', { name: 'Orchestrator runtime' }),
-  ).toContainText('Observed status')
+    orchestratorRuntime.locator('.status-badge[data-status="idle"]'),
+  ).toBeVisible()
 
   await page.getByRole('button', { name: 'Close details' }).click()
   await page.setViewportSize({ width: 390, height: 844 })
@@ -11938,11 +12228,10 @@ test('changes a project orchestrator only to an eligible live workspace worker',
     expected_orchestrator_runtime: originalProject.orchestrator.runtime,
   })
   await expect(dialog).toHaveCount(0)
+  const details = inspector.locator('details.worker-inspector-details')
+  await details.locator('summary').click()
   await expect(
-    inspector
-      .getByRole('region', { name: 'Orchestrator runtime' })
-      .locator('.detail-row')
-      .filter({ hasText: 'Worker ID' }),
+    details.locator('.detail-row').filter({ hasText: 'Worker ID' }),
   ).toContainText('worker-unassigned')
   await expect(inspector.getByRole('heading', { name: 'Yard' })).toBeVisible()
   expect(state.projectRequests).toBeGreaterThan(requestCounts.projects)
@@ -12501,12 +12790,12 @@ test('delivers and ignores an older transfer response after a newer generation',
   expect(deliveredWorkerReadIndex).toBeGreaterThan(olderCompleteIndex)
   expect(deliveredWorkerReadIndex).toBeLessThan(nextBetaInventoryIndex)
   expect(state.projectOrchestratorCommands).toHaveLength(1)
+  const details = page
+    .locator('.inspector')
+    .locator('details.worker-inspector-details')
+  await details.locator('summary').click()
   await expect(
-    page
-      .locator('.inspector')
-      .getByRole('region', { name: 'Orchestrator runtime' })
-      .locator('.detail-row')
-      .filter({ hasText: 'Worker ID' }),
+    details.locator('.detail-row').filter({ hasText: 'Worker ID' }),
   ).toContainText('worker-unassigned')
 })
 
@@ -12784,11 +13073,10 @@ test('recovers a stale project orchestrator transfer on mobile', async ({
     expected_worker_version: '2',
     expected_orchestrator_worker_version: '2',
   })
+  const details = inspector.locator('details.worker-inspector-details')
+  await details.locator('summary').click()
   await expect(
-    inspector
-      .getByRole('region', { name: 'Orchestrator runtime' })
-      .locator('.detail-row')
-      .filter({ hasText: 'Worker ID' }),
+    details.locator('.detail-row').filter({ hasText: 'Worker ID' }),
   ).toContainText('worker-unassigned')
   const overflow = await page.evaluate(() => ({
     document:

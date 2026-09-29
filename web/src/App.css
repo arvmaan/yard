@@ -494,8 +494,8 @@ select:focus-visible {
   border: 0;
 }
 
-.resource-shelf .rail-section--resources:has(.segmented-control) {
-  grid-template-columns: 140px 220px minmax(0, 1fr);
+.resource-shelf .rail-section--resources:has(.worker-shelf-controls) {
+  grid-template-columns: 220px minmax(0, 1fr);
 }
 
 .resource-shelf__collapse {
@@ -525,8 +525,35 @@ select:focus-visible {
 }
 
 .resource-shelf .segmented-control {
-  align-self: center;
+  align-self: start;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   margin: 0;
+}
+
+.worker-shelf-controls {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 6px;
+}
+
+.worker-shelf-controls .segmented-control button {
+  min-width: 0;
+  padding-right: 5px;
+  padding-left: 5px;
+}
+
+.worker-shelf-controls .segmented-control small {
+  min-width: 16px;
+  padding: 2px 4px;
+  border-radius: 3px;
+  background: var(--surface-raised);
+  font: 8px/1 "IBM Plex Mono", monospace;
+}
+
+.worker-shelf-hide-stale {
+  min-height: 30px;
+  justify-content: center;
 }
 
 .resource-shelf .resource-list {
@@ -4607,11 +4634,8 @@ html[data-yard-allocation-dragging="true"]
 }
 
 .agent-window-row__identity {
-  display: flex;
+  display: block;
   min-width: 0;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 6px;
 }
 
 .agent-window-row strong,
@@ -4627,14 +4651,22 @@ html[data-yard-allocation-dragging="true"]
   font-size: 10px;
 }
 
+.agent-window-row__identity strong,
+.agent-window-row__connection {
+  display: block;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
+
 .agent-window-row small {
   color: var(--muted);
   font: 8px/1.25 "IBM Plex Mono", monospace;
 }
 
-.agent-window-row__identity small {
-  flex: 0 0 auto;
-  color: var(--ink);
+.agent-window-row__connection {
+  color: var(--muted);
 }
 
 .agent-window-row__context {
@@ -5808,6 +5840,31 @@ html[data-yard-allocation-dragging="true"]
   gap: 8px;
   padding: 14px 16px 16px;
   border-top: 1px solid var(--line);
+}
+
+.stale-worker-confirmation-list {
+  display: grid;
+  max-height: min(34vh, 260px);
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.stale-worker-confirmation-list li {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface-muted);
+}
+
+.stale-worker-confirmation-list strong,
+.stale-worker-confirmation-list code {
+  overflow-wrap: anywhere;
 }
 
 .dialog-heading {
@@ -7192,15 +7249,11 @@ html[data-yard-allocation-dragging="true"]
   }
 
   .resource-shelf .rail-section--resources,
-  .resource-shelf .rail-section--resources:has(.segmented-control) {
+  .resource-shelf .rail-section--resources:has(.worker-shelf-controls) {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto minmax(0, 1fr);
     gap: 7px;
     padding: 8px;
-  }
-
-  .resource-shelf .rail-section--resources:has(.segmented-control) {
-    grid-template-rows: auto auto minmax(0, 1fr);
   }
 
   .resource-shelf .section-heading {
@@ -7220,7 +7273,6 @@ html[data-yard-allocation-dragging="true"]
 
   .resource-shelf .segmented-control {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
   .resource-shelf .profile-list__mobile-actions {

@@ -1,39 +1,41 @@
 import { useRef } from 'react'
 import { CircleAlert, LoaderCircle, Trash2, X } from 'lucide-react'
-import type { WorkerCandidate } from './types'
 import { useModalDialog } from './useModalDialog'
 
-interface DeleteWorkerDialogProps {
-  busy: boolean
-  candidate: WorkerCandidate
-  error: string | null
-  hideOnly?: boolean
+export interface StaleWorkerConfirmationItem {
+  id: string
   label: string
-  onClose: () => void
-  onConfirm: () => Promise<void>
 }
 
-export function DeleteWorkerDialog({
+export function HideStaleWorkersDialog({
   busy,
-  candidate,
   error,
-  hideOnly = false,
-  label,
+  items,
   onClose,
   onConfirm,
-}: DeleteWorkerDialogProps) {
+  returnFocus,
+}: {
+  busy: boolean
+  error: string | null
+  items: StaleWorkerConfirmationItem[]
+  onClose: () => void
+  onConfirm: () => Promise<void>
+  returnFocus: HTMLElement | null
+}) {
   const dialogRef = useRef<HTMLElement>(null)
-  const ended = candidate.worker.desired_state === 'ended'
+  const confirmRef = useRef<HTMLButtonElement>(null)
   useModalDialog({
     canClose: !busy,
     dialogRef,
+    initialFocusRef: confirmRef,
     onClose,
+    returnFocus,
   })
 
   return (
     <div className="modal-backdrop" role="presentation">
       <section
-        aria-labelledby="delete-worker-title"
+        aria-labelledby="hide-stale-workers-title"
         aria-modal="true"
         className="control-dialog end-session-dialog"
         ref={dialogRef}
@@ -41,13 +43,13 @@ export function DeleteWorkerDialog({
       >
         <header className="dialog-heading">
           <div>
-            <p className="eyebrow">Worker disposition</p>
-            <h2 id="delete-worker-title">
-              {hideOnly ? 'Hide stale worker' : 'Delete worker'}
+            <p className="eyebrow">Visibility cleanup</p>
+            <h2 id="hide-stale-workers-title">
+              Hide {items.length} stale {items.length === 1 ? 'worker' : 'workers'}
             </h2>
           </div>
           <button
-            aria-label="Close delete worker"
+            aria-label="Close hide stale workers"
             className="icon-button"
             disabled={busy}
             onClick={onClose}
@@ -57,23 +59,22 @@ export function DeleteWorkerDialog({
             <X aria-hidden="true" size={17} />
           </button>
         </header>
-        <div className="end-session-context">
-          <Trash2 aria-hidden="true" size={19} />
-          <span>
-            <strong>{label}</strong>
-            <small>{candidate.worker.id}</small>
-          </span>
-        </div>
         <div className="end-session-impact">
           <CircleAlert aria-hidden="true" size={17} />
           <p>
-            {hideOnly
-              ? 'This external worker is absent from the current Herdr snapshot. Yard will end its stale session record if needed, then hide it from views. Assignments, artifacts, receipts, and audit history remain durable.'
-              : ended
-              ? 'This permanently removes the ended worker from Yard history. Durable audit and cleanup records remain, but this UI deletion cannot be undone.'
-              : 'This first ends the worker session, then permanently removes it from Yard views. Durable audit and cleanup records remain, but this UI deletion cannot be undone.'}
+            Each listed external worker will be ended if needed, then hidden
+            from Yard views. Assignments, artifacts, receipts, and audit history
+            remain durable.
           </p>
         </div>
+        <ul className="stale-worker-confirmation-list">
+          {items.map((item) => (
+            <li key={item.id}>
+              <strong>{item.label}</strong>
+              <code>{item.id}</code>
+            </li>
+          ))}
+        </ul>
         {error ? (
           <p className="dialog-error" role="alert">
             <CircleAlert aria-hidden="true" size={16} />
@@ -87,13 +88,13 @@ export function DeleteWorkerDialog({
             onClick={onClose}
             type="button"
           >
-            Keep worker
+            Keep workers
           </button>
           <button
-            autoFocus
             className="destructive-button"
-            disabled={busy}
+            disabled={busy || items.length === 0}
             onClick={() => void onConfirm()}
+            ref={confirmRef}
             type="button"
           >
             {busy ? (
@@ -105,7 +106,7 @@ export function DeleteWorkerDialog({
             ) : (
               <Trash2 aria-hidden="true" size={16} />
             )}
-            {hideOnly ? 'Hide stale' : 'Delete worker'}
+            Hide stale
           </button>
         </footer>
       </section>

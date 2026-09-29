@@ -109,7 +109,7 @@ pub use project::{
     Project, ProjectPlacement, ProjectRepositories, ProjectRepository, ProjectRuntimeBinding,
     ProjectValidationError, ProjectWorkflowProfilePin, Projects, RuntimeObservationState,
     RuntimeProcessState, SetProjectRepository, UpdateProjectPlacement,
-    UpdateProjectWorkflowProfile, Worker, WorkerRuntimeBinding,
+    UpdateProjectWorkflowProfile, Worker, WorkerOwnershipKind, WorkerRuntimeBinding,
 };
 pub use repository_files::{
     RepositoryDiff, RepositoryDiffHunk, RepositoryDiffLine, RepositoryDiffLineKind, RepositoryFile,

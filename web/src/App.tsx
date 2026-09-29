@@ -166,6 +166,7 @@ import { CompletedRuntimeCleanupPreviewDialog } from './CompletedRuntimeCleanupP
 import { ArchiveProjectDialog } from './ArchiveProjectDialog'
 import { DeleteProjectDialog } from './DeleteProjectDialog'
 import { DeleteWorkerDialog } from './DeleteWorkerDialog'
+import { HideStaleWorkersDialog } from './HideStaleWorkersDialog'
 import {
   HandoffDialog,
   type HandoffDetails,
@@ -200,6 +201,10 @@ import {
   workerDisplayLabel,
   type WorkerLabelSource,
 } from './workerDisplay'
+import {
+  workerAttentionState,
+  workerCurrentlyObserved,
+} from './workerAttention'
 import {
   beginProjectTransferRefresh,
   emptyProjectTransferContext,
@@ -256,6 +261,7 @@ import './App.css'
 const INVENTORY_REFRESH_INTERVAL_MS = 1_000
 const ASSIGNMENT_REFRESH_INTERVAL_MS = 5_000
 const PROJECT_STATUS_REFRESH_INTERVAL_MS = 15_000
+const MAX_STALE_HIDE_BATCH = 50
 
 const ArtifactInspector = lazy(() =>
   import('./ArtifactInspector').then((module) => ({
@@ -263,7 +269,13 @@ const ArtifactInspector = lazy(() =>
   })),
 )
 
-type Filter = 'current' | 'available' | 'allocated' | 'attention' | 'history'
+type Filter =
+  | 'current'
+  | 'available'
+  | 'allocated'
+  | 'attention'
+  | 'stale'
+  | 'history'
 type ProjectCreationDetails =
   | {
       mode: 'existing'
@@ -291,6 +303,7 @@ const FILTERS: Array<{ value: Filter; label: string }> = [
   { value: 'available', label: 'Available' },
   { value: 'allocated', label: 'Allocated' },
   { value: 'attention', label: 'Attention' },
+  { value: 'stale', label: 'Stale' },
   { value: 'history', label: 'History' },
 ]
 
@@ -305,6 +318,7 @@ const STATUS_ICONS = {
 const AVAILABILITY_ICONS = {
   ambiguous: CircleHelp,
   assigned: Bot,
+  coordination_node: Network,
   ended: CircleStop,
   orchestrator: BriefcaseBusiness,
   resumable: RefreshCw,
@@ -316,6 +330,7 @@ const AVAILABILITY_ICONS = {
 const AVAILABILITY_LABELS = {
   ambiguous: 'Ambiguous',
   assigned: 'Assigned',
+  coordination_node: 'Coordination node',
   ended: 'Ended',
   orchestrator: 'Orchestrator',
   resumable: 'Replacement ready',
@@ -336,9 +351,17 @@ const OBSERVATION_ICONS = {
   observed: Wifi,
 } satisfies Record<RuntimeObservationState, typeof CircleAlert>
 
-function matchesFilter(candidate: WorkerCandidate, filter: Filter) {
+function matchesFilter(
+  candidate: WorkerCandidate,
+  filter: Filter,
+  snapshotCurrent: boolean,
+  inventory: RuntimeInventory | null,
+) {
   if (filter === 'current') return candidate.availability !== 'ended'
   if (filter === 'history') return candidate.availability === 'ended'
+  if (filter === 'stale') {
+    return workerAttentionState(candidate, snapshotCurrent, inventory) === 'stale'
+  }
   if (filter === 'available') {
     return (
       candidate.availability === 'unassigned_live' ||
@@ -349,16 +372,14 @@ function matchesFilter(candidate: WorkerCandidate, filter: Filter) {
     return (
       candidate.availability === 'orchestrator' ||
       candidate.availability === 'yard_orchestrator' ||
+      candidate.availability === 'coordination_node' ||
       candidate.availability === 'assigned'
     )
   }
   if (filter === 'attention') {
     return (
-      candidate.availability === 'unavailable' ||
-      candidate.availability === 'ambiguous' ||
-      candidate.worker.runtime?.status === 'blocked' ||
-      candidate.worker.runtime?.status === 'done' ||
-      candidate.worker.runtime?.status === 'unknown'
+      workerAttentionState(candidate, snapshotCurrent, inventory) ===
+      'actionable'
     )
   }
   return false
@@ -412,6 +433,7 @@ function canEndCandidate(candidate: WorkerCandidate) {
   return (
     candidate.worker.desired_state === 'running' &&
     candidate.availability !== 'yard_orchestrator' &&
+    candidate.availability !== 'coordination_node' &&
     candidate.availability !== 'orchestrator' &&
     candidate.availability !== 'assigned'
   )
@@ -422,6 +444,30 @@ function canDeleteCandidate(candidate: WorkerCandidate) {
     candidate.availability === 'ended' ||
     canEndCandidate(candidate)
   )
+}
+
+async function hideWorkerCandidate(
+  candidate: WorkerCandidate,
+  endCommandId: string,
+  deleteCommandId: string,
+) {
+  let expectedWorkerVersion = candidate.worker.version
+  if (candidate.worker.desired_state !== 'ended') {
+    const ended = await endWorkerSession(candidate.worker.id, {
+      command_id: endCommandId,
+      actor: 'local-user',
+      expected_worker_version: candidate.worker.version,
+      ...(candidate.worker.runtime
+        ? { expected_runtime_version: candidate.worker.runtime.version }
+        : {}),
+    })
+    expectedWorkerVersion = ended.worker.version
+  }
+  return deleteWorker(candidate.worker.id, {
+    command_id: deleteCommandId,
+    actor: 'local-user',
+    expected_worker_version: expectedWorkerVersion,
+  })
 }
 
 function allocationAction(candidate: WorkerCandidate) {
@@ -865,6 +911,7 @@ function WorkerCandidateInspector({
   activeAssignment,
   candidate,
   completedAssignment,
+  hideOnly,
   inventory,
   label,
   onAllocate,
@@ -877,6 +924,7 @@ function WorkerCandidateInspector({
   activeAssignment: Assignment | undefined
   candidate: WorkerCandidate
   completedAssignment: Assignment | undefined
+  hideOnly: boolean
   inventory: RuntimeInventory | null
   label: string
   onAllocate: (project: Project) => void
@@ -1021,7 +1069,7 @@ function WorkerCandidateInspector({
             type="button"
           >
             <Trash2 aria-hidden="true" size={16} />
-            Delete worker
+            {hideOnly ? 'Hide stale' : 'Delete worker'}
           </button>
         </div>
       ) : null}
@@ -1704,21 +1752,22 @@ function ProjectOrchestratorInspector({
         <div>
           <p className="eyebrow">Project orchestrator</p>
           <h2>{label}</h2>
+          <span
+            className="availability-badge"
+            data-availability="orchestrator"
+          >
+            <BriefcaseBusiness aria-hidden="true" size={12} />
+            Orchestrator
+          </span>
         </div>
       </div>
-      {statusReport ? (
-        <WorkflowStatusSummary report={statusReport} />
-      ) : null}
-      <section
-        aria-label="Orchestrator runtime"
-        className="durable-runtime-section"
-      >
-        <p className="eyebrow">Orchestrator runtime</p>
-        <RuntimeStateSummary
-          inventory={inventory}
-          runtime={runtime}
-          snapshotCurrent={snapshotCurrent}
-        />
+      <RuntimeStateSummary
+        compact
+        inventory={inventory}
+        runtime={runtime}
+        snapshotCurrent={snapshotCurrent}
+      />
+      <div className="inspector-actions project-orchestrator-actions">
         {bindingRecoveryRequired ? (
           <button
             className="command-button project-orchestrator-replace"
@@ -1729,15 +1778,6 @@ function ProjectOrchestratorInspector({
             Replace orchestrator
           </button>
         ) : null}
-        <dl className="detail-list">
-          <DetailRow
-            label="Worker"
-            value={label}
-          />
-          <DetailRow label="Worker ID" value={project.orchestrator.id} mono />
-          <DetailRow label="Herdr session" value={runtime?.session} mono />
-          <DetailRow label="Terminal" value={runtime?.terminal_id} mono />
-        </dl>
         <button
           aria-describedby={transferStatusId}
           className="secondary-button project-orchestrator-transfer"
@@ -1761,7 +1801,24 @@ function ProjectOrchestratorInspector({
             inventoryError,
           )}
         </p>
-      </section>
+      </div>
+      {statusReport ? (
+        <WorkflowStatusSummary report={statusReport} />
+      ) : null}
+      {!bindingRecoveryRequired ? (
+        <WorkerInterventions
+          key={[
+            project.id,
+            project.orchestrator.id,
+            runtime?.terminal_id,
+            runtime?.pane_id,
+          ].join(':')}
+          inventory={inventory}
+          onRefresh={onRefresh}
+          snapshotCurrent={snapshotCurrent}
+          target={{ kind: 'orchestrator', project }}
+        />
+      ) : null}
       <section aria-label="Ephemeral summary workers" className="durable-runtime-section">
         <p className="eyebrow">Ephemeral summary</p>
         <p className="project-orchestrator-transfer-status">
@@ -1820,18 +1877,14 @@ function ProjectOrchestratorInspector({
           </div>
         ))}
       </section>
-      <WorkerInterventions
-        key={[
-          project.id,
-          project.orchestrator.id,
-          runtime?.terminal_id,
-          runtime?.pane_id,
-        ].join(':')}
-        inventory={inventory}
-        onRefresh={onRefresh}
-        snapshotCurrent={snapshotCurrent}
-        target={{ kind: 'orchestrator', project }}
-      />
+      <details className="worker-inspector-details">
+        <summary>Details</summary>
+        <dl className="detail-list">
+          <DetailRow label="Worker ID" value={project.orchestrator.id} mono />
+          <DetailRow label="Herdr session" value={runtime?.session} mono />
+          <DetailRow label="Terminal" value={runtime?.terminal_id} mono />
+        </dl>
+      </details>
     </>
   )
 }
@@ -2941,11 +2994,22 @@ function App() {
     candidate: WorkerCandidate
     deleteCommandId: string
     endCommandId: string
+    hideOnly: boolean
   } | null>(null)
   const [workerDeleteBusy, setWorkerDeleteBusy] = useState(false)
   const [workerDeleteError, setWorkerDeleteError] = useState<string | null>(
     null,
   )
+  const [staleHideProposal, setStaleHideProposal] = useState<{
+    items: Array<{
+      candidate: WorkerCandidate
+      deleteCommandId: string
+      endCommandId: string
+    }>
+    returnFocus: HTMLElement | null
+  } | null>(null)
+  const [staleHideBusy, setStaleHideBusy] = useState(false)
+  const [staleHideError, setStaleHideError] = useState<string | null>(null)
   const [projectArchiveProposal, setProjectArchiveProposal] = useState<{
     commandId: string
     project: Project
@@ -3720,15 +3784,40 @@ function App() {
     workerCandidates,
   ])
   const visibleCandidates = useMemo(
-    () => workerCandidates.filter((candidate) => matchesFilter(candidate, filter)),
-    [filter, workerCandidates],
+    () =>
+      workerCandidates.filter((candidate) =>
+        matchesFilter(candidate, filter, inventoryCurrent, inventory),
+      ),
+    [filter, inventory, inventoryCurrent, workerCandidates],
   )
   const attentionCount = useMemo(
     () =>
       workerCandidates.filter((candidate) =>
-        matchesFilter(candidate, 'attention'),
+        matchesFilter(
+          candidate,
+          'attention',
+          inventoryCurrent,
+          inventory,
+        ),
       ).length,
-    [workerCandidates],
+    [inventory, inventoryCurrent, workerCandidates],
+  )
+  const staleCandidates = useMemo(
+    () =>
+      workerCandidates.filter((candidate) =>
+        matchesFilter(candidate, 'stale', inventoryCurrent, inventory),
+      ),
+    [inventory, inventoryCurrent, workerCandidates],
+  )
+  const hideableStaleCandidates = useMemo(
+    () =>
+      staleCandidates.filter(
+        (candidate) =>
+          candidate.worker.ownership_kind === 'external' &&
+          !workerCurrentlyObserved(candidate, inventoryCurrent, inventory) &&
+          canDeleteCandidate(candidate),
+      ),
+    [inventory, inventoryCurrent, staleCandidates],
   )
   const automaticCoordination = tokenSpendSettings
     ? [
@@ -3820,6 +3909,13 @@ function App() {
             selectedObservedWorker,
           )
         : undefined
+  const selectedWorkerAttentionState = selectedWorkerCandidate
+    ? workerAttentionState(
+        selectedWorkerCandidate,
+        inventoryCurrent,
+        inventory,
+      )
+    : 'quiet'
   const selectedWorkspace =
     selection?.kind === 'workspace'
       ? inventory?.workspaces.find(
@@ -4830,16 +4926,20 @@ function App() {
     selectedSession,
   ])
 
-  const proposeWorkerDelete = useCallback((candidate: WorkerCandidate) => {
-    if (!canDeleteCandidate(candidate)) return
-    setWorkerDeleteError(null)
-    setActionNotice(null)
-    setWorkerDeleteProposal({
-      candidate,
-      deleteCommandId: crypto.randomUUID(),
-      endCommandId: crypto.randomUUID(),
-    })
-  }, [])
+  const proposeWorkerDelete = useCallback(
+    (candidate: WorkerCandidate, hideOnly = false) => {
+      if (!canDeleteCandidate(candidate)) return
+      setWorkerDeleteError(null)
+      setActionNotice(null)
+      setWorkerDeleteProposal({
+        candidate,
+        deleteCommandId: crypto.randomUUID(),
+        endCommandId: crypto.randomUUID(),
+        hideOnly,
+      })
+    },
+    [],
+  )
 
   const deleteSelectedWorker = useCallback(async () => {
     if (!workerDeleteProposal) return
@@ -4849,26 +4949,11 @@ function App() {
     setWorkerDeleteError(null)
     setActionError(null)
     try {
-      let expectedWorkerVersion = candidate.worker.version
-      if (candidate.worker.desired_state !== 'ended') {
-        const ended = await endWorkerSession(candidate.worker.id, {
-          command_id: endCommandId,
-          actor: 'local-user',
-          expected_worker_version: candidate.worker.version,
-          ...(candidate.worker.runtime
-            ? {
-                expected_runtime_version:
-                  candidate.worker.runtime.version,
-              }
-            : {}),
-        })
-        expectedWorkerVersion = ended.worker.version
-      }
-      const result = await deleteWorker(candidate.worker.id, {
-        command_id: deleteCommandId,
-        actor: 'local-user',
-        expected_worker_version: expectedWorkerVersion,
-      })
+      const result = await hideWorkerCandidate(
+        candidate,
+        endCommandId,
+        deleteCommandId,
+      )
       setWorkerCandidates((current) =>
         current.filter(
           ({ worker }) => worker.id !== candidate.worker.id,
@@ -4883,8 +4968,8 @@ function App() {
       setWorkerDeleteProposal(null)
       setActionNotice(
         result.cleanup_pending
-          ? 'Worker deleted from Yard. Runtime cleanup continues in the background.'
-          : 'Worker deleted from Yard.',
+          ? 'Worker hidden from Yard. Runtime cleanup continues in the background.'
+          : 'Worker hidden from Yard.',
       )
       await Promise.all([
         loadProjects(),
@@ -4902,7 +4987,7 @@ function App() {
         setWorkerDeleteProposal(null)
         setSelection(null)
         setActionNotice(
-          'Worker deleted from Yard. Runtime cleanup continues in the background if needed.',
+          'Worker hidden from Yard. Runtime cleanup continues in the background if needed.',
         )
       } else {
         if (reconciled) {
@@ -4921,6 +5006,115 @@ function App() {
     loadWorkers,
     selectedSession,
     workerDeleteProposal,
+  ])
+
+  const proposeHideStaleWorkers = useCallback(
+    (returnFocus: HTMLElement) => {
+      const candidates = hideableStaleCandidates.slice(
+        0,
+        MAX_STALE_HIDE_BATCH,
+      )
+      if (candidates.length === 0) return
+      setStaleHideError(null)
+      setActionNotice(null)
+      setStaleHideProposal({
+        items: candidates.map((candidate) => ({
+          candidate,
+          deleteCommandId: crypto.randomUUID(),
+          endCommandId: crypto.randomUUID(),
+        })),
+        returnFocus,
+      })
+    },
+    [hideableStaleCandidates],
+  )
+
+  const hideStaleWorkers = useCallback(async () => {
+    if (!staleHideProposal) return
+    const currentCandidates = new Map(
+      hideableStaleCandidates.map((candidate) => [
+        candidate.worker.id,
+        candidate,
+      ]),
+    )
+    if (
+      staleHideProposal.items.some(
+        ({ candidate }) => !currentCandidates.has(candidate.worker.id),
+      )
+    ) {
+      setStaleHideError(
+        'The current Herdr snapshot changed. Close this dialog and review the stale workers again.',
+      )
+      return
+    }
+
+    setStaleHideBusy(true)
+    setStaleHideError(null)
+    setActionError(null)
+    const completedIds = new Set<string>()
+    for (const item of staleHideProposal.items) {
+      const candidate = currentCandidates.get(item.candidate.worker.id)
+      if (!candidate) continue
+      try {
+        await hideWorkerCandidate(
+          candidate,
+          item.endCommandId,
+          item.deleteCommandId,
+        )
+        completedIds.add(candidate.worker.id)
+      } catch (caught) {
+        setStaleHideProposal((current) =>
+          current
+            ? {
+                ...current,
+                items: current.items.filter(
+                  ({ candidate: remaining }) =>
+                    !completedIds.has(remaining.worker.id),
+                ),
+              }
+            : current,
+        )
+        setStaleHideError(
+          `${completedIds.size} workers were hidden before Yard stopped: ${
+            caught instanceof Error ? caught.message : 'Hide stale failed'
+          }`,
+        )
+        await Promise.all([
+          loadProjects(),
+          loadWorkers(),
+          loadInventory(selectedSession),
+        ]).catch(() => undefined)
+        setStaleHideBusy(false)
+        return
+      }
+    }
+
+    const hiddenCount = completedIds.size
+    setWorkerCandidates((current) =>
+      current.filter(({ worker }) => !completedIds.has(worker.id)),
+    )
+    setSelection((current) =>
+      current?.kind === 'worker' && completedIds.has(current.id)
+        ? null
+        : current,
+    )
+    setStaleHideProposal(null)
+    setActionNotice(
+      `${hiddenCount} stale ${hiddenCount === 1 ? 'worker' : 'workers'} hidden from Yard.`,
+    )
+    await Promise.all([
+      loadProjects(),
+      loadWorkers(),
+      loadInventory(selectedSession),
+    ]).catch(() => undefined)
+    setStaleHideBusy(false)
+  }, [
+    hideableStaleCandidates,
+    loadInventory,
+    loadProjects,
+    loadWorkers,
+    selectedSession,
+    staleHideProposal,
   ])
 
   const proposeProjectArchive = useCallback(
@@ -6634,34 +6828,52 @@ function App() {
           </div>
         ) : railView === 'workers' ? (
           <div className="rail-section rail-section--resources" role="tabpanel">
-            <div className="section-heading">
-              <div>
-                <p className="eyebrow">Allocation</p>
-                <h2>Workers</h2>
-              </div>
-              <span>{visibleCandidates.length}</span>
-              <button
-                aria-label="Review completed runtimes, read-only; nothing will be closed"
-                className="icon-button section-heading__action"
-                onClick={() => void openCompletedRuntimeCleanupPreview()}
-                ref={completedRuntimeCleanupPreviewTrigger}
-                title="Review completed runtimes, read-only; nothing will be closed"
-                type="button"
-              >
-                <CircleHelp aria-hidden="true" size={16} />
-              </button>
-            </div>
-            <div className="segmented-control" aria-label="Filter workers">
-              {FILTERS.map((option) => (
+            <div className="worker-shelf-controls">
+              <div className="section-heading">
+                <div>
+                  <p className="eyebrow">Allocation</p>
+                  <h2>Workers</h2>
+                </div>
+                <span>{visibleCandidates.length}</span>
                 <button
-                  aria-pressed={filter === option.value}
-                  key={option.value}
-                  onClick={() => setFilter(option.value)}
+                  aria-label="Review completed runtimes, read-only; nothing will be closed"
+                  className="icon-button section-heading__action"
+                  onClick={() => void openCompletedRuntimeCleanupPreview()}
+                  ref={completedRuntimeCleanupPreviewTrigger}
+                  title="Review completed runtimes, read-only; nothing will be closed"
                   type="button"
                 >
-                  {option.label}
+                  <CircleHelp aria-hidden="true" size={16} />
                 </button>
-              ))}
+              </div>
+              <div className="segmented-control" aria-label="Filter workers">
+                {FILTERS.map((option) => (
+                  <button
+                    aria-pressed={filter === option.value}
+                    key={option.value}
+                    onClick={() => setFilter(option.value)}
+                    type="button"
+                  >
+                    {option.label}
+                    {option.value === 'stale' ? (
+                      <small>{staleCandidates.length}</small>
+                    ) : null}
+                  </button>
+                ))}
+              </div>
+              {filter === 'stale' ? (
+                <button
+                  className="secondary-button worker-shelf-hide-stale"
+                  disabled={hideableStaleCandidates.length === 0}
+                  onClick={(event) =>
+                    proposeHideStaleWorkers(event.currentTarget)
+                  }
+                  type="button"
+                >
+                  <Trash2 aria-hidden="true" size={14} />
+                  Hide stale ({hideableStaleCandidates.length})
+                </button>
+              ) : null}
             </div>
             <div className="resource-list worker-list">
               {visibleCandidates.map((candidate) => {
@@ -7139,6 +7351,7 @@ function App() {
             activeAssignment={selectedCandidateActiveAssignment}
             candidate={selectedWorkerCandidate}
             completedAssignment={selectedCandidateCompletion}
+            hideOnly={selectedWorkerAttentionState === 'stale'}
             inventory={inventory}
             label={workerLabels[selectedWorkerCandidate.worker.id]}
             onAllocate={(project) =>
@@ -7151,7 +7364,10 @@ function App() {
               proposeEndSession(selectedWorkerCandidate)
             }
             onDelete={() =>
-              proposeWorkerDelete(selectedWorkerCandidate)
+              proposeWorkerDelete(
+                selectedWorkerCandidate,
+                selectedWorkerAttentionState === 'stale',
+              )
             }
             onRefresh={() => void refresh()}
             projects={projects}
@@ -7480,12 +7696,36 @@ function App() {
           busy={workerDeleteBusy}
           candidate={workerDeleteProposal.candidate}
           error={workerDeleteError}
+          hideOnly={workerDeleteProposal.hideOnly}
+          label={
+            workerLabels[workerDeleteProposal.candidate.worker.id] ??
+            candidateLabel(workerDeleteProposal.candidate)
+          }
           onClose={() => {
             if (workerDeleteBusy) return
             setWorkerDeleteError(null)
             setWorkerDeleteProposal(null)
           }}
           onConfirm={deleteSelectedWorker}
+        />
+      ) : null}
+      {staleHideProposal ? (
+        <HideStaleWorkersDialog
+          busy={staleHideBusy}
+          error={staleHideError}
+          items={staleHideProposal.items.map(({ candidate }) => ({
+            id: candidate.worker.id,
+            label:
+              workerLabels[candidate.worker.id] ??
+              candidateLabel(candidate),
+          }))}
+          onClose={() => {
+            if (staleHideBusy) return
+            setStaleHideError(null)
+            setStaleHideProposal(null)
+          }}
+          onConfirm={hideStaleWorkers}
+          returnFocus={staleHideProposal.returnFocus}
         />
       ) : null}
       {herdrInventoryOpen ? (

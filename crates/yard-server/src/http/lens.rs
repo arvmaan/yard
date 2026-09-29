@@ -1376,6 +1376,7 @@ mod tests {
                 id: format!("worker-{index}"),
                 profile_id: None,
                 profile_version: None,
+                ownership_kind: yard_domain::WorkerOwnershipKind::External,
                 desired_state: yard_domain::WorkerDesiredState::Running,
                 runtime: Some(WorkerRuntimeBinding {
                     adapter: "herdr".to_owned(),

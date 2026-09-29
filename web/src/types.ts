@@ -353,10 +353,16 @@ export interface WorkerRuntimeBinding extends ProjectRuntimeBinding {
   last_observed_at_unix_ms: number
 }
 
+export type WorkerOwnershipKind =
+  | 'external'
+  | 'yard_owned'
+  | 'system_ephemeral'
+
 export interface Worker {
   id: string
   profile_id: string | null
   profile_version: string | null
+  ownership_kind: WorkerOwnershipKind
   desired_state: 'running' | 'ended'
   runtime: WorkerRuntimeBinding | null
   version: string
@@ -846,6 +852,7 @@ export interface Assignments {
 
 export type WorkerAvailability =
   | 'yard_orchestrator'
+  | 'coordination_node'
   | 'orchestrator'
   | 'assigned'
   | 'unassigned_live'

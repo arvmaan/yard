@@ -124,12 +124,23 @@ pub enum RuntimeProcessState {
     Unknown,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerOwnershipKind {
+    #[default]
+    External,
+    YardOwned,
+    SystemEphemeral,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Worker {
     pub id: String,
     pub profile_id: Option<String>,
     #[serde(default, with = "crate::serde_u64::option")]
     pub profile_version: Option<u64>,
+    #[serde(default)]
+    pub ownership_kind: WorkerOwnershipKind,
     pub desired_state: WorkerDesiredState,
     pub runtime: Option<WorkerRuntimeBinding>,
     #[serde(with = "crate::serde_u64")]
@@ -537,7 +548,7 @@ mod tests {
         ArchiveProject, CanvasPlacement, CreateProject, CreateProjectFromProfile,
         CreateWorkspaceProjectFromProfile, MAX_PROJECT_CWD_BYTES, ProjectRuntimeBinding,
         ProjectValidationError, SetProjectRepository, UpdateProjectPlacement,
-        UpdateProjectWorkflowProfile,
+        UpdateProjectWorkflowProfile, Worker, WorkerOwnershipKind,
     };
 
     fn placement() -> CanvasPlacement {
@@ -742,6 +753,29 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, ProjectValidationError::InvalidVersion);
+    }
+
+    #[test]
+    fn worker_ownership_serializes_and_defaults_to_external() {
+        let worker = serde_json::from_value::<Worker>(serde_json::json!({
+            "id": "worker-1",
+            "profile_id": null,
+            "profile_version": null,
+            "desired_state": "running",
+            "runtime": null,
+            "version": "1",
+            "created_at_unix_ms": 1,
+            "updated_at_unix_ms": 1
+        }))
+        .unwrap();
+        assert_eq!(worker.ownership_kind, WorkerOwnershipKind::External);
+
+        let serialized = serde_json::to_value(Worker {
+            ownership_kind: WorkerOwnershipKind::YardOwned,
+            ..worker
+        })
+        .unwrap();
+        assert_eq!(serialized["ownership_kind"], "yard_owned");
     }
 
     #[test]
