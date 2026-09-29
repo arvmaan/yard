@@ -362,6 +362,7 @@ mod tests {
                 id: "parent".to_owned(),
                 profile_id: None,
                 profile_version: None,
+                ownership_kind: yard_domain::WorkerOwnershipKind::External,
                 desired_state: WorkerDesiredState::Running,
                 runtime: Some(WorkerRuntimeBinding {
                     adapter: "herdr".to_owned(),
