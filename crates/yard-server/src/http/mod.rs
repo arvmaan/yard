@@ -4157,14 +4157,13 @@ mod tests {
     };
     use tower::ServiceExt;
     use yard_domain::{
-        ArchiveProject, AutomationScope, CanvasPlacement, ConfigureYardOrchestrator,
-        CoordinationNodeKind, CreateAutomation, CreateCoordinationNode, CreateProject,
-        CreateWorkerProfile, DailySchedule, DeleteProject, FocusObservation, ObservedStatus,
-        ObservedWorker, OrchestratorWorkflowProfileValidationError, PaneObservation,
-        ProjectRuntimeBinding, ProviderSessionRef, ProvisionCoordinationNode, RunAutomationNow,
-        RuntimeInventory, RuntimeObservationState, RuntimeProcessState, RuntimeSession,
-        RuntimeSessions, UpdateTokenSpendSettings, WorkerProfileSpec, WorkerRuntimeBinding,
-        WorkspaceObservation, WorktreeObservation,
+        ArchiveProject, CanvasPlacement, ConfigureYardOrchestrator, CoordinationNodeKind,
+        CreateCoordinationNode, CreateProject, CreateWorkerProfile, DeleteProject,
+        FocusObservation, ObservedStatus, ObservedWorker,
+        OrchestratorWorkflowProfileValidationError, PaneObservation, ProjectRuntimeBinding,
+        ProviderSessionRef, ProvisionCoordinationNode, RuntimeInventory, RuntimeObservationState,
+        RuntimeProcessState, RuntimeSession, RuntimeSessions, WorkerProfileSpec,
+        WorkerRuntimeBinding, WorkspaceObservation, WorktreeObservation,
     };
     use yard_herdr::{HerdrAdapter, HerdrConfig, HerdrError};
     use yard_store::{
@@ -4183,12 +4182,10 @@ mod tests {
         RuntimeWorkspaceProvisionRequest,
     };
     use crate::artifact_service::ArtifactService;
-    use crate::automation_service::AutomationService;
-    use crate::coordination_node_service::{CoordinationNodeService, CoordinationNodeServiceError};
+    use crate::coordination_node_service::CoordinationNodeServiceError;
     use crate::intervention_service::{
-        InterventionService, InterventionServiceError, RuntimeIntervention,
-        RuntimeInterventionError, RuntimeOutputRequest, RuntimeOutputResult, RuntimePromptRequest,
-        RuntimePromptResult,
+        InterventionServiceError, RuntimeIntervention, RuntimeInterventionError,
+        RuntimeOutputRequest, RuntimeOutputResult, RuntimePromptRequest, RuntimePromptResult,
     };
     use crate::inventory_service::{
         HerdrInventorySource, InventoryServiceError, InventorySource, RuntimeSessionDescriptor,
