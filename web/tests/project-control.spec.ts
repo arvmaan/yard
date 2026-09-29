@@ -10530,117 +10530,35 @@ test('creates a project-targeted automation and persists its satellite placement
   expect(state.automations[0].placement.geometry).toEqual(persisted)
 })
 
-test('persists independent automatic token-use settings while keeping manual actions separate', async ({
+test('keeps automatic summaries isolated while manual actions remain available', async ({
   page,
 }, testInfo) => {
   const state = await mockApi(page)
   await page.goto('/')
 
   const dialog = await openSettings(page)
-  const superintendent = dialog.getByRole('switch', {
-    name: /Request project summaries automatically/,
-  })
-  const projectOrchestrators = dialog.getByRole('switch', {
-    name: /Request worker summaries automatically/,
-  })
-  const scheduled = dialog.getByRole('switch', {
-    name: /Run scheduled summaries automatically/,
-  })
-  await expect(superintendent).not.toBeChecked()
-  await expect(projectOrchestrators).not.toBeChecked()
-  await expect(scheduled).not.toBeChecked()
+  await expect(dialog.getByText('Automatic summaries are unavailable')).toBeVisible()
   await expect(
-    dialog.getByText(
-      /Manual requests and Run now remain available when these are off/,
-    ),
+    dialog.getByText(/Summaries must run in isolated ephemeral workers/),
   ).toBeVisible()
-
-  await superintendent.check()
-  await dialog.getByRole('button', {
-    name: 'Save automatic settings',
-  }).click()
-
-  expect(state.tokenSpendSettingsUpdates).toHaveLength(1)
-  expect(state.tokenSpendSettingsUpdates[0]).toMatchObject({
-    superintendent_auto_requests_project_summaries: true,
-    project_orchestrators_auto_request_worker_summaries: false,
-    scheduled_automatic_summaries: false,
-  })
-  await expect(dialog).toBeVisible()
-  await dialog.getByRole('button', { name: 'Close settings' }).click()
-  const auto = page.getByRole('button', {
-    name: /Automatic coordination enabled: project summaries/,
-  })
-  await expect(auto).toBeVisible()
-  await auto.click()
-  const reopened = page.getByRole('dialog', { name: 'Settings' })
-  await expect(
-    reopened.getByRole('switch', {
-      name: /Request project summaries automatically/,
-    }),
-  ).toBeFocused()
-  await expect(
-    reopened.getByRole('switch', {
-      name: /Request project summaries automatically/,
-    }),
-  ).toBeChecked()
-  await expect(
-    reopened.getByRole('switch', {
-      name: /Request worker summaries automatically/,
-    }),
-  ).not.toBeChecked()
-  await expect(
-    reopened.getByRole('switch', {
-      name: /Run scheduled summaries automatically/,
-    }),
-  ).not.toBeChecked()
+  await expect(dialog.getByRole('button', { name: 'Off' })).toBeDisabled()
+  await expect(dialog.getByRole('switch')).toHaveCount(0)
+  expect(state.tokenSpendSettingsUpdates).toHaveLength(0)
 
   await page.screenshot({
-    path: testInfo.outputPath('token-spend-settings-desktop.png'),
+    path: testInfo.outputPath('summary-isolation-settings-desktop.png'),
     fullPage: true,
   })
   await page.setViewportSize({ width: 390, height: 844 })
-  const manualCopy = reopened.getByText(
-    /Manual requests and Run now remain available when these are off/,
+  const dialogBox = await dialog.boundingBox()
+  expect(dialogBox).not.toBeNull()
+  expect(dialogBox!.width).toBeLessThanOrEqual(390)
+  const documentOverflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - window.innerWidth,
   )
-  const manualBox = await manualCopy.boundingBox()
-  const actionsBox = await reopened.locator('.settings-save-row').boundingBox()
-  expect(manualBox).not.toBeNull()
-  expect(actionsBox).not.toBeNull()
-  expect(manualBox!.y + manualBox!.height).toBeLessThanOrEqual(actionsBox!.y)
+  expect(documentOverflow).toBeLessThanOrEqual(0)
   await page.screenshot({
-    path: testInfo.outputPath('token-spend-settings-mobile.png'),
-    fullPage: true,
-  })
-  await page.setViewportSize({ width: 320, height: 844 })
-  await expect(
-    page.getByRole('tab', { name: 'Files view' }),
-  ).toHaveCount(0)
-  const commandBarLayout = await page.locator('.command-bar').evaluate((bar) => {
-    const bounds = bar.getBoundingClientRect()
-    return {
-      children: Array.from(bar.children).map((child) => {
-        const childBounds = child.getBoundingClientRect()
-        return {
-          left: childBounds.left,
-          right: childBounds.right,
-        }
-      }),
-      clientWidth: bar.clientWidth,
-      left: bounds.left,
-      right: bounds.right,
-      scrollWidth: bar.scrollWidth,
-    }
-  })
-  expect(commandBarLayout.scrollWidth).toBeLessThanOrEqual(
-    commandBarLayout.clientWidth,
-  )
-  for (const child of commandBarLayout.children) {
-    expect(child.left).toBeGreaterThanOrEqual(commandBarLayout.left)
-    expect(child.right).toBeLessThanOrEqual(commandBarLayout.right)
-  }
-  await page.screenshot({
-    path: testInfo.outputPath('token-spend-settings-320.png'),
+    path: testInfo.outputPath('summary-isolation-settings-mobile.png'),
     fullPage: true,
   })
 })

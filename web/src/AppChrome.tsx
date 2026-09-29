@@ -560,36 +560,11 @@ export function SettingsDialog({
   const titleId = useId()
   const dialogRef = useRef<HTMLElement>(null)
   const appearanceFocusRef = useRef<HTMLSelectElement>(null)
-  const automaticFocusRef = useRef<HTMLInputElement>(null)
-  const [superintendent, setSuperintendent] = useState(
-    automaticCoordinationSettings?.superintendent_auto_requests_project_summaries ??
-      false,
-  )
-  const [projectOrchestrators, setProjectOrchestrators] = useState(
-    automaticCoordinationSettings?.project_orchestrators_auto_request_worker_summaries ??
-      false,
-  )
-  const [scheduled, setScheduled] = useState(
-    automaticCoordinationSettings?.scheduled_automatic_summaries ?? false,
-  )
-  useEffect(() => {
-    if (!automaticCoordinationSettings) return
-    setSuperintendent(
-      automaticCoordinationSettings.superintendent_auto_requests_project_summaries,
-    )
-    setProjectOrchestrators(
-      automaticCoordinationSettings.project_orchestrators_auto_request_worker_summaries,
-    )
-    setScheduled(automaticCoordinationSettings.scheduled_automatic_summaries)
-  }, [automaticCoordinationSettings])
-  const automaticDirty =
-    automaticCoordinationSettings !== null &&
-    (superintendent !==
-      automaticCoordinationSettings.superintendent_auto_requests_project_summaries ||
-      projectOrchestrators !==
-        automaticCoordinationSettings.project_orchestrators_auto_request_worker_summaries ||
-      scheduled !==
-        automaticCoordinationSettings.scheduled_automatic_summaries)
+  const automaticFocusRef = useRef<HTMLButtonElement>(null)
+  void automaticCoordinationBusy
+  void automaticCoordinationError
+  void automaticCoordinationSettings
+  void onSaveAutomaticCoordination
   const requestClose = useModalDialog({
     canClose: !automaticCoordinationBusy,
     dialogRef,
@@ -678,85 +653,24 @@ export function SettingsDialog({
           </section>
           <section aria-labelledby={`${titleId}-automatic`}>
             <h3 id={`${titleId}-automatic`}>Automatic coordination</h3>
-            <p className="settings-section-copy">
-              Automatic requests may use provider tokens. Manual requests and
-              Run now remain available when these are off.
-            </p>
-            <label className="settings-switch-row">
-              <span>
-                <strong>Request project summaries automatically</strong>
-                <small>Superintendent to project orchestrators</small>
-              </span>
-              <input
-                checked={superintendent}
-                disabled={!automaticCoordinationSettings}
-                onChange={(event) => setSuperintendent(event.target.checked)}
-                ref={automaticFocusRef}
-                role="switch"
-                type="checkbox"
-              />
-            </label>
-            <label className="settings-switch-row">
-              <span>
-                <strong>Request worker summaries automatically</strong>
-                <small>Project orchestrators to workers</small>
-              </span>
-              <input
-                checked={projectOrchestrators}
-                disabled={!automaticCoordinationSettings}
-                onChange={(event) =>
-                  setProjectOrchestrators(event.target.checked)
-                }
-                role="switch"
-                type="checkbox"
-              />
-            </label>
-            <label className="settings-switch-row">
-              <span>
-                <strong>Run scheduled summaries automatically</strong>
-                <small>Unrelated automations and Run now stay available</small>
-              </span>
-              <input
-                checked={scheduled}
-                disabled={!automaticCoordinationSettings}
-                onChange={(event) => setScheduled(event.target.checked)}
-                role="switch"
-                type="checkbox"
-              />
-            </label>
-            <div className="settings-save-row">
-              <small>
-                {automaticCoordinationSettings
-                  ? automaticDirty
-                    ? 'Unsaved automatic coordination changes'
-                    : 'Durable settings are current'
-                  : 'Durable settings unavailable'}
-              </small>
+            <div className="settings-row">
+              <div>
+                <strong>Automatic summaries are unavailable</strong>
+                <small>
+                  Summaries must run in isolated ephemeral workers. Use the
+                  explicit Summarize action until isolated scheduling is
+                  available.
+                </small>
+              </div>
               <button
-                className="command-button"
-                disabled={
-                  automaticCoordinationBusy ||
-                  !automaticCoordinationSettings ||
-                  !automaticDirty
-                }
-                onClick={() =>
-                  onSaveAutomaticCoordination({
-                    projectOrchestrators,
-                    scheduled,
-                    superintendent,
-                  })
-                }
+                className="secondary-button settings-action"
+                disabled
+                ref={automaticFocusRef}
                 type="button"
               >
-                {automaticCoordinationBusy ? 'Saving' : 'Save automatic settings'}
+                Off
               </button>
             </div>
-            {automaticCoordinationError ? (
-              <p className="dialog-error" role="alert">
-                <CircleAlert aria-hidden="true" size={15} />
-                <span>{automaticCoordinationError}</span>
-              </p>
-            ) : null}
           </section>
           <section aria-labelledby={`${titleId}-coordination`}>
             <h3 id={`${titleId}-coordination`}>Coordination</h3>
