@@ -3,8 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 use yard_domain::{
-    Assignment, AssignmentLifecycle, AttemptLifecycle, AutomaticSummaryRequestKind,
-    OrchestratorPromptAcknowledgement, OrchestratorStatusReport, OrchestratorTerminalOutput,
+    Assignment, AssignmentLifecycle, AttemptLifecycle, OrchestratorPromptAcknowledgement, OrchestratorStatusReport, OrchestratorTerminalOutput,
     Project, PromptAcknowledgement, SendAssignmentPrompt, SendOrchestratorPrompt,
     SendYardOrchestratorPrompt, SendYardOrchestratorRoute, TerminalOutput, Worker,
     WorkerRuntimeBinding, YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator,
@@ -78,19 +77,12 @@ pub struct InterventionService {
 
 #[derive(Clone, Copy)]
 enum AutomaticTokenSpendPolicy {
-    Summary(AutomaticSummaryRequestKind),
     ScheduledSummary,
 }
 
 impl AutomaticTokenSpendPolicy {
     const fn command_source(self) -> TokenSpendCommandSource {
         match self {
-            Self::Summary(AutomaticSummaryRequestKind::SuperintendentProject) => {
-                TokenSpendCommandSource::SuperintendentProjectSummary
-            }
-            Self::Summary(AutomaticSummaryRequestKind::ProjectWorker) => {
-                TokenSpendCommandSource::ProjectWorkerSummary
-            }
             Self::ScheduledSummary => TokenSpendCommandSource::ScheduledSummary,
         }
     }
@@ -124,23 +116,6 @@ impl InterventionService {
     ) -> Result<PromptAcknowledgement, InterventionServiceError> {
         self.prompt_with_automatic_policy(project_id, assignment_id, command, None)
             .await
-    }
-
-    pub(crate) async fn request_automatic_worker_summary(
-        &self,
-        project_id: &str,
-        assignment_id: &str,
-        command: SendAssignmentPrompt,
-    ) -> Result<PromptAcknowledgement, InterventionServiceError> {
-        self.prompt_with_automatic_policy(
-            project_id,
-            assignment_id,
-            command,
-            Some(AutomaticTokenSpendPolicy::Summary(
-                AutomaticSummaryRequestKind::ProjectWorker,
-            )),
-        )
-        .await
     }
 
     async fn prompt_with_automatic_policy(
@@ -500,19 +475,6 @@ impl InterventionService {
             .await
     }
 
-    pub(crate) async fn request_automatic_project_summary(
-        &self,
-        command: SendYardOrchestratorRoute,
-    ) -> Result<YardOrchestratorRoute, InterventionServiceError> {
-        self.route_yard_orchestrator_with_automatic_policy(
-            command,
-            Some(AutomaticTokenSpendPolicy::Summary(
-                AutomaticSummaryRequestKind::SuperintendentProject,
-            )),
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_lines)]
     async fn route_yard_orchestrator_with_automatic_policy(
         &self,
@@ -629,7 +591,6 @@ impl InterventionService {
     ) -> Result<(), InterventionServiceError> {
         let settings = self.store.get_token_spend_settings().await?;
         let enabled = match policy {
-            AutomaticTokenSpendPolicy::Summary(kind) => settings.automatic_summary_enabled(kind),
             AutomaticTokenSpendPolicy::ScheduledSummary => settings.scheduled_automatic_summaries,
         };
         if enabled {

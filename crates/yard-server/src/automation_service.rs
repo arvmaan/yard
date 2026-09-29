@@ -23,7 +23,6 @@ use crate::{
 
 const SCHEDULER_INTERVAL: Duration = Duration::from_secs(30);
 const SCHEDULER_BATCH_SIZE: usize = 100;
-const AUTOMATIC_SUMMARY_INTERVAL_MS: u64 = 15 * 60 * 1_000;
 const MAX_RUN_LIST_LIMIT: usize = 500;
 
 #[derive(Clone)]
