@@ -6,13 +6,11 @@ use thiserror::Error;
 use tokio::{sync::Mutex, time::sleep};
 use uuid::Uuid;
 use yard_domain::{
-    AssignmentLifecycle, AttemptLifecycle, AutomaticSummaryRequestKind, Automation,
-    AutomationCommandResult, AutomationRun, AutomationRunCommandResult, AutomationRunTrigger,
-    AutomationRuns, AutomationScope, Automations, CreateAutomation, DailySchedule, ObservedStatus,
-    RunAutomationNow, SendAssignmentPrompt, SendCoordinationNodePrompt, SendOrchestratorPrompt,
-    SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SetAutomationPaused, TokenSpendSettings,
-    UpdateAutomation, UpdateAutomationPlacement, UpdateTokenSpendSettings,
-    automation_dispatch_command_id,
+    Automation, AutomationCommandResult, AutomationRun, AutomationRunCommandResult,
+    AutomationRunTrigger, AutomationRuns, AutomationScope, Automations, CreateAutomation,
+    DailySchedule, RunAutomationNow, SendCoordinationNodePrompt, SendOrchestratorPrompt,
+    SendYardOrchestratorPrompt, SetAutomationPaused, TokenSpendSettings, UpdateAutomation,
+    UpdateAutomationPlacement, UpdateTokenSpendSettings, automation_dispatch_command_id,
 };
 use yard_store::{ProjectStoreError, YardStore};
 
@@ -448,126 +446,21 @@ impl AutomationService {
 
     async fn request_project_summaries(
         &self,
-        now_unix_ms: u64,
+        _now_unix_ms: u64,
     ) -> Result<(), AutomationServiceError> {
-        let superintendent = self.store.get_yard_orchestrator().await?;
-        let Some(superintendent_worker) = superintendent.worker.as_ref() else {
-            return Ok(());
-        };
-        if superintendent_worker.runtime.is_none() {
-            return Ok(());
-        }
-        for project in self.store.list_projects().await?.projects {
-            let Some(runtime) = project.orchestrator.runtime.as_ref() else {
-                continue;
-            };
-            if !matches!(runtime.status, ObservedStatus::Idle | ObservedStatus::Done) {
-                continue;
-            }
-            if !self
-                .store
-                .claim_automatic_summary_request(
-                    AutomaticSummaryRequestKind::SuperintendentProject,
-                    &project.id,
-                    now_unix_ms,
-                    AUTOMATIC_SUMMARY_INTERVAL_MS,
-                )
-                .await?
-            {
-                continue;
-            }
-            let command = SendYardOrchestratorRoute {
-                command_id: Uuid::now_v7().to_string(),
-                actor: "yard:auto:superintendent-project-summary".to_owned(),
-                expected_orchestrator_version: superintendent.version,
-                orchestrator_worker_id: superintendent_worker.id.clone(),
-                target_project_id: project.id.clone(),
-                expected_project_version: project.version,
-                target_orchestrator_worker_id: project.orchestrator.id.clone(),
-                text: "AUTOMATIC PROJECT SUMMARY REQUEST\n\
-                       The superintendent is requesting a concise current summary. Report progress, \
-                       next action, blockers, and any decision needed. Do not infer workflow \
-                       completion from runtime status."
-                    .to_owned(),
-            };
-            if let Err(error) = self
-                .interventions
-                .request_automatic_project_summary(command)
-                .await
-            {
-                tracing::warn!(
-                    project_id = %project.id,
-                    %error,
-                    "Automatic project summary request failed"
-                );
-            }
-        }
+        tracing::warn!(
+            "Skipped legacy automatic project summaries; summaries require isolated ephemeral workers"
+        );
         Ok(())
     }
 
     async fn request_worker_summaries(
         &self,
-        now_unix_ms: u64,
+        _now_unix_ms: u64,
     ) -> Result<(), AutomationServiceError> {
-        for project in self.store.list_projects().await?.projects {
-            if project.orchestrator.runtime.is_none() {
-                continue;
-            }
-            for assignment in self
-                .store
-                .list_project_assignments(&project.id)
-                .await?
-                .assignments
-            {
-                if assignment.lifecycle != AssignmentLifecycle::Active
-                    || assignment.attempt.lifecycle != AttemptLifecycle::Active
-                {
-                    continue;
-                }
-                let Some(runtime) = assignment.worker.runtime.as_ref() else {
-                    continue;
-                };
-                if !matches!(runtime.status, ObservedStatus::Idle | ObservedStatus::Done) {
-                    continue;
-                }
-                if !self
-                    .store
-                    .claim_automatic_summary_request(
-                        AutomaticSummaryRequestKind::ProjectWorker,
-                        &assignment.id,
-                        now_unix_ms,
-                        AUTOMATIC_SUMMARY_INTERVAL_MS,
-                    )
-                    .await?
-                {
-                    continue;
-                }
-                let command = SendAssignmentPrompt {
-                    command_id: Uuid::now_v7().to_string(),
-                    actor: format!("yard:auto:project-worker-summary:{}", project.id),
-                    attempt_id: assignment.attempt.id.clone(),
-                    expected_assignment_version: assignment.version,
-                    expected_attempt_version: assignment.attempt.version,
-                    text: "AUTOMATIC WORKER SUMMARY REQUEST\n\
-                           Your project orchestrator is requesting a concise current summary. \
-                           Report progress, next action, blockers, and any decision needed. Do not \
-                           treat this request as a completion instruction."
-                        .to_owned(),
-                };
-                if let Err(error) = self
-                    .interventions
-                    .request_automatic_worker_summary(&project.id, &assignment.id, command)
-                    .await
-                {
-                    tracing::warn!(
-                        project_id = %project.id,
-                        assignment_id = %assignment.id,
-                        %error,
-                        "Automatic worker summary request failed"
-                    );
-                }
-            }
-        }
+        tracing::warn!(
+            "Skipped legacy automatic worker summaries; summaries require isolated ephemeral workers"
+        );
         Ok(())
     }
 
