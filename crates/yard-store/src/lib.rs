@@ -19889,6 +19889,19 @@ mod tests {
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = OFF;
+                 DROP TABLE IF EXISTS summary_worker_commands;
+                 DROP TABLE IF EXISTS profile_launch_audits;
+                 DROP TABLE IF EXISTS agent_profile_files;
+                 DROP TABLE IF EXISTS cleanup_advisor_artifacts;
+                 DROP TABLE IF EXISTS worker_cleanup_pins;
+                 DROP TABLE IF EXISTS worker_cleanup_run_items;
+                 DROP TABLE IF EXISTS worker_cleanup_runs;
+                 DROP TABLE IF EXISTS worker_cleanup_policy;
+                 DROP TABLE IF EXISTS pane_management_leases;
+                 DROP TABLE IF EXISTS pane_management_batches;
+                 DROP TABLE IF EXISTS yard_installation;
+                 ALTER TABLE workers DROP COLUMN parent_worker_id;
+                 ALTER TABLE workers DROP COLUMN ownership_kind;
                  DROP TABLE project_repositories;
                  DROP TABLE IF EXISTS deleted_projects;
                  DROP TABLE IF EXISTS deleted_workers;
