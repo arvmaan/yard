@@ -242,12 +242,6 @@ impl AutomationService {
                 self.dispatch(run).await?;
             }
         }
-        if settings.superintendent_auto_requests_project_summaries {
-            self.request_project_summaries(now).await?;
-        }
-        if settings.project_orchestrators_auto_request_worker_summaries {
-            self.request_worker_summaries(now).await?;
-        }
         Ok(())
     }
 
@@ -447,26 +441,6 @@ impl AutomationService {
                 "Scheduled automatic summaries are disabled".to_owned(),
             ))
         }
-    }
-
-    async fn request_project_summaries(
-        &self,
-        _now_unix_ms: u64,
-    ) -> Result<(), AutomationServiceError> {
-        tracing::warn!(
-            "Skipped legacy automatic project summaries; summaries require isolated ephemeral workers"
-        );
-        Ok(())
-    }
-
-    async fn request_worker_summaries(
-        &self,
-        _now_unix_ms: u64,
-    ) -> Result<(), AutomationServiceError> {
-        tracing::warn!(
-            "Skipped legacy automatic worker summaries; summaries require isolated ephemeral workers"
-        );
-        Ok(())
     }
 
     async fn dispatch_prompt(

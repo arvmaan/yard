@@ -1327,6 +1327,7 @@ fn launch_ghostty_process(binary: &OsString, command: &[String]) -> io::Result<(
 }
 
 #[cfg(test)]
+#[allow(clippy::unnecessary_wraps)]
 fn noop_ghostty_launcher(_: &OsString, _: &[String]) -> io::Result<()> {
     Ok(())
 }

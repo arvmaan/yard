@@ -69,6 +69,7 @@ impl PaneManagementService {
     /// # Errors
     ///
     /// Returns an error when command validation or batch persistence fails.
+    #[allow(clippy::too_many_lines)]
     pub async fn manage_all_agents(
         &self,
         command: ManageAllAgents,
@@ -234,7 +235,7 @@ impl PaneManagementService {
                     runtime_version: String::new(),
                     protocol: 0,
                     observed_at_unix_ms: candidate.observed_at_unix_ms,
-                    focus: Default::default(),
+                    focus: yard_domain::FocusObservation::default(),
                     workspaces: Vec::new(),
                     tabs: Vec::new(),
                     panes: Vec::new(),
@@ -358,7 +359,7 @@ impl PaneManagementService {
                         worker_id = %lease.worker_id,
                         error_code = error_code(&error),
                         "Pane lease renewal failed; retrying before expiry"
-                    )
+                    );
                 }
             }
         }
@@ -417,6 +418,7 @@ impl PaneManagementService {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn classify_inventory(
     inventory: &RuntimeInventory,
     projects: &[Project],

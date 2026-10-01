@@ -764,7 +764,7 @@ impl OrchestratorReplacementService {
             self.fail_ambiguous_replacement(&command_id, &message)
                 .await?;
             return Err(error.into());
-        };
+        }
         if let Err(error) = self
             .verify_target_and_displaced_runtime(
                 &context.project,

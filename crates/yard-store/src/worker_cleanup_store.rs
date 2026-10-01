@@ -186,7 +186,7 @@ pub(super) async fn start_run(
                     .filter(|candidate| candidate.public.close_eligible)
                     .take(policy.batch_size - inserted)
                 {
-                    insert_item(&transaction, &run_id, candidate, now)?;
+                    insert_item(&transaction, &run_id, &candidate, now)?;
                     inserted += 1;
                 }
                 offset += scanned;
@@ -574,6 +574,7 @@ pub(super) async fn authorize_close(
         .await
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn record_advisor_assignment(
     store: &SqliteProjectStore,
     item: &ClaimedWorkerCleanupItem,
@@ -697,6 +698,7 @@ pub(super) async fn record_advisor_assignment(
         .await
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn record_advisor_artifact(
     store: &SqliteProjectStore,
     item: &ClaimedWorkerCleanupItem,
@@ -978,6 +980,7 @@ fn select_candidates_page(
         .map_err(Into::into)
 }
 
+#[allow(clippy::too_many_lines)]
 fn candidate_from_row(
     row: &Row<'_>,
     grace_period_ms: u64,
@@ -1126,7 +1129,7 @@ fn candidate_from_row(
 fn insert_item(
     connection: &Connection,
     run_id: &str,
-    candidate: CleanupCandidate,
+    candidate: &CleanupCandidate,
     now: u64,
 ) -> Result<(), ProjectStoreError> {
     let provider = candidate.runtime.provider_session.as_ref();
@@ -1276,6 +1279,7 @@ fn archive_binding(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn cleanup_item_authorized(
     connection: &Connection,
     run_id: &str,

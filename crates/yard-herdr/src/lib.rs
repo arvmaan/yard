@@ -301,6 +301,11 @@ impl HerdrAdapter {
         control::read_pane(&self.config, request).await
     }
 
+    /// Negotiate safe pane-management support for a running Herdr session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed RPC or runtime error when capability discovery fails.
     pub async fn pane_management_capability(
         &self,
         session_name: &str,
@@ -308,6 +313,11 @@ impl HerdrAdapter {
         management::capability(&self.config, session_name).await
     }
 
+    /// Acquire exclusive management authority for one exact pane instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed conflict, identity, protocol, or runtime error.
     pub async fn acquire_pane_lease(
         &self,
         request: AcquirePaneLeaseRequest,
@@ -315,6 +325,11 @@ impl HerdrAdapter {
         management::acquire(&self.config, request).await
     }
 
+    /// Renew management authority for one exact pane instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed expiry, identity, protocol, or runtime error.
     pub async fn renew_pane_lease(
         &self,
         request: RenewPaneLeaseRequest,
@@ -322,6 +337,11 @@ impl HerdrAdapter {
         management::renew(&self.config, request).await
     }
 
+    /// Release management authority for one exact pane instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed identity, protocol, or runtime error.
     pub async fn release_pane_lease(
         &self,
         request: ReleasePaneLeaseRequest,
@@ -329,6 +349,11 @@ impl HerdrAdapter {
         management::release(&self.config, request).await
     }
 
+    /// Read management authority for one exact pane instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed identity, protocol, or runtime error.
     pub async fn pane_lease_status(
         &self,
         request: PaneLeaseStatusRequest,
@@ -336,6 +361,11 @@ impl HerdrAdapter {
         management::status(&self.config, request).await
     }
 
+    /// Close one pane only while the supplied exact lease remains valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed expiry, identity, protocol, or runtime error.
     pub async fn close_if_pane_leased(
         &self,
         request: CloseLeasedPaneRequest,
