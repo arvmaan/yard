@@ -1354,6 +1354,9 @@ fn is_ownership_failure(message: &str) -> bool {
         || message.contains("already controlled")
         || message.contains("controller already")
         || message.contains("control conflict")
+        // Herdr 0.9.x: "terminal term_… already has an attached client;
+        // retry with --takeover".
+        || message.contains("already has an attached client")
 }
 
 fn classify_prompt_error(error: &HerdrError) -> RuntimeInterventionError {
@@ -1393,7 +1396,8 @@ mod tests {
     };
 
     use super::{
-        RetirementResolution, retirement_outcome, retirement_resolution, start_failure_error,
+        RetirementResolution, is_ownership_failure, retirement_outcome, retirement_resolution,
+        start_failure_error,
     };
     use crate::allocation_service::{
         RuntimeProvisionError, RuntimeRetirementError, RuntimeRetirementRequest,
@@ -1651,5 +1655,15 @@ mod tests {
             RetirementResolution::Absent
         ));
         assert!(retirement_outcome(&inventory, &request).is_ok());
+    }
+
+    #[test]
+    fn herdr_attached_client_refusal_is_an_ownership_failure() {
+        assert!(is_ownership_failure(
+            "terminal attach failed: terminal term_0f3a already has an attached client; retry with --takeover"
+        ));
+        assert!(!is_ownership_failure(
+            "terminal attach failed: no such terminal"
+        ));
     }
 }

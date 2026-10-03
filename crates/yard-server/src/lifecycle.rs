@@ -27,7 +27,7 @@ use tokio::{
     time::{Instant, sleep, timeout},
 };
 use uuid::Uuid;
-use yard_server::config::{ServerConfig, database_path_from_env};
+use yard_server::config::{ServerConfig, SlackConfig, SlackInbound, database_path_from_env};
 
 // Lifecycle commands trust only a same-UID peer that proves the random secret
 // over this private socket. Persisted PIDs are diagnostic and never authorize a
@@ -1384,6 +1384,25 @@ fn config_fingerprint(config: &ServerConfig) -> String {
     );
     let log_retention = config.storage.log_retention_days.to_string();
     let workspace_markers = config.storage.workspace_markers.join("\0");
+    // The Slack settings name a secret and a member id; the token itself is
+    // never configuration and never part of the fingerprint.
+    let slack = match &config.slack {
+        SlackConfig::Off => "off".to_owned(),
+        SlackConfig::Misconfigured(reason) => format!("misconfigured\0{reason}"),
+        SlackConfig::Enabled(settings) => format!(
+            "on\0{}\0{}\0{}\0{}\0{}\0{}",
+            settings.secret_id,
+            settings.aws_profile.as_deref().unwrap_or(""),
+            settings.aws_region,
+            settings.owner_user_id,
+            settings.enterprise_id.as_deref().unwrap_or(""),
+            match &settings.inbound {
+                SlackInbound::Off => "inbound-off".to_owned(),
+                SlackInbound::Enabled { app_secret_id } => format!("inbound-on\0{app_secret_id}"),
+                SlackInbound::Misconfigured(reason) => format!("inbound-misconfigured\0{reason}"),
+            },
+        ),
+    };
     for value in [
         config.bind.to_string().as_bytes(),
         config.herdr_binary.as_os_str().as_bytes(),
@@ -1395,6 +1414,7 @@ fn config_fingerprint(config: &ServerConfig) -> String {
         storage_roots.as_slice(),
         log_retention.as_bytes(),
         workspace_markers.as_bytes(),
+        slack.as_bytes(),
     ] {
         digest.update(value.len().to_le_bytes());
         digest.update(value);
@@ -1609,7 +1629,9 @@ mod tests {
         LifecycleError, ManagedState, RuntimePaths, config_fingerprint, database_identity, inspect,
         request, spawn_control, write_metadata,
     };
-    use yard_server::config::{ServerConfig, StorageConfig};
+    use yard_server::config::{
+        ServerConfig, SlackConfig, SlackInbound, SlackSettings, StorageConfig,
+    };
 
     #[test]
     fn config_fingerprint_covers_storage_roots_and_log_retention() {
@@ -1622,6 +1644,7 @@ mod tests {
             coordination_path: "/data/yard/coordination".into(),
             knowledge_path: "/data/yard/knowledge".into(),
             storage: StorageConfig::default(),
+            slack: SlackConfig::Off,
         };
         let mut configured = base.clone();
         configured.storage.roots = Some(vec!["/work/a".into()]);
@@ -1652,6 +1675,69 @@ mod tests {
             );
         }
         assert_eq!(config_fingerprint(&base), config_fingerprint(&base.clone()));
+    }
+
+    #[test]
+    fn config_fingerprint_covers_slack_settings() {
+        let base = ServerConfig {
+            bind: "127.0.0.1:4317".parse().expect("bind"),
+            herdr_binary: "herdr".into(),
+            database_path: "/data/yard/yard.sqlite3".into(),
+            artifact_path: "/data/yard/artifacts".into(),
+            orchestrator_cwd: "/work".into(),
+            coordination_path: "/data/yard/coordination".into(),
+            knowledge_path: "/data/yard/knowledge".into(),
+            storage: StorageConfig::default(),
+            slack: SlackConfig::Off,
+        };
+        let settings = SlackSettings {
+            secret_id: "yard/slack-bot".to_owned(),
+            aws_profile: None,
+            aws_region: "us-west-2".to_owned(),
+            owner_user_id: "U01ABCDEF".to_owned(),
+            enterprise_id: None,
+            inbound: SlackInbound::Off,
+        };
+        let with = |slack: SlackConfig| {
+            let mut config = base.clone();
+            config.slack = slack;
+            config_fingerprint(&config)
+        };
+        let mut profile = settings.clone();
+        profile.aws_profile = Some("yard-dev".to_owned());
+        let mut owner = settings.clone();
+        owner.owner_user_id = "U02ABCDEF".to_owned();
+        let mut enterprise = settings.clone();
+        enterprise.enterprise_id = Some("E01SANDBOX0".to_owned());
+        let mut inbound = settings.clone();
+        inbound.inbound = SlackInbound::Enabled {
+            app_secret_id: "yard/slack-app".to_owned(),
+        };
+        let mut inbound_other = settings.clone();
+        inbound_other.inbound = SlackInbound::Enabled {
+            app_secret_id: "yard/slack-app-2".to_owned(),
+        };
+        let mut inbound_broken = settings.clone();
+        inbound_broken.inbound = SlackInbound::Misconfigured("missing".to_owned());
+        let fingerprints = [
+            config_fingerprint(&base),
+            with(SlackConfig::Enabled(settings)),
+            with(SlackConfig::Enabled(profile)),
+            with(SlackConfig::Enabled(owner)),
+            with(SlackConfig::Enabled(enterprise)),
+            with(SlackConfig::Enabled(inbound)),
+            with(SlackConfig::Enabled(inbound_other)),
+            with(SlackConfig::Enabled(inbound_broken)),
+            with(SlackConfig::Misconfigured("missing".to_owned())),
+        ];
+        for (index, fingerprint) in fingerprints.iter().enumerate() {
+            assert!(
+                fingerprints[index + 1..]
+                    .iter()
+                    .all(|other| other != fingerprint),
+                "{index}"
+            );
+        }
     }
 
     fn metadata(instance_id: &str, mode: InstanceMode) -> InstanceMetadata {

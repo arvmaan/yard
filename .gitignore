@@ -3,7 +3,8 @@
 /web/dist/
 **/test-results/
 **/playwright-report/
-/docs/
+/docs/*
+!/docs/slack/
 /AGENTS.md
 .yard/
 *.log

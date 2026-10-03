@@ -75,6 +75,7 @@ use yard_domain::{
 mod assignment_disposition_store;
 mod automation_store;
 mod coordination_node_store;
+mod notification_store;
 mod orchestrator_workflow_profile_store;
 mod pane_management_store;
 mod project_archive_store;
@@ -85,6 +86,10 @@ mod token_spend_store;
 mod transcript_capture_store;
 mod worker_cleanup_store;
 
+pub use notification_store::{
+    ATTENTION_COMMAND_BATCH_LIMIT, ATTENTION_COMMAND_TYPES, AttentionCommand,
+    AttentionCommandStatus, AttentionRecords, AttentionRuntime, AttentionRuntimeRole,
+};
 pub use pane_management_store::{
     BeginPaneManagementBatch, ManagedPaneAdoption, StoredLeaseToken, StoredPaneManagementLease,
 };
@@ -210,6 +215,13 @@ pub trait YardStore: Send + Sync {
     /// Read the project and workstream paths the storage scan uses for
     /// ownership, plus current project workspace bindings.
     async fn storage_owner_records(&self) -> Result<StorageOwnerRecords, ProjectStoreError>;
+    /// Read-only attention inputs for outbound notifications: bound runtimes
+    /// of visible work, and prompt/route/allocation/handoff/disposition
+    /// commands that ended failed or ambiguous after the given time.
+    async fn attention_records(
+        &self,
+        commands_updated_after_unix_ms: u64,
+    ) -> Result<AttentionRecords, ProjectStoreError>;
     async fn claim_automatic_summary_request(
         &self,
         kind: AutomaticSummaryRequestKind,
@@ -1838,6 +1850,13 @@ impl YardStore for SqliteProjectStore {
 
     async fn storage_owner_records(&self) -> Result<StorageOwnerRecords, ProjectStoreError> {
         storage_owner_store::owner_records(self).await
+    }
+
+    async fn attention_records(
+        &self,
+        commands_updated_after_unix_ms: u64,
+    ) -> Result<AttentionRecords, ProjectStoreError> {
+        notification_store::attention_records(self, commands_updated_after_unix_ms).await
     }
 
     async fn claim_automatic_summary_request(

@@ -1654,6 +1654,41 @@ export interface Automations {
   automations: Automation[]
 }
 
+export type SlackIntegrationState =
+  | 'off'
+  | 'misconfigured'
+  | 'connecting'
+  | 'connected'
+  | 'error'
+
+export interface SlackTeam {
+  id: string
+  name: string
+  enterprise_id: string | null
+}
+
+/** `GET /api/v1/integrations/slack`; never carries the bot token. */
+export interface SlackIntegrationStatus {
+  enabled: boolean
+  status: SlackIntegrationState
+  team: SlackTeam | null
+  last_error: string | null
+  /** Unix milliseconds of the last message Slack accepted. */
+  last_sent_at: number | null
+  /**
+   * Only a `YARD_SLACK_*` change and a restart can help (off, invalid
+   * settings). `false` for problems found at runtime, such as the secret.
+   */
+  restart_required: boolean
+}
+
+/** One agent an open chat view shows (`PUT /api/v1/integrations/slack/presence`). */
+export type SlackPresenceTarget =
+  | { kind: 'assignment'; id: string }
+  | { kind: 'project_orchestrator'; id: string }
+  | { kind: 'yard_orchestrator' }
+  | { kind: 'coordination_node'; id: string }
+
 export interface TokenSpendSettings {
   superintendent_auto_requests_project_summaries: boolean
   project_orchestrators_auto_request_worker_summaries: boolean

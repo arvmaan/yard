@@ -1,0 +1,31 @@
+{
+  "display_information": {
+    "name": "Yard",
+    "description": "DMs its owner about blocked or finished Yard agents and answers the owner's DMs."
+  },
+  "features": {
+    "app_home": {
+      "home_tab_enabled": false,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    },
+    "bot_user": {
+      "display_name": "Yard",
+      "always_online": false
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": ["chat:write", "im:write", "im:history"]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": ["message.im"]
+    },
+    "interactivity": {
+      "is_enabled": true
+    },
+    "socket_mode_enabled": true
+  }
+}

@@ -58,6 +58,7 @@ import {
   TERMINAL_OUTPUT_LINES,
   TRUNCATED_TERMINAL_OUTPUT_LABEL,
 } from './terminalOutput'
+import { useSlackPresence } from './slackPresence'
 import { useModalDialog } from './useModalDialog'
 import type {
   Assignment,
@@ -71,6 +72,7 @@ import type {
   SendOrchestratorPromptInput,
   SendYardOrchestratorPromptInput,
   SendYardOrchestratorRouteInput,
+  SlackPresenceTarget,
   YardOrchestrator,
   YardOrchestratorRoute,
 } from './types'
@@ -83,6 +85,19 @@ export type AgentChatTarget =
 
 function agentChatTargetKey(target: AgentChatTarget) {
   return agentQuestionKey(target)
+}
+
+function slackPresenceTargets(target: AgentChatTarget): SlackPresenceTarget[] {
+  switch (target.kind) {
+    case 'assignment':
+      return [{ kind: 'assignment', id: target.assignment.id }]
+    case 'orchestrator':
+      return [{ kind: 'project_orchestrator', id: target.project.id }]
+    case 'yard-orchestrator':
+      return [{ kind: 'yard_orchestrator' }]
+    case 'coordination-node':
+      return [{ kind: 'coordination_node', id: target.node.id }]
+  }
 }
 
 type PromptFeedback =
@@ -199,6 +214,7 @@ export function AgentChatWorkspace({
     coordinationNode?.worker?.id ??
     ''
   const targetKey = agentChatTargetKey(target)
+  useSlackPresence(slackPresenceTargets(target), open)
   const workspaceQuestionKey = targetKey
   const recordedQuestion = useLatestAgentQuestion(workspaceQuestionKey)
   const targetRole =

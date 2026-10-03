@@ -25,6 +25,7 @@ use yard_server::{
     pane_management_service::PaneManagementService,
     reconciliation_service::ReconciliationService,
     runtime_cleanup_service::RuntimeCleanupService,
+    slack::{SlackNotifier, threads::thread_file_path},
     storage_inventory_service::StorageScanSettings,
     terminal_service::RuntimeTerminal,
     transcript_capture_service::TranscriptCaptureService,
@@ -195,6 +196,11 @@ where
     let worker_cleanup = WorkerCleanupService::new(source.clone(), store.clone());
     let transcripts =
         TranscriptCaptureService::new(source.clone(), intervention.clone(), store.clone());
+    let slack = SlackNotifier::new(
+        config.slack.clone(),
+        store.clone(),
+        thread_file_path(&config.database_path),
+    );
     let (shutdown, shutdown_receiver) = watch::channel(false);
     let (app, automations, connections) =
         app_with_reconciliation_and_paths_and_automation_and_shutdown(
@@ -210,6 +216,7 @@ where
             config.knowledge_path.clone(),
             StorageScanSettings::from_config(&config, Some(runtime_claim.paths().root())),
             shutdown_receiver.clone(),
+            slack.clone(),
         );
 
     let instance_id = match mode {
@@ -259,6 +266,10 @@ where
         automations.run().await;
         "automation scheduler"
     });
+    background_tasks.spawn(async move {
+        slack.run().await;
+        "slack notifier"
+    });
 
     tracing::info!(
         target: "yard_server",
@@ -270,6 +281,7 @@ where
         coordination = %config.coordination_path.display(),
         knowledge = %config.knowledge_path.display(),
         storage_roots = config.storage.roots.as_ref().map_or(0, Vec::len),
+        slack_notifications = config.slack.enabled(),
         mode = %lifecycle_mode,
         "Yard UI available"
     );
@@ -693,6 +705,7 @@ mod tests {
             coordination_path: temp.path().join("coordination"),
             knowledge_path: temp.path().join("knowledge"),
             storage: yard_server::config::StorageConfig::default(),
+            slack: yard_server::config::SlackConfig::Off,
         };
         let runtime_claim = lifecycle::claim_runtime(&database_path, InstanceMode::Managed)
             .await

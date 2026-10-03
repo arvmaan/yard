@@ -39,6 +39,7 @@ import {
   sessionOptionLabel,
   type SessionRoleCounts,
 } from './sessionSelection'
+import { SlackSettingsRow } from './SlackSettingsRow'
 import { useModalDialog } from './useModalDialog'
 
 export type ResourceView = 'archived' | 'profiles' | 'workspaces' | 'workers'
@@ -710,6 +711,10 @@ export function SettingsDialog({
                 </button>
               </div>
             </div>
+          </section>
+          <section aria-labelledby={`${titleId}-notifications`}>
+            <h3 id={`${titleId}-notifications`}>Notifications</h3>
+            <SlackSettingsRow />
           </section>
           <section aria-labelledby={`${titleId}-automatic`}>
             <h3 id={`${titleId}-automatic`}>Automatic coordination</h3>

@@ -66,6 +66,7 @@ import type {
   SendYardOrchestratorPromptInput,
   SendYardOrchestratorRouteInput,
   StatusReport,
+  SlackIntegrationStatus,
   SummaryWorker,
   TokenSpendSettings,
   TerminalClientMessage,
@@ -6674,6 +6675,191 @@ test('provides one-click runtime health and persistent appearance settings', asy
     path: testInfo.outputPath('slice1-command-bar-desktop.png'),
     fullPage: true,
   })
+})
+
+test('shows Slack DM status and sends a test message from Settings', async ({
+  page,
+}) => {
+  await mockApi(page)
+  let slack: SlackIntegrationStatus = {
+    enabled: true,
+    status: 'error',
+    team: { id: 'T01SANDBOX', name: 'Acme Sandbox', enterprise_id: 'E01' },
+    last_error: 'Slack could not be reached: timed out',
+    last_sent_at: null,
+    restart_required: false,
+  }
+  const testRequests: string[] = []
+  await page.route('**/api/v1/integrations/slack**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    if (path === '/api/v1/integrations/slack' && request.method() === 'GET') {
+      await route.fulfill({ json: slack })
+      return
+    }
+    if (
+      path === '/api/v1/integrations/slack/test' &&
+      request.method() === 'POST'
+    ) {
+      testRequests.push(request.method())
+      if (testRequests.length === 1) {
+        await route.fulfill({
+          status: 502,
+          json: {
+            error: {
+              code: 'slack_delivery_failed',
+              message: 'Slack returned `channel_not_found`',
+            },
+          },
+        })
+        return
+      }
+      slack = {
+        ...slack,
+        status: 'connected',
+        last_error: null,
+        last_sent_at: Date.UTC(2026, 8, 28, 17, 5),
+      }
+      await route.fulfill({ json: slack })
+      return
+    }
+    await route.fulfill({ status: 404 })
+  })
+  await page.goto('/')
+
+  const dialog = await openSettings(page)
+  const row = dialog.locator('.settings-row', { hasText: 'Slack DMs' })
+  await expect(row).toContainText(
+    'Not delivering: Slack could not be reached: timed out',
+  )
+  const send = row.getByRole('button', { name: 'Send Slack test message' })
+  await expect(send).toBeEnabled()
+
+  await send.click()
+  await expect(row.getByRole('alert')).toHaveText(
+    'Slack returned `channel_not_found`',
+  )
+  await expect(send).toBeEnabled()
+
+  await send.click()
+  await expect(row.getByRole('status')).toHaveText(
+    'Test message sent. Check your Slack DMs.',
+  )
+  await expect(row).toContainText('Connected to Acme Sandbox · last message')
+  expect(testRequests).toHaveLength(2)
+})
+
+test('explains off and misconfigured Slack notifications without a test button', async ({
+  page,
+}) => {
+  await mockApi(page)
+  let slack: SlackIntegrationStatus = {
+    enabled: true,
+    status: 'misconfigured',
+    team: null,
+    last_error: 'YARD_SLACK_OWNER_USER_ID is required when YARD_SLACK_NOTIFICATIONS=on',
+    last_sent_at: null,
+    restart_required: true,
+  }
+  let posts = 0
+  await page.route('**/api/v1/integrations/slack**', async (route) => {
+    if (route.request().method() === 'POST') posts += 1
+    await route.fulfill({ json: slack })
+  })
+  await page.goto('/')
+
+  let dialog = await openSettings(page)
+  let row = dialog.locator('.settings-row', { hasText: 'Slack DMs' })
+  await expect(row).toContainText(
+    'Misconfigured: YARD_SLACK_OWNER_USER_ID is required',
+  )
+  await expect(
+    row.getByRole('button', { name: 'Send Slack test message' }),
+  ).toBeDisabled()
+  await dialog.getByRole('button', { name: 'Close settings' }).click()
+
+  slack = { ...slack, enabled: false, status: 'off', last_error: null }
+  dialog = await openSettings(page)
+  row = dialog.locator('.settings-row', { hasText: 'Slack DMs' })
+  await expect(row).toContainText(
+    'Off. Set YARD_SLACK_NOTIFICATIONS=on and restart Yard to get DMs',
+  )
+  await expect(
+    row.getByRole('button', { name: 'Send Slack test message' }),
+  ).toBeDisabled()
+  expect(posts).toBe(0)
+})
+
+test('updates Slack status after connecting and allows a retry for a bad secret', async ({
+  page,
+}) => {
+  await mockApi(page)
+  let slack: SlackIntegrationStatus = {
+    enabled: true,
+    status: 'connecting',
+    team: null,
+    last_error: null,
+    last_sent_at: null,
+    restart_required: false,
+  }
+  let reads = 0
+  await page.route('**/api/v1/integrations/slack**', async (route) => {
+    if (route.request().method() === 'GET') reads += 1
+    await route.fulfill({ json: slack })
+  })
+  await page.goto('/')
+
+  const dialog = await openSettings(page)
+  const row = dialog.locator('.settings-row', { hasText: 'Slack DMs' })
+  await expect(row).toContainText('Connecting to Slack…')
+  const send = row.getByRole('button', { name: 'Send Slack test message' })
+  await expect(send).toBeDisabled()
+
+  // The first connect finishes while Settings stays open: the row re-polls.
+  slack = {
+    ...slack,
+    status: 'misconfigured',
+    last_error: 'The secret does not hold a bot token (xoxb-…)',
+  }
+  await expect(row).toContainText(
+    'Misconfigured: The secret does not hold a bot token (xoxb-…). After fixing it, send a test message to retry; no restart needed',
+    { timeout: 10_000 },
+  )
+  await expect(send).toBeEnabled()
+  const settledReads = reads
+  await page.waitForTimeout(3_500)
+  expect(reads).toBe(settledReads)
+})
+
+test('reports Slack presence only while a chat is open', async ({ page }) => {
+  const state = await mockApi(page)
+  const seeded = seedActiveAssignment(state)
+  const reports: unknown[] = []
+  await page.route('**/api/v1/integrations/slack/presence', async (route) => {
+    expect(route.request().method()).toBe('PUT')
+    reports.push(route.request().postDataJSON())
+    await route.fulfill({ status: 204, body: '' })
+  })
+  await page.setViewportSize({ width: 1200, height: 760 })
+  await page.goto('/')
+  await expect(page.locator('.assigned-worker-marker')).toBeVisible()
+  // Background status polling and the canvas never report presence.
+  await page.waitForTimeout(500)
+  expect(reports).toEqual([])
+
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open chat', exact: true }).click()
+  await expect
+    .poll(() => reports)
+    .toEqual([{ targets: [{ kind: 'assignment', id: seeded.id }] }])
+
+  await page.getByRole('button', { name: 'Back to Map' }).click()
+  const afterClose = reports.length
+  await page.evaluate(() =>
+    document.dispatchEvent(new Event('visibilitychange')),
+  )
+  await page.waitForTimeout(300)
+  expect(reports).toHaveLength(afterClose)
 })
 
 test('keeps Slice 1 chrome visible and motion-safe at mobile widths', async ({

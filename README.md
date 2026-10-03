@@ -66,6 +66,7 @@ tabs do not provide:
 - [Orchestration](#orchestration)
 - [Knowledge and automations](#knowledge-and-automations)
 - [Storage preview](#storage-preview)
+- [Slack notifications](#slack-notifications)
 - [Architecture](#architecture)
 - [Configuration](#configuration)
 - [Development and verification](#development-and-verification)
@@ -388,6 +389,245 @@ Stopping Yard cancels a running walk. Git
 runs read-only with no fetch. Both requests accept only a loopback `Host` and,
 from a browser, a loopback `Origin`; this is provenance, not authentication.
 
+## Slack notifications
+
+Yard can DM one person (its owner) on Slack when something needs them, and,
+when inbound is also on, let that person answer from the DM. It is off unless
+`YARD_SLACK_NOTIFICATIONS=on`.
+
+- **Outbound** (phase 1): DM notifications with a bot token (`chat:write`,
+  `im:write`). On its own nothing in Slack can drive Yard.
+- **Inbound** (phase 2, [Answering from Slack](#answering-from-slack)): off
+  unless `YARD_SLACK_INBOUND=on` and `YARD_SLACK_APP_SECRET_ID` are also set.
+  Yard opens an outbound Socket Mode WebSocket with an app-level token; there
+  is still no inbound HTTP endpoint. Only the owner's own DMs and button clicks
+  are accepted.
+
+What is sent, derived on the server from durable state (not from the browser):
+
+- **Blocked**: Herdr reports a bound worker, project orchestrator,
+  superintendent, or workstream agent is waiting on a prompt in its terminal.
+- **Ready for review**: an assignment worker went from working (or blocked) to
+  Herdr's `done`. The message says no receipt has been recorded; Yard never
+  infers completion. Turns started by Yard's automatic worker summary requests
+  (the "auto-request worker summaries" setting) are not announced.
+- **Command failed or ambiguous**: a prompt, route, allocation, handoff, or
+  disposition ended `failed` or `ambiguous` ("Yard can't tell whether this
+  landed; it was not retried").
+
+Nothing is sent for ended, archived, or deleted work, for states that were
+already true when Yard started, or while the agent's terminal or chat is open
+in a browser tab (an open terminal counts while its socket is connected; an
+open chat reports itself every 20 s while the tab is visible and counts for
+60 s after each report; background status polling never counts). An
+announcement that was skipped because the agent was open is not sent later. A state must hold through a settle window (15 s blocked, 20 s
+ready for review, 10 s commands) and is announced once until it changes. At most
+one message goes out every 10 seconds; anything that becomes ready meanwhile is
+combined into one message (in the project's thread, or one digest when several
+projects are involved), and a backlog older than an hour is summarized as a
+count. Each project gets one DM thread; replies are broadcast so they notify.
+Messages carry titles and states only (project, agent profile, a short
+objective title, state, time), never terminal output, transcripts, file
+contents, or links to this machine. The objective title is the first line of
+the assignment objective, which is also the start of the worker's prompt, cut
+to 80 characters; keep secrets and private detail out of that first line.
+Every title passes a redactor that replaces credential-like words, loopback
+URLs and local file paths.
+
+The token lives in AWS Secrets Manager. Yard reads it with
+`aws secretsmanager get-secret-value` (AWS CLI v2 on `PATH`), keeps it only in
+memory, and never logs it, stores it, or returns it from an API. If Slack
+rejects the token, Yard drops it and re-reads the secret after a backoff, so a
+rotated secret is picked up without a restart. A missing or invalid setting
+never stops Yard: Settings shows `misconfigured` with the reason. A setting
+problem needs a restart; a problem found at runtime (the secret does not hold a
+bot token, a different enterprise, a Slack error such as `channel_not_found`)
+does not: fix it and press **Send test message** to retry at once, otherwise
+Yard retries after its backoff (failed posts wait 30 s, doubling to 10 min).
+
+`GET /api/v1/integrations/slack` reports
+`{enabled, status: off|misconfigured|connecting|connected|error, team,
+last_error, last_sent_at, restart_required}` (`last_sent_at` in Unix
+milliseconds; `connecting` until the first connection attempt finishes). `POST
+/api/v1/integrations/slack/test` sends one test DM; like lifecycle commands it
+accepts only a loopback `Host` and, from a browser, a loopback `Origin`.
+`PUT /api/v1/integrations/slack/presence` is the open chat's report; it has the
+same guard and also requires `Sec-Fetch-Site: same-origin`, so only the Yard
+page itself can mark an agent as open. The Settings dialog shows the status
+and a **Send test message** button. With inbound configured, the status also
+carries `inbound: {status: off|misconfigured|connecting|connected|error,
+last_error}` (not shown in the web UI yet).
+
+### Answering from Slack
+
+With inbound on, the owner can use the DM with the Yard bot:
+
+- **Unblock an agent.** A blocked notification is followed, in the same
+  thread, by a card showing what the agent is asking, read from its terminal
+  now: the question and its options, or the exact command of a permission or
+  approval prompt (redacted: environment values, secret-looking flags, URL
+  credentials, tokens and paths are replaced; capped at 1,500 characters).
+  Each option has a button; permission prompts, and any menu that reads like
+  one, get only **Allow once** and **Deny**. "Always allow", "don't ask
+  again", "this session" and similar standing grants are never offered and
+  can never be sent. A permission whose command is not fully shown (cut by
+  the detail limit, the top of the screen or the 1,500-character cap) gets
+  no buttons. A plain question from the agent gets its own top-level card
+  with "reply in this thread"; the reply is delivered as a prompt prefixed
+  `From Slack (owner):`. Herdr reports an agent that asks at its input box
+  as finished rather than blocked, so a "finished" notification is followed
+  by such a question card too when the agent's screen ends in a question.
+  Only a question card's thread takes a free-text reply: typed text in any
+  other thread (a menu or permission card, a notification, an answer) is
+  not sent anywhere unless it starts with `<Project>:`; use the buttons, or
+  open Yard for a menu's "Type something" entry. A prompt Yard cannot parse
+  confidently gets a
+  redacted screen excerpt and "open Yard", never guessed buttons; so do
+  multi-select (checkbox) lists and Submit / Review steps. An agent that is
+  no longer blocked gets a note and nothing from its screen. About 1.5 s
+  after a button is sent Yard reads the pane again: a next prompt (for
+  example question 2 of a multi-question dialog) gets its own card in the
+  same thread, and a prompt that is still unchanged gets "open Yard". A
+  refused or expired button collapses its card to "not sent — reason".
+- **Status commands** (instant, from durable state, no model involved):
+  `status` (every project, the Superintendent and workstreams), `status
+  <project>` (one project's agents), `blocked` (a card with answer buttons for
+  each blocked agent, at most 5), `review` (workers whose turn finished) and
+  `help`. They show titles and states only. A message Slack delivers more
+  than 5 minutes late (Yard offline or reconnecting) is not acted on; Yard
+  replies once in its thread asking to send it again.
+- **Questions.** Any other top-level message goes to the Superintendent, or to a
+  project's orchestrator when it starts with the project's name and a colon
+  (`Telemetry: what's left?`). It is delivered through the same guarded
+  orchestrator prompt path as Yard's prompt box, prefixed `From Slack
+  (owner):`, and refused while that orchestrator is itself waiting on a prompt
+  (its card is shown instead). The orchestrator answers with Yard's status
+  report for that prompt; Yard re-reads the pane every 5 s and posts the
+  report whose command ID matches (state, `last`, `next`, blockers; redacted,
+  capped at 2,900 characters with "(truncated)") in the thread. Nothing else
+  from the terminal is relayed; a report the agent's UI wrapped over several
+  rows (up to 60) is rejoined. With no report after 5 minutes Yard says so
+  and keeps watching, every 30 s, for up to 30 minutes; at most 4 answers are
+  watched at once.
+
+Every button carries only a random single-use ID that expires after 5 minutes;
+Yard keeps the rest (agent, terminal identity, a fingerprint of the prompt as
+shown, the option) in memory, so a restart invalidates open buttons. Before
+typing anything Yard re-reads the pane and requires the same terminal (worker,
+terminal, pane, tab, provider session), the agent still blocked, and the same
+prompt fingerprint; with the terminal lease held it reads the pane again
+(same prompt and cursor) and checks the cursor is on the option before Enter;
+otherwise nothing is typed and the current prompt is shown.
+Keys go through the terminal lease the web terminal uses, so an agent whose
+terminal you control in Yard is answered there ("open in Yard"). An event is
+accepted only from the configured owner, in the bot's DM, from the same team,
+enterprise and app, not from a bot, not edited, not a retry of one already
+handled, and less than 5 minutes old; everything is acknowledged to Slack
+within its 3-second window before any work. Each inbound action and its
+outcome is appended to `slack-audit.jsonl` beside the database (0600; Slack
+user, action, target, outcome; never message or prompt text); dropped events
+(anyone but the owner, stale, malformed) go to `slack-audit-dropped.jsonl`,
+so they can never rotate the owner's records away. Run inbound on
+one Yard only: Slack spreads events over every open connection.
+
+### Setting it up
+
+Build and test in a sandbox workspace first; production later uses the same
+manifest.
+
+1. In Slack, create a personal sandbox workspace on
+   `example-sandbox.enterprise.slack.com`.
+2. Create an app **From a manifest** (JSON) with
+   [`docs/slack/manifest.json`](docs/slack/manifest.json), or
+   [`docs/slack/manifest-outbound-only.json`](docs/slack/manifest-outbound-only.json)
+   if you want notifications only (rename it `Yard-<name>` first), then
+   **Install to Workspace**.
+3. Copy the **Bot User OAuth Token** (`xoxb-…`) from **OAuth & Permissions**.
+4. Store it yourself; Yard only reads it:
+
+   ```sh
+   umask 077
+   read -rs 'token?Bot token: '    # bash: read -rsp 'Bot token: ' token
+   printf '{"bot_token":"%s"}' "$token" > bot-token.json
+   unset token
+   aws secretsmanager create-secret --profile yard-dev --region us-west-2 \
+     --name yard/slack-bot --secret-string file://bot-token.json
+   rm -P bot-token.json            # Linux: shred -u bot-token.json
+   ```
+
+   This keeps the token out of the process list and your shell history (never
+   put it on the command line: Yard's own agents run as you and can read
+   history). Rotate the same way with `aws secretsmanager put-secret-value
+   --secret-id yard/slack-bot --secret-string file://bot-token.json` (every 90
+   days or per your workspace policy). A plain `xoxb-…` secret string also works.
+5. Find your member ID: your Slack profile, **⋮**, **Copy member ID**
+   (`U…`). Member IDs differ between the sandbox and production workspaces.
+6. Set the variables on the command that starts Yard and restart it:
+
+   ```sh
+   YARD_SLACK_NOTIFICATIONS=on \
+   YARD_SLACK_SECRET_ID=yard/slack-bot \
+   YARD_SLACK_AWS_PROFILE=yard-dev \
+   YARD_SLACK_OWNER_USER_ID=U0123ABCD \
+   YARD_SLACK_ENTERPRISE_ID=E01SANDBOX0 \
+   yard start
+   ```
+
+   `YARD_SLACK_ENTERPRISE_ID` is optional; when set, Yard refuses to send if
+   `auth.test` reports a different enterprise. Start without it, read the
+   enterprise ID that `GET /api/v1/integrations/slack` reports under `team`
+   once connected, then pin it (the value above is a placeholder). Enable
+   Slack only on the one Yard instance you watch; a rehearsal instance with
+   the same settings would DM you too.
+7. Open **Settings**, check the Slack row says connected, and press **Send test
+   message**.
+
+To turn on inbound (an app created from the outbound-only manifest, or before
+phase 2, needs steps 8–9 first):
+
+8. In the app's settings, open **App Manifest**, paste
+   [`docs/slack/manifest.json`](docs/slack/manifest.json), save, and
+   **Reinstall to Workspace** (it adds `im:history`, the `message.im` event,
+   interactivity, the Messages tab and Socket Mode). The bot token usually stays
+   the same; if Slack issues a new one, store it as in step 4 with
+   `put-secret-value`.
+9. Under **Basic Information → App-Level Tokens**, **Generate Token and
+   Scopes** with the one scope `connections:write`, and store the `xapp-…`
+   token under its own secret the same way:
+
+   ```sh
+   umask 077
+   read -rs 'token?App-level token: '    # bash: read -rsp 'App-level token: ' token
+   printf '{"app_token":"%s"}' "$token" > app-token.json
+   unset token
+   aws secretsmanager create-secret --profile yard-dev --region us-west-2 \
+     --name yard/slack-app --secret-string file://app-token.json
+   rm -P app-token.json            # Linux: shred -u app-token.json
+   ```
+
+10. Add `YARD_SLACK_INBOUND=on YARD_SLACK_APP_SECRET_ID=yard/slack-app` to the
+    variables of step 6 and restart Yard. `GET /api/v1/integrations/slack`
+    reports `inbound.status: connected`; DM the bot `help`. The app-level token
+    is read, held and redacted like the bot token; a rejected one is dropped
+    and re-read. Without `YARD_SLACK_APP_SECRET_ID`, or if the app secret
+    cannot be read, inbound reports `misconfigured` or `error` and
+    notifications keep working.
+
+For an isolated rehearsal, a debug build (`cargo build`, never `--release`)
+honours `YARD_SLACK_TEST_ENDPOINT=http://127.0.0.1:<port>`: the Web API and
+the Socket Mode URL then go to a fake Slack on that loopback port (any other
+value is ignored with a warning, and a WARN is logged while it is active).
+Release builds do not read it.
+
+For production: recreate the app from the same manifest in your production
+workspace and follow that workspace's app-approval process. The bot scopes are
+`chat:write`, `im:write`, and (inbound only) `im:history`; `connections:write`
+belongs to the app-level token, not the bot. The app stores no Slack
+conversation data (the audit file keeps who did what, never message text) and
+sends nothing to a third party. Then store the production tokens under their
+own secrets, and update `YARD_SLACK_SECRET_ID`, `YARD_SLACK_APP_SECRET_ID`,
+`YARD_SLACK_OWNER_USER_ID`, and `YARD_SLACK_ENTERPRISE_ID`.
+
 ## Architecture
 
 Yard is a Rust workspace with a React client embedded in the `yard`
@@ -434,6 +674,14 @@ exclusively owns a database.
 | `YARD_STORAGE_ROOTS` | colon-separated absolute directories the read-only storage preview may scan; each must be an existing directory and not itself a symlink, including spellings such as `link/` or `link/.` (symlinked ancestors are fine), for example `/local/home/sample/workspaces:/home/sample/yard`; an invalid or missing entry stops `yard start` with a configuration error (fail closed) | unset: nothing is scanned |
 | `YARD_STORAGE_LOG_RETENTION_DAYS` | build logs newer than this many days keep a workspace candidate in review | `14` |
 | `YARD_STORAGE_WORKSPACE_MARKERS` | comma-separated file names that mark a workspace root (a directory holding one of them and a `src/` directory), for example `workspace.toml`; its `build/`, `env/`, `.build/`, and `.build-logs/` become workspace candidates | unset: workspace classes disabled |
+| `YARD_SLACK_NOTIFICATIONS` | `on` enables outbound Slack DM notifications ([Slack notifications](#slack-notifications)); any other value except `off` reports `misconfigured` | `off` |
+| `YARD_SLACK_SECRET_ID` | Secrets Manager secret name or ARN holding `{"bot_token":"xoxb-…"}` or a plain `xoxb-…` string; required when on | unset |
+| `YARD_SLACK_AWS_PROFILE` | AWS CLI profile used to read the secret | unset: default credential chain |
+| `YARD_SLACK_AWS_REGION` | region of the secret | `us-west-2` |
+| `YARD_SLACK_OWNER_USER_ID` | Slack member ID (`U…` or `W…`) of the one person Yard DMs; required when on | unset |
+| `YARD_SLACK_ENTERPRISE_ID` | when set, Yard sends nothing unless `auth.test` reports this Slack enterprise (fail closed) | unset: not checked |
+| `YARD_SLACK_INBOUND` | `on` (with notifications on) answers the owner's DMs and buttons over Socket Mode ([Answering from Slack](#answering-from-slack)); any other value except `off` reports inbound `misconfigured` and leaves notifications running | `off` |
+| `YARD_SLACK_APP_SECRET_ID` | Secrets Manager secret name or ARN holding `{"app_token":"xapp-…"}` or a plain `xapp-…` string (app-level token with `connections:write`), read with the same profile and region; required when inbound is on | unset |
 | `YARD_API_TARGET` | Vite development proxy target only | `http://127.0.0.1:4317` |
 
 Stop Yard before copying its database and managed directories for backup.

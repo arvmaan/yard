@@ -1756,6 +1756,7 @@ fn server_config_excludes_every_yard_data_path_and_the_runtime_dir() {
         coordination_path: PathBuf::from("/data/coordination"),
         knowledge_path: PathBuf::from("/data/knowledge"),
         storage: crate::config::StorageConfig::default(),
+        slack: crate::config::SlackConfig::Off,
     };
     let settings = StorageScanSettings::from_config(&config, Some(Path::new("/run/yard")));
     assert_eq!(
