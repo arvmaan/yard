@@ -76,6 +76,10 @@ use crate::project_orchestrator_transfer_service::{
 use crate::project_service::{ProjectService, ProjectServiceError};
 use crate::reconciliation_service::{ReconciliationService, ReconciliationServiceError};
 use crate::repository_files_service::{RepositoryFilesService, RepositoryFilesServiceError};
+use crate::slack::{
+    SlackIntegrationStatus, SlackNotifier, SlackTestError,
+    presence::{ViewTarget, ViewerPresence},
+};
 use crate::storage_inventory_service::{StorageScanService, StorageScanSettings};
 use crate::summary_worker_service::{SummaryWorkerService, SummaryWorkerServiceError};
 use crate::terminal_service::{RuntimeTerminal, TerminalService};
@@ -116,6 +120,8 @@ struct AppState {
     storage: StorageScanService,
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
+    slack: SlackNotifier,
+    presence: ViewerPresence,
 }
 
 #[cfg(test)]
@@ -138,6 +144,7 @@ pub(crate) fn router(
         StorageScanSettings::not_configured(),
         None,
         ConnectionTracker::default(),
+        SlackNotifier::off(),
     )
 }
 
@@ -154,6 +161,7 @@ fn test_router_with_shutdown(
     storage: StorageScanSettings,
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
+    slack: SlackNotifier,
 ) -> Router {
     let reconciliation = ReconciliationService::new(Arc::clone(&source), Arc::clone(&store));
     let managed_root = env::temp_dir().join(format!("yard-http-{}", uuid::Uuid::now_v7()));
@@ -188,6 +196,7 @@ fn test_router_with_shutdown(
         storage,
         shutdown,
         connections,
+        slack,
     )
 }
 
@@ -207,6 +216,7 @@ pub(crate) fn router_with_reconciliation_and_shutdown(
     storage: StorageScanSettings,
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
+    slack: SlackNotifier,
 ) -> Router {
     router_with_reconciliation_and_shutdown_and_ghostty(
         source,
@@ -224,6 +234,7 @@ pub(crate) fn router_with_reconciliation_and_shutdown(
         storage,
         shutdown,
         connections,
+        slack,
     )
 }
 
@@ -244,7 +255,9 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
     storage: StorageScanSettings,
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
+    slack: SlackNotifier,
 ) -> Router {
+    let presence = slack.presence();
     let storage = StorageScanService::with_shutdown(
         storage,
         Arc::clone(&store),
@@ -304,6 +317,12 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
     );
     let terminals =
         TerminalService::new(interventions.clone(), coordination_nodes.clone(), terminal);
+    slack.attach_console(Arc::new(crate::slack::console::YardConsole::new(
+        interventions.clone(),
+        terminals.clone(),
+        coordination_nodes.clone(),
+        Arc::clone(&store),
+    )));
     let yard_orchestrator = YardOrchestratorService::new(
         runtime,
         yard_orchestrator_intervention,
@@ -635,6 +654,15 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             axum::routing::post(start_storage_scan),
         )
         .route("/api/v1/storage/scans/{scan_id}", get(get_storage_scan))
+        .route("/api/v1/integrations/slack", get(get_slack_integration))
+        .route(
+            "/api/v1/integrations/slack/test",
+            axum::routing::post(send_slack_test_message),
+        )
+        .route(
+            "/api/v1/integrations/slack/presence",
+            axum::routing::put(put_slack_presence),
+        )
         .route(
             "/api/v1/worker-profiles",
             get(list_worker_profiles).post(create_worker_profile),
@@ -686,6 +714,8 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             storage,
             shutdown,
             connections,
+            slack,
+            presence,
         })
 }
 
@@ -2347,6 +2377,124 @@ async fn get_storage_scan(
             code: "storage_scan_not_found",
             message: "The storage scan expired or was replaced; start a new scan".to_owned(),
         })
+}
+
+async fn get_slack_integration(
+    State(state): State<AppState>,
+) -> NoStoreJson<SlackIntegrationStatus> {
+    NoStoreJson(state.slack.status())
+}
+
+/// Send one test DM. Guarded like lifecycle commands: a cross-site page or a
+/// DNS-rebinding host cannot make Yard post to Slack.
+async fn send_slack_test_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<NoStoreJson<SlackIntegrationStatus>, ApiError> {
+    lifecycle_request_origin(&headers)?;
+    state
+        .slack
+        .send_test()
+        .await
+        .map(NoStoreJson)
+        .map_err(|error| {
+            let (status, code) = match &error {
+                SlackTestError::Off => (StatusCode::CONFLICT, "slack_notifications_off"),
+                SlackTestError::Misconfigured(_) => (StatusCode::CONFLICT, "slack_misconfigured"),
+                SlackTestError::RateLimited => {
+                    (StatusCode::TOO_MANY_REQUESTS, "slack_test_rate_limited")
+                }
+                SlackTestError::Failed(_) => (StatusCode::BAD_GATEWAY, "slack_delivery_failed"),
+            };
+            ApiError {
+                status,
+                code,
+                message: error.to_string(),
+            }
+        })
+}
+
+/// Agents one browser tab has open in a chat view (Slack suppression).
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SlackPresenceRequest {
+    targets: Vec<SlackPresenceTarget>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SlackPresenceTarget {
+    Assignment { id: String },
+    ProjectOrchestrator { id: String },
+    YardOrchestrator,
+    CoordinationNode { id: String },
+}
+
+const SLACK_PRESENCE_MAX_TARGETS: usize = 32;
+const SLACK_PRESENCE_MAX_ID_LEN: usize = 256;
+
+impl SlackPresenceTarget {
+    fn into_view_target(self) -> Option<ViewTarget> {
+        let valid = |id: &String| !id.is_empty() && id.len() <= SLACK_PRESENCE_MAX_ID_LEN;
+        match self {
+            Self::Assignment { id } => valid(&id).then_some(ViewTarget::Assignment(id)),
+            Self::ProjectOrchestrator { id } => {
+                valid(&id).then_some(ViewTarget::ProjectOrchestrator(id))
+            }
+            Self::YardOrchestrator => Some(ViewTarget::YardOrchestrator),
+            Self::CoordinationNode { id } => valid(&id).then_some(ViewTarget::CoordinationNode(id)),
+        }
+    }
+}
+
+/// Heartbeat from an open chat view: those agents count as "in view" for
+/// [`crate::slack::presence::RECENT_VIEW_TTL`].
+///
+/// Presence is explicit on purpose. Terminal-output reads do not count,
+/// because the web's background status poll reads every project
+/// orchestrator and would silence all of them while any Yard tab is visible.
+/// The request must come from the Yard page itself: the lifecycle guard
+/// (loopback `Host`, loopback `Origin` when present) plus
+/// `Sec-Fetch-Site: same-origin`, which browsers set and CLIs or agents do
+/// not, since a suppressed episode is consumed, not deferred.
+async fn put_slack_presence(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SlackPresenceRequest>,
+) -> Result<StatusCode, ApiError> {
+    lifecycle_request_origin(&headers)?;
+    let same_origin = headers
+        .get("sec-fetch-site")
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"same-origin"));
+    if !same_origin {
+        return Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            code: "slack_presence_browser_only",
+            message: "Only the Yard web page reports which agents are open".to_owned(),
+        });
+    }
+    if request.targets.len() > SLACK_PRESENCE_MAX_TARGETS {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "slack_presence_too_many_targets",
+            message: format!("At most {SLACK_PRESENCE_MAX_TARGETS} agents per presence report"),
+        });
+    }
+    let targets = request
+        .targets
+        .into_iter()
+        .map(SlackPresenceTarget::into_view_target)
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "slack_presence_invalid_target",
+            message: "Each presence target needs a non-empty id".to_owned(),
+        })?;
+    let now = std::time::Instant::now();
+    for target in targets {
+        state.presence.touch(target, now);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn put_artifact(
@@ -6374,6 +6522,7 @@ mod tests {
                 crate::storage_inventory_service::StorageScanSettings::not_configured(),
                 None,
                 crate::ConnectionTracker::default(),
+                crate::slack::SlackNotifier::off(),
             ),
             temp,
         )
@@ -7088,6 +7237,7 @@ mod tests {
             crate::storage_inventory_service::StorageScanSettings::not_configured(),
             Some(receiver),
             connections.clone(),
+            crate::slack::SlackNotifier::off(),
         );
         (app, temp, shutdown, connections)
     }
@@ -8898,6 +9048,153 @@ mod tests {
         assert!(revoked.is_err(), "open terminal was closed: {revoked:?}");
 
         server.abort();
+    }
+
+    /// Slack must not type where the UI would not: into a managed pane whose
+    /// lease needs recovery, or into an isolated summary worker. Both typing
+    /// paths (button keys and free-text prompts) refuse before touching the
+    /// pane; with neither condition the same prompt goes through.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn slack_console_refuses_recovery_required_panes_and_summary_workers() {
+        use crate::{
+            CoordinationNodeService, InterventionService,
+            slack::{
+                actions::{AgentConsole, AgentTarget, ConsoleError, KeyPlan},
+                console::{LEASE_RECOVERY_REQUIRED, SUMMARY_WORKER_REFUSED, YardConsole},
+                prompt::OptionRole,
+            },
+            terminal_service::TerminalService,
+        };
+
+        let source: Arc<dyn InventorySource> = Arc::new(FakeInventory);
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("yard.sqlite3");
+        let store = Arc::new(SqliteProjectStore::open(&db).await.unwrap());
+        let runtime = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            source.clone(),
+            runtime.clone(),
+            runtime.clone(),
+            runtime.clone(),
+            store.clone(),
+            artifacts,
+        );
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+
+        let reconciliation = ReconciliationService::new(Arc::clone(&source), store.clone());
+        let nodes = CoordinationNodeService::new(
+            Arc::clone(&source),
+            runtime.clone(),
+            runtime.clone(),
+            store.clone(),
+            reconciliation,
+            temp.path().join("coordination"),
+            temp.path().join("knowledge"),
+        );
+        let interventions =
+            InterventionService::new(Arc::clone(&source), runtime.clone(), store.clone());
+        let terminals = TerminalService::new(interventions.clone(), nodes.clone(), runtime);
+        let console = YardConsole::new(interventions, terminals, nodes, store.clone());
+        let target = AgentTarget::Assignment {
+            project_id: project_id.clone(),
+            assignment_id,
+        };
+        let identity = console.snapshot(&target).await.unwrap().identity;
+        let plan = KeyPlan {
+            fingerprint: "unused".to_owned(),
+            option_index: 0,
+            role: OptionRole::Allow,
+            keys: vec!["\r"],
+        };
+        let installation = store.pane_management_installation_uuid().await.unwrap();
+        let raw = rusqlite::Connection::open(&db).unwrap();
+        let far_future = i64::MAX / 2;
+
+        // A managed pane whose lease Yard lost.
+        raw.execute(
+            "INSERT INTO pane_management_leases (
+                 worker_id, project_id, allocation_id, installation_uuid, herdr_session,
+                 pane_id, pane_instance_id, owner_id, lease_token, expires_at_unix_ms,
+                 acquisition_request_id, status, renew_after_unix_ms,
+                 created_at_unix_ms, updated_at_unix_ms)
+             SELECT allocation.worker_id, ?1, allocation.id, ?2, 'default', 'pane-1',
+                    'instance-1', 'owner', 'token', ?3, 'request-1', 'recovery_required',
+                    ?3, 0, 0
+               FROM worker_allocations allocation
+              WHERE allocation.worker_id = ?4",
+            rusqlite::params![project_id, installation, far_future, identity.worker_id],
+        )
+        .unwrap();
+        let lease_refusal = |error: ConsoleError| {
+            assert!(
+                matches!(&error, ConsoleError::Unavailable(message) if message == LEASE_RECOVERY_REQUIRED),
+                "{error:?}"
+            );
+        };
+        lease_refusal(
+            console
+                .type_keys(&target, &identity, &plan)
+                .await
+                .unwrap_err(),
+        );
+        lease_refusal(
+            console
+                .send_prompt(&target, &identity, "hello", "slack:owner:U1")
+                .await
+                .unwrap_err(),
+        );
+        // An active lease that already expired needs recovery too (as the UI shows it).
+        raw.execute(
+            "UPDATE pane_management_leases SET status = 'active', expires_at_unix_ms = 1",
+            [],
+        )
+        .unwrap();
+        lease_refusal(
+            console
+                .send_prompt(&target, &identity, "hello", "slack:owner:U1")
+                .await
+                .unwrap_err(),
+        );
+        raw.execute("DELETE FROM pane_management_leases", [])
+            .unwrap();
+
+        // An isolated summary worker.
+        raw.execute(
+            "UPDATE workers SET ownership_kind = 'system_ephemeral' WHERE id = ?1",
+            [&identity.worker_id],
+        )
+        .unwrap();
+        let summary_refusal = |error: ConsoleError| {
+            assert!(
+                matches!(&error, ConsoleError::Unavailable(message) if message == SUMMARY_WORKER_REFUSED),
+                "{error:?}"
+            );
+        };
+        summary_refusal(
+            console
+                .type_keys(&target, &identity, &plan)
+                .await
+                .unwrap_err(),
+        );
+        summary_refusal(
+            console
+                .send_prompt(&target, &identity, "hello", "slack:owner:U1")
+                .await
+                .unwrap_err(),
+        );
+
+        // Neither condition: the same prompt is delivered.
+        raw.execute(
+            "UPDATE workers SET ownership_kind = 'yard_owned' WHERE id = ?1",
+            [&identity.worker_id],
+        )
+        .unwrap();
+        console
+            .send_prompt(&target, &identity, "hello", "slack:owner:U1")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -18498,8 +18795,328 @@ done
             storage,
             None,
             crate::ConnectionTracker::default(),
+            crate::slack::SlackNotifier::off(),
         );
         (app, temp)
+    }
+
+    async fn slack_test_router(slack: crate::slack::SlackNotifier) -> (Router, TempDir) {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = test_router_with_shutdown(
+            Arc::new(FakeInventory),
+            runtime.clone(),
+            runtime.clone(),
+            runtime,
+            store,
+            artifacts,
+            noop_ghostty_launcher,
+            crate::storage_inventory_service::StorageScanSettings::not_configured(),
+            None,
+            crate::ConnectionTracker::default(),
+            slack,
+        );
+        (app, temp)
+    }
+
+    #[tokio::test]
+    async fn slack_status_is_off_by_default_and_never_cached() {
+        let (app, _temp) = slack_test_router(crate::slack::SlackNotifier::off()).await;
+        let response = storage_request(&app, Method::GET, "/api/v1/integrations/slack", &[]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({
+                "enabled": false,
+                "status": "off",
+                "team": null,
+                "last_error": null,
+                "last_sent_at": null,
+                "restart_required": true,
+                "inbound": { "status": "off", "last_error": null },
+            })
+        );
+        let response = storage_request(
+            &app,
+            Method::POST,
+            "/api/v1/integrations/slack/test",
+            &[("origin", "http://127.0.0.1:4317")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "slack_notifications_off"
+        );
+    }
+
+    #[tokio::test]
+    async fn slack_test_message_requires_the_loopback_request_guard() {
+        let temp = TempDir::new().unwrap();
+        let (store, _) = crate::slack::tests::store_with_project(&temp).await;
+        let slack = crate::slack::tests::MockSlack::start().await;
+        let notifier = crate::slack::tests::notifier(
+            &temp,
+            store,
+            &slack,
+            crate::config::SlackConfig::Enabled(crate::slack::tests::settings(None)),
+        );
+        let (app, _router_temp) = slack_test_router(notifier).await;
+        for headers in [
+            &[("origin", "https://evil.example")][..],
+            &[("host", "attacker.example:4317")][..],
+        ] {
+            let response = storage_request(
+                &app,
+                Method::POST,
+                "/api/v1/integrations/slack/test",
+                headers,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{headers:?}");
+        }
+        assert!(slack.calls("chat.postMessage").is_empty());
+
+        let response = storage_request(
+            &app,
+            Method::POST,
+            "/api/v1/integrations/slack/test",
+            &[
+                ("origin", "http://127.0.0.1:4317"),
+                ("host", "127.0.0.1:4317"),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let status = response_json(response).await;
+        assert_eq!(status["status"], "connected");
+        assert_eq!(status["team"]["id"], "T01SANDBOX");
+        assert!(status["last_sent_at"].as_u64().is_some());
+        assert!(!status.to_string().contains("xoxb-"));
+        assert_eq!(slack.calls("chat.postMessage").len(), 1);
+
+        let again =
+            storage_request(&app, Method::POST, "/api/v1/integrations/slack/test", &[]).await;
+        assert_eq!(again.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn an_open_terminal_marks_its_agent_as_viewed_until_it_closes() {
+        let slack = crate::slack::SlackNotifier::off();
+        let presence = slack.presence();
+        let (app, _temp) = slack_test_router(slack).await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let target = crate::slack::presence::ViewTarget::Assignment(assignment_id.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+        let url = format!(
+            "ws://{address}/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal?cols=80&rows=24"
+        );
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://127.0.0.1:5173"),
+        );
+        assert!(!presence.is_viewing(&target, std::time::Instant::now()));
+        let (mut socket, _) = connect_async(request).await.unwrap();
+        socket.next().await.unwrap().unwrap();
+        assert!(presence.is_viewing(&target, std::time::Instant::now()));
+        socket
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({"type": "terminal.release"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        socket.next().await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while presence.is_viewing(&target, std::time::Instant::now()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("closing the terminal ends the view");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn slack_answers_use_the_guarded_terminal_lease_and_binding() {
+        use crate::slack::actions::{AgentTarget, ConsoleError};
+        let slack = crate::slack::SlackNotifier::off();
+        let (app, _temp) = slack_test_router(slack.clone()).await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let console = slack.console().expect("the app attaches Yard's console");
+        let target = AgentTarget::Assignment {
+            project_id: project_id.clone(),
+            assignment_id,
+        };
+        let snapshot = console.snapshot(&target).await.unwrap();
+        assert!(!snapshot.identity.pane_id.is_empty());
+        assert!(!snapshot.blocked, "the fake agent is working");
+        assert!(
+            console
+                .screen(&target)
+                .await
+                .unwrap()
+                .contains("Focused tests")
+        );
+        // Keys go through TerminalService's lease; with the lease held the
+        // pane is re-read, and a screen that no longer shows the planned
+        // prompt (here: a working agent) types nothing.
+        let plan = crate::slack::actions::KeyPlan {
+            fingerprint: "planned-prompt".to_owned(),
+            option_index: 0,
+            role: crate::slack::prompt::OptionRole::Allow,
+            keys: vec!["\r"],
+        };
+        assert!(matches!(
+            console.type_keys(&target, &snapshot.identity, &plan).await,
+            Err(ConsoleError::PromptChanged(_))
+        ));
+        let mut other = snapshot.identity.clone();
+        other.pane_id = "pane-other".to_owned();
+        assert!(matches!(
+            console.type_keys(&target, &other, &plan).await,
+            Err(ConsoleError::IdentityChanged(_))
+        ));
+        // Questions: the orchestrator prompt path returns its command id;
+        // the answer is only its status report for that id.
+        let orchestrator = AgentTarget::ProjectOrchestrator {
+            project_id: project_id.clone(),
+        };
+        let identity = console.snapshot(&orchestrator).await.unwrap().identity;
+        let command_id = console
+            .send_prompt(
+                &orchestrator,
+                &identity,
+                "From Slack (owner): what's left?",
+                "slack:owner:U01OWNER",
+            )
+            .await
+            .expect("the guarded orchestrator prompt path");
+        assert!(uuid::Uuid::parse_str(&command_id).is_ok(), "{command_id}");
+        assert_eq!(
+            console
+                .status_report(&orchestrator, &command_id)
+                .await
+                .unwrap(),
+            None,
+            "the fake output has no report"
+        );
+        assert_eq!(
+            console.status_report(&target, &command_id).await.unwrap(),
+            None
+        );
+        let missing = AgentTarget::Assignment {
+            project_id,
+            assignment_id: "missing".to_owned(),
+        };
+        assert!(matches!(
+            console.snapshot(&missing).await,
+            Err(ConsoleError::Gone(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn only_explicit_same_origin_presence_marks_an_agent_as_viewed() {
+        let slack = crate::slack::SlackNotifier::off();
+        let presence = slack.presence();
+        let (app, _temp) = slack_test_router(slack).await;
+        let now = std::time::Instant::now;
+        let yard = crate::slack::presence::ViewTarget::YardOrchestrator;
+        let orchestrator =
+            crate::slack::presence::ViewTarget::ProjectOrchestrator("p-1".to_owned());
+        // Output reads never count, even from the page: the web's status
+        // poll reads every orchestrator in the background.
+        for uri in [
+            "/api/v1/yard/orchestrator/terminal-output?lines=10",
+            "/api/v1/projects/p-1/orchestrator/terminal-output?lines=80",
+        ] {
+            storage_request(
+                &app,
+                Method::GET,
+                uri,
+                &[
+                    ("sec-fetch-site", "same-origin"),
+                    ("host", "127.0.0.1:5173"),
+                ],
+            )
+            .await;
+        }
+        assert!(!presence.is_viewing(&yard, now()));
+        assert!(!presence.is_viewing(&orchestrator, now()));
+
+        let body = r#"{"targets":[{"kind":"yard_orchestrator"},{"kind":"project_orchestrator","id":"p-1"}]}"#;
+        for headers in [
+            &[][..],
+            &[("sec-fetch-site", "cross-site")][..],
+            &[("sec-fetch-site", "same-site")][..],
+            &[("sec-fetch-site", "none")][..],
+            &[
+                ("sec-fetch-site", "same-origin"),
+                ("host", "evil.example:4317"),
+            ][..],
+            &[
+                ("sec-fetch-site", "same-origin"),
+                ("origin", "https://evil.example"),
+            ][..],
+        ] {
+            let response = presence_request(&app, body, headers).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{headers:?}");
+            assert!(!presence.is_viewing(&yard, now()), "{headers:?}");
+        }
+        for invalid in [
+            r#"{"targets":[{"kind":"assignment","id":""}]}"#,
+            r#"{"targets":[{"kind":"assignment"}]}"#,
+        ] {
+            let response =
+                presence_request(&app, invalid, &[("sec-fetch-site", "same-origin")]).await;
+            assert!(response.status().is_client_error(), "{invalid}");
+        }
+        let response = presence_request(
+            &app,
+            body,
+            &[
+                ("sec-fetch-site", "same-origin"),
+                ("host", "127.0.0.1:5173"),
+                ("origin", "http://127.0.0.1:5173"),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(presence.is_viewing(&yard, now()));
+        assert!(presence.is_viewing(&orchestrator, now()));
+        assert!(!presence.is_viewing(
+            &crate::slack::presence::ViewTarget::ProjectOrchestrator("p-2".to_owned()),
+            now()
+        ));
+    }
+
+    async fn presence_request(
+        app: &Router,
+        body: &'static str,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let mut request = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/integrations/slack/presence")
+            .header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        app.clone()
+            .oneshot(request.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
     }
 
     async fn storage_request(

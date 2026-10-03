@@ -96,6 +96,8 @@ import type {
   SendYardOrchestratorPromptInput,
   SendYardOrchestratorRouteInput,
   SetProjectRepositoryInput,
+  SlackIntegrationStatus,
+  SlackPresenceTarget,
   TerminalOutput,
   SummaryWorker,
   SummaryWorkers,
@@ -543,6 +545,40 @@ export function fetchTokenSpendSettings(
   signal?: AbortSignal,
 ): Promise<TokenSpendSettings> {
   return requestJson('/api/v1/token-spend-settings', { signal })
+}
+
+export function fetchSlackIntegration(
+  signal?: AbortSignal,
+): Promise<SlackIntegrationStatus> {
+  return requestJson('/api/v1/integrations/slack', { signal })
+}
+
+export function sendSlackTestMessage(
+  signal?: AbortSignal,
+): Promise<SlackIntegrationStatus> {
+  return requestJson('/api/v1/integrations/slack/test', {
+    method: 'POST',
+    signal,
+  })
+}
+
+/** Tell Yard which agents an open chat shows, so Slack stays quiet about them. */
+export async function reportSlackPresence(
+  targets: SlackPresenceTarget[],
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch('/api/v1/integrations/slack/presence', {
+    body: JSON.stringify({ targets }),
+    headers: { 'Content-Type': 'application/json' },
+    method: 'PUT',
+    signal,
+  })
+  if (!response.ok) {
+    throw new YardApiError(
+      `http_${response.status}`,
+      `Yard returned HTTP ${response.status}`,
+    )
+  }
 }
 
 export function fetchOrchestratorWorkflowProfile(

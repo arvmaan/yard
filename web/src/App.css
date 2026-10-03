@@ -3277,6 +3277,11 @@ html[data-yard-allocation-dragging="true"]
   justify-self: end;
 }
 
+.settings-row small[data-tone="attention"],
+.settings-feedback {
+  color: var(--ink);
+}
+
 @keyframes settings-dialog-in {
   from {
     opacity: 0;

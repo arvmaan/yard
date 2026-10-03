@@ -22,6 +22,7 @@ pub mod reconciliation_service;
 pub mod repository_files_service;
 pub mod runtime_cleanup_service;
 mod runtime_identity;
+pub mod slack;
 mod status_protocol;
 mod storage_classify;
 pub mod storage_inventory_service;
@@ -46,6 +47,7 @@ use coordination_node_service::CoordinationNodeService;
 use intervention_service::{InterventionService, RuntimeIntervention};
 use inventory_service::InventorySource;
 use reconciliation_service::ReconciliationService;
+use slack::SlackNotifier;
 use std::path::PathBuf;
 use storage_inventory_service::StorageScanSettings;
 use terminal_service::RuntimeTerminal;
@@ -240,6 +242,7 @@ pub fn app_with_reconciliation_and_paths_and_automation(
         StorageScanSettings::not_configured(),
         None,
         ConnectionTracker::default(),
+        SlackNotifier::off(),
     )
 }
 
@@ -258,6 +261,7 @@ pub fn app_with_reconciliation_and_paths_and_automation_and_shutdown(
     knowledge_path: PathBuf,
     storage: StorageScanSettings,
     shutdown: watch::Receiver<bool>,
+    slack: SlackNotifier,
 ) -> (Router, AutomationService, ConnectionTracker) {
     let connections = ConnectionTracker::default();
     let (router, automations) = build_app_with_reconciliation_and_paths_and_automation(
@@ -274,6 +278,7 @@ pub fn app_with_reconciliation_and_paths_and_automation_and_shutdown(
         storage,
         Some(shutdown),
         connections.clone(),
+        slack,
     );
     (router, automations, connections)
 }
@@ -293,6 +298,7 @@ fn build_app_with_reconciliation_and_paths_and_automation(
     storage: StorageScanSettings,
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
+    slack: SlackNotifier,
 ) -> (Router, AutomationService) {
     let artifacts = ArtifactService::new(artifact_path, Arc::clone(&store));
     let coordination_nodes = CoordinationNodeService::new(
@@ -328,6 +334,7 @@ fn build_app_with_reconciliation_and_paths_and_automation(
         storage,
         shutdown,
         connections,
+        slack,
     );
     (router, automations)
 }

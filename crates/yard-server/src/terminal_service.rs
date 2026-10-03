@@ -268,6 +268,27 @@ impl TerminalLease {
             TerminalLeaseTarget::CoordinationNode { .. } => "coordination_node_changed",
         }
     }
+
+    /// The worker and runtime the lease was granted for: `(worker id,
+    /// terminal id, pane id, tab id, provider session)`. Slack compares it
+    /// with the identity a button was issued for before typing.
+    pub(crate) fn granted_identity(
+        &self,
+    ) -> (&str, &str, &str, Option<&str>, Option<&ProviderSessionRef>) {
+        let worker_id = match &self.target {
+            TerminalLeaseTarget::Assignment { worker_id, .. }
+            | TerminalLeaseTarget::Orchestrator { worker_id }
+            | TerminalLeaseTarget::YardOrchestrator { worker_id }
+            | TerminalLeaseTarget::CoordinationNode { worker_id, .. } => worker_id.as_str(),
+        };
+        (
+            worker_id,
+            &self.runtime.terminal_id,
+            &self.runtime.pane_id,
+            self.runtime.tab_id.as_deref(),
+            self.runtime.provider_session.as_ref(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

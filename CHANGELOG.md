@@ -7,6 +7,20 @@ a release is tagged.
 
 ### Added
 
+- Added Slack DM notifications for one owner (`YARD_SLACK_NOTIFICATIONS=on`):
+  blocked agents, work ready for review, and failed or ambiguous commands,
+  titles and states only, with the bot token read from Secrets Manager.
+- Added answering from Slack (`YARD_SLACK_INBOUND=on` with an app-level token
+  in `YARD_SLACK_APP_SECRET_ID`), over an outbound Socket Mode connection with
+  no inbound endpoint and only the owner's own DMs accepted: blocked
+  notifications carry the agent's current prompt (redacted) with single-use,
+  5-minute buttons that re-check the terminal and prompt before typing, and
+  never offer "always allow"; `status`, `status <project>`, `blocked`,
+  `review` and `help` answer from durable state; any other message goes to
+  the Superintendent, or to a project orchestrator for `Project: question`,
+  and its status report is posted back in the thread. Every inbound action is
+  audited in `slack-audit.jsonl`. The Slack app manifests are now JSON
+  (`docs/slack/manifest.json`, `docs/slack/manifest-outbound-only.json`).
 - Installed `yard` CLI with managed `start`, `status`, and `stop` commands,
   explicit foreground `run`, and a user-local source installer.
 - Added durable project archiving with guarded runtime cleanup, active-map

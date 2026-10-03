@@ -21,6 +21,7 @@ use crate::{
     ConnectionGuard,
     coordination_node_service::CoordinationNodeServiceError,
     intervention_service::InterventionServiceError,
+    slack::presence::{PresenceGuard, ViewTarget},
     terminal_service::{
         MAX_TERMINAL_MESSAGE_BYTES, RuntimeTerminalError, TerminalClientMessage,
         TerminalServerMessage, TerminalServiceError, sequence_continues,
@@ -123,10 +124,13 @@ pub(super) async fn assignment_terminal(
         .map_err(|error| terminal_error(&error))?;
     let terminals = state.terminals.clone();
     let shutdown = state.shutdown.clone();
+    let viewing = state.presence.open(ViewTarget::Assignment(assignment_id));
     Ok(websocket
         .max_message_size(MAX_TERMINAL_MESSAGE_BYTES)
         .max_frame_size(MAX_TERMINAL_MESSAGE_BYTES)
-        .on_upgrade(move |socket| relay(socket, terminal, terminals, shutdown, connection)))
+        .on_upgrade(move |socket| {
+            relay(socket, terminal, terminals, shutdown, connection, viewing)
+        }))
 }
 
 pub(super) async fn orchestrator_terminal(
@@ -145,10 +149,15 @@ pub(super) async fn orchestrator_terminal(
         .map_err(|error| terminal_error(&error))?;
     let terminals = state.terminals.clone();
     let shutdown = state.shutdown.clone();
+    let viewing = state
+        .presence
+        .open(ViewTarget::ProjectOrchestrator(project_id));
     Ok(websocket
         .max_message_size(MAX_TERMINAL_MESSAGE_BYTES)
         .max_frame_size(MAX_TERMINAL_MESSAGE_BYTES)
-        .on_upgrade(move |socket| relay(socket, terminal, terminals, shutdown, connection)))
+        .on_upgrade(move |socket| {
+            relay(socket, terminal, terminals, shutdown, connection, viewing)
+        }))
 }
 
 pub(super) async fn yard_orchestrator_terminal(
@@ -166,10 +175,13 @@ pub(super) async fn yard_orchestrator_terminal(
         .map_err(|error| terminal_error(&error))?;
     let terminals = state.terminals.clone();
     let shutdown = state.shutdown.clone();
+    let viewing = state.presence.open(ViewTarget::YardOrchestrator);
     Ok(websocket
         .max_message_size(MAX_TERMINAL_MESSAGE_BYTES)
         .max_frame_size(MAX_TERMINAL_MESSAGE_BYTES)
-        .on_upgrade(move |socket| relay(socket, terminal, terminals, shutdown, connection)))
+        .on_upgrade(move |socket| {
+            relay(socket, terminal, terminals, shutdown, connection, viewing)
+        }))
 }
 
 pub(super) async fn coordination_node_terminal(
@@ -188,10 +200,13 @@ pub(super) async fn coordination_node_terminal(
         .map_err(|error| terminal_error(&error))?;
     let terminals = state.terminals.clone();
     let shutdown = state.shutdown.clone();
+    let viewing = state.presence.open(ViewTarget::CoordinationNode(node_id));
     Ok(websocket
         .max_message_size(MAX_TERMINAL_MESSAGE_BYTES)
         .max_frame_size(MAX_TERMINAL_MESSAGE_BYTES)
-        .on_upgrade(move |socket| relay(socket, terminal, terminals, shutdown, connection)))
+        .on_upgrade(move |socket| {
+            relay(socket, terminal, terminals, shutdown, connection, viewing)
+        }))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -201,6 +216,7 @@ async fn relay(
     terminals: crate::terminal_service::TerminalService,
     mut shutdown: Option<watch::Receiver<bool>>,
     _connection: ConnectionGuard,
+    _viewing: PresenceGuard,
 ) {
     let crate::terminal_service::OpenedTerminal { lease, mut session } = terminal;
     let mut last_sequence = None;

@@ -52,6 +52,7 @@ import {
   TERMINAL_OUTPUT_LINES,
   TRUNCATED_TERMINAL_OUTPUT_LABEL,
 } from './terminalOutput'
+import { useSlackPresence } from './slackPresence'
 import { useModalDialog } from './useModalDialog'
 import type {
   Assignment,
@@ -198,6 +199,14 @@ export function AgentGroupChat({
   const [promptText, setPromptText] = useState('')
   const [sending, setSending] = useState(false)
   const [open, setOpen] = useState(false)
+  useSlackPresence(
+    stableTargets.map((target) =>
+      target.kind === 'assignment'
+        ? { kind: 'assignment', id: target.assignment.id }
+        : { kind: 'project_orchestrator', id: target.project.id },
+    ),
+    open,
+  )
   const [deliveries, setDeliveries] = useState<
     Record<string, TargetDelivery>
   >({})

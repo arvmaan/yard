@@ -1,0 +1,20 @@
+{
+  "display_information": {
+    "name": "Yard",
+    "description": "DMs its owner when a Yard agent is blocked, ready for review, or a command failed."
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "Yard",
+      "always_online": false
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": ["chat:write", "im:write"]
+    }
+  },
+  "settings": {
+    "socket_mode_enabled": false
+  }
+}

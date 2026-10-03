@@ -17,6 +17,7 @@ pub struct ServerConfig {
     pub coordination_path: PathBuf,
     pub knowledge_path: PathBuf,
     pub storage: StorageConfig,
+    pub slack: SlackConfig,
 }
 
 /// Default for `YARD_STORAGE_LOG_RETENTION_DAYS`.
@@ -192,6 +193,251 @@ fn canonical_storage_root(path: &Path) -> Result<PathBuf, ConfigError> {
     Ok(canonical)
 }
 
+/// Default for `YARD_SLACK_AWS_REGION`.
+pub const DEFAULT_SLACK_AWS_REGION: &str = "us-west-2";
+
+/// Slack DM notifications (phase 1) and optional inbound Socket Mode
+/// (phase 2, [`SlackInbound`]).
+///
+/// Parsing never fails: with `YARD_SLACK_NOTIFICATIONS=on` and a missing or
+/// invalid setting, Yard still starts and the notifier reports
+/// `misconfigured` with the reason. The bot token is never configuration;
+/// only the Secrets Manager secret that holds it is.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SlackConfig {
+    /// `YARD_SLACK_NOTIFICATIONS` is unset, empty or `off`.
+    #[default]
+    Off,
+    Enabled(SlackSettings),
+    /// Notifications were requested but a setting is missing or invalid.
+    Misconfigured(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlackSettings {
+    /// Secrets Manager secret id or ARN (a pointer, not a credential).
+    pub secret_id: String,
+    /// `None` uses the default AWS credential chain.
+    pub aws_profile: Option<String>,
+    pub aws_region: String,
+    /// Slack member id (`U…` or `W…`) of the one person Yard DMs.
+    pub owner_user_id: String,
+    /// When set, `auth.test` must report this enterprise (fail closed).
+    pub enterprise_id: Option<String>,
+    /// Inbound Socket Mode (phase 2); off unless explicitly enabled.
+    pub inbound: SlackInbound,
+}
+
+/// Inbound Slack over Socket Mode (phase 2).
+///
+/// Runs only when notifications are on, `YARD_SLACK_INBOUND=on` and
+/// `YARD_SLACK_APP_SECRET_ID` names the secret holding the app-level
+/// (`xapp-…`) token. A problem here never disables outbound notifications.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SlackInbound {
+    /// `YARD_SLACK_INBOUND` is unset, empty or `off`.
+    #[default]
+    Off,
+    Enabled {
+        /// Secrets Manager secret id or ARN holding the app-level token.
+        app_secret_id: String,
+    },
+    /// Inbound was requested but a setting is missing or invalid.
+    Misconfigured(String),
+}
+
+impl SlackInbound {
+    fn parse(values: &SlackEnv) -> Self {
+        let mode = values
+            .inbound
+            .as_deref()
+            .map(|value| value.to_str().map(str::trim));
+        match mode {
+            None | Some(Some("" | "off")) => return Self::Off,
+            Some(Some("on")) => {}
+            Some(_) => {
+                return Self::Misconfigured("YARD_SLACK_INBOUND must be `on` or `off`".to_owned());
+            }
+        }
+        match optional_setting(
+            "YARD_SLACK_APP_SECRET_ID",
+            values.app_secret_id.as_deref(),
+            2048,
+            |byte| byte.is_ascii_alphanumeric() || b"/_+=.@-:".contains(&byte),
+            "a Secrets Manager secret name or ARN",
+        ) {
+            Ok(Some(app_secret_id)) => Self::Enabled { app_secret_id },
+            Ok(None) => Self::Misconfigured(
+                "YARD_SLACK_APP_SECRET_ID is required when YARD_SLACK_INBOUND=on".to_owned(),
+            ),
+            Err(reason) => Self::Misconfigured(reason),
+        }
+    }
+
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        matches!(self, Self::Enabled { .. })
+    }
+}
+
+impl SlackConfig {
+    /// Read the `YARD_SLACK_*` variables.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let read = |name: &str| env::var_os(name);
+        Self::parse(&SlackEnv {
+            notifications: read("YARD_SLACK_NOTIFICATIONS"),
+            secret_id: read("YARD_SLACK_SECRET_ID"),
+            aws_profile: read("YARD_SLACK_AWS_PROFILE"),
+            aws_region: read("YARD_SLACK_AWS_REGION"),
+            owner_user_id: read("YARD_SLACK_OWNER_USER_ID"),
+            enterprise_id: read("YARD_SLACK_ENTERPRISE_ID"),
+            inbound: read("YARD_SLACK_INBOUND"),
+            app_secret_id: read("YARD_SLACK_APP_SECRET_ID"),
+        })
+    }
+
+    /// Parse raw values; `from_env` passes the environment.
+    #[must_use]
+    pub fn parse(values: &SlackEnv) -> Self {
+        let mode = values
+            .notifications
+            .as_deref()
+            .map(|value| value.to_str().map(str::trim));
+        match mode {
+            None | Some(Some("" | "off")) => return Self::Off,
+            Some(Some("on")) => {}
+            Some(_) => {
+                return Self::Misconfigured(
+                    "YARD_SLACK_NOTIFICATIONS must be `on` or `off`".to_owned(),
+                );
+            }
+        }
+        match SlackSettings::parse(values) {
+            Ok(settings) => Self::Enabled(settings),
+            Err(reason) => Self::Misconfigured(reason),
+        }
+    }
+
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+/// Raw `YARD_SLACK_*` values.
+#[derive(Debug, Clone, Default)]
+pub struct SlackEnv {
+    pub notifications: Option<OsString>,
+    pub secret_id: Option<OsString>,
+    pub aws_profile: Option<OsString>,
+    pub aws_region: Option<OsString>,
+    pub owner_user_id: Option<OsString>,
+    pub enterprise_id: Option<OsString>,
+    pub inbound: Option<OsString>,
+    pub app_secret_id: Option<OsString>,
+}
+
+impl SlackSettings {
+    fn parse(values: &SlackEnv) -> Result<Self, String> {
+        let secret_id = required_setting(
+            "YARD_SLACK_SECRET_ID",
+            values.secret_id.as_deref(),
+            2048,
+            |byte| byte.is_ascii_alphanumeric() || b"/_+=.@-:".contains(&byte),
+            "a Secrets Manager secret name or ARN",
+        )?;
+        let aws_profile = optional_setting(
+            "YARD_SLACK_AWS_PROFILE",
+            values.aws_profile.as_deref(),
+            128,
+            |byte| byte.is_ascii_alphanumeric() || b"_.+@-".contains(&byte),
+            "an AWS CLI profile name",
+        )?;
+        let aws_region = optional_setting(
+            "YARD_SLACK_AWS_REGION",
+            values.aws_region.as_deref(),
+            32,
+            |byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-',
+            "an AWS region such as us-west-2",
+        )?
+        .unwrap_or_else(|| DEFAULT_SLACK_AWS_REGION.to_owned());
+        let owner_user_id = required_setting(
+            "YARD_SLACK_OWNER_USER_ID",
+            values.owner_user_id.as_deref(),
+            32,
+            |byte| byte.is_ascii_uppercase() || byte.is_ascii_digit(),
+            "a Slack member id such as U01ABCDEF",
+        )?;
+        if !(owner_user_id.starts_with('U') || owner_user_id.starts_with('W'))
+            || owner_user_id.len() < 3
+        {
+            return Err(
+                "YARD_SLACK_OWNER_USER_ID must be a Slack member id such as U01ABCDEF".to_owned(),
+            );
+        }
+        let enterprise_id = optional_setting(
+            "YARD_SLACK_ENTERPRISE_ID",
+            values.enterprise_id.as_deref(),
+            32,
+            |byte| byte.is_ascii_uppercase() || byte.is_ascii_digit(),
+            "a Slack enterprise id such as E01ABCDEF",
+        )?;
+        if enterprise_id
+            .as_deref()
+            .is_some_and(|id| !id.starts_with('E') || id.len() < 3)
+        {
+            return Err(
+                "YARD_SLACK_ENTERPRISE_ID must be a Slack enterprise id such as E01ABCDEF"
+                    .to_owned(),
+            );
+        }
+        Ok(Self {
+            secret_id,
+            aws_profile,
+            aws_region,
+            owner_user_id,
+            enterprise_id,
+            inbound: SlackInbound::parse(values),
+        })
+    }
+}
+
+fn required_setting(
+    name: &str,
+    value: Option<&std::ffi::OsStr>,
+    max_len: usize,
+    allowed: impl Fn(u8) -> bool,
+    expected: &str,
+) -> Result<String, String> {
+    optional_setting(name, value, max_len, allowed, expected)?
+        .ok_or_else(|| format!("{name} is required when YARD_SLACK_NOTIFICATIONS=on"))
+}
+
+/// A value is passed to the AWS CLI as its own argument, so it must not look
+/// like an option and may only use the listed bytes.
+fn optional_setting(
+    name: &str,
+    value: Option<&std::ffi::OsStr>,
+    max_len: usize,
+    allowed: impl Fn(u8) -> bool,
+    expected: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(value) = value.to_str().map(str::trim) else {
+        return Err(format!("{name} must be {expected}"));
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > max_len || value.starts_with('-') || !value.bytes().all(allowed) {
+        return Err(format!("{name} must be {expected}"));
+    }
+    Ok(Some(value.to_owned()))
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("YARD_BIND must be a valid socket address: {0}")]
@@ -269,6 +515,7 @@ impl ServerConfig {
                 source,
             })?;
         let storage = StorageConfig::from_env()?;
+        let slack = SlackConfig::from_env();
 
         Ok(Self {
             bind,
@@ -279,6 +526,7 @@ impl ServerConfig {
             coordination_path,
             knowledge_path,
             storage,
+            slack,
         })
     }
 }
@@ -346,7 +594,223 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{ConfigError, DEFAULT_STORAGE_LOG_RETENTION_DAYS, StorageConfig};
+    use super::{
+        ConfigError, DEFAULT_SLACK_AWS_REGION, DEFAULT_STORAGE_LOG_RETENTION_DAYS, SlackConfig,
+        SlackEnv, SlackInbound, SlackSettings, StorageConfig,
+    };
+
+    fn slack_env(pairs: &[(&str, &str)]) -> SlackEnv {
+        let mut env = SlackEnv::default();
+        for (name, value) in pairs {
+            let value = Some(std::ffi::OsString::from(value));
+            match *name {
+                "notifications" => env.notifications = value,
+                "secret" => env.secret_id = value,
+                "profile" => env.aws_profile = value,
+                "region" => env.aws_region = value,
+                "owner" => env.owner_user_id = value,
+                "enterprise" => env.enterprise_id = value,
+                "inbound" => env.inbound = value,
+                "app_secret" => env.app_secret_id = value,
+                other => panic!("unknown slack setting {other}"),
+            }
+        }
+        env
+    }
+
+    #[test]
+    fn slack_notifications_are_off_unless_explicitly_on() {
+        for pairs in [
+            &[][..],
+            &[("notifications", "")][..],
+            &[("notifications", "off")][..],
+            &[("notifications", " off "), ("secret", "yard/slack-bot")][..],
+        ] {
+            assert_eq!(SlackConfig::parse(&slack_env(pairs)), SlackConfig::Off);
+        }
+    }
+
+    #[test]
+    fn slack_on_parses_settings_with_defaults() {
+        let config = SlackConfig::parse(&slack_env(&[
+            ("notifications", "on"),
+            ("secret", "yard/slack-bot"),
+            ("owner", "U01ABCDEF"),
+        ]));
+        assert_eq!(
+            config,
+            SlackConfig::Enabled(SlackSettings {
+                secret_id: "yard/slack-bot".to_owned(),
+                aws_profile: None,
+                aws_region: DEFAULT_SLACK_AWS_REGION.to_owned(),
+                owner_user_id: "U01ABCDEF".to_owned(),
+                enterprise_id: None,
+                inbound: SlackInbound::Off,
+            })
+        );
+        let config = SlackConfig::parse(&slack_env(&[
+            ("notifications", "on"),
+            (
+                "secret",
+                "arn:aws:secretsmanager:us-west-2:123456789012:secret:yard/slack-bot-AbCdEf",
+            ),
+            ("profile", "yard-dev"),
+            ("region", "us-east-1"),
+            ("owner", "W012AB"),
+            ("enterprise", "E01SANDBOX0"),
+        ]));
+        let SlackConfig::Enabled(settings) = config else {
+            panic!("expected enabled: {config:?}");
+        };
+        assert_eq!(settings.aws_profile.as_deref(), Some("yard-dev"));
+        assert_eq!(settings.aws_region, "us-east-1");
+        assert_eq!(settings.enterprise_id.as_deref(), Some("E01SANDBOX0"));
+    }
+
+    #[test]
+    fn slack_on_with_missing_or_invalid_settings_is_misconfigured_not_fatal() {
+        for (pairs, needle) in [
+            (&[("notifications", "yes")][..], "YARD_SLACK_NOTIFICATIONS"),
+            (
+                &[("notifications", "on"), ("owner", "U01ABCDEF")][..],
+                "YARD_SLACK_SECRET_ID",
+            ),
+            (
+                &[("notifications", "on"), ("secret", "yard/slack-bot")][..],
+                "YARD_SLACK_OWNER_USER_ID",
+            ),
+            (
+                &[
+                    ("notifications", "on"),
+                    ("secret", "--endpoint-url=http://x"),
+                    ("owner", "U01"),
+                ][..],
+                "YARD_SLACK_SECRET_ID",
+            ),
+            (
+                &[
+                    ("notifications", "on"),
+                    ("secret", "yard slack"),
+                    ("owner", "U01"),
+                ][..],
+                "YARD_SLACK_SECRET_ID",
+            ),
+            (
+                &[
+                    ("notifications", "on"),
+                    ("secret", "yard/slack-bot"),
+                    ("owner", "@sample"),
+                ][..],
+                "YARD_SLACK_OWNER_USER_ID",
+            ),
+            (
+                &[
+                    ("notifications", "on"),
+                    ("secret", "yard/slack-bot"),
+                    ("owner", "C0123"),
+                ][..],
+                "YARD_SLACK_OWNER_USER_ID",
+            ),
+            (
+                &[
+                    ("notifications", "on"),
+                    ("secret", "yard/slack-bot"),
+                    ("owner", "U01"),
+                    ("profile", "-x"),
+                ][..],
+                "YARD_SLACK_AWS_PROFILE",
+            ),
+            (
+                &[
+                    ("notifications", "on"),
+                    ("secret", "yard/slack-bot"),
+                    ("owner", "U01"),
+                    ("region", "US_WEST"),
+                ][..],
+                "YARD_SLACK_AWS_REGION",
+            ),
+            (
+                &[
+                    ("notifications", "on"),
+                    ("secret", "yard/slack-bot"),
+                    ("owner", "U01"),
+                    ("enterprise", "T0123"),
+                ][..],
+                "YARD_SLACK_ENTERPRISE_ID",
+            ),
+        ] {
+            let config = SlackConfig::parse(&slack_env(pairs));
+            let SlackConfig::Misconfigured(reason) = &config else {
+                panic!("{pairs:?}: expected misconfigured, got {config:?}");
+            };
+            assert!(reason.contains(needle), "{pairs:?}: {reason}");
+            assert!(config.enabled());
+        }
+    }
+
+    #[test]
+    fn slack_inbound_needs_its_own_switch_and_app_secret() {
+        let base = [
+            ("notifications", "on"),
+            ("secret", "yard/slack-bot"),
+            ("owner", "U01ABCDEF"),
+        ];
+        let inbound = |extra: &[(&str, &str)]| {
+            let pairs = base.iter().chain(extra).copied().collect::<Vec<_>>();
+            let SlackConfig::Enabled(settings) = SlackConfig::parse(&slack_env(&pairs)) else {
+                panic!("notifications must stay enabled for {extra:?}");
+            };
+            settings.inbound
+        };
+        // Default off, and an app secret alone does not turn it on.
+        assert_eq!(inbound(&[]), SlackInbound::Off);
+        assert_eq!(
+            inbound(&[("app_secret", "yard/slack-app")]),
+            SlackInbound::Off
+        );
+        assert_eq!(
+            inbound(&[("inbound", " off "), ("app_secret", "yard/slack-app")]),
+            SlackInbound::Off
+        );
+        assert_eq!(
+            inbound(&[("inbound", "on"), ("app_secret", "yard/slack-app")]),
+            SlackInbound::Enabled {
+                app_secret_id: "yard/slack-app".to_owned()
+            }
+        );
+        for (extra, needle) in [
+            (
+                &[("inbound", "on")][..],
+                "YARD_SLACK_APP_SECRET_ID is required",
+            ),
+            (
+                &[("inbound", "on"), ("app_secret", "")][..],
+                "YARD_SLACK_APP_SECRET_ID is required",
+            ),
+            (
+                &[("inbound", "on"), ("app_secret", "--profile=x")][..],
+                "YARD_SLACK_APP_SECRET_ID",
+            ),
+            (
+                &[("inbound", "yes"), ("app_secret", "yard/slack-app")][..],
+                "YARD_SLACK_INBOUND",
+            ),
+        ] {
+            let SlackInbound::Misconfigured(reason) = inbound(extra) else {
+                panic!("{extra:?}: expected misconfigured inbound");
+            };
+            assert!(reason.contains(needle), "{extra:?}: {reason}");
+        }
+        // Inbound never turns notifications on by itself.
+        assert_eq!(
+            SlackConfig::parse(&slack_env(&[
+                ("inbound", "on"),
+                ("app_secret", "yard/slack-app")
+            ])),
+            SlackConfig::Off
+        );
+        assert!(!SlackInbound::Misconfigured(String::new()).enabled());
+    }
 
     #[test]
     fn unset_or_empty_storage_roots_are_not_configured() {
