@@ -2,8 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   YardApiError,
   disposeAssignment,
+  fetchAssignmentTerminalOutput,
   fetchAssignmentTranscript,
   restoreProject,
+  fetchSessions,
+  TERMINAL_OUTPUT_REQUEST_TIMEOUT_MS,
 } from './api'
 import type { DisposeAssignmentInput } from './types'
 
@@ -133,5 +136,66 @@ describe('project restore client', () => {
     expect(error).toBeInstanceOf(YardApiError)
     expect((error as YardApiError).code).toBe('project_restore_unavailable')
     expect((error as YardApiError).reason).toBe('herdr_unreachable')
+  })
+})
+
+function stalledFetch(
+  _input: string | URL | Request,
+  init?: RequestInit,
+): Promise<Response> {
+  return new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener(
+      'abort',
+      () => reject(new DOMException('Aborted', 'AbortError')),
+      { once: true },
+    )
+  })
+}
+
+describe('Yard API requests', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it('times out a stalled read request', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', vi.fn(stalledFetch))
+
+    const result = expect(fetchSessions()).rejects.toMatchObject({
+      code: 'request_timeout',
+      message: 'Yard request timed out after 15 seconds',
+    })
+
+    await vi.advanceTimersByTimeAsync(15_000)
+    await result
+  })
+
+  it('waits past a slow alternate-screen history read before timing out', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', vi.fn(stalledFetch))
+    let settled = false
+
+    const result = fetchAssignmentTerminalOutput(
+      'project-1',
+      'assignment-1',
+      1_000,
+    ).finally(() => {
+      settled = true
+    })
+    const rejection = expect(result).rejects.toMatchObject({
+      code: 'request_timeout',
+      message: 'Yard request timed out after 30 seconds',
+    })
+
+    // Herdr may page an idle full-screen agent's transcript for 15 s and
+    // restore for 5 s, and Yard's server allows 25 s; the read must still be
+    // pending then.
+    await vi.advanceTimersByTimeAsync(25_000)
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(
+      TERMINAL_OUTPUT_REQUEST_TIMEOUT_MS - 25_000,
+    )
+    await rejection
   })
 })

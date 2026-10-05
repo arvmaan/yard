@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{io::Write as _, path::Path};
 
 use serde_json::json;
 use tokio::{
@@ -13,6 +13,50 @@ use crate::{
 };
 
 const SNAPSHOT_REQUEST_ID: &str = "yard:session:snapshot";
+
+/// Connect to Herdr's API socket and send one request line.
+///
+/// Herdr 0.9.1 reads a new connection's request without blocking and sleeps
+/// 100 ms each time no byte is waiting yet (`src/api/server.rs`
+/// `read_initial_request_line_with_limits`). An async connect returns only
+/// after a reactor round trip, which is long enough for Herdr to find the
+/// socket empty, so every request paid that sleep. The connect and the first
+/// write therefore happen back to back on a blocking thread, as one step;
+/// whatever does not fit in the socket buffer is written asynchronously.
+async fn send_request_line(socket_path: &Path, request: Vec<u8>) -> Result<UnixStream, HerdrError> {
+    let path = socket_path.to_path_buf();
+    let (stream, request, written) = tokio::task::spawn_blocking(move || {
+        let stream = std::os::unix::net::UnixStream::connect(&path).map_err(|source| {
+            HerdrError::SocketConnect {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        stream
+            .set_nonblocking(true)
+            .map_err(|source| HerdrError::SocketConnect { path, source })?;
+        let written = match (&stream).write(&request) {
+            Ok(written) => written,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Err(error) => return Err(HerdrError::SocketWrite(error)),
+        };
+        Ok((stream, request, written))
+    })
+    .await
+    .map_err(|error| HerdrError::SocketWrite(std::io::Error::other(error)))??;
+    let mut stream = UnixStream::from_std(stream).map_err(|source| HerdrError::SocketConnect {
+        path: socket_path.to_path_buf(),
+        source,
+    })?;
+    if written < request.len() {
+        stream
+            .write_all(&request[written..])
+            .await
+            .map_err(HerdrError::SocketWrite)?;
+    }
+    stream.flush().await.map_err(HerdrError::SocketWrite)?;
+    Ok(stream)
+}
 
 pub(crate) async fn request_snapshot(
     config: &HerdrConfig,
@@ -30,14 +74,6 @@ async fn request_snapshot_inner(
     config: &HerdrConfig,
     socket_path: &Path,
 ) -> Result<SessionSnapshot, HerdrError> {
-    let stream =
-        UnixStream::connect(socket_path)
-            .await
-            .map_err(|source| HerdrError::SocketConnect {
-                path: socket_path.to_path_buf(),
-                source,
-            })?;
-    let (reader, mut writer) = stream.into_split();
     let mut request = serde_json::to_vec(&json!({
         "id": SNAPSHOT_REQUEST_ID,
         "method": "session.snapshot",
@@ -45,12 +81,8 @@ async fn request_snapshot_inner(
     }))
     .expect("static snapshot request must serialize");
     request.push(b'\n');
-
-    writer
-        .write_all(&request)
-        .await
-        .map_err(HerdrError::SocketWrite)?;
-    writer.flush().await.map_err(HerdrError::SocketWrite)?;
+    let stream = send_request_line(socket_path, request).await?;
+    let (reader, _writer) = stream.into_split();
 
     let limit = u64::try_from(config.max_response_bytes)
         .unwrap_or(u64::MAX)
@@ -121,14 +153,6 @@ async fn request_command_inner(
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, HerdrError> {
-    let stream =
-        UnixStream::connect(socket_path)
-            .await
-            .map_err(|source| HerdrError::SocketConnect {
-                path: socket_path.to_path_buf(),
-                source,
-            })?;
-    let (reader, mut writer) = stream.into_split();
     let mut request = serde_json::to_vec(&json!({
         "id": request_id,
         "method": method,
@@ -136,11 +160,8 @@ async fn request_command_inner(
     }))
     .expect("serializable Herdr command request");
     request.push(b'\n');
-    writer
-        .write_all(&request)
-        .await
-        .map_err(HerdrError::SocketWrite)?;
-    writer.flush().await.map_err(HerdrError::SocketWrite)?;
+    let stream = send_request_line(socket_path, request).await?;
+    let (reader, _writer) = stream.into_split();
 
     let limit = u64::try_from(config.max_response_bytes)
         .unwrap_or(u64::MAX)
@@ -310,5 +331,98 @@ mod tests {
         server.await.unwrap();
 
         assert_eq!(result["type"], "tab_created");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sends_the_request_before_herdr_first_polls_the_connection() {
+        // Herdr 0.9.1 hands each connection to a new thread that polls for
+        // the request without blocking and sleeps 100 ms whenever no byte is
+        // waiting yet. Yard must have written the request by then, or every
+        // Herdr request costs that sleep. A busy runtime (Yard serving other
+        // requests and terminal frames) delays an async connect's readiness
+        // well past Herdr's first poll.
+        use std::io::{BufRead as _, Read as _, Write as _};
+        const REQUESTS: usize = 10;
+        let busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let spinning = std::sync::Arc::clone(&busy);
+        let spinner = tokio::spawn(async move {
+            while spinning.load(std::sync::atomic::Ordering::Relaxed) {
+                let until = std::time::Instant::now() + Duration::from_micros(50);
+                while std::time::Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut waits = 0;
+            for _ in 0..REQUESTS {
+                let (stream, _) = listener.accept().unwrap();
+                let connection = std::thread::spawn(move || {
+                    stream.set_nonblocking(true).unwrap();
+                    let mut first = [0_u8; 1];
+                    let waited = match (&stream).read(&mut first) {
+                        Ok(1) => false,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(100));
+                            stream.set_nonblocking(false).unwrap();
+                            (&stream).read_exact(&mut first).unwrap();
+                            true
+                        }
+                        other => panic!("unexpected first read {other:?}"),
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let mut line = String::new();
+                    std::io::BufReader::new(&stream)
+                        .read_line(&mut line)
+                        .unwrap();
+                    let request: serde_json::Value =
+                        serde_json::from_str(&format!("{}{line}", first[0] as char)).unwrap();
+                    let id = request["id"].as_str().unwrap();
+                    (&stream)
+                        .write_all(
+                            format!("{{\"id\":\"{id}\",\"result\":{{\"type\":\"pane_info\"}}}}\n")
+                                .as_bytes(),
+                        )
+                        .unwrap();
+                    waited
+                });
+                if connection.join().unwrap() {
+                    waits += 1;
+                }
+            }
+            waits
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(2),
+            ..HerdrConfig::default()
+        };
+
+        for request in 0..REQUESTS {
+            let result = request_command(
+                &config,
+                &socket_path,
+                &format!("yard:poll-{request}"),
+                "pane.get",
+                serde_json::json!({"pane_id": "pane-1"}),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["type"], "pane_info");
+        }
+        busy.store(false, std::sync::atomic::Ordering::Relaxed);
+        spinner.await.unwrap();
+        let waits = server.join().unwrap();
+
+        // A lost race now and then is tolerated; waiting on most requests is
+        // the regression.
+        assert!(
+            waits <= 2,
+            "{waits} of {REQUESTS} requests waited for Herdr's poll"
+        );
     }
 }

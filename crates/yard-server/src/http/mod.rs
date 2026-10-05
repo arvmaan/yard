@@ -37,9 +37,9 @@ use yard_domain::{
     RuntimeSessions, RuntimeTopology, SendAssignmentPrompt, SendCoordinationNodePrompt,
     SendCoordinationNodeRoute, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
     SendYardOrchestratorRoute, SetAutomationPaused, SetProjectRepository, StartWorkerCleanupRun,
-    StorageScan, SummaryWorker, SummaryWorkers, TerminalOutput, TokenSpendSettings,
-    TransferProjectOrchestrator, TransferredProjectOrchestrator, UpdateAgentProfile,
-    UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
+    StorageScan, SummaryWorker, SummaryWorkers, TerminalOutput, TerminalOutputFormat,
+    TokenSpendSettings, TransferProjectOrchestrator, TransferredProjectOrchestrator,
+    UpdateAgentProfile, UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
     UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
     UpdateProjectWorkflowProfile, UpdateTokenSpendSettings, UpdateWorkerCleanupPolicy,
     UpdateWorkerProfile, UploadArtifact, WorkerCandidates, WorkerCleanupDashboard,
@@ -1043,7 +1043,7 @@ async fn read_coordination_node_output(
 ) -> Result<NoStoreJson<CoordinationNodeTerminalOutput>, ApiError> {
     state
         .coordination_nodes
-        .read_output(&node_id, query.lines)
+        .read_output(&node_id, query.lines, query.format)
         .await
         .map(NoStoreJson)
         .map_err(ApiError::from)
@@ -1218,7 +1218,7 @@ async fn read_yard_orchestrator_output(
 ) -> Result<NoStoreJson<YardOrchestratorTerminalOutput>, ApiError> {
     state
         .interventions
-        .read_yard_orchestrator_output(query.lines)
+        .read_yard_orchestrator_output(query.lines, query.format)
         .await
         .map(NoStoreJson)
         .map_err(ApiError::from)
@@ -2455,6 +2455,10 @@ async fn transfer_project_orchestrator(
 struct OutputQuery {
     #[serde(default = "default_output_lines")]
     lines: u32,
+    /// `ansi` returns rendered rows with colours plus Herdr's scroll
+    /// position (terminal history mode); the default is plain text.
+    #[serde(default)]
+    format: TerminalOutputFormat,
 }
 
 const fn default_output_lines() -> u32 {
@@ -2468,7 +2472,7 @@ async fn read_assignment_output(
 ) -> Result<NoStoreJson<TerminalOutput>, ApiError> {
     state
         .interventions
-        .read_output(&project_id, &assignment_id, query.lines)
+        .read_output(&project_id, &assignment_id, query.lines, query.format)
         .await
         .map(NoStoreJson)
         .map_err(ApiError::from)
@@ -2481,7 +2485,7 @@ async fn read_orchestrator_output(
 ) -> Result<NoStoreJson<OrchestratorTerminalOutput>, ApiError> {
     state
         .interventions
-        .read_orchestrator_output(&project_id, query.lines)
+        .read_orchestrator_output(&project_id, query.lines, query.format)
         .await
         .map(NoStoreJson)
         .map_err(ApiError::from)
@@ -6143,6 +6147,7 @@ mod tests {
                 text,
                 revision: 7,
                 truncated: false,
+                scroll: None,
             })
         }
     }
@@ -6161,6 +6166,7 @@ mod tests {
                     width: 80,
                     height: 24,
                     full: true,
+                    scrolls: None,
                 }));
             }
             std::future::pending().await
@@ -6276,15 +6282,27 @@ mod tests {
             } else {
                 "tab-yard-prompta-345234a24b29951c"
             };
+            // Rendered rows with colours carry Herdr's scroll position, as
+            // the Herdr adapter reports them for `format=ansi`.
+            let ansi = request.format == yard_domain::TerminalOutputFormat::Ansi;
             Ok(RuntimeOutputResult {
                 pane_id: request.pane_id,
                 workspace_id: "workspace-1".to_owned(),
                 tab_id: tab_id.to_owned(),
-                source: "recent_unwrapped".to_owned(),
-                format: "text".to_owned(),
-                text: "Focused tests are passing.".to_owned(),
+                source: if ansi { "recent" } else { "recent_unwrapped" }.to_owned(),
+                format: if ansi { "ansi" } else { "text" }.to_owned(),
+                text: if ansi {
+                    "\u{1b}[32mFocused tests are passing.\u{1b}[0m".to_owned()
+                } else {
+                    "Focused tests are passing.".to_owned()
+                },
                 revision: 0,
                 truncated: false,
+                scroll: ansi.then_some(yard_domain::TerminalScrollPosition {
+                    offset_from_bottom: 3,
+                    max_offset_from_bottom: 120,
+                    viewport_rows: 24,
+                }),
             })
         }
     }
@@ -9511,6 +9529,452 @@ mod tests {
         server.abort();
     }
 
+    /// A stand-in for `herdr terminal session control`: it emits the initial
+    /// full frame, then writes the next frame line in two parts with a pause
+    /// longer than the relay's 250 ms lease tick (Herdr's CLI also writes one
+    /// frame line in several `write(2)` calls), records every stdin command,
+    /// and closes cleanly on `terminal.release`.
+    fn fake_herdr_terminal_controller(directory: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let body = r#"#!/bin/sh
+set -eu
+printf '%s\n' '{"type":"terminal.frame","seq":1,"encoding":"ansi","width":80,"height":24,"full":true,"bytes":"cmVhZHk="}'
+printf '%s' '{"type":"terminal.frame","seq":2,"encoding":"ansi",'
+sleep 0.7
+printf '%s\n' '"width":80,"height":24,"full":false,"bytes":"dGFpbA=="}'
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$0.stdin"
+    case "$line" in
+        *'"terminal.release"'*)
+            printf '%s\n' '{"type":"terminal.closed","reason":"released"}'
+            exit 0
+            ;;
+    esac
+done
+"#;
+        let path = directory.join("fake-herdr");
+        let temporary = directory.join(".fake-herdr.tmp");
+        std::fs::write(&temporary, body).unwrap();
+        let mut permissions = std::fs::metadata(&temporary).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&temporary, permissions).unwrap();
+        std::fs::rename(temporary, &path).unwrap();
+        path
+    }
+
+    /// A fake `herdr terminal session control` that answers every
+    /// `terminal.scroll` line with a new frame, like Herdr's repaint.
+    fn fake_herdr_scroll_echo_controller(directory: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let body = r#"#!/bin/sh
+set -eu
+seq=1
+printf '{"type":"terminal.frame","seq":%s,"encoding":"ansi","width":80,"height":24,"full":true,"bytes":"cmVhZHk="}\n' "$seq"
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$0.stdin"
+    case "$line" in
+        *'"terminal.release"'*)
+            printf '%s\n' '{"type":"terminal.closed","reason":"released"}'
+            exit 0
+            ;;
+        *'"terminal.scroll"'*)
+            seq=$((seq + 1))
+            printf '{"type":"terminal.frame","seq":%s,"encoding":"ansi","width":80,"height":24,"full":true,"bytes":"cmVhZHk="}\n' "$seq"
+            ;;
+    esac
+done
+"#;
+        let path = directory.join("fake-herdr-echo");
+        let temporary = directory.join(".fake-herdr-echo.tmp");
+        std::fs::write(&temporary, body).unwrap();
+        let mut permissions = std::fs::metadata(&temporary).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&temporary, permissions).unwrap();
+        std::fs::rename(temporary, &path).unwrap();
+        path
+    }
+
+    async fn herdr_terminal_test_router(binary: &std::path::Path) -> (Router, TempDir) {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(FakeRuntime);
+        let terminal = Arc::new(crate::inventory_service::HerdrInventorySource::new(
+            yard_herdr::HerdrAdapter::new(yard_herdr::HerdrConfig {
+                binary: binary.as_os_str().to_owned(),
+                ..yard_herdr::HerdrConfig::default()
+            }),
+        ));
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        (
+            router(
+                Arc::new(FakeInventory),
+                runtime.clone(),
+                runtime,
+                terminal,
+                store,
+                artifacts,
+            ),
+            temp,
+        )
+    }
+
+    async fn next_terminal_json(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> serde_json::Value {
+        loop {
+            let message = timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("terminal socket stalled")
+                .expect("terminal socket ended")
+                .unwrap();
+            if let TungsteniteMessage::Text(text) = message {
+                return serde_json::from_str(&text).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn relays_a_herdr_frame_split_across_lease_checks_without_runtime_error() {
+        // The relay polls Herdr output inside select! next to a 250 ms lease
+        // check. When a tick landed between the two halves of one frame line,
+        // the old per-call line buffer dropped the head and the relay closed
+        // the browser terminal with `runtime_error` on the tail.
+        let scripts = TempDir::new().unwrap();
+        let binary = fake_herdr_terminal_controller(scripts.path());
+        let (app, _temp) = herdr_terminal_test_router(&binary).await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+        let mut request = format!(
+            "ws://{address}/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal?cols=80&rows=24"
+        )
+        .into_client_request()
+        .unwrap();
+        request.headers_mut().insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://127.0.0.1:5173"),
+        );
+        let (mut socket, _) = connect_async(request).await.unwrap();
+
+        let first = next_terminal_json(&mut socket).await;
+        assert_eq!(first["type"], "terminal.frame");
+        assert_eq!(first["seq"], 1);
+        let split = next_terminal_json(&mut socket).await;
+        assert_eq!(split["type"], "terminal.frame", "{split}");
+        assert_eq!(split["seq"], 2);
+        assert_eq!(split["bytes"], "dGFpbA==");
+        assert_eq!(split["full"], false);
+
+        socket
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({"type": "terminal.release"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let closed = next_terminal_json(&mut socket).await;
+        assert_eq!(closed["type"], "terminal.closed");
+        assert_eq!(closed["reason"], "released");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn relays_browser_scroll_commands_to_herdr_terminal_scroll() {
+        let scripts = TempDir::new().unwrap();
+        let binary = fake_herdr_terminal_controller(scripts.path());
+        let (app, _temp) = herdr_terminal_test_router(&binary).await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+        let mut request = format!(
+            "ws://{address}/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal?cols=80&rows=24"
+        )
+        .into_client_request()
+        .unwrap();
+        request.headers_mut().insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://127.0.0.1:5173"),
+        );
+        let (mut socket, _) = connect_async(request).await.unwrap();
+        assert_eq!(next_terminal_json(&mut socket).await["seq"], 1);
+        assert_eq!(next_terminal_json(&mut socket).await["seq"], 2);
+
+        let paste = format!("\u{1b}[200~{}\u{1b}[201~", "pasted line\r".repeat(3_000));
+        for message in [
+            serde_json::json!({
+                "type": "terminal.scroll",
+                "direction": "up",
+                "lines": 3,
+                "source": "wheel",
+                "column": 10,
+                "row": 5
+            }),
+            serde_json::json!({
+                "type": "terminal.scroll",
+                "direction": "down",
+                "lines": 23,
+                "source": "page_key"
+            }),
+            serde_json::json!({"type": "terminal.input", "text": paste}),
+            serde_json::json!({"type": "terminal.release"}),
+        ] {
+            socket
+                .send(TungsteniteMessage::Text(message.to_string().into()))
+                .await
+                .unwrap();
+        }
+        let closed = next_terminal_json(&mut socket).await;
+        assert_eq!(closed["reason"], "released", "{closed}");
+        server.abort();
+
+        let recorded = std::fs::read_to_string(format!("{}.stdin", binary.display())).unwrap();
+        let commands: Vec<serde_json::Value> = recorded
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                serde_json::json!({
+                    "type": "terminal.scroll",
+                    "direction": "up",
+                    "lines": 3,
+                    "source": "wheel",
+                    "column": 10,
+                    "row": 5
+                }),
+                serde_json::json!({
+                    "type": "terminal.scroll",
+                    "direction": "down",
+                    "lines": 23,
+                    "source": "page_key"
+                }),
+                serde_json::json!({"type": "terminal.input", "text": paste}),
+                serde_json::json!({"type": "terminal.release"}),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tags_frames_with_the_scrolls_forwarded_and_writes_a_counted_scroll_as_steps() {
+        // The browser answers a scroll batch only with a frame read after the
+        // batch reached Herdr, so every frame says how many scroll messages
+        // came before it. A counted scroll reaches Herdr as that many
+        // separate commands.
+        let scripts = TempDir::new().unwrap();
+        let binary = fake_herdr_scroll_echo_controller(scripts.path());
+        let (app, _temp) = herdr_terminal_test_router(&binary).await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+        let mut request = format!(
+            "ws://{address}/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal?cols=80&rows=24"
+        )
+        .into_client_request()
+        .unwrap();
+        request.headers_mut().insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://127.0.0.1:5173"),
+        );
+        let (mut socket, _) = connect_async(request).await.unwrap();
+        let first = next_terminal_json(&mut socket).await;
+        assert_eq!(
+            (first["seq"].clone(), first["scrolls"].clone()),
+            (1.into(), 0.into())
+        );
+
+        let steps = serde_json::json!({
+            "type": "terminal.scroll",
+            "direction": "up",
+            "lines": 3,
+            "source": "wheel",
+            "column": 4,
+            "row": 2,
+            "count": 3
+        });
+        for message in [
+            serde_json::json!({"type": "terminal.resize", "cols": 80, "rows": 24}),
+            steps,
+        ] {
+            socket
+                .send(TungsteniteMessage::Text(message.to_string().into()))
+                .await
+                .unwrap();
+        }
+        for seq in 2..=4 {
+            let frame = next_terminal_json(&mut socket).await;
+            assert_eq!(
+                (frame["seq"].clone(), frame["scrolls"].clone()),
+                (seq.into(), 1.into())
+            );
+        }
+        let page = serde_json::json!({
+            "type": "terminal.scroll",
+            "direction": "down",
+            "lines": 23,
+            "source": "page_key"
+        });
+        socket
+            .send(TungsteniteMessage::Text(page.to_string().into()))
+            .await
+            .unwrap();
+        let frame = next_terminal_json(&mut socket).await;
+        assert_eq!(
+            (frame["seq"].clone(), frame["scrolls"].clone()),
+            (5.into(), 2.into())
+        );
+
+        socket
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({"type": "terminal.release"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next_terminal_json(&mut socket).await["reason"], "released");
+        server.abort();
+
+        let recorded = std::fs::read_to_string(format!("{}.stdin", binary.display())).unwrap();
+        let commands: Vec<serde_json::Value> = recorded
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let step = serde_json::json!({
+            "type": "terminal.scroll",
+            "direction": "up",
+            "lines": 3,
+            "source": "wheel",
+            "column": 4,
+            "row": 2
+        });
+        assert_eq!(
+            commands,
+            [
+                serde_json::json!({"type": "terminal.resize", "cols": 80, "rows": 24}),
+                step.clone(),
+                step.clone(),
+                step,
+                page,
+                // Leaving after a scroll returns the pane to its latest output.
+                serde_json::json!({"type": "terminal.input", "text": ""}),
+                serde_json::json!({"type": "terminal.release"}),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_a_scrolled_herdr_pane_to_the_latest_output_when_the_browser_leaves() {
+        // Herdr keeps one scroll offset per pane and resets it only on input.
+        // A browser that scrolls back and then disappears must not leave the
+        // pane (and so Herdr's own client or the next viewer) scrolled back.
+        let scripts = TempDir::new().unwrap();
+        let binary = fake_herdr_terminal_controller(scripts.path());
+        let (app, _temp) = herdr_terminal_test_router(&binary).await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+        let mut request = format!(
+            "ws://{address}/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal?cols=80&rows=24"
+        )
+        .into_client_request()
+        .unwrap();
+        request.headers_mut().insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://127.0.0.1:5173"),
+        );
+        let (mut socket, _) = connect_async(request).await.unwrap();
+        assert_eq!(next_terminal_json(&mut socket).await["seq"], 1);
+        assert_eq!(next_terminal_json(&mut socket).await["seq"], 2);
+
+        let up = serde_json::json!({
+            "type": "terminal.scroll",
+            "direction": "up",
+            "lines": 3,
+            "source": "wheel"
+        });
+        for message in [
+            up.clone(),
+            serde_json::json!({"type": "terminal.scroll_reset"}),
+            up.clone(),
+        ] {
+            socket
+                .send(TungsteniteMessage::Text(message.to_string().into()))
+                .await
+                .unwrap();
+        }
+        // The browser goes away without sending terminal.release.
+        socket.close(None).await.unwrap();
+        drop(socket);
+
+        let stdin = PathBuf::from(format!("{}.stdin", binary.display()));
+        let reset = serde_json::json!({"type": "terminal.input", "text": ""});
+        let release = serde_json::json!({"type": "terminal.release"});
+        let expected = vec![up.clone(), reset.clone(), up, reset, release];
+        let mut commands = Vec::new();
+        for _ in 0..200 {
+            commands = std::fs::read_to_string(&stdin)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect();
+            if commands.len() >= expected.len() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        server.abort();
+        assert_eq!(commands, expected);
+    }
+
+    #[tokio::test]
+    async fn closes_the_terminal_for_an_out_of_range_scroll() {
+        let (app, _temp) = test_router().await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+        let mut request = format!(
+            "ws://{address}/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal?cols=80&rows=24"
+        )
+        .into_client_request()
+        .unwrap();
+        request.headers_mut().insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://127.0.0.1:5173"),
+        );
+        let (mut socket, _) = connect_async(request).await.unwrap();
+        assert_eq!(
+            next_terminal_json(&mut socket).await["type"],
+            "terminal.frame"
+        );
+        socket
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({"type": "terminal.scroll", "direction": "up", "lines": 0})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let closed = next_terminal_json(&mut socket).await;
+        assert_eq!(closed["type"], "terminal.closed");
+        assert_eq!(closed["reason"], "invalid_command");
+        server.abort();
+    }
+
     #[tokio::test]
     async fn shutdown_closes_active_terminal_websocket_and_drains_tracker() {
         let (app, _temp, shutdown, connections) = shutdown_test_router().await;
@@ -9561,6 +10025,206 @@ mod tests {
             .expect("server did not stop")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn revokes_a_terminal_that_keeps_scrolling_after_assignment_completion() {
+        // Scroll commands reuse a lease check from the last 250 ms. A steady
+        // stream of them must not keep a revoked terminal open.
+        let (app, _temp) = test_router().await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let assignments =
+            get_json(&app, &format!("/api/v1/projects/{project_id}/assignments")).await;
+        let assignment = assignments["assignments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|assignment| assignment["id"] == assignment_id)
+            .unwrap()
+            .clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, app.clone()).into_future());
+        let mut request = format!(
+            "ws://{address}/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal?cols=80&rows=24"
+        )
+        .into_client_request()
+        .unwrap();
+        request.headers_mut().insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://127.0.0.1:5173"),
+        );
+        let (mut socket, _) = connect_async(request).await.unwrap();
+        assert_eq!(
+            next_terminal_json(&mut socket).await["type"],
+            "terminal.frame"
+        );
+        let (mut sink, mut stream) = socket.split();
+        let scrolling = tokio::spawn(async move {
+            let scroll = serde_json::json!({
+                "type": "terminal.scroll",
+                "direction": "up",
+                "lines": 3,
+                "source": "wheel"
+            })
+            .to_string();
+            while sink
+                .send(TungsteniteMessage::Text(scroll.clone().into()))
+                .await
+                .is_ok()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let completion = serde_json::json!({
+            "command_id": "completion-revokes-scrolling-terminal",
+            "actor": "local-user",
+            "attempt_id": assignment["attempt"]["id"],
+            "expected_assignment_version": assignment["version"],
+            "expected_attempt_version": assignment["attempt"]["version"],
+            "outcome": "completed",
+            "summary": "Verified terminal lease revocation under scroll traffic.",
+            "artifact_refs": [],
+            "evidence_refs": ["test://terminal-lease-revocation-scrolling"],
+            "unresolved_blockers": []
+        });
+        let completion_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/projects/{project_id}/assignments/{assignment_id}/completion-receipts"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(completion.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completion_response.status(), StatusCode::CREATED);
+        let completed = std::time::Instant::now();
+
+        let closed = loop {
+            let message = timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("a scrolling terminal was not revoked")
+                .expect("terminal socket ended before terminal.closed")
+                .unwrap();
+            if let TungsteniteMessage::Text(text) = message {
+                let message: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if message["type"] == "terminal.closed" {
+                    break message;
+                }
+            }
+        };
+        let revoked_after = completed.elapsed();
+        scrolling.abort();
+        server.abort();
+        assert_eq!(closed["reason"], "assignment_changed", "{closed}");
+        assert!(
+            revoked_after < Duration::from_secs(1),
+            "revocation took {revoked_after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn never_forwards_input_on_a_scroll_warmed_lease_after_assignment_completion() {
+        // A scroll (and its answer frame) leaves a fresh lease confirmation
+        // that later scrolls may reuse. Input right after the assignment
+        // completes must still query the store: the terminal closes and the
+        // keystroke never reaches Herdr.
+        let scripts = TempDir::new().unwrap();
+        let binary = fake_herdr_scroll_echo_controller(scripts.path());
+        let (app, _temp) = herdr_terminal_test_router(&binary).await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let assignments =
+            get_json(&app, &format!("/api/v1/projects/{project_id}/assignments")).await;
+        let assignment = assignments["assignments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|assignment| assignment["id"] == assignment_id)
+            .unwrap()
+            .clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, app.clone()).into_future());
+        let mut request = format!(
+            "ws://{address}/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal?cols=80&rows=24"
+        )
+        .into_client_request()
+        .unwrap();
+        request.headers_mut().insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://127.0.0.1:5173"),
+        );
+        let (mut socket, _) = connect_async(request).await.unwrap();
+        assert_eq!(next_terminal_json(&mut socket).await["seq"], 1);
+
+        let completion = serde_json::json!({
+            "command_id": "completion-revokes-scroll-warmed-terminal",
+            "actor": "local-user",
+            "attempt_id": assignment["attempt"]["id"],
+            "expected_assignment_version": assignment["version"],
+            "expected_attempt_version": assignment["attempt"]["version"],
+            "outcome": "completed",
+            "summary": "Verified input is checked after a scroll-warmed lease.",
+            "artifact_refs": [],
+            "evidence_refs": ["test://terminal-lease-input-after-scroll"],
+            "unresolved_blockers": []
+        });
+        let completion_request = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/api/v1/projects/{project_id}/assignments/{assignment_id}/completion-receipts"
+            ))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(completion.to_string()))
+            .unwrap();
+
+        let scroll = serde_json::json!({
+            "type": "terminal.scroll",
+            "direction": "up",
+            "lines": 3,
+            "source": "wheel"
+        });
+        socket
+            .send(TungsteniteMessage::Text(scroll.to_string().into()))
+            .await
+            .unwrap();
+        assert_eq!(next_terminal_json(&mut socket).await["seq"], 2);
+        // Complete and type well inside the 250 ms reuse window.
+        let completion_response = app.clone().oneshot(completion_request).await.unwrap();
+        assert_eq!(completion_response.status(), StatusCode::CREATED);
+        socket
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({"type": "terminal.input", "text": "must-not-arrive\r"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let closed = next_terminal_json(&mut socket).await;
+        assert_eq!(
+            (closed["type"].clone(), closed["reason"].clone()),
+            ("terminal.closed".into(), "assignment_changed".into()),
+            "{closed}"
+        );
+        // Wait for the relay to release the session and end the socket.
+        while let Ok(Some(Ok(message))) = timeout(Duration::from_secs(5), socket.next()).await {
+            if matches!(message, TungsteniteMessage::Close(_)) {
+                break;
+            }
+        }
+        server.abort();
+
+        let recorded = std::fs::read_to_string(format!("{}.stdin", binary.display())).unwrap();
+        assert!(recorded.contains("\"terminal.scroll\""), "{recorded}");
+        assert!(!recorded.contains("must-not-arrive"), "{recorded}");
     }
 
     #[tokio::test]
@@ -14057,10 +14721,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output.status(), StatusCode::OK);
+        let plain = response_json(output).await;
+        assert_eq!(plain["text"], "Focused tests are passing.");
+        assert!(plain.get("scroll").is_none());
+
+        // Terminal history mode asks for coloured rows and Herdr's scroll
+        // position through the same endpoint.
+        let rows = get_json(
+            &app,
+            &format!(
+                "/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal-output?lines=1000&format=ansi"
+            ),
+        )
+        .await;
+        assert_eq!(rows["format"], "ansi");
         assert_eq!(
-            response_json(output).await["text"],
-            "Focused tests are passing."
+            rows["text"],
+            "\u{1b}[32mFocused tests are passing.\u{1b}[0m"
         );
+        assert_eq!(
+            rows["scroll"],
+            serde_json::json!({
+                "offset_from_bottom": 3,
+                "max_offset_from_bottom": 120,
+                "viewport_rows": 24
+            })
+        );
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal-output?lines=10&format=html"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 
         let prompt_uri =
             format!("/api/v1/projects/{project_id}/assignments/{assignment_id}/prompts");

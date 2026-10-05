@@ -95,12 +95,35 @@ pub struct PromptedAgent {
     pub status: String,
 }
 
+/// How `read_pane` asks Herdr to render the pane.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PaneReadFormat {
+    /// `recent_unwrapped` plain text; more than 1,000 lines come from an
+    /// uncapped selection read.
+    #[default]
+    Text,
+    /// `recent` rows with their colours, one rendered row per `\r\n` line,
+    /// plus the pane's scroll position read right after. Herdr renders at
+    /// most its latest 1,000 rows this way.
+    Ansi,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadPaneRequest {
     pub request_id: String,
     pub session: String,
     pub pane_id: String,
     pub lines: u32,
+    pub format: PaneReadFormat,
+}
+
+/// Herdr's `pane.get` scroll metrics for a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct PaneScroll {
+    #[serde(default)]
+    pub offset_from_bottom: u64,
+    pub max_offset_from_bottom: u64,
+    pub viewport_rows: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -113,6 +136,10 @@ pub struct PaneOutput {
     pub text: String,
     pub revision: u64,
     pub truncated: bool,
+    /// Set for [`PaneReadFormat::Ansi`] reads when `pane.get` answered for
+    /// the same pane.
+    #[serde(default)]
+    pub scroll: Option<PaneScroll>,
 }
 
 #[derive(Debug, Error)]
@@ -649,6 +676,9 @@ async fn read_pane_at_socket(
     socket_path: &std::path::Path,
     request: ReadPaneRequest,
 ) -> Result<PaneOutput, HerdrError> {
+    if request.format == PaneReadFormat::Ansi {
+        return read_pane_rows_at_socket(config, socket_path, &request).await;
+    }
     let request_id = request.request_id.as_str();
     let pane_id = request.pane_id.as_str();
     let result = request_command(
@@ -663,15 +693,14 @@ async fn read_pane_at_socket(
             "format": "text",
             "strip_ansi": true
         }),
-        config.request_timeout,
+        config.pane_read_timeout,
     )
     .await?;
     expect_result_type(&result, "pane_read")?;
     let result: PaneRead = serde_json::from_value(result).map_err(HerdrError::CommandDecode)?;
     let mut output = result.read;
-    if request.lines > HERDR_PANE_READ_MAX_LINES
-        && output.truncated
-        && let Ok(Some(history)) = read_retained_pane_history(
+    if request.lines > HERDR_PANE_READ_MAX_LINES && output.truncated {
+        match read_retained_pane_history(
             config,
             socket_path,
             request_id,
@@ -680,13 +709,100 @@ async fn read_pane_at_socket(
             &output,
         )
         .await
-    {
-        output.text = history.text;
-        output.truncated = history.truncated;
+        {
+            Ok(Some(history)) => {
+                output.text = history.text;
+                output.truncated = history.truncated;
+            }
+            Ok(None) => {}
+            // The capped read is still returned, marked truncated.
+            Err(error) => tracing::warn!(
+                %error,
+                pane_id,
+                requested_lines = request.lines,
+                "Herdr extended history read failed; returning only the latest rendered rows"
+            ),
+        }
     }
     Ok(output)
 }
 
+/// Read the latest rendered rows with their colours, then the pane's scroll
+/// position. The rows are `recent` (not unwrapped), so each `\r\n` line is
+/// one row exactly as Herdr lays it out at the pane width. The scroll
+/// position is read after the rows so it reflects every scroll Herdr applied
+/// before the read; it is left out if `pane.get` fails or answers for another
+/// pane.
+async fn read_pane_rows_at_socket(
+    config: &HerdrConfig,
+    socket_path: &std::path::Path,
+    request: &ReadPaneRequest,
+) -> Result<PaneOutput, HerdrError> {
+    let request_id = request.request_id.as_str();
+    let pane_id = request.pane_id.as_str();
+    let result = request_command(
+        config,
+        socket_path,
+        &format!("yard:{request_id}:read-rows"),
+        "pane.read",
+        json!({
+            "pane_id": pane_id,
+            "source": "recent",
+            "lines": request.lines.min(HERDR_PANE_READ_MAX_LINES),
+            "format": "ansi",
+            "strip_ansi": false
+        }),
+        config.pane_read_timeout,
+    )
+    .await?;
+    expect_result_type(&result, "pane_read")?;
+    let result: PaneRead = serde_json::from_value(result).map_err(HerdrError::CommandDecode)?;
+    let mut output = result.read;
+    output.scroll = None;
+    match request_command(
+        config,
+        socket_path,
+        &format!("yard:{request_id}:read-scroll"),
+        "pane.get",
+        json!({ "pane_id": pane_id }),
+        config.request_timeout,
+    )
+    .await
+    .and_then(|result| {
+        expect_result_type(&result, "pane_info")?;
+        serde_json::from_value::<PaneInfoResult>(result).map_err(HerdrError::CommandDecode)
+    }) {
+        Ok(info)
+            if info.pane.pane_id == pane_id
+                && info.pane.workspace_id == output.workspace_id
+                && info.pane.tab_id == output.tab_id =>
+        {
+            output.scroll = info.pane.scroll;
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            pane_id,
+            "Herdr scroll position read failed; returning rows without it"
+        ),
+    }
+    Ok(output)
+}
+
+/// Copy-motion and selection reads pinned to one content revision before the
+/// retained history is read without a revision.
+const RETAINED_HISTORY_PINNED_ATTEMPTS: u32 = 3;
+
+/// Read Herdr's retained history beyond the 1,000-row `pane.read` cap.
+///
+/// The selection read is pinned to the content revision of the copy motion
+/// just before it. A pane that keeps printing (or redraws a spinner) changes
+/// between the two, and Herdr then refuses the read with `stale_content`, so
+/// the pair is retried from a fresh position. After
+/// [`RETAINED_HISTORY_PINNED_ATTEMPTS`] the rows are read without a
+/// revision: Herdr still extracts them in one step, so the text is one
+/// consistent range of the pane's rows, possibly a few rows later than
+/// planned, and the web joins it to the rendered rows by content.
 async fn read_retained_pane_history(
     config: &HerdrConfig,
     socket_path: &std::path::Path,
@@ -695,6 +811,45 @@ async fn read_retained_pane_history(
     lines: u32,
     output: &PaneOutput,
 ) -> Result<Option<RetainedPaneHistory>, HerdrError> {
+    let mut attempt = 1;
+    loop {
+        let pinned = attempt <= RETAINED_HISTORY_PINNED_ATTEMPTS;
+        match read_retained_pane_history_once(
+            config,
+            socket_path,
+            request_id,
+            pane_id,
+            lines,
+            output,
+            attempt,
+            pinned,
+        )
+        .await
+        {
+            Err(HerdrError::Api { code, .. }) if pinned && code == "stale_content" => {
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_retained_pane_history_once(
+    config: &HerdrConfig,
+    socket_path: &std::path::Path,
+    request_id: &str,
+    pane_id: &str,
+    lines: u32,
+    output: &PaneOutput,
+    attempt: u32,
+    pinned: bool,
+) -> Result<Option<RetainedPaneHistory>, HerdrError> {
+    let request_id = if attempt == 1 {
+        request_id.to_owned()
+    } else {
+        format!("{request_id}:{attempt}")
+    };
     let result = request_command(
         config,
         socket_path,
@@ -754,21 +909,24 @@ async fn read_retained_pane_history(
         return Ok(None);
     }
 
+    let mut params = json!({
+        "pane_id": pane_id,
+        "anchor": {
+            "row": start_row,
+            "col": 0
+        },
+        "cursor": motion.cursor
+    });
+    if pinned {
+        params["content_revision"] = json!(motion.content_revision);
+    }
     let result = request_command(
         config,
         socket_path,
         &format!("yard:{request_id}:read-selection"),
         "pane.selection.read",
-        json!({
-            "pane_id": pane_id,
-            "anchor": {
-                "row": start_row,
-                "col": 0
-            },
-            "cursor": motion.cursor,
-            "content_revision": motion.content_revision
-        }),
-        config.request_timeout,
+        params,
+        config.pane_read_timeout,
     )
     .await?;
     expect_result_type(&result, "pane_selection")?;
@@ -827,6 +985,7 @@ async fn prompt_when_ready(
     ready_timeout: Duration,
 ) -> Result<serde_json::Value, HerdrError> {
     let deadline = Instant::now() + ready_timeout;
+    let blocked_deadline = Instant::now() + config.initial_prompt_blocked_retry_timeout;
     let mut attempt = 1_u32;
     loop {
         let result = request_command(
@@ -845,8 +1004,10 @@ async fn prompt_when_ready(
         match result {
             Ok(result) => return Ok(result),
             Err(error) => {
-                let retryable = is_prompt_readiness_retryable(&error);
-                if !retryable || Instant::now() >= deadline {
+                let now = Instant::now();
+                let retryable = is_prompt_readiness_retryable(&error)
+                    || (is_agent_blocked(&error) && now < blocked_deadline);
+                if !retryable || now >= deadline {
                     return Err(error);
                 }
             }
@@ -864,12 +1025,15 @@ fn is_prompt_readiness_retryable(error: &HerdrError) -> bool {
     )
 }
 
+fn is_agent_blocked(error: &HerdrError) -> bool {
+    matches!(
+        error,
+        HerdrError::Api { code, .. } if code == "agent_blocked"
+    )
+}
+
 fn prompt_definitely_not_submitted(error: &HerdrError) -> bool {
-    is_prompt_readiness_retryable(error)
-        || matches!(
-            error,
-            HerdrError::Api { code, .. } if code == "agent_blocked"
-        )
+    is_prompt_readiness_retryable(error) || is_agent_blocked(error)
 }
 
 fn runtime_creation_outcome_ambiguous(error: &HerdrError) -> bool {
@@ -1068,13 +1232,7 @@ struct PaneHistoryInfo {
     pane_id: String,
     workspace_id: String,
     tab_id: String,
-    scroll: Option<PaneScrollInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PaneScrollInfo {
-    max_offset_from_bottom: u64,
-    viewport_rows: u64,
+    scroll: Option<PaneScroll>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1111,13 +1269,13 @@ mod tests {
     };
 
     use super::{
-        BootstrapAgentRequest, HerdrControlError, PrepareAgentRequest, PromptAgentRequest,
-        ProvisionAgentRequest, ReadPaneRequest, StartPreparedAgentRequest, StartRollback,
-        bootstrap_agent_at_socket, close_tab, close_workspace, deliver_prompt_when_ready,
-        expect_tab_close_result, prepare_agent_at_socket, prompt_agent_at_socket,
-        prompt_definitely_not_submitted, prompt_failure_after_rollback, provision_agent_at_socket,
-        read_pane_at_socket, retained_prepared_topology, runtime_creation_outcome_ambiguous,
-        start_agent_at_socket, start_prepared_agent_at_socket,
+        BootstrapAgentRequest, HerdrControlError, PaneReadFormat, PaneScroll, PrepareAgentRequest,
+        PromptAgentRequest, ProvisionAgentRequest, ReadPaneRequest, StartPreparedAgentRequest,
+        StartRollback, bootstrap_agent_at_socket, close_tab, close_workspace,
+        deliver_prompt_when_ready, expect_tab_close_result, prepare_agent_at_socket,
+        prompt_agent_at_socket, prompt_definitely_not_submitted, prompt_failure_after_rollback,
+        provision_agent_at_socket, read_pane_at_socket, retained_prepared_topology,
+        runtime_creation_outcome_ambiguous, start_agent_at_socket, start_prepared_agent_at_socket,
     };
     use crate::{HerdrConfig, HerdrError};
     use yard_domain::{
@@ -1297,6 +1455,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retries_a_transient_block_before_prompting_a_new_agent() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            for step in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].as_str().unwrap();
+                let response = match step {
+                    0 => {
+                        assert_eq!(request["method"], "agent.start");
+                        started_claude_response(id)
+                    }
+                    1 => {
+                        assert_eq!(request["method"], "agent.prompt");
+                        serde_json::json!({
+                            "id": id,
+                            "error": {
+                                "code": "agent_blocked",
+                                "message": "agent startup is still settling"
+                            }
+                        })
+                    }
+                    _ => {
+                        assert_eq!(request["method"], "agent.prompt");
+                        serde_json::json!({
+                            "id": id,
+                            "result": {
+                                "type": "agent_prompted",
+                                "status": "working"
+                            }
+                        })
+                    }
+                };
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            initial_prompt_blocked_retry_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let provisioned = start_prepared_agent_at_socket(
+            &config,
+            &socket_path,
+            StartPreparedAgentRequest {
+                command_id: "transient-block".to_owned(),
+                prepared: runtime_topology("workspace-1", "tab-1", "pane-1", "terminal-1"),
+                agent_name: "yard-transient-block".to_owned(),
+                kind: "claude".to_owned(),
+                args: Vec::new(),
+                prompt: "Continue.".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(provisioned.runtime.pane_id, "pane-1");
+    }
+
+    #[tokio::test]
     async fn blocked_prompt_closes_the_yard_owned_tab_without_raw_input() {
         let temp = tempfile::TempDir::new().unwrap();
         let socket_path = temp.path().join("herdr.sock");
@@ -1346,6 +1579,7 @@ mod tests {
         });
         let config = HerdrConfig {
             request_timeout: Duration::from_secs(1),
+            initial_prompt_blocked_retry_timeout: Duration::ZERO,
             ..HerdrConfig::default()
         };
 
@@ -1414,6 +1648,7 @@ mod tests {
         });
         let config = HerdrConfig {
             request_timeout: Duration::from_secs(1),
+            initial_prompt_blocked_retry_timeout: Duration::ZERO,
             ..HerdrConfig::default()
         };
 
@@ -1487,6 +1722,7 @@ mod tests {
         });
         let config = HerdrConfig {
             request_timeout: Duration::from_secs(1),
+            initial_prompt_blocked_retry_timeout: Duration::ZERO,
             ..HerdrConfig::default()
         };
 
@@ -2145,6 +2381,7 @@ mod tests {
                 session: "default".to_owned(),
                 pane_id: created.runtime.pane_id.clone(),
                 lines: 1_000,
+                format: PaneReadFormat::Text,
             },
         )
         .await
@@ -2817,6 +3054,7 @@ mod tests {
                 session: "default".to_owned(),
                 pane_id: "pane-1".to_owned(),
                 lines: 120,
+                format: PaneReadFormat::Text,
             },
         )
         .await
@@ -2826,6 +3064,57 @@ mod tests {
         assert_eq!(output.text, "tests pass");
         assert_eq!(output.revision, 0);
         assert!(!output.truncated);
+    }
+
+    #[tokio::test]
+    async fn pane_reads_wait_for_a_slow_alternate_screen_history_harvest() {
+        // Herdr answers `pane.read` for an idle full-screen agent only after
+        // paging its alternate-screen transcript (up to 15 s, plus up to 5 s
+        // restoring the view). That read must not be cut off by the short
+        // timeout used for control requests.
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            writer
+                .write_all(
+                    b"{\"id\":\"yard:request-slow:read\",\"result\":{\"type\":\"pane_read\",\"read\":{\"pane_id\":\"pane-1\",\"workspace_id\":\"workspace-1\",\"tab_id\":\"tab-1\",\"source\":\"recent_unwrapped\",\"format\":\"text\",\"text\":\"harvested transcript\",\"revision\":3,\"truncated\":true}}}\n",
+                )
+                .await
+                .unwrap();
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_millis(100),
+            pane_read_timeout: Duration::from_secs(3),
+            ..HerdrConfig::default()
+        };
+        assert!(
+            HerdrConfig::default().pane_read_timeout > Duration::from_secs(20),
+            "the default history read timeout must exceed Herdr's 15 s alt-screen harvest plus its 5 s restore"
+        );
+
+        let output = read_pane_at_socket(
+            &config,
+            &socket_path,
+            ReadPaneRequest {
+                request_id: "request-slow".to_owned(),
+                session: "default".to_owned(),
+                pane_id: "pane-1".to_owned(),
+                lines: 1_000,
+                format: PaneReadFormat::Text,
+            },
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(output.text, "harvested transcript");
+        assert!(output.truncated);
     }
 
     #[tokio::test]
@@ -2865,6 +3154,7 @@ mod tests {
                 session: "default".to_owned(),
                 pane_id: "pane-1".to_owned(),
                 lines: 10_000,
+                format: PaneReadFormat::Text,
             },
         )
         .await
@@ -2873,5 +3163,256 @@ mod tests {
 
         assert_eq!(output.text, "selected 10000 lines");
         assert!(output.truncated);
+    }
+
+    #[tokio::test]
+    async fn retries_a_stale_retained_history_read_then_reads_it_unpinned() {
+        // A pane that keeps printing changes between the copy motion and the
+        // selection read. Yard retries the pinned pair from a fresh position,
+        // then reads the rows without a revision rather than falling back to
+        // the capped rows.
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let mut ids = Vec::new();
+            for step in 0..13 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].as_str().unwrap().to_owned();
+                // Steps 1..=12: four attempts of pane.get, copy_motion and
+                // selection.read; the first three selection reads are stale.
+                let phase = if step == 0 { 0 } else { (step - 1) % 3 + 1 };
+                let attempt = if step == 0 { 0 } else { (step - 1) / 3 + 1 };
+                let response = if phase == 3 && attempt <= 3 {
+                    assert_eq!(request["method"], "pane.selection.read");
+                    assert_eq!(request["params"]["content_revision"], 44);
+                    serde_json::json!({
+                        "id": id,
+                        "error": {"code": "stale_content", "message": "pane content changed"}
+                    })
+                } else if phase == 3 {
+                    assert_eq!(request["method"], "pane.selection.read");
+                    assert!(request["params"].get("content_revision").is_none());
+                    assert_eq!(request["params"]["anchor"]["row"], 2_000);
+                    serde_json::json!({
+                        "id": id,
+                        "result": {
+                            "type": "pane_selection",
+                            "pane_id": "pane-1",
+                            "text": "selected 10000 lines"
+                        }
+                    })
+                } else {
+                    serde_json::json!({
+                        "id": id,
+                        "result": extended_history_result(phase, &request)
+                    })
+                };
+                ids.push(id);
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            ids
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let output = read_pane_at_socket(
+            &config,
+            &socket_path,
+            ReadPaneRequest {
+                request_id: "request-stale".to_owned(),
+                session: "default".to_owned(),
+                pane_id: "pane-1".to_owned(),
+                lines: 10_000,
+                format: PaneReadFormat::Text,
+            },
+        )
+        .await
+        .unwrap();
+        let ids = server.await.unwrap();
+
+        assert_eq!(output.text, "selected 10000 lines");
+        assert!(output.truncated);
+        let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len());
+    }
+
+    #[tokio::test]
+    async fn reads_coloured_rendered_rows_then_the_scroll_position() {
+        // History mode needs each rendered row exactly as Herdr lays it out
+        // (`recent`, not unwrapped, with colours) and Herdr's scroll position
+        // read after the rows, so a wheel step Herdr applied to its own
+        // scrollback shows as `offset_from_bottom > 0`.
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            for step in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].as_str().unwrap().to_owned();
+                let result = if step == 0 {
+                    assert_eq!(id, "yard:request-rows:read-rows");
+                    assert_eq!(request["method"], "pane.read");
+                    assert_eq!(request["params"]["pane_id"], "pane-1");
+                    assert_eq!(request["params"]["source"], "recent");
+                    // Herdr colours at most its latest 1,000 rows.
+                    assert_eq!(request["params"]["lines"], 1_000);
+                    assert_eq!(request["params"]["format"], "ansi");
+                    assert_eq!(request["params"]["strip_ansi"], false);
+                    serde_json::json!({
+                        "type": "pane_read",
+                        "read": {
+                            "pane_id": "pane-1",
+                            "workspace_id": "workspace-1",
+                            "tab_id": "tab-1",
+                            "source": "recent",
+                            "format": "ansi",
+                            "text": "\u{1b}[31mone\u{1b}[0m\r\ntwo",
+                            "revision": 0,
+                            "truncated": true
+                        }
+                    })
+                } else {
+                    assert_eq!(id, "yard:request-rows:read-scroll");
+                    assert_eq!(request["method"], "pane.get");
+                    assert_eq!(request["params"]["pane_id"], "pane-1");
+                    serde_json::json!({
+                        "type": "pane_info",
+                        "pane": {
+                            "pane_id": "pane-1",
+                            "workspace_id": "workspace-1",
+                            "tab_id": "tab-1",
+                            "scroll": {
+                                "offset_from_bottom": 3,
+                                "max_offset_from_bottom": 2_975,
+                                "viewport_rows": 30
+                            }
+                        }
+                    })
+                };
+                let response = serde_json::json!({ "id": id, "result": result });
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let output = read_pane_at_socket(
+            &config,
+            &socket_path,
+            ReadPaneRequest {
+                request_id: "request-rows".to_owned(),
+                session: "default".to_owned(),
+                pane_id: "pane-1".to_owned(),
+                lines: 10_000,
+                format: PaneReadFormat::Ansi,
+            },
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(output.text, "\u{1b}[31mone\u{1b}[0m\r\ntwo");
+        assert_eq!(output.format, "ansi");
+        assert!(output.truncated);
+        assert_eq!(
+            output.scroll,
+            Some(PaneScroll {
+                offset_from_bottom: 3,
+                max_offset_from_bottom: 2_975,
+                viewport_rows: 30,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn leaves_out_a_scroll_position_that_belongs_to_another_pane() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            for step in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].as_str().unwrap().to_owned();
+                let result = if step == 0 {
+                    serde_json::json!({
+                        "type": "pane_read",
+                        "read": {
+                            "pane_id": "pane-1",
+                            "workspace_id": "workspace-1",
+                            "tab_id": "tab-1",
+                            "source": "recent",
+                            "format": "ansi",
+                            "text": "rows",
+                            "revision": 0,
+                            "truncated": false
+                        }
+                    })
+                } else {
+                    serde_json::json!({
+                        "type": "pane_info",
+                        "pane": {
+                            "pane_id": "pane-1",
+                            "workspace_id": "workspace-1",
+                            "tab_id": "tab-2",
+                            "scroll": {
+                                "offset_from_bottom": 3,
+                                "max_offset_from_bottom": 40,
+                                "viewport_rows": 30
+                            }
+                        }
+                    })
+                };
+                let response = serde_json::json!({ "id": id, "result": result });
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let output = read_pane_at_socket(
+            &config,
+            &socket_path,
+            ReadPaneRequest {
+                request_id: "request-moved".to_owned(),
+                session: "default".to_owned(),
+                pane_id: "pane-1".to_owned(),
+                lines: 1_000,
+                format: PaneReadFormat::Ansi,
+            },
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(output.text, "rows");
+        assert_eq!(output.scroll, None);
     }
 }

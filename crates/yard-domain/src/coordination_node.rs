@@ -389,6 +389,8 @@ pub struct CoordinationNodeTerminalOutput {
     pub revision: u64,
     pub truncated: bool,
     pub status_report: Option<OrchestratorStatusReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll: Option<crate::TerminalScrollPosition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

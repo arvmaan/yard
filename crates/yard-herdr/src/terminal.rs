@@ -19,9 +19,16 @@ pub const MIN_TERMINAL_COLS: u16 = 20;
 pub const MAX_TERMINAL_COLS: u16 = 400;
 pub const MIN_TERMINAL_ROWS: u16 = 5;
 pub const MAX_TERMINAL_ROWS: u16 = 200;
-pub const MAX_TERMINAL_INPUT_BYTES: usize = 16 * 1024;
-pub const MAX_TERMINAL_COMMAND_LINE_BYTES: usize = 32 * 1024;
+/// Largest decoded `terminal.input` payload. A whole bracketed paste travels
+/// as one command so Herdr can re-bracket it for the pane; this stays well
+/// under Herdr's 1 MiB per-message input limit.
+pub const MAX_TERMINAL_INPUT_BYTES: usize = 512 * 1024;
+/// Largest NDJSON command line. JSON escapes a control byte as `\u00XX`, so
+/// the bound covers a maximal input made entirely of control bytes.
+pub const MAX_TERMINAL_COMMAND_LINE_BYTES: usize = MAX_TERMINAL_INPUT_BYTES * 6 + 1024;
 pub const MAX_TERMINAL_EVENT_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// Most repeats of one [`TerminalScroll`] sent to Herdr in a single write.
+pub const MAX_TERMINAL_SCROLL_REPEAT: u8 = 16;
 
 const MAX_TERMINAL_STDERR_BYTES: usize = 64 * 1024;
 const MAX_TERMINAL_TARGET_BYTES: usize = 256;
@@ -95,10 +102,101 @@ pub enum TerminalInput {
     BytesBase64(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalScrollDirection {
+    Up,
+    Down,
+}
+
+/// How Herdr should interpret a scroll request.
+///
+/// `Wheel` is routed like a mouse wheel: mouse-reporting apps receive wheel
+/// reports, alternate-scroll apps receive arrow keys, and everything else
+/// scrolls Herdr's own pane scrollback. `PageKey` scrolls Herdr's scrollback
+/// at a shell-like prompt and otherwise forwards PageUp/PageDown to the app.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalScrollSource {
+    #[default]
+    Wheel,
+    PageKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalScroll {
+    direction: TerminalScrollDirection,
+    lines: u16,
+    source: TerminalScrollSource,
+    column: Option<u16>,
+    row: Option<u16>,
+    repeat: u8,
+}
+
+impl TerminalScroll {
+    /// Create a bounded scroll request for Herdr's `terminal.scroll` command.
+    ///
+    /// `column` and `row` are the zero-based pointer cell used for wheel
+    /// reports sent to mouse-aware apps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HerdrTerminalError::InvalidScroll`] when `lines` is zero or
+    /// taller than the largest terminal, or the pointer cell lies outside the
+    /// largest terminal.
+    pub fn new(
+        direction: TerminalScrollDirection,
+        lines: u16,
+        source: TerminalScrollSource,
+        column: Option<u16>,
+        row: Option<u16>,
+    ) -> Result<Self, HerdrTerminalError> {
+        if !(1..=MAX_TERMINAL_ROWS).contains(&lines)
+            || column.is_some_and(|column| column >= MAX_TERMINAL_COLS)
+            || row.is_some_and(|row| row >= MAX_TERMINAL_ROWS)
+        {
+            return Err(HerdrTerminalError::InvalidScroll);
+        }
+        Ok(Self {
+            direction,
+            lines,
+            source,
+            column,
+            row,
+            repeat: 1,
+        })
+    }
+
+    /// Send this scroll `repeat` times back to back in one write.
+    ///
+    /// Herdr turns each command into one wheel report (or arrow key) for a
+    /// mouse-aware app, so a batch of steps must stay separate commands. When
+    /// they arrive together, Herdr drains them in one loop pass and answers
+    /// with one render instead of rendering the first at once and the rest a
+    /// render interval later.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HerdrTerminalError::InvalidScroll`] when `repeat` is zero or
+    /// above [`MAX_TERMINAL_SCROLL_REPEAT`].
+    pub fn repeated(self, repeat: u8) -> Result<Self, HerdrTerminalError> {
+        if !(1..=MAX_TERMINAL_SCROLL_REPEAT).contains(&repeat) {
+            return Err(HerdrTerminalError::InvalidScroll);
+        }
+        Ok(Self { repeat, ..self })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalCommand {
     Input(TerminalInput),
     Resize(TerminalDimensions),
+    Scroll(TerminalScroll),
+    /// Return the pane's viewport to the live bottom. Herdr keeps one scroll
+    /// offset per pane and resets it only on input, so this is sent as an
+    /// empty `terminal.input`: Herdr applies its scroll reset and writes no
+    /// bytes to the pane.
+    ScrollReset,
     Release,
 }
 
@@ -136,6 +234,10 @@ pub enum TerminalEvent {
 pub enum HerdrTerminalError {
     #[error("terminal dimensions {cols}x{rows} are outside the supported range")]
     InvalidDimensions { cols: u16, rows: u16 },
+    #[error(
+        "terminal scroll must move 1 to {MAX_TERMINAL_ROWS} lines at a cell inside the terminal"
+    )]
+    InvalidScroll,
     #[error("terminal {field} must contain 1 to {MAX_TERMINAL_TARGET_BYTES} bytes")]
     InvalidTarget { field: &'static str },
     #[error("terminal input must not be empty")]
@@ -187,11 +289,21 @@ pub enum HerdrTerminalError {
 
 pub struct HerdrTerminal {
     child: Option<Child>,
+    exit_status: Option<ExitStatus>,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    /// Bytes of the NDJSON line currently being read. It lives on the
+    /// terminal, not in the read future, so [`Self::next_event`] stays
+    /// cancel-safe when a `select!` drops it between partial writes.
+    stdout_line: Vec<u8>,
     stderr_task: Option<JoinHandle<io::Result<StderrCapture>>>,
     saw_closed: bool,
     release_sent: bool,
+    /// A scroll was sent since the last input or scroll reset, so Herdr's
+    /// per-pane viewport may be scrolled back. Release resets it first, so a
+    /// closed Yard view never leaves the pane (Herdr's own client, or the
+    /// next viewer) away from the latest output.
+    scrolled_since_input: bool,
 }
 
 impl HerdrTerminal {
@@ -222,11 +334,14 @@ impl HerdrTerminal {
 
         Ok(Self {
             child: Some(child),
+            exit_status: None,
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),
+            stdout_line: Vec::new(),
             stderr_task: Some(stderr_task),
             saw_closed: false,
             release_sent: false,
+            scrolled_since_input: false,
         })
     }
 
@@ -235,13 +350,20 @@ impl HerdrTerminal {
     /// `Ok(None)` is returned only after a `terminal.closed` event and a
     /// successful controller exit.
     ///
+    /// # Cancel safety
+    ///
+    /// This method is cancel-safe. Herdr writes one frame line in several
+    /// `write(2)` calls, so a relay `select!` may drop this future after only
+    /// part of a line arrived; those bytes are kept and the next call resumes
+    /// the same line instead of parsing its tail as a new event.
+    ///
     /// # Errors
     ///
     /// Returns [`HerdrTerminalError`] for process I/O, malformed or oversized
     /// NDJSON, invalid frame fields, and exits not preceded by
     /// `terminal.closed`.
     pub async fn next_event(&mut self) -> Result<Option<TerminalEvent>, HerdrTerminalError> {
-        let Some(line) = read_event_line(&mut self.stdout).await? else {
+        let Some(line) = read_event_line(&mut self.stdout, &mut self.stdout_line).await? else {
             return self.finish_after_stdout().await;
         };
         let event = parse_event(&line)?;
@@ -266,7 +388,12 @@ impl HerdrTerminal {
         }
 
         let release = matches!(command, TerminalCommand::Release);
-        let line = encode_command(&command)?;
+        let mut line = if release && self.scrolled_since_input {
+            encode_command(&TerminalCommand::ScrollReset)?
+        } else {
+            Vec::new()
+        };
+        line.extend(encode_command(&command)?);
         let Some(stdin) = self.stdin.as_mut() else {
             return Err(HerdrTerminalError::Closed);
         };
@@ -275,6 +402,13 @@ impl HerdrTerminal {
         }
         if let Err(source) = stdin.flush().await {
             return self.write_error(source).await;
+        }
+        match command {
+            TerminalCommand::Scroll(_) => self.scrolled_since_input = true,
+            TerminalCommand::Input(_) | TerminalCommand::ScrollReset => {
+                self.scrolled_since_input = false;
+            }
+            TerminalCommand::Resize(_) | TerminalCommand::Release => {}
         }
         if release {
             self.release_sent = true;
@@ -344,14 +478,22 @@ impl HerdrTerminal {
     }
 
     async fn finish_after_stdout(&mut self) -> Result<Option<TerminalEvent>, HerdrTerminalError> {
-        let status = self
-            .child
-            .as_mut()
-            .ok_or(HerdrTerminalError::Closed)?
-            .wait()
-            .await
-            .map_err(HerdrTerminalError::Wait)?;
-        self.child.take();
+        // Keep the reaped status so a call cancelled while draining stderr
+        // can resume without losing it.
+        let status = if let Some(status) = self.exit_status {
+            status
+        } else {
+            let status = self
+                .child
+                .as_mut()
+                .ok_or(HerdrTerminalError::Closed)?
+                .wait()
+                .await
+                .map_err(HerdrTerminalError::Wait)?;
+            self.exit_status = Some(status);
+            self.child.take();
+            status
+        };
         self.stdin.take();
         let stderr = self.take_stderr().await?;
         if self.saw_closed && status.success() {
@@ -461,33 +603,42 @@ async fn drain_stderr_from(mut stderr: impl AsyncRead + Unpin) -> io::Result<Std
 
 async fn read_event_line(
     reader: &mut (impl AsyncBufRead + Unpin),
+    line: &mut Vec<u8>,
 ) -> Result<Option<Vec<u8>>, HerdrTerminalError> {
-    read_bounded_line(reader, MAX_TERMINAL_EVENT_LINE_BYTES).await
+    read_bounded_line(reader, line, MAX_TERMINAL_EVENT_LINE_BYTES).await
 }
 
+/// Read one newline-terminated line of at most `max_bytes` into `line`.
+///
+/// Cancel-safe: `read_until` appends each consumed chunk to `line` before it
+/// yields, so when the future is dropped mid-line the partial bytes remain in
+/// `line` and the next call continues that line. A completed line is taken
+/// out of `line`, leaving it empty for the next one.
 async fn read_bounded_line(
     reader: &mut (impl AsyncBufRead + Unpin),
+    line: &mut Vec<u8>,
     max_bytes: usize,
 ) -> Result<Option<Vec<u8>>, HerdrTerminalError> {
-    let limit = u64::try_from(max_bytes)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    let mut limited = reader.take(limit);
-    let mut line = Vec::new();
-    limited
-        .read_until(b'\n', &mut line)
+    let remaining = max_bytes.saturating_add(1).saturating_sub(line.len());
+    let limit = u64::try_from(remaining).unwrap_or(u64::MAX);
+    reader
+        .take(limit)
+        .read_until(b'\n', line)
         .await
         .map_err(HerdrTerminalError::Stdout)?;
+    if line.len() > max_bytes {
+        line.clear();
+        return Err(HerdrTerminalError::EventLineTooLarge);
+    }
+    if line.last() == Some(&b'\n') {
+        return Ok(Some(std::mem::take(line)));
+    }
+    // `read_until` stops short of a newline only at end of output.
     if line.is_empty() {
         return Ok(None);
     }
-    if line.len() > max_bytes {
-        return Err(HerdrTerminalError::EventLineTooLarge);
-    }
-    if line.last() != Some(&b'\n') {
-        return Err(HerdrTerminalError::UnterminatedEvent);
-    }
-    Ok(Some(line))
+    line.clear();
+    Err(HerdrTerminalError::UnterminatedEvent)
 }
 
 fn parse_event(line: &[u8]) -> Result<TerminalEvent, HerdrTerminalError> {
@@ -518,6 +669,16 @@ enum WireCommand<'a> {
     InputBytes { bytes: &'a str },
     #[serde(rename = "terminal.resize")]
     Resize { cols: u16, rows: u16 },
+    #[serde(rename = "terminal.scroll")]
+    Scroll {
+        direction: TerminalScrollDirection,
+        lines: u16,
+        source: TerminalScrollSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        column: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        row: Option<u16>,
+    },
     #[serde(rename = "terminal.release")]
     Release,
 }
@@ -541,6 +702,14 @@ fn encode_command(command: &TerminalCommand) -> Result<Vec<u8>, HerdrTerminalErr
             cols: dimensions.cols,
             rows: dimensions.rows,
         },
+        TerminalCommand::Scroll(scroll) => WireCommand::Scroll {
+            direction: scroll.direction,
+            lines: scroll.lines,
+            source: scroll.source,
+            column: scroll.column,
+            row: scroll.row,
+        },
+        TerminalCommand::ScrollReset => WireCommand::InputText { text: "" },
         TerminalCommand::Release => WireCommand::Release,
     };
 
@@ -548,6 +717,9 @@ fn encode_command(command: &TerminalCommand) -> Result<Vec<u8>, HerdrTerminalErr
     line.push(b'\n');
     if line.len() > MAX_TERMINAL_COMMAND_LINE_BYTES {
         return Err(HerdrTerminalError::CommandLineTooLarge);
+    }
+    if let TerminalCommand::Scroll(scroll) = command {
+        return Ok(line.repeat(usize::from(scroll.repeat)));
     }
     Ok(line)
 }
@@ -651,15 +823,16 @@ mod tests {
         process::{Pid, test_kill_process},
     };
     use tokio::{
-        io::BufReader,
-        time::{sleep, timeout},
+        io::{AsyncWriteExt, BufReader},
+        time::{interval, sleep, timeout},
     };
 
     use super::{
-        HerdrTerminal, HerdrTerminalError, MAX_TERMINAL_INPUT_BYTES, OpenTerminalRequest,
-        TerminalClosed, TerminalCommand, TerminalDimensions, TerminalEncoding, TerminalEvent,
-        TerminalFrame, TerminalInput, controller_command, encode_command, parse_event,
-        read_bounded_line,
+        HerdrTerminal, HerdrTerminalError, MAX_TERMINAL_COLS, MAX_TERMINAL_COMMAND_LINE_BYTES,
+        MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_ROWS, MAX_TERMINAL_SCROLL_REPEAT,
+        OpenTerminalRequest, TerminalClosed, TerminalCommand, TerminalDimensions, TerminalEncoding,
+        TerminalEvent, TerminalFrame, TerminalInput, TerminalScroll, TerminalScrollDirection,
+        TerminalScrollSource, controller_command, encode_command, parse_event, read_bounded_line,
     };
     use crate::HerdrConfig;
 
@@ -738,6 +911,99 @@ mod tests {
     }
 
     #[test]
+    fn serializes_scroll_commands_for_herdr_terminal_scroll() {
+        // Herdr 0.9.x `terminal session control` accepts
+        // {"type":"terminal.scroll","direction","lines","source","column","row"}.
+        let wheel = TerminalScroll::new(
+            TerminalScrollDirection::Up,
+            3,
+            TerminalScrollSource::Wheel,
+            Some(12),
+            Some(4),
+        )
+        .unwrap();
+        assert_eq!(
+            encode_command(&TerminalCommand::Scroll(wheel)).unwrap(),
+            br#"{"type":"terminal.scroll","direction":"up","lines":3,"source":"wheel","column":12,"row":4}
+"#
+        );
+        let page = TerminalScroll::new(
+            TerminalScrollDirection::Down,
+            23,
+            TerminalScrollSource::PageKey,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            encode_command(&TerminalCommand::Scroll(page)).unwrap(),
+            br#"{"type":"terminal.scroll","direction":"down","lines":23,"source":"page_key"}
+"#
+        );
+    }
+
+    #[test]
+    fn encodes_a_repeated_scroll_as_separate_commands_in_one_buffer() {
+        // One write, so Herdr drains every step before it renders, but still
+        // one command per step, so a mouse-aware app gets one report each.
+        let wheel = TerminalScroll::new(
+            TerminalScrollDirection::Up,
+            3,
+            TerminalScrollSource::Wheel,
+            Some(1),
+            Some(2),
+        )
+        .unwrap();
+        let line = r#"{"type":"terminal.scroll","direction":"up","lines":3,"source":"wheel","column":1,"row":2}
+"#;
+        assert_eq!(
+            encode_command(&TerminalCommand::Scroll(wheel.repeated(3).unwrap())).unwrap(),
+            line.repeat(3).into_bytes()
+        );
+        assert_eq!(
+            encode_command(&TerminalCommand::Scroll(wheel.repeated(1).unwrap())).unwrap(),
+            line.as_bytes()
+        );
+        for repeat in [0, MAX_TERMINAL_SCROLL_REPEAT + 1] {
+            assert!(matches!(
+                wheel.repeated(repeat),
+                Err(HerdrTerminalError::InvalidScroll)
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_scrolls_outside_the_terminal_bounds() {
+        for (lines, column, row) in [
+            (0, None, None),
+            (MAX_TERMINAL_ROWS + 1, None, None),
+            (1, Some(MAX_TERMINAL_COLS), None),
+            (1, None, Some(MAX_TERMINAL_ROWS)),
+        ] {
+            assert!(matches!(
+                TerminalScroll::new(
+                    TerminalScrollDirection::Up,
+                    lines,
+                    TerminalScrollSource::Wheel,
+                    column,
+                    row,
+                ),
+                Err(HerdrTerminalError::InvalidScroll)
+            ));
+        }
+        assert!(
+            TerminalScroll::new(
+                TerminalScrollDirection::Down,
+                MAX_TERMINAL_ROWS,
+                TerminalScrollSource::PageKey,
+                Some(MAX_TERMINAL_COLS - 1),
+                Some(MAX_TERMINAL_ROWS - 1),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn rejects_malformed_and_oversized_input() {
         assert!(matches!(
             TerminalDimensions::new(10, 24),
@@ -755,12 +1021,26 @@ mod tests {
             ))),
             Err(HerdrTerminalError::InputTooLarge)
         ));
-        assert!(matches!(
-            encode_command(&TerminalCommand::Input(TerminalInput::Text(
-                "\0".repeat(MAX_TERMINAL_INPUT_BYTES)
-            ))),
-            Err(HerdrTerminalError::CommandLineTooLarge)
-        ));
+        // The largest accepted input still fits one command line even when
+        // every byte needs a six-byte JSON escape.
+        let escaped = encode_command(&TerminalCommand::Input(TerminalInput::Text(
+            "\0".repeat(MAX_TERMINAL_INPUT_BYTES),
+        )))
+        .unwrap();
+        assert!(escaped.len() <= MAX_TERMINAL_COMMAND_LINE_BYTES);
+    }
+
+    #[test]
+    fn carries_a_whole_bracketed_paste_in_one_command() {
+        let paste = format!(
+            "\u{1b}[200~{}\u{1b}[201~",
+            "line of pasted text\r".repeat(10_000)
+        );
+        assert!(paste.len() > 64 * 1024);
+        let line =
+            encode_command(&TerminalCommand::Input(TerminalInput::Text(paste.clone()))).unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(decoded["text"], paste);
     }
 
     #[tokio::test]
@@ -777,22 +1057,201 @@ mod tests {
             Err(HerdrTerminalError::InvalidEvent(_))
         ));
 
+        let mut line = Vec::new();
         let mut oversized = BufReader::new(&b"123456789\n"[..]);
         assert!(matches!(
-            read_bounded_line(&mut oversized, 8).await,
+            read_bounded_line(&mut oversized, &mut line, 8).await,
             Err(HerdrTerminalError::EventLineTooLarge)
         ));
         let mut unterminated = BufReader::new(&b"{}\n{}"[..]);
         assert!(
-            read_bounded_line(&mut unterminated, 8)
+            read_bounded_line(&mut unterminated, &mut line, 8)
                 .await
                 .unwrap()
                 .is_some()
         );
         assert!(matches!(
-            read_bounded_line(&mut unterminated, 8).await,
+            read_bounded_line(&mut unterminated, &mut line, 8).await,
             Err(HerdrTerminalError::UnterminatedEvent)
         ));
+        let mut empty = BufReader::new(&b""[..]);
+        assert!(
+            read_bounded_line(&mut empty, &mut line, 8)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn resumes_a_partial_line_after_the_read_is_cancelled() {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let mut reader = BufReader::new(reader);
+        let mut line = Vec::new();
+        writer
+            .write_all(br#"{"type":"terminal.closed","#)
+            .await
+            .unwrap();
+        tokio::select! {
+            biased;
+            read = read_bounded_line(&mut reader, &mut line, 1024) => {
+                panic!("an incomplete line must not resolve: {read:?}");
+            }
+            () = sleep(Duration::from_millis(20)) => {}
+        }
+        writer
+            .write_all(b"\"reason\":\"detached\"}\n")
+            .await
+            .unwrap();
+
+        let resumed = read_bounded_line(&mut reader, &mut line, 1024)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parse_event(&resumed).unwrap(),
+            TerminalEvent::Closed(TerminalClosed {
+                reason: "detached".to_owned(),
+            })
+        );
+        assert!(line.is_empty());
+    }
+
+    #[tokio::test]
+    async fn next_event_survives_a_select_that_drops_it_mid_frame() {
+        // Herdr's CLI writes one frame line in several write(2) calls. The
+        // relay polls next_event() inside select! next to a 250 ms lease tick;
+        // dropping the future between those writes used to discard the
+        // frame's head and fail on its tail with MalformedEvent, which the
+        // relay reported as `runtime_error`, freezing the browser terminal.
+        let temp = tempfile::tempdir().unwrap();
+        let binary = write_script(
+            temp.path(),
+            "split-frame-herdr",
+            r#"printf '%s' '{"type":"terminal.frame","seq":2,"encoding":"ansi",'
+sleep 0.3
+printf '%s\n' '"width":80,"height":24,"full":false,"bytes":"dGFpbA=="}'
+printf '%s\n' '{"type":"terminal.closed","reason":"detached"}'
+"#,
+        );
+        let config = HerdrConfig {
+            binary: binary.into_os_string(),
+            ..HerdrConfig::default()
+        };
+        let request = OpenTerminalRequest::new(
+            "alpha",
+            "term_123",
+            TerminalDimensions::new(80, 24).unwrap(),
+        )
+        .unwrap();
+        let mut terminal = HerdrTerminal::spawn(&config, request).unwrap();
+        let mut ticker = interval(Duration::from_millis(25));
+        let mut ticks = 0_u32;
+        let mut events = Vec::new();
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => ticks += 1,
+                    event = terminal.next_event() => match event.unwrap() {
+                        Some(event) => events.push(event),
+                        None => break,
+                    },
+                }
+            }
+        })
+        .await
+        .expect("controller output should finish");
+
+        assert!(ticks > 2, "the ticker must have interrupted the read");
+        assert_eq!(
+            events,
+            [
+                TerminalEvent::Frame(TerminalFrame {
+                    bytes: "dGFpbA==".to_owned(),
+                    encoding: TerminalEncoding::Ansi,
+                    seq: 2,
+                    width: 80,
+                    height: 24,
+                    full: false,
+                }),
+                TerminalEvent::Closed(TerminalClosed {
+                    reason: "detached".to_owned(),
+                }),
+            ]
+        );
+    }
+
+    async fn recorded_release_commands(commands: Vec<TerminalCommand>) -> String {
+        let temp = tempfile::tempdir().unwrap();
+        let record = temp.path().join("stdin.ndjson");
+        let binary = write_script(
+            temp.path(),
+            "recording-herdr",
+            &format!(
+                "cat > '{}'\nprintf '%s\\n' '{{\"type\":\"terminal.closed\",\"reason\":\"detached\"}}'\n",
+                record.display()
+            ),
+        );
+        let config = HerdrConfig {
+            binary: binary.into_os_string(),
+            ..HerdrConfig::default()
+        };
+        let request = OpenTerminalRequest::new(
+            "alpha",
+            "term_123",
+            TerminalDimensions::new(80, 24).unwrap(),
+        )
+        .unwrap();
+        let mut terminal = HerdrTerminal::spawn(&config, request).unwrap();
+        for command in commands {
+            terminal.send(command).await.unwrap();
+        }
+        terminal.close().await.unwrap();
+        fs::read_to_string(record).unwrap()
+    }
+
+    #[tokio::test]
+    async fn release_returns_a_scrolled_pane_to_the_latest_output() {
+        // Herdr keeps one scroll offset per pane and resets it only on input,
+        // so a Yard view closed while scrolled back used to leave the pane
+        // (Herdr's own client and the next viewer) away from the latest output.
+        let up = TerminalScroll::new(
+            TerminalScrollDirection::Up,
+            3,
+            TerminalScrollSource::Wheel,
+            None,
+            None,
+        )
+        .unwrap();
+        let scroll = r#"{"type":"terminal.scroll","direction":"up","lines":3,"source":"wheel"}"#;
+        let reset = r#"{"type":"terminal.input","text":""}"#;
+        let release = r#"{"type":"terminal.release"}"#;
+        assert_eq!(
+            recorded_release_commands(vec![TerminalCommand::Scroll(up)]).await,
+            format!("{scroll}\n{reset}\n{release}\n")
+        );
+        // Input already reset Herdr's offset, so release sends nothing extra.
+        assert_eq!(
+            recorded_release_commands(vec![
+                TerminalCommand::Scroll(up),
+                TerminalCommand::Input(TerminalInput::Text("x".to_owned())),
+            ])
+            .await,
+            format!("{scroll}\n{{\"type\":\"terminal.input\",\"text\":\"x\"}}\n{release}\n")
+        );
+        assert_eq!(
+            recorded_release_commands(vec![
+                TerminalCommand::Scroll(up),
+                TerminalCommand::ScrollReset,
+            ])
+            .await,
+            format!("{scroll}\n{reset}\n{release}\n")
+        );
+        assert_eq!(
+            recorded_release_commands(Vec::new()).await,
+            format!("{release}\n")
+        );
     }
 
     #[test]

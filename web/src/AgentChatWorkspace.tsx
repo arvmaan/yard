@@ -38,7 +38,13 @@ import {
   useLatestAgentQuestion,
 } from './agentQuestions'
 import {
+  ExecutionOrderByteCount,
+  ExecutionOrderLimitError,
+} from './ExecutionOrderLimit'
+import {
   buildExecutionOrder,
+  executionOrderBytes,
+  MAX_EXECUTION_ORDER_BYTES,
   ORDER_TEMPLATES,
 } from './orderTemplates'
 import {
@@ -174,6 +180,7 @@ export function AgentChatWorkspace({
 }) {
   const titleId = useId()
   const messageId = useId()
+  const messageLimitId = useId()
   const templateId = useId()
   const dispatchId = useId()
   const assignment =
@@ -466,9 +473,12 @@ export function AgentChatWorkspace({
       48
   }
 
+  const orderBytes = executionOrderBytes(promptText)
+  const orderTooLong = orderBytes > MAX_EXECUTION_ORDER_BYTES
+
   const sendPrompt = async (forceNewCommand: boolean) => {
     const text = promptText.trim()
-    if (!text || promptInFlight.current) return
+    if (!text || promptInFlight.current || orderTooLong) return
     const requestedTargetKey = promptTargetKeyRef.current
 
     const retainedCommand = retainedPromptCommand.current
@@ -916,13 +926,17 @@ export function AgentChatWorkspace({
         className="chat-composer"
         onSubmit={(event) => void submitPrompt(event)}
         >
-          <label className="field-label" htmlFor={messageId}>
-            Message
-          </label>
+          <div className="chat-composer__label-row">
+            <label className="field-label" htmlFor={messageId}>
+              Message
+            </label>
+            <ExecutionOrderByteCount bytes={orderBytes} id={messageLimitId} />
+          </div>
           <div className="chat-composer__input">
             <textarea
+              aria-describedby={messageLimitId}
+              aria-invalid={orderTooLong || undefined}
               id={messageId}
-              maxLength={16000}
               onChange={(event) => updatePrompt(event.target.value)}
               onKeyDown={handleComposerKeyDown}
               placeholder="Give this agent its next order..."
@@ -936,6 +950,7 @@ export function AgentChatWorkspace({
               disabled={
                 promptBusy ||
                 !promptText.trim() ||
+                orderTooLong ||
                 (promptFeedback?.kind === 'error' &&
                   promptFeedback.requiresNewCommand)
               }
@@ -953,6 +968,7 @@ export function AgentChatWorkspace({
               )}
             </button>
           </div>
+          <ExecutionOrderLimitError bytes={orderBytes} />
           {promptFeedback ? (
             <div
               className="chat-delivery-feedback"

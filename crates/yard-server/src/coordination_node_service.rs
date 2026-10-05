@@ -20,8 +20,8 @@ use yard_domain::{
     CreateCoordinationNode, DeleteCoordinationNode, DeletedCoordinationNode,
     OrchestratorStatusReport, ProvisionCoordinationNode, RequestCoordinationSnapshot,
     SendCoordinationNodePrompt, SendCoordinationNodeRoute, SnapshotCollectionStatus,
-    UpdateCoordinationNode, UpdateCoordinationNodePlacement, Worker, WorkerAvailability,
-    WorkerRuntimeBinding,
+    TerminalOutputFormat, UpdateCoordinationNode, UpdateCoordinationNodePlacement, Worker,
+    WorkerAvailability, WorkerRuntimeBinding,
 };
 use yard_store::{
     BeginCoordinationNodePrompt, BeginCoordinationNodeRoute, ProjectStoreError,
@@ -51,6 +51,8 @@ use crate::{
 
 pub const COORDINATION_SESSION: &str = "yard-coordination";
 
+const COORDINATION_AGENT_NAME_PREFIX: &str = "coord-";
+const HERDR_AGENT_NAME_MAX_LEN: usize = 32;
 const RUNTIME_IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUIRED_SNAPSHOT_FILES: [&str; 8] = [
     "overview.md",
@@ -713,6 +715,7 @@ impl CoordinationNodeService {
         &self,
         node_id: &str,
         lines: u32,
+        format: TerminalOutputFormat,
     ) -> Result<CoordinationNodeTerminalOutput, CoordinationNodeServiceError> {
         if !(1..=MAX_TERMINAL_OUTPUT_LINES).contains(&lines) {
             return Err(CoordinationNodeServiceError::InvalidLineCount);
@@ -731,6 +734,7 @@ impl CoordinationNodeService {
                 session: runtime.session.clone(),
                 pane_id: runtime.pane_id.clone(),
                 lines,
+                format,
             })
             .await?;
         validate_output_identity(runtime, &result)?;
@@ -739,9 +743,12 @@ impl CoordinationNodeService {
             .store
             .latest_delivered_coordination_node_command_id(&node.id)
             .await?;
-        let status_report = expected_command_id.as_deref().and_then(|command_id| {
-            OrchestratorStatusReport::scan_terminal_output_for_command(&result.text, command_id)
-        });
+        let status_report = expected_command_id
+            .as_deref()
+            .filter(|_| format == TerminalOutputFormat::Text)
+            .and_then(|command_id| {
+                OrchestratorStatusReport::scan_terminal_output_for_command(&result.text, command_id)
+            });
         Ok(CoordinationNodeTerminalOutput {
             node_id: node.id,
             worker_id: worker.id.clone(),
@@ -752,6 +759,7 @@ impl CoordinationNodeService {
             revision: result.revision,
             truncated: result.truncated,
             status_report,
+            scroll: result.scroll,
         })
     }
 
@@ -963,7 +971,10 @@ impl CoordinationNodeService {
                 && inventory.session == runtime.session
                 && workspace_matches
                 && let Some(worker) = inventory.workers.into_iter().find(|worker| {
-                    worker.name.as_deref() == Some(agent_name(&node.id).as_str())
+                    worker
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| agent_name_matches(name, &node.id))
                         && worker.workspace_id == runtime.workspace_id
                         && worker.terminal_id == runtime.terminal_id
                         && Some(worker.tab_id.as_str()) == runtime.tab_id.as_deref()
@@ -1097,7 +1108,10 @@ fn dedicated_worker(
         .workers
         .iter()
         .filter(|worker| {
-            worker.name.as_deref() == Some(agent_name(&node.id).as_str())
+            worker
+                .name
+                .as_deref()
+                .is_some_and(|name| agent_name_matches(name, &node.id))
                 && workspaces.contains(worker.workspace_id.as_str())
                 && worker.interactive_ready
         })
@@ -1118,7 +1132,22 @@ fn workspace_label(node_id: &str) -> String {
 }
 
 fn agent_name(node_id: &str) -> String {
+    let suffix_len = HERDR_AGENT_NAME_MAX_LEN - COORDINATION_AGENT_NAME_PREFIX.len();
+    let compact_node_id = node_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .take(suffix_len)
+        .collect::<String>();
+    format!("{COORDINATION_AGENT_NAME_PREFIX}{compact_node_id}")
+}
+
+fn legacy_agent_name(node_id: &str) -> String {
     format!("coordination-{node_id}")
+}
+
+fn agent_name_matches(observed_name: &str, node_id: &str) -> bool {
+    observed_name == agent_name(node_id) || observed_name == legacy_agent_name(node_id)
 }
 
 fn node_runtime(
@@ -1442,7 +1471,8 @@ mod tests {
 
     use super::{
         COORDINATION_SESSION, CoordinationNodeService, CoordinationNodeServiceError,
-        REQUIRED_SNAPSHOT_FILES, create_managed_path,
+        HERDR_AGENT_NAME_MAX_LEN, REQUIRED_SNAPSHOT_FILES, agent_name, agent_name_matches,
+        create_managed_path,
     };
 
     #[derive(Default)]
@@ -1641,6 +1671,7 @@ mod tests {
                 text: "idle".to_owned(),
                 revision: 1,
                 truncated: false,
+                scroll: None,
             })
         }
     }
@@ -1719,12 +1750,35 @@ mod tests {
         assert_eq!(request.session, COORDINATION_SESSION);
         assert_eq!(request.cwd, cwd);
         assert!(request.workspace_label.contains(&created.node.id));
-        assert!(request.agent_name.contains(&created.node.id));
+        assert_eq!(request.agent_name, agent_name(&created.node.id));
         assert!(request.prompt.contains("There is no completed state"));
         assert!(request.prompt.contains("command \"provision-workstream\""));
         assert!(
             yard_domain::OrchestratorStatusReport::scan_terminal_output(&request.prompt).is_none()
         );
+    }
+
+    #[test]
+    fn coordination_agent_name_obeys_herdr_constraints() {
+        let node_id = "01a0493e-67fe-7f03-855d-c7a0b18b856c";
+        let name = agent_name(node_id);
+
+        assert_eq!(name.len(), HERDR_AGENT_NAME_MAX_LEN);
+        assert!(
+            name.chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_lowercase())
+        );
+        assert!(name.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '-' | '_')
+        }));
+        assert!(agent_name_matches(&name, node_id));
+        assert!(agent_name_matches(
+            &format!("coordination-{node_id}"),
+            node_id
+        ));
     }
 
     #[tokio::test]

@@ -57,3 +57,14 @@ Verify: Make the request specific enough for the user to answer in one response.
 export function buildExecutionOrder(text: string) {
   return `${text.trim()}\n\n${MANUAL_INTERVENTION_CONTRACT}`
 }
+
+// Yard's server rejects an order above 16,000 UTF-8 bytes (yard-domain
+// MAX_PROMPT_BYTES), measured on the full text it receives: the operator's
+// message plus the manual-intervention contract appended above.
+export const MAX_EXECUTION_ORDER_BYTES = 16_000
+
+const orderEncoder = new TextEncoder()
+
+export function executionOrderBytes(text: string) {
+  return orderEncoder.encode(buildExecutionOrder(text).trim()).byteLength
+}

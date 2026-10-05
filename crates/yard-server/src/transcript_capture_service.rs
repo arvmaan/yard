@@ -205,6 +205,7 @@ impl TranscriptCaptureService {
                 session: job.session.clone(),
                 pane_id: job.pane_id.clone(),
                 lines: MAX_TERMINAL_OUTPUT_LINES,
+                format: yard_domain::TerminalOutputFormat::Text,
             })
             .await
         {

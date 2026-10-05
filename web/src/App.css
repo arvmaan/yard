@@ -3699,6 +3699,11 @@ html[data-yard-allocation-dragging="true"]
   gap: 12px;
 }
 
+.agent-output__truncated {
+  margin: 0;
+  color: var(--muted);
+  font: 10px/1.35 "IBM Plex Mono", monospace;
+}
 
 .agent-output__primary {
   display: grid;
@@ -4130,6 +4135,37 @@ html[data-yard-allocation-dragging="true"]
   padding: 11px 14px 13px;
   border-top: 1px solid var(--ink);
   background: var(--paper);
+}
+
+.chat-composer__label-row {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.chat-composer__label-row .field-label {
+  margin-bottom: 0;
+}
+
+.chat-composer__limit {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font: 9px/1.4 "IBM Plex Mono", monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-composer__limit[data-over] {
+  color: var(--vermilion);
+  font-weight: 600;
+}
+
+.chat-composer__limit-error {
+  margin: 0;
+  color: var(--vermilion);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .chat-composer__input {

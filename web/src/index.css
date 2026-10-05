@@ -41,11 +41,25 @@ body {
 }
 
 .terminal-session__viewport {
+  position: relative;
   width: 100%;
   height: 196px;
   min-width: 0;
   overflow: hidden;
   background: var(--terminal-bg, var(--surface-muted, Canvas));
+}
+
+/* Local history mode: a read-only xterm with the live terminal's grid,
+   laid over it until the user returns to live. */
+.terminal-session__history {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  background: var(--terminal-bg, #111715);
+}
+
+.terminal-session__history[data-ready="false"] {
+  visibility: hidden;
 }
 
 .terminal-session__viewport .xterm {
@@ -117,6 +131,12 @@ body {
   background: var(--status-success);
 }
 
+.terminal-session[data-state="connected"][data-terminal-view="history"]
+  .terminal-session__status-text
+  > span {
+  background: #e7b32b;
+}
+
 .terminal-session[data-state="closed"] .terminal-session__status-text > span,
 .terminal-session[data-state="error"] .terminal-session__status-text > span {
   background: var(--status-danger);
@@ -145,8 +165,41 @@ body {
   outline-offset: 1px;
 }
 
+.terminal-session__latest {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 6px;
+  border: 1px solid var(--terminal-line, var(--border-strong, CanvasText));
+  border-radius: 2px;
+  background: var(--terminal-bg, var(--surface-muted, Canvas));
+  color: var(--terminal-ink, var(--text-primary, CanvasText));
+  font: inherit;
+  cursor: pointer;
+}
+
+.terminal-session__latest:hover {
+  border-color: var(--terminal-ink, var(--text-primary, CanvasText));
+}
+
+.terminal-session__latest:focus-visible {
+  outline: 2px solid var(--status-info);
+  outline-offset: 1px;
+}
+
 @media (max-width: 680px) {
   .terminal-session__viewport {
     height: 176px;
   }
+}
+
+.terminal-session__notice {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  color: var(--status-danger);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

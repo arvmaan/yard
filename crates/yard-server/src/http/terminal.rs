@@ -7,8 +7,14 @@ use axum::{
     response::Response,
 };
 use serde::Deserialize;
-use std::{future::pending, time::Duration};
-use tokio::{sync::watch, time::timeout};
+use std::{
+    future::{Future, pending},
+    time::Duration,
+};
+use tokio::{
+    sync::watch,
+    time::{Instant, interval_at, timeout},
+};
 
 use super::{ApiError, AppState};
 use crate::{
@@ -23,6 +29,77 @@ use crate::{
 
 const TERMINAL_OPERATION_TIMEOUT: Duration = Duration::from_secs(6);
 const TERMINAL_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+const TERMINAL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const TERMINAL_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often the relay re-checks its lease while nothing else does.
+const TERMINAL_LEASE_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+/// Scroll commands and outgoing frames reuse a lease confirmation younger
+/// than this instead of querying the store for each one. The lease tick runs
+/// at the same period, so a revoked lease still closes the terminal within
+/// about one tick; input and every other command are always checked.
+const TERMINAL_LEASE_REUSE_WINDOW: Duration = Duration::from_millis(250);
+
+/// When the relay last confirmed that its lease is still valid.
+#[derive(Debug, Default)]
+struct LeaseConfirmation {
+    confirmed_at: Option<Instant>,
+}
+
+impl LeaseConfirmation {
+    fn is_fresh(&self, now: Instant) -> bool {
+        self.confirmed_at
+            .is_some_and(|at| now.saturating_duration_since(at) < TERMINAL_LEASE_REUSE_WINDOW)
+    }
+}
+
+/// Whether a relay step may reuse a recent lease confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseCheck {
+    /// Scroll commands and outgoing frames: reuse a fresh confirmation.
+    Reusable,
+    /// The lease tick, input, and every other command: always query.
+    Required,
+}
+
+/// The lease check a browser command needs: only `terminal.scroll` may reuse
+/// a recent confirmation. Input, resize, `scroll_reset`, and everything else
+/// always query the store, so a keystroke never reaches a revoked terminal.
+fn lease_check_for(command: &TerminalClientMessage) -> LeaseCheck {
+    if matches!(command, TerminalClientMessage::Scroll { .. }) {
+        LeaseCheck::Reusable
+    } else {
+        LeaseCheck::Required
+    }
+}
+
+/// Confirm the lease at `started`, reusing a confirmation from the last
+/// 250 ms when `check` allows it. A confirmation is dated from when its query
+/// started, and a reused one is never extended, so no step relies on a lease
+/// check older than the reuse window.
+async fn confirm_lease<F, Validation>(
+    confirmation: &mut LeaseConfirmation,
+    check: LeaseCheck,
+    started: Instant,
+    validate: F,
+) -> Result<(), &'static str>
+where
+    F: FnOnce() -> Validation,
+    Validation: Future<Output = Result<(), &'static str>>,
+{
+    if check == LeaseCheck::Reusable && confirmation.is_fresh(started) {
+        return Ok(());
+    }
+    match validate().await {
+        Ok(()) => {
+            confirmation.confirmed_at = Some(started);
+            Ok(())
+        }
+        Err(reason) => {
+            confirmation.confirmed_at = None;
+            Err(reason)
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub(super) struct TerminalQuery {
@@ -127,24 +204,66 @@ async fn relay(
 ) {
     let crate::terminal_service::OpenedTerminal { lease, mut session } = terminal;
     let mut last_sequence = None;
-    let mut lease_check = tokio::time::interval(Duration::from_millis(250));
+    // `terminal.scroll` messages written to Herdr so far. Each frame carries
+    // the count at the time it was read, which tells the browser whether the
+    // frame can already show its latest scroll batch.
+    let mut scrolls_forwarded: u64 = 0;
+    let mut lease_confirmation = LeaseConfirmation::default();
+    // The first tick is one interval after open (the open handler has just
+    // validated the lease), so the first scroll or frame after open always
+    // runs its own lease query instead of reusing an immediate tick's.
+    let mut lease_check = interval_at(
+        Instant::now() + TERMINAL_LEASE_CHECK_INTERVAL,
+        TERMINAL_LEASE_CHECK_INTERVAL,
+    );
     lease_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat = interval_at(
+        Instant::now() + TERMINAL_HEARTBEAT_INTERVAL,
+        TERMINAL_HEARTBEAT_INTERVAL,
+    );
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_client_activity = Instant::now();
     loop {
         tokio::select! {
             () = wait_for_shutdown(&mut shutdown) => {
                 send_closed(&mut socket, "server_shutdown").await;
                 break;
             }
+            _ = heartbeat.tick() => {
+                if last_client_activity.elapsed() >= TERMINAL_HEARTBEAT_TIMEOUT {
+                    tracing::warn!("interactive terminal client heartbeat timed out");
+                    break;
+                }
+                if send_ping(&mut socket).await.is_err() {
+                    break;
+                }
+            }
             _ = lease_check.tick() => {
-                if let Err(reason) = validate_lease(&terminals, &lease).await {
+                if let Err(reason) = confirm_lease(
+                    &mut lease_confirmation,
+                    LeaseCheck::Required,
+                    Instant::now(),
+                    || validate_lease(&terminals, &lease),
+                )
+                .await
+                {
                     send_closed(&mut socket, reason).await;
                     break;
                 }
             }
+            // Cancel-safe: a partially read Herdr frame is kept by the
+            // session when a timer or client branch wins this select.
             runtime_message = session.next_message() => {
                 match runtime_message {
                     Ok(Some(message)) => {
-                        if let Err(reason) = validate_lease(&terminals, &lease).await {
+                        if let Err(reason) = confirm_lease(
+                            &mut lease_confirmation,
+                            LeaseCheck::Reusable,
+                            Instant::now(),
+                            || validate_lease(&terminals, &lease),
+                        )
+                        .await
+                        {
                             send_closed(&mut socket, reason).await;
                             break;
                         }
@@ -156,6 +275,7 @@ async fn relay(
                             last_sequence = Some(sequence);
                         }
                         let closed = matches!(message, TerminalServerMessage::Closed { .. });
+                        let message = message.with_scrolls(scrolls_forwarded);
                         if send_message(&mut socket, &message).await.is_err() || closed {
                             break;
                         }
@@ -178,6 +298,7 @@ async fn relay(
                 let Ok(client_message) = client_message else {
                     break;
                 };
+                last_client_activity = Instant::now();
                 match client_message {
                     Message::Text(text) => {
                         if text.len() > MAX_TERMINAL_MESSAGE_BYTES {
@@ -207,12 +328,24 @@ async fn relay(
                             }
                             break;
                         }
-                        if let Err(reason) = validate_lease(&terminals, &lease).await {
+                        let scroll = matches!(command, TerminalClientMessage::Scroll { .. });
+                        if let Err(reason) = confirm_lease(
+                            &mut lease_confirmation,
+                            lease_check_for(&command),
+                            Instant::now(),
+                            || validate_lease(&terminals, &lease),
+                        )
+                        .await
+                        {
                             send_closed(&mut socket, reason).await;
                             break;
                         }
                         match timeout(TERMINAL_OPERATION_TIMEOUT, session.send(command)).await {
-                            Ok(Ok(())) => {}
+                            Ok(Ok(())) => {
+                                if scroll {
+                                    scrolls_forwarded += 1;
+                                }
+                            }
                             Ok(Err(error)) => {
                                 tracing::warn!(%error, "interactive terminal command failed");
                                 send_closed(&mut socket, "runtime_error").await;
@@ -226,7 +359,12 @@ async fn relay(
                         }
                     }
                     Message::Close(_) => break,
-                    Message::Ping(_) | Message::Pong(_) => {}
+                    Message::Ping(payload) => {
+                        if send_pong(&mut socket, payload).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Pong(_) => {}
                     Message::Binary(_) => {
                         send_closed(&mut socket, "invalid_command").await;
                         break;
@@ -274,6 +412,21 @@ async fn send_message(socket: &mut WebSocket, message: &TerminalServerMessage) -
     .await
     .map_err(|_| ())?
     .map_err(|_| ())
+}
+
+async fn send_ping(socket: &mut WebSocket) -> Result<(), ()> {
+    send_socket_message(socket, Message::Ping(Vec::new().into())).await
+}
+
+async fn send_pong(socket: &mut WebSocket, payload: axum::body::Bytes) -> Result<(), ()> {
+    send_socket_message(socket, Message::Pong(payload)).await
+}
+
+async fn send_socket_message(socket: &mut WebSocket, message: Message) -> Result<(), ()> {
+    timeout(TERMINAL_SOCKET_WRITE_TIMEOUT, socket.send(message))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
 }
 
 async fn send_closed(socket: &mut WebSocket, reason: &str) {
@@ -469,9 +622,178 @@ fn terminal_error(error: &TerminalServiceError) -> ApiError {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::{HeaderMap, HeaderValue, header};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use super::validate_origin;
+    use axum::http::{HeaderMap, HeaderValue, header};
+    use tokio::time::{Duration, Instant};
+
+    use super::{LeaseCheck, LeaseConfirmation, confirm_lease, lease_check_for, validate_origin};
+    use crate::terminal_service::TerminalClientMessage;
+
+    /// A stand-in for the store query that counts calls and fails once the
+    /// lease is revoked.
+    struct LeaseStore {
+        queries: AtomicUsize,
+        revoked: AtomicBool,
+    }
+
+    impl LeaseStore {
+        fn new() -> Self {
+            Self {
+                queries: AtomicUsize::new(0),
+                revoked: AtomicBool::new(false),
+            }
+        }
+
+        fn queries(&self) -> usize {
+            self.queries.load(Ordering::SeqCst)
+        }
+
+        async fn confirm(
+            &self,
+            confirmation: &mut LeaseConfirmation,
+            check: LeaseCheck,
+            at: Instant,
+        ) -> Result<(), &'static str> {
+            confirm_lease(confirmation, check, at, || async {
+                self.queries.fetch_add(1, Ordering::SeqCst);
+                if self.revoked.load(Ordering::SeqCst) {
+                    Err("assignment_changed")
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+        }
+    }
+
+    #[tokio::test]
+    async fn reuses_a_lease_confirmation_for_scrolls_and_frames_only_within_250_ms() {
+        let store = LeaseStore::new();
+        let mut confirmation = LeaseConfirmation::default();
+        let opened = Instant::now();
+        let at = |ms| opened + Duration::from_millis(ms);
+
+        // The first scroll or frame after open is always checked.
+        assert_eq!(
+            store
+                .confirm(&mut confirmation, LeaseCheck::Reusable, at(0))
+                .await,
+            Ok(())
+        );
+        assert_eq!(store.queries(), 1);
+        // Scrolls and frames inside the window reuse it without extending it.
+        for ms in [100, 200, 249] {
+            assert_eq!(
+                store
+                    .confirm(&mut confirmation, LeaseCheck::Reusable, at(ms))
+                    .await,
+                Ok(())
+            );
+        }
+        assert_eq!(store.queries(), 1);
+        assert_eq!(
+            store
+                .confirm(&mut confirmation, LeaseCheck::Reusable, at(250))
+                .await,
+            Ok(())
+        );
+        assert_eq!(store.queries(), 2);
+        // Input and the lease tick always query the store.
+        assert_eq!(
+            store
+                .confirm(&mut confirmation, LeaseCheck::Required, at(260))
+                .await,
+            Ok(())
+        );
+        assert_eq!(store.queries(), 3);
+    }
+
+    #[test]
+    fn only_scroll_commands_may_reuse_a_lease_confirmation() {
+        for (command, check) in [
+            (
+                serde_json::json!({"type": "terminal.scroll", "direction": "up", "lines": 3, "source": "wheel"}),
+                LeaseCheck::Reusable,
+            ),
+            (
+                serde_json::json!({"type": "terminal.input", "text": "x"}),
+                LeaseCheck::Required,
+            ),
+            (
+                serde_json::json!({"type": "terminal.resize", "cols": 80, "rows": 24}),
+                LeaseCheck::Required,
+            ),
+            (
+                serde_json::json!({"type": "terminal.scroll_reset"}),
+                LeaseCheck::Required,
+            ),
+            (
+                serde_json::json!({"type": "terminal.release"}),
+                LeaseCheck::Required,
+            ),
+        ] {
+            let message: TerminalClientMessage = serde_json::from_value(command.clone()).unwrap();
+            assert_eq!(lease_check_for(&message), check, "{command}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_a_revoked_lease_at_the_next_tick_input_or_expired_window() {
+        let store = LeaseStore::new();
+        let mut confirmation = LeaseConfirmation::default();
+        let opened = Instant::now();
+        let at = |ms| opened + Duration::from_millis(ms);
+        assert_eq!(
+            store
+                .confirm(&mut confirmation, LeaseCheck::Required, at(0))
+                .await,
+            Ok(())
+        );
+        store.revoked.store(true, Ordering::SeqCst);
+
+        // A scroll inside the window may still pass: the documented bound,
+        // which the 250 ms lease tick enforces.
+        assert_eq!(
+            store
+                .confirm(&mut confirmation, LeaseCheck::Reusable, at(100))
+                .await,
+            Ok(())
+        );
+        assert_eq!(store.queries(), 1);
+        // Input (or the tick) inside the same window is rejected at once.
+        assert_eq!(
+            store
+                .confirm(&mut confirmation, LeaseCheck::Required, at(100))
+                .await,
+            Err("assignment_changed")
+        );
+        // A rejection is never reused.
+        assert_eq!(
+            store
+                .confirm(&mut confirmation, LeaseCheck::Reusable, at(101))
+                .await,
+            Err("assignment_changed")
+        );
+        assert_eq!(store.queries(), 3);
+
+        // Without the tick, a scroll or frame after the window rejects too.
+        let mut stale = LeaseConfirmation::default();
+        store.revoked.store(false, Ordering::SeqCst);
+        assert_eq!(
+            store
+                .confirm(&mut stale, LeaseCheck::Reusable, at(200))
+                .await,
+            Ok(())
+        );
+        store.revoked.store(true, Ordering::SeqCst);
+        assert_eq!(
+            store
+                .confirm(&mut stale, LeaseCheck::Reusable, at(450))
+                .await,
+            Err("assignment_changed")
+        );
+    }
 
     #[test]
     fn accepts_only_loopback_http_origins() {

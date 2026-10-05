@@ -78,6 +78,7 @@ pub use coordination_node::{
 pub use intervention::{
     InterventionValidationError, OrchestratorPromptAcknowledgement, OrchestratorTerminalOutput,
     PromptAcknowledgement, SendAssignmentPrompt, SendOrchestratorPrompt, TerminalOutput,
+    TerminalOutputFormat, TerminalScrollPosition,
 };
 pub use inventory::{
     FocusObservation, ManagedRuntimeOccupant, ManagedRuntimeOccupantKind, ManagedRuntimeWorkspace,

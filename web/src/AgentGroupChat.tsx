@@ -33,7 +33,13 @@ import {
   type AgentQuestion,
 } from './agentQuestions'
 import {
+  ExecutionOrderByteCount,
+  ExecutionOrderLimitError,
+} from './ExecutionOrderLimit'
+import {
   buildExecutionOrder,
+  executionOrderBytes,
+  MAX_EXECUTION_ORDER_BYTES,
   ORDER_TEMPLATES,
 } from './orderTemplates'
 import {
@@ -173,6 +179,7 @@ export function AgentGroupChat({
 }) {
   const titleId = useId()
   const messageId = useId()
+  const messageLimitId = useId()
   const templateId = useId()
   const stableTargets = useMemo(
     () =>
@@ -368,10 +375,13 @@ export function AgentGroupChat({
     if (groupKeyRef.current === requestedGroup) setSending(false)
   }
 
+  const orderBytes = executionOrderBytes(promptText)
+  const orderTooLong = orderBytes > MAX_EXECUTION_ORDER_BYTES
+
   const submit = async (event: FormEvent) => {
     event.preventDefault()
     const text = promptText.trim()
-    if (!text || sending) return
+    if (!text || sending || orderTooLong) return
     activeText.current = text
     const commands = stableTargets.map((target) => {
       const command = commandForTarget(target, text)
@@ -704,13 +714,20 @@ export function AgentGroupChat({
               className="chat-composer"
               onSubmit={(event) => void submit(event)}
             >
-              <label className="field-label" htmlFor={messageId}>
-                Message
-              </label>
+              <div className="chat-composer__label-row">
+                <label className="field-label" htmlFor={messageId}>
+                  Message
+                </label>
+                <ExecutionOrderByteCount
+                  bytes={orderBytes}
+                  id={messageLimitId}
+                />
+              </div>
               <div className="chat-composer__input">
                 <textarea
+                  aria-describedby={messageLimitId}
+                  aria-invalid={orderTooLong || undefined}
                   id={messageId}
-                  maxLength={16000}
                   onChange={(event) => updatePrompt(event.target.value)}
                   onKeyDown={handleComposerKeyDown}
                   placeholder="Give every selected agent the same order..."
@@ -721,7 +738,7 @@ export function AgentGroupChat({
                 <button
                   aria-label={`Send to ${stableTargets.length}`}
                   className="command-button"
-                  disabled={sending || !promptText.trim()}
+                  disabled={sending || !promptText.trim() || orderTooLong}
                   title={`Send to ${stableTargets.length} agents`}
                   type="submit"
                 >
@@ -736,6 +753,7 @@ export function AgentGroupChat({
                   )}
                 </button>
               </div>
+              <ExecutionOrderLimitError bytes={orderBytes} />
             </form>
           </section>
         </div>,

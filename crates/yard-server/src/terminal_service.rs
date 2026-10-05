@@ -15,8 +15,21 @@ pub const MIN_TERMINAL_COLS: u16 = 20;
 pub const MAX_TERMINAL_COLS: u16 = 400;
 pub const MIN_TERMINAL_ROWS: u16 = 5;
 pub const MAX_TERMINAL_ROWS: u16 = 200;
-pub const MAX_TERMINAL_INPUT_BYTES: usize = 16 * 1024;
-pub const MAX_TERMINAL_MESSAGE_BYTES: usize = 32 * 1024;
+/// Largest decoded `terminal.input` payload. The browser sends a whole
+/// bracketed paste as one message so Herdr can deliver it to the pane as a
+/// single paste; Herdr itself accepts up to 1 MiB per input message.
+pub const MAX_TERMINAL_INPUT_BYTES: usize = 512 * 1024;
+/// Largest browser WebSocket message. JSON escapes a control character as a
+/// six-byte `\u00XX`, so this admits any input within
+/// [`MAX_TERMINAL_INPUT_BYTES`].
+pub const MAX_TERMINAL_MESSAGE_BYTES: usize = MAX_TERMINAL_INPUT_BYTES * 6 + 4 * 1024;
+/// Most repeats one `terminal.scroll` may ask for: the browser's largest
+/// scroll batch.
+pub const MAX_TERMINAL_SCROLL_COUNT: u8 = 5;
+
+const fn one_scroll() -> u8 {
+    1
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenTerminalRequest {
@@ -37,6 +50,12 @@ pub enum TerminalServerMessage {
         width: u16,
         height: u16,
         full: bool,
+        /// How many `terminal.scroll` messages the relay had forwarded to
+        /// Herdr when it read this frame. The browser counts the scrolls it
+        /// sent, so a frame read before its latest batch reached Herdr (one
+        /// already on the way) is never taken as that batch's answer.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scrolls: Option<u64>,
     },
     #[serde(rename = "terminal.closed")]
     Closed { reason: String },
@@ -50,6 +69,48 @@ impl TerminalServerMessage {
             Self::Closed { .. } => None,
         }
     }
+
+    /// Tag a frame with the relay's forwarded scroll count.
+    #[must_use]
+    pub fn with_scrolls(self, forwarded: u64) -> Self {
+        match self {
+            Self::Frame {
+                bytes,
+                encoding,
+                seq,
+                width,
+                height,
+                full,
+                ..
+            } => Self::Frame {
+                bytes,
+                encoding,
+                seq,
+                width,
+                height,
+                full,
+                scrolls: Some(forwarded),
+            },
+            closed @ Self::Closed { .. } => closed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalScrollDirection {
+    Up,
+    Down,
+}
+
+/// `wheel` lets Herdr route the scroll to a mouse-aware app or its own pane
+/// scrollback; `page_key` behaves like PageUp/PageDown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalScrollSource {
+    #[default]
+    Wheel,
+    PageKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -64,6 +125,28 @@ pub enum TerminalClientMessage {
     },
     #[serde(rename = "terminal.resize")]
     Resize { cols: u16, rows: u16 },
+    /// Scroll the Herdr-rendered viewport. Herdr frames are repaints of a
+    /// fixed screen, so the browser has no scrollback of its own; earlier
+    /// output is reached only by asking Herdr to scroll and repaint.
+    #[serde(rename = "terminal.scroll")]
+    Scroll {
+        direction: TerminalScrollDirection,
+        lines: u16,
+        #[serde(default)]
+        source: TerminalScrollSource,
+        #[serde(default)]
+        column: Option<u16>,
+        #[serde(default)]
+        row: Option<u16>,
+        /// Send this scroll `count` times in one write to Herdr, so a batch
+        /// of steps shares one Herdr render but stays one wheel report per
+        /// step for a mouse-aware app.
+        #[serde(default = "one_scroll")]
+        count: u8,
+    },
+    /// Return Herdr's viewport to the latest output after scrolling back.
+    #[serde(rename = "terminal.scroll_reset")]
+    ScrollReset,
     #[serde(rename = "terminal.release")]
     Release,
 }
@@ -95,13 +178,37 @@ impl TerminalClientMessage {
                 )),
             },
             Self::Resize { cols, rows } => validate_dimensions(*cols, *rows),
-            Self::Release => Ok(()),
+            Self::Scroll {
+                lines,
+                column,
+                row,
+                count,
+                ..
+            } => {
+                if (1..=MAX_TERMINAL_ROWS).contains(lines)
+                    && (1..=MAX_TERMINAL_SCROLL_COUNT).contains(count)
+                    && column.is_none_or(|column| column < MAX_TERMINAL_COLS)
+                    && row.is_none_or(|row| row < MAX_TERMINAL_ROWS)
+                {
+                    Ok(())
+                } else {
+                    Err(TerminalServiceError::InvalidCommand(format!(
+                        "terminal.scroll requires 1 to {MAX_TERMINAL_ROWS} lines at a cell inside the terminal, sent 1 to {MAX_TERMINAL_SCROLL_COUNT} times"
+                    )))
+                }
+            }
+            Self::ScrollReset | Self::Release => Ok(()),
         }
     }
 }
 
 #[async_trait]
 pub trait RuntimeTerminalSession: Send {
+    /// Wait for the next runtime frame or closure.
+    ///
+    /// Implementations must be cancel-safe: the relay polls this inside
+    /// `select!` beside timers and the browser socket, and drops the future
+    /// whenever another branch wins. Partially read output must survive.
     async fn next_message(&mut self)
     -> Result<Option<TerminalServerMessage>, RuntimeTerminalError>;
 
@@ -603,7 +710,9 @@ pub fn sequence_continues(previous: Option<u64>, current: u64, full: bool) -> bo
 #[cfg(test)]
 mod tests {
     use super::{
-        TerminalClientMessage, TerminalServiceError, sequence_continues, validate_dimensions,
+        MAX_TERMINAL_COLS, MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_MESSAGE_BYTES, MAX_TERMINAL_ROWS,
+        MAX_TERMINAL_SCROLL_COUNT, TerminalClientMessage, TerminalScrollDirection,
+        TerminalScrollSource, TerminalServiceError, sequence_continues, validate_dimensions,
     };
 
     #[test]
@@ -629,6 +738,152 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_and_bounds_the_scroll_repeat_count() {
+        let batch: TerminalClientMessage = serde_json::from_str(
+            r#"{"type":"terminal.scroll","direction":"up","lines":3,"source":"wheel","count":5}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            batch,
+            TerminalClientMessage::Scroll { count: 5, .. }
+        ));
+        assert!(batch.validate().is_ok());
+        for count in [0, MAX_TERMINAL_SCROLL_COUNT + 1] {
+            let scroll = TerminalClientMessage::Scroll {
+                direction: TerminalScrollDirection::Up,
+                lines: 3,
+                source: TerminalScrollSource::Wheel,
+                column: None,
+                row: None,
+                count,
+            };
+            assert!(scroll.validate().is_err(), "count {count}");
+        }
+    }
+
+    #[test]
+    fn parses_and_bounds_terminal_scroll_commands() {
+        let reset: TerminalClientMessage =
+            serde_json::from_str(r#"{"type":"terminal.scroll_reset"}"#).unwrap();
+        assert_eq!(reset, TerminalClientMessage::ScrollReset);
+        assert!(reset.validate().is_ok());
+
+        let wheel: TerminalClientMessage = serde_json::from_str(
+            r#"{"type":"terminal.scroll","direction":"up","lines":3,"source":"wheel","column":7,"row":2}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            wheel,
+            TerminalClientMessage::Scroll {
+                direction: TerminalScrollDirection::Up,
+                lines: 3,
+                source: TerminalScrollSource::Wheel,
+                column: Some(7),
+                row: Some(2),
+                count: 1,
+            }
+        );
+        assert!(wheel.validate().is_ok());
+
+        let page: TerminalClientMessage = serde_json::from_str(
+            r#"{"type":"terminal.scroll","direction":"down","lines":39,"source":"page_key"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            page,
+            TerminalClientMessage::Scroll {
+                direction: TerminalScrollDirection::Down,
+                lines: 39,
+                source: TerminalScrollSource::PageKey,
+                column: None,
+                row: None,
+                count: 1,
+            }
+        );
+        assert!(page.validate().is_ok());
+
+        for invalid in [
+            TerminalClientMessage::Scroll {
+                direction: TerminalScrollDirection::Up,
+                lines: 0,
+                source: TerminalScrollSource::Wheel,
+                column: None,
+                row: None,
+                count: 1,
+            },
+            TerminalClientMessage::Scroll {
+                direction: TerminalScrollDirection::Up,
+                lines: MAX_TERMINAL_ROWS + 1,
+                source: TerminalScrollSource::Wheel,
+                column: None,
+                row: None,
+                count: 1,
+            },
+            TerminalClientMessage::Scroll {
+                direction: TerminalScrollDirection::Down,
+                lines: 1,
+                source: TerminalScrollSource::Wheel,
+                column: Some(MAX_TERMINAL_COLS),
+                row: None,
+                count: 1,
+            },
+            TerminalClientMessage::Scroll {
+                direction: TerminalScrollDirection::Down,
+                lines: 1,
+                source: TerminalScrollSource::Wheel,
+                column: None,
+                row: Some(MAX_TERMINAL_ROWS),
+                count: 1,
+            },
+        ] {
+            assert!(
+                matches!(
+                    invalid.validate(),
+                    Err(TerminalServiceError::InvalidCommand(_))
+                ),
+                "{invalid:?}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<TerminalClientMessage>(
+                r#"{"type":"terminal.scroll","direction":"sideways","lines":1}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn admits_a_whole_paste_up_to_the_input_limit() {
+        let paste = format!(
+            "\u{1b}[200~{}\u{1b}[201~",
+            "x".repeat(MAX_TERMINAL_INPUT_BYTES - 12)
+        );
+        assert!(
+            TerminalClientMessage::Input {
+                text: Some(paste),
+                bytes: None,
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            TerminalClientMessage::Input {
+                text: Some("x".repeat(MAX_TERMINAL_INPUT_BYTES + 1)),
+                bytes: None,
+            }
+            .validate()
+            .is_err()
+        );
+        // Any accepted input fits one WebSocket message after JSON escaping.
+        let escaped = serde_json::json!({
+            "type": "terminal.input",
+            "text": "\u{1}".repeat(MAX_TERMINAL_INPUT_BYTES),
+        })
+        .to_string();
+        assert!(escaped.len() <= MAX_TERMINAL_MESSAGE_BYTES);
     }
 
     #[test]

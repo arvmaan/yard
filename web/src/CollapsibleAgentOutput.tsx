@@ -15,6 +15,7 @@ import {
 } from 'react'
 import {
   parseTerminalTranscript,
+  TERMINAL_OUTPUT_LINES,
   type TerminalTranscriptTurn,
 } from './terminalOutput'
 import type { ObservedStatus } from './types'
@@ -337,8 +338,21 @@ export function CollapsibleAgentOutput({
     (turn) =>
       Boolean(turn.question) || Boolean(turn.work) || Boolean(turn.answer),
   )
+  // Herdr's pane.read stops at the latest rows; say so rather than let the
+  // snapshot look like the whole conversation.
+  const truncationNotice = truncated ? (
+    <p className="agent-output__truncated" role="note">
+      Showing the latest {TERMINAL_OUTPUT_LINES.toLocaleString('en-US')}{' '}
+      lines. Scroll the terminal for earlier output.
+    </p>
+  ) : null
   if (!transcript.structured || !hasVisibleContent) {
-    return <RawOutput agentLabel={agentLabel} text={text} />
+    return (
+      <>
+        {truncationNotice}
+        <RawOutput agentLabel={agentLabel} text={text} />
+      </>
+    )
   }
   const primaryIndex = transcript.turns.reduce(
     (latest, turn, index) => turn.answer ? index : latest,
@@ -347,6 +361,7 @@ export function CollapsibleAgentOutput({
 
   return (
     <div className="agent-output">
+      {truncationNotice}
       {transcript.turns.map((turn, index) => (
         <AgentTurn
           agentLabel={agentLabel}
