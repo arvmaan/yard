@@ -27,6 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde::{Deserialize, Serialize};
 use yard_domain::{ObservedStatus, RuntimeObservationState, RuntimeProcessState};
 use yard_store::{
     ATTENTION_COMMAND_BATCH_LIMIT, AttentionCommand, AttentionCommandStatus, AttentionRecords,
@@ -61,7 +62,8 @@ impl Default for DetectorTiming {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AttentionKind {
     Blocked,
     ReadyForReview,
@@ -78,7 +80,8 @@ impl AttentionKind {
 }
 
 /// Who or what the notification is about (titles only).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Subject {
     Worker {
         profile_name: Option<String>,
@@ -96,7 +99,8 @@ pub enum Subject {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventSource {
     Runtime {
         worker_id: String,
@@ -108,7 +112,9 @@ pub enum EventSource {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serializable for the held queue (`slack-held.json`); `ready_at` is
+/// process-local and restarts at load time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttentionEvent {
     pub kind: AttentionKind,
     pub source: EventSource,
@@ -119,7 +125,12 @@ pub struct AttentionEvent {
     /// When the state was first observed (for the message time).
     pub observed_at_unix_ms: u64,
     /// When the event passed its settle re-check.
+    #[serde(skip, default = "Instant::now")]
     pub ready_at: Instant,
+    /// Caused by Yard's own automatic summary prompts (`yard:auto:*`), when
+    /// that is attributable; such events never notify.
+    #[serde(default)]
+    pub automatic: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -352,6 +363,8 @@ impl Detector {
             && automatic_turn(runtime, worker.turn_after_quiet_since_unix_ms)
         {
             // Yard asked for a summary; the owner did not start this turn.
+            // (A turn like that which blocks still needs the owner, so a
+            // Blocked event is never marked `automatic`.)
             return;
         }
         let event = runtime_event(runtime, kind, since_unix_ms, now);
@@ -539,6 +552,7 @@ fn runtime_event(
         view_target,
         observed_at_unix_ms: since_unix_ms,
         ready_at: now,
+        automatic: false,
     }
 }
 
@@ -578,6 +592,8 @@ fn command_event(command: &AttentionCommand, since_unix_ms: u64, now: Instant) -
         view_target,
         observed_at_unix_ms: command.updated_at_unix_ms.min(since_unix_ms),
         ready_at: now,
+        // Acknowledgements carry no actor here, so not attributable.
+        automatic: false,
     }
 }
 

@@ -143,8 +143,11 @@ pub(super) async fn attention_records(
         .await
 }
 
+/// A restored project keeps its `archived_projects` row (stamped with
+/// `restored_at_unix_ms`), so only an unrestored archive hides it.
 const VISIBLE_PROJECT: &str = "NOT EXISTS (SELECT 1 FROM archived_projects archived
-                                   WHERE archived.project_id = project.id)
+                                   WHERE archived.project_id = project.id
+                                     AND archived.restored_at_unix_ms IS NULL)
          AND NOT EXISTS (SELECT 1 FROM deleted_projects deleted
                           WHERE deleted.project_id = project.id)";
 
@@ -722,6 +725,21 @@ mod tests {
         assert!(archived.runtimes.is_empty(), "{:?}", archived.runtimes);
         assert!(archived.commands.is_empty(), "{:?}", archived.commands);
         assert!(!archived.visible_project_ids.contains(&project_id));
+
+        // Restore keeps the archive row and stamps it restored; the project
+        // is live again and its runtimes, commands and id come back.
+        connection
+            .execute(
+                "UPDATE archived_projects
+                    SET restore_command_id = 'restore-command', restored_at_unix_ms = 7
+                  WHERE project_id = ?1",
+                [&project_id],
+            )
+            .unwrap();
+        let restored = store.attention_records(0).await.unwrap();
+        assert_eq!(restored.runtimes.len(), 2, "{:?}", restored.runtimes);
+        assert_eq!(restored.commands.len(), 1, "{:?}", restored.commands);
+        assert!(restored.visible_project_ids.contains(&project_id));
         connection
             .execute("DELETE FROM archived_projects", [])
             .unwrap();

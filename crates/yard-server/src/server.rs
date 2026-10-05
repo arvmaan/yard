@@ -35,6 +35,8 @@ use yard_store::{ProjectStoreError, SqliteProjectStore, YardStore};
 
 use crate::lifecycle::{self, LifecycleError};
 
+/// How long shutdown waits for the Slack socket's close handshake.
+const SLACK_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 const CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_MANAGED_LOG_BYTES: u64 = 8 * 1024 * 1024;
@@ -266,6 +268,7 @@ where
         automations.run().await;
         "automation scheduler"
     });
+    let slack_inbound = slack.clone();
     background_tasks.spawn(async move {
         slack.run().await;
         "slack notifier"
@@ -326,6 +329,9 @@ where
         };
         let _ = shutdown.send(true);
         connections.close();
+        // Close the Slack socket with a close frame before the task is
+        // aborted, so Slack does not count it after a restart.
+        slack_inbound.close_inbound(SLACK_CLOSE_TIMEOUT).await;
         abort_background_tasks(&mut background_tasks).await;
         let server_result = if let Some(result) = http_result {
             result.map_err(ServerError::Io)

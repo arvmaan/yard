@@ -20,7 +20,7 @@ use serde_json::json;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
-    sync::mpsc,
+    sync::{mpsc, watch},
     time::timeout,
 };
 use tokio_rustls::{
@@ -29,7 +29,10 @@ use tokio_rustls::{
 };
 use tokio_tungstenite::{
     WebSocketStream, client_async_with_config,
-    tungstenite::{Message, protocol::WebSocketConfig},
+    tungstenite::{
+        Message,
+        protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode},
+    },
 };
 
 use super::inbound::{Envelope, EnvelopeKind, parse_envelope};
@@ -166,6 +169,8 @@ pub(crate) enum SessionEnd {
     Closed,
     Idle,
     Error(String),
+    /// Yard is shutting down: the socket gets a close frame, no reconnect.
+    Shutdown,
 }
 
 impl SessionEnd {
@@ -199,9 +204,15 @@ pub(crate) async fn run_session(
     queue: &mpsc::Sender<SocketEvent>,
     idle_timeout: Duration,
     stats: &mut SessionStats,
+    closing: &mut watch::Receiver<bool>,
 ) -> SessionEnd {
     loop {
-        let frame = match timeout(idle_timeout, socket.next()).await {
+        let next = tokio::select! {
+            biased;
+            _ = closing.wait_for(|closing| *closing) => return SessionEnd::Shutdown,
+            next = timeout(idle_timeout, socket.next()) => next,
+        };
+        let frame = match next {
             Err(_) => return SessionEnd::Idle,
             Ok(None) => return SessionEnd::Closed,
             Ok(Some(Err(error))) => return SessionEnd::Error(transport_error(&error)),
@@ -257,6 +268,16 @@ fn transport_error(error: &tokio_tungstenite::tungstenite::Error) -> String {
         Error::Protocol(error) => format!("protocol: {error}"),
         _ => "transport error".to_owned(),
     }
+}
+
+/// The close frame Yard sends when a session ends: `1000 normal` with a
+/// reason on shutdown, so Slack drops the connection at once instead of
+/// counting it in `num_connections` until it times out.
+pub(crate) fn close_frame(end: &SessionEnd) -> Option<CloseFrame> {
+    matches!(end, SessionEnd::Shutdown).then(|| CloseFrame {
+        code: CloseCode::Normal,
+        reason: "yard shutting down".into(),
+    })
 }
 
 /// The wait before the next connection attempt.

@@ -25,6 +25,14 @@ use super::prompt::{KEY_ENTER, OptionRole, ParsedScreen, parse_screen};
 
 /// Buttons work for this long after they are posted.
 pub const ACTION_TTL: Duration = Duration::from_secs(5 * 60);
+/// "Retry" and "Check again" on a question's error and timeout cards work
+/// this long (still single-use): they are posted after a long wait, and
+/// "Check again" is meant for the whole late window.
+pub const ASK_ACTION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+/// "Answer" on a digest works this long (still single-use): a digest is
+/// read later, and the button only re-reads the agent and posts a freshly
+/// guarded prompt card.
+pub const DIGEST_ACTION_TTL: Duration = Duration::from_secs(9 * 60 * 60);
 /// A free-text reply in a question's thread is accepted this long.
 pub const QUESTION_TTL: Duration = Duration::from_secs(30 * 60);
 /// Used and expired ids are remembered this long to explain a late click.
@@ -63,6 +71,33 @@ pub struct AgentSnapshot {
     pub identity: TerminalIdentity,
     /// Herdr reports the agent `blocked` (observed, process not exited).
     pub blocked: bool,
+    /// Whether an agent runs in the bound pane (see [`AgentHealth`]).
+    pub health: AgentHealth,
+}
+
+/// What the durable binding says about the agent in its pane.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AgentHealth {
+    Working,
+    Idle,
+    /// Observed state unknown or ambiguous; treated as reachable.
+    #[default]
+    Unknown,
+    /// No agent runs there; the reason is shown to the owner.
+    NotRunning(String),
+}
+
+impl AgentHealth {
+    /// A short word for progress messages.
+    #[must_use]
+    pub const fn word(&self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Idle => "idle",
+            Self::Unknown => "thinking",
+            Self::NotRunning(_) => "not running",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -162,6 +197,12 @@ impl KeyPlan {
 pub trait AgentConsole: Send + Sync {
     /// Durable identity and blocked state.
     async fn snapshot(&self, target: &AgentTarget) -> Result<AgentSnapshot, ConsoleError>;
+    /// Whether Yard would accept input for this agent now: the same
+    /// refusals as [`Self::send_prompt`] (an isolated summary worker, or a
+    /// managed pane whose lease needs recovery), checked before asking.
+    async fn sendable(&self, _target: &AgentTarget) -> Result<(), ConsoleError> {
+        Ok(())
+    }
     /// The ANSI-stripped tail of the pane, read now.
     async fn screen(&self, target: &AgentTarget) -> Result<String, ConsoleError>;
     /// Take the terminal lease, require `identity`, re-read the agent and
@@ -191,6 +232,18 @@ pub trait AgentConsole: Send + Sync {
         target: &AgentTarget,
         command_id: &str,
     ) -> Result<Option<OrchestratorStatusReport>, ConsoleError>;
+    /// One look while waiting for `command_id`'s answer: its report and
+    /// whether the agent UI lost its session, from one guarded read.
+    async fn watch(
+        &self,
+        target: &AgentTarget,
+        command_id: &str,
+    ) -> Result<crate::slack::relay::Watched, ConsoleError> {
+        Ok(crate::slack::relay::Watched {
+            report: self.status_report(target, command_id).await?,
+            session_lost: None,
+        })
+    }
 }
 
 /// One option button, as registered.
@@ -218,6 +271,95 @@ pub struct PendingQuestion {
     pub fingerprint: String,
     /// Display name of the agent (already cleaned).
     pub title: String,
+    expires_at: Instant,
+}
+
+/// A navigation button (help, status and project cards): it re-runs a
+/// read-only command, or posts an agent's current prompt card through the
+/// guarded prompt path. Like answer buttons it is an opaque, single-use id
+/// that expires after [`ACTION_TTL`]; Slack never supplies the command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NavAction {
+    Status,
+    Blocked,
+    Review,
+    ProjectStatus {
+        project_id: String,
+    },
+    /// Post what this agent shows now (re-read; buttons only for a
+    /// blocked prompt).
+    Answer {
+        target: AgentTarget,
+        /// Display name (already cleaned).
+        title: String,
+    },
+    /// How to ask the Superintendent.
+    AskHint,
+    /// Send the same question again as a new command. The text never
+    /// leaves Yard: Slack only returns this id.
+    Retry {
+        target: AgentTarget,
+        /// "the Superintendent" / "the X orchestrator" (already cleaned).
+        to: String,
+        question: String,
+    },
+    /// Re-read the latest status report for `command_id` and relay it if
+    /// it now answers that question.
+    CheckAgain {
+        target: AgentTarget,
+        to: String,
+        command_id: String,
+        /// The question's progress message (updated once answered).
+        progress_ts: Option<String>,
+        asked_at: Instant,
+    },
+    /// A quiet-hours control from the settings card (mute, unmute,
+    /// digest now).
+    Quiet(super::controls::Control),
+}
+
+impl NavAction {
+    /// The audit name.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Status => "nav_status",
+            Self::Blocked => "nav_blocked",
+            Self::Review => "nav_review",
+            Self::ProjectStatus { .. } => "nav_status_project",
+            Self::Answer { .. } => "nav_answer",
+            Self::AskHint => "nav_ask_hint",
+            Self::Retry { .. } => "nav_retry",
+            Self::CheckAgain { .. } => "nav_check_again",
+            Self::Quiet(control) => match control {
+                super::controls::Control::Settings => "nav_settings",
+                super::controls::Control::Mute(_) => "nav_mute",
+                super::controls::Control::Unmute => "nav_unmute",
+                super::controls::Control::Digest => "nav_digest",
+            },
+        }
+    }
+
+    /// How long this button works after it is posted.
+    #[must_use]
+    pub const fn ttl(&self) -> Duration {
+        match self {
+            Self::Retry { .. } | Self::CheckAgain { .. } => ASK_ACTION_TTL,
+            _ => ACTION_TTL,
+        }
+    }
+}
+
+/// Why a navigation button did nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavError {
+    Expired,
+    AlreadyUsed,
+}
+
+#[derive(Debug, Clone)]
+struct PendingNav {
+    action: NavAction,
     expires_at: Instant,
 }
 
@@ -257,6 +399,9 @@ pub struct ActionRegistry {
     /// Question threads answered or expired, for [`TOMBSTONE_TTL`].
     closed_questions: HashMap<String, Instant>,
     tombstones: HashMap<String, Tombstone>,
+    navs: HashMap<String, PendingNav>,
+    /// Used (`false`) or expired (`true`) navigation ids.
+    nav_tombstones: HashMap<String, (bool, Instant)>,
     next_card: u64,
 }
 
@@ -316,6 +461,40 @@ impl ActionRegistry {
         }
         self.tombstones
             .retain(|_, tombstone| now.saturating_duration_since(tombstone.at) < TOMBSTONE_TTL);
+        let expired = self
+            .navs
+            .iter()
+            .filter(|(_, nav)| now >= nav.expires_at)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in expired {
+            self.navs.remove(&id);
+            self.nav_tombstones.insert(id, (true, now));
+        }
+        self.nav_tombstones
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) < TOMBSTONE_TTL);
+        while self.navs.len() > MAX_CARDS * 4 {
+            let Some(oldest) = self
+                .navs
+                .iter()
+                .min_by_key(|(_, nav)| nav.expires_at)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.navs.remove(&oldest);
+        }
+        while self.nav_tombstones.len() > MAX_CARDS * 4 {
+            let Some(oldest) = self
+                .nav_tombstones
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.nav_tombstones.remove(&oldest);
+        }
         // Bound memory: drop the oldest cards first.
         while self.actions.len() > MAX_CARDS * 4 {
             let Some(oldest) = self.actions.values().map(|action| action.card).min() else {
@@ -355,6 +534,52 @@ impl ActionRegistry {
             );
         }
         Ok(ids)
+    }
+
+    /// Register one navigation button; returns its id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the OS RNG fails; nothing is registered.
+    pub fn issue_nav(&mut self, action: NavAction, now: Instant) -> Result<String, String> {
+        let ttl = action.ttl();
+        self.issue_nav_for(action, now, ttl)
+    }
+
+    /// [`Self::issue_nav`] with an explicit lifetime (a digest's buttons).
+    ///
+    /// # Errors
+    ///
+    /// When no random id can be made.
+    pub fn issue_nav_for(
+        &mut self,
+        action: NavAction,
+        now: Instant,
+        ttl: Duration,
+    ) -> Result<String, String> {
+        self.prune(now);
+        let id = random_token()?;
+        let expires_at = now + ttl;
+        self.navs
+            .insert(id.clone(), PendingNav { action, expires_at });
+        Ok(id)
+    }
+
+    /// Consume a navigation id (only that button: the rest of its card
+    /// stays usable). `None` when `id` is not a navigation id at all.
+    pub fn take_nav(&mut self, id: &str, now: Instant) -> Option<Result<NavAction, NavError>> {
+        self.prune(now);
+        if let Some(nav) = self.navs.remove(id) {
+            self.nav_tombstones.insert(id.to_owned(), (false, now));
+            return Some(Ok(nav.action));
+        }
+        self.nav_tombstones.get(id).map(|(expired, _)| {
+            Err(if *expired {
+                NavError::Expired
+            } else {
+                NavError::AlreadyUsed
+            })
+        })
     }
 
     /// Consume `id` and every sibling on its card.
@@ -634,6 +859,10 @@ pub(crate) mod tests {
         /// Command ids whose status report was looked for.
         pub report_reads: Mutex<Vec<String>>,
         pub prompt_targets: Mutex<Vec<AgentTarget>>,
+        /// Returned by `watch` while set.
+        pub watch_error: Mutex<Option<ConsoleError>>,
+        /// Returned by `sendable` while set.
+        pub send_refusal: Mutex<Option<ConsoleError>>,
     }
 
     pub(crate) fn identity() -> TerminalIdentity {
@@ -659,6 +888,7 @@ pub(crate) mod tests {
                 snapshot: Mutex::new(Ok(AgentSnapshot {
                     identity: identity(),
                     blocked: true,
+                    health: super::AgentHealth::Working,
                 })),
                 screen: Mutex::new(screen.to_owned()),
                 typed: Mutex::default(),
@@ -667,6 +897,8 @@ pub(crate) mod tests {
                 prompt_error: Mutex::default(),
                 report_reads: Mutex::default(),
                 prompt_targets: Mutex::default(),
+                watch_error: Mutex::default(),
+                send_refusal: Mutex::default(),
             }
         }
 
@@ -679,6 +911,14 @@ pub(crate) mod tests {
     impl AgentConsole for FakeConsole {
         async fn snapshot(&self, _: &AgentTarget) -> Result<AgentSnapshot, ConsoleError> {
             self.snapshot.lock().unwrap().clone()
+        }
+
+        async fn sendable(&self, _: &AgentTarget) -> Result<(), ConsoleError> {
+            self.send_refusal
+                .lock()
+                .unwrap()
+                .clone()
+                .map_or(Ok(()), Err)
         }
 
         async fn screen(&self, _: &AgentTarget) -> Result<String, ConsoleError> {
@@ -729,6 +969,24 @@ pub(crate) mod tests {
                 command_id,
             ))
         }
+
+        async fn watch(
+            &self,
+            _: &AgentTarget,
+            command_id: &str,
+        ) -> Result<crate::slack::relay::Watched, ConsoleError> {
+            if let Some(error) = self.watch_error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            self.report_reads
+                .lock()
+                .unwrap()
+                .push(command_id.to_owned());
+            Ok(crate::slack::relay::watched(
+                &self.screen.lock().unwrap(),
+                command_id,
+            ))
+        }
     }
 
     /// Register the offered buttons of `screen`; `(ids, fingerprint)`.
@@ -754,6 +1012,145 @@ pub(crate) mod tests {
                 .collect(),
         };
         (registry.issue(&spec, now).unwrap(), choice.fingerprint)
+    }
+
+    #[test]
+    fn navigation_ids_are_opaque_single_use_and_expire_per_button() {
+        let mut registry = ActionRegistry::default();
+        let now = Instant::now();
+        let status = registry.issue_nav(super::NavAction::Status, now).unwrap();
+        let review = registry.issue_nav(super::NavAction::Review, now).unwrap();
+        assert!(crate::slack::inbound::is_action_token(&status));
+        assert_ne!(status, review);
+        assert_eq!(registry.take_nav("f".repeat(32).as_str(), now), None);
+        assert_eq!(
+            registry.take_nav(&status, now),
+            Some(Ok(super::NavAction::Status))
+        );
+        assert_eq!(
+            registry.take_nav(&status, now),
+            Some(Err(super::NavError::AlreadyUsed))
+        );
+        // Its sibling on the same card still works until it expires.
+        let later = now + super::ACTION_TTL;
+        assert_eq!(
+            registry.take_nav(&review, later),
+            Some(Err(super::NavError::Expired))
+        );
+        // A navigation id is never an answer id.
+        let fresh = registry
+            .issue_nav(super::NavAction::Blocked, later)
+            .unwrap();
+        assert_eq!(registry.take(&fresh, later), Err(super::TakeError::Unknown));
+    }
+
+    #[test]
+    fn quiet_control_buttons_are_single_use_and_expire_like_navigation() {
+        use crate::slack::controls::Control;
+        let mut registry = ActionRegistry::default();
+        let now = Instant::now();
+        let mute = registry
+            .issue_nav(super::NavAction::Quiet(Control::Unmute), now)
+            .unwrap();
+        let digest = registry
+            .issue_nav(super::NavAction::Quiet(Control::Digest), now)
+            .unwrap();
+        assert_eq!(
+            registry.take_nav(&mute, now),
+            Some(Ok(super::NavAction::Quiet(Control::Unmute)))
+        );
+        assert_eq!(
+            registry.take_nav(&mute, now),
+            Some(Err(super::NavError::AlreadyUsed))
+        );
+        assert_eq!(
+            registry.take_nav(&digest, now + super::ACTION_TTL),
+            Some(Err(super::NavError::Expired))
+        );
+        assert_eq!(
+            super::NavAction::Quiet(Control::Digest).name(),
+            "nav_digest"
+        );
+    }
+
+    #[test]
+    fn question_retry_and_check_again_buttons_outlive_the_short_ttl() {
+        let mut registry = ActionRegistry::default();
+        let now = Instant::now();
+        let check = super::NavAction::CheckAgain {
+            target: target(),
+            to: "the Superintendent".to_owned(),
+            command_id: "command-1".to_owned(),
+            progress_ts: None,
+            asked_at: now,
+        };
+        let retry = super::NavAction::Retry {
+            target: target(),
+            to: "the Superintendent".to_owned(),
+            question: "why?".to_owned(),
+        };
+        let ids = [check.clone(), retry.clone(), super::NavAction::Status]
+            .map(|nav| registry.issue_nav(nav, now).unwrap());
+        // 20 minutes after a timeout card: Check again and Retry still work.
+        let later = now + Duration::from_secs(20 * 60);
+        assert_eq!(registry.take_nav(&ids[0], later), Some(Ok(check)));
+        assert_eq!(registry.take_nav(&ids[1], later), Some(Ok(retry)));
+        assert_eq!(
+            registry.take_nav(&ids[2], later),
+            Some(Err(super::NavError::Expired))
+        );
+        // Still single-use, and they do expire.
+        assert_eq!(
+            registry.take_nav(&ids[0], later),
+            Some(Err(super::NavError::AlreadyUsed))
+        );
+        let old = registry
+            .issue_nav(
+                super::NavAction::Retry {
+                    target: target(),
+                    to: "x".to_owned(),
+                    question: "y".to_owned(),
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            registry.take_nav(&old, now + super::ASK_ACTION_TTL),
+            Some(Err(super::NavError::Expired))
+        );
+    }
+
+    #[test]
+    fn a_digests_answer_button_works_for_the_working_day_once() {
+        let mut registry = ActionRegistry::default();
+        let now = Instant::now();
+        let answer = super::NavAction::Answer {
+            target: target(),
+            title: "Checkout · alpha".to_owned(),
+        };
+        let digest = registry
+            .issue_nav_for(answer.clone(), now, super::DIGEST_ACTION_TTL)
+            .unwrap();
+        let card = registry.issue_nav(answer.clone(), now).unwrap();
+        // 20 minutes after the morning digest: its Answer still works; a
+        // notification card's (short TTL) does not.
+        let later = now + Duration::from_secs(20 * 60);
+        assert_eq!(registry.take_nav(&digest, later), Some(Ok(answer.clone())));
+        assert_eq!(
+            registry.take_nav(&card, later),
+            Some(Err(super::NavError::Expired))
+        );
+        assert_eq!(
+            registry.take_nav(&digest, later),
+            Some(Err(super::NavError::AlreadyUsed))
+        );
+        let old = registry
+            .issue_nav_for(answer, now, super::DIGEST_ACTION_TTL)
+            .unwrap();
+        assert_eq!(
+            registry.take_nav(&old, now + super::DIGEST_ACTION_TTL),
+            Some(Err(super::NavError::Expired))
+        );
     }
 
     #[test]

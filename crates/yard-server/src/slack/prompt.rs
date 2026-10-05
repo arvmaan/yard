@@ -112,6 +112,19 @@ pub enum ParsedScreen {
     },
 }
 
+impl ParsedScreen {
+    /// What identifies this prompt (cursor excluded), for the quiet
+    /// policy's "same prompt" debounce. Only the hash leaves this module.
+    #[must_use]
+    pub fn prompt_fingerprint(&self) -> String {
+        match self {
+            Self::Choice(choice) => choice.fingerprint.clone(),
+            Self::Question { fingerprint, .. } => fingerprint.clone(),
+            Self::Unparsed { excerpt } => fingerprint(&["unparsed", excerpt]),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OptionLine {
     number: usize,

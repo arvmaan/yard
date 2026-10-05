@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 
 use super::{
     actions::{ACTION_TTL, Refusal},
-    message::{OutgoingMessage, clean_prompt_line},
+    blocks,
+    message::{OutgoingMessage, clean, clean_prompt_line, since_token},
     prompt::{ChoicePrompt, MAX_PROMPT_CHARS, OptionRole, ParsedScreen, cap},
 };
 
@@ -18,14 +19,6 @@ use super::{
 const MAX_BUTTON_CHARS: usize = 60;
 /// `action_id` prefix of Yard's prompt buttons.
 pub const BUTTON_ACTION_PREFIX: &str = "yard_prompt_";
-
-fn section(text: &str) -> Value {
-    json!({ "type": "section", "text": { "type": "mrkdwn", "text": text } })
-}
-
-fn context(text: &str) -> Value {
-    json!({ "type": "context", "elements": [{ "type": "mrkdwn", "text": text }] })
-}
 
 /// Button text: redacted, controls removed, capped; plain text (Slack does
 /// not parse mentions there).
@@ -78,57 +71,106 @@ fn buttons(choice: &ChoicePrompt, ids: &[String]) -> Value {
     json!({ "type": "actions", "block_id": "yard_prompt", "elements": elements })
 }
 
+/// What a prompt card shows besides the prompt.
+#[derive(Debug, Clone, Copy)]
+pub struct CardContext<'a> {
+    /// "Open in Yard" target.
+    pub ui_url: &'a str,
+    /// The agent's Herdr pane, when known.
+    pub pane: Option<&'a str>,
+    pub at_unix_ms: u64,
+}
+
+fn links(ui_url: &str) -> Value {
+    blocks::actions("yard_links", vec![blocks::open_in_yard(ui_url)])
+}
+
+fn footer(context: &CardContext<'_>, lead: &str) -> Value {
+    let mut parts = vec![lead.to_owned()];
+    if let Some(pane) = context.pane {
+        parts.push(format!("pane `{}`", clean(pane, 40)));
+    }
+    parts.push(format!("updated {}", since_token(context.at_unix_ms)));
+    blocks::context(&parts)
+}
+
 /// The card for what `title` (already cleaned) shows now. `ids` has one
 /// action id per offered option of a choice prompt.
 #[must_use]
-pub fn prompt_card(title: &str, screen: &ParsedScreen, ids: &[String]) -> OutgoingMessage {
+pub fn prompt_card(
+    title: &str,
+    screen: &ParsedScreen,
+    ids: &[String],
+    context: &CardContext<'_>,
+) -> OutgoingMessage {
     let minutes = ACTION_TTL.as_secs() / 60;
-    match screen {
+    let blocks = match screen {
         ParsedScreen::Choice(choice) => {
-            let text = format!("{title} is waiting on a prompt in Yard.");
-            let body = format!("*{title}* is waiting on a prompt:\n{}", choice.display());
-            let mut blocks = vec![section(&body)];
+            let mut blocks = vec![
+                blocks::header(&format!(":raised_hand: {title}")),
+                blocks::section(&format!("*Waiting on a prompt*\n{}", choice.display())),
+            ];
             if ids.len() == choice.options.len() && !ids.is_empty() {
                 blocks.push(buttons(choice, ids));
             }
-            blocks.push(context(&format!(
-                "Buttons work once and expire in {minutes} min. \"Always allow\" style options are never offered here."
-            )));
-            OutgoingMessage {
-                text,
-                blocks: Value::Array(blocks),
-            }
+            blocks.push(links(context.ui_url));
+            blocks.push(footer(
+                context,
+                &format!(
+                    "Buttons work once and expire in {minutes} min · \"Always allow\" style options are never offered here"
+                ),
+            ));
+            return OutgoingMessage {
+                text: format!("{title} is waiting on a prompt in Yard."),
+                blocks: blocks::finish(blocks),
+            };
         }
         ParsedScreen::Question { question, .. } => {
             let question = cap(&clean_prompt_line(question), MAX_PROMPT_CHARS);
-            OutgoingMessage {
+            return OutgoingMessage {
                 text: format!("{title} asked a question."),
-                blocks: json!([
-                    section(&format!("*{title}* asks:\n>{question}")),
-                    context(
-                        "Reply in this thread to answer; your reply is sent as \"From Slack (owner)\"."
+                blocks: blocks::finish(vec![
+                    blocks::header(&format!(":speech_balloon: {title} asks")),
+                    blocks::section(&format!(">{question}")),
+                    links(context.ui_url),
+                    footer(
+                        context,
+                        "Reply in this thread to answer; your reply is sent as \"From Slack (owner)\"",
                     ),
                 ]),
-            }
+            };
         }
-        ParsedScreen::Unparsed { excerpt } => OutgoingMessage {
-            text: format!("{title} is blocked. Open Yard to answer it."),
-            blocks: json!([section(&format!(
-                "*{title}* is blocked, but Yard could not read the prompt confidently. Open Yard to answer it.\n```{excerpt}```"
-            )),]),
-        },
+        ParsedScreen::Unparsed { excerpt } => vec![
+            blocks::header(&format!(":raised_hand: {title}")),
+            blocks::section(&format!(
+                "*Blocked*, but Yard could not read the prompt confidently. Open Yard to answer it.\n```{excerpt}```"
+            )),
+            links(context.ui_url),
+            footer(
+                context,
+                "Nothing can be answered from Slack for this prompt",
+            ),
+        ],
+    };
+    OutgoingMessage {
+        text: format!("{title} is blocked. Open Yard to answer it."),
+        blocks: blocks::finish(blocks),
     }
 }
 
-/// The card after it was used: no buttons left.
+/// The card after it was used: collapsed to one line, no buttons left.
 #[must_use]
-pub fn answered_card(title: &str, answer: &str) -> OutgoingMessage {
+pub fn answered_card(title: &str, answer: &str, at_unix_ms: u64) -> OutgoingMessage {
     let answer = clean_prompt_line(answer);
     OutgoingMessage {
         text: format!("{title}: answered from Slack ({answer})."),
-        blocks: json!([section(&format!(
-            "*{title}*: answered from Slack — {answer}."
-        ))]),
+        blocks: blocks::finish(vec![
+            blocks::section(&format!(
+                ":white_check_mark: *Answered:* {answer} by you · {}",
+                since_token(at_unix_ms)
+            )),
+            blocks::context(&[format!("*{title}*")]),
+        ]),
     }
 }
 
@@ -150,7 +192,10 @@ pub fn not_sent_card(title: &str, refusal: &Refusal) -> OutgoingMessage {
     };
     OutgoingMessage {
         text: format!("{title}: not sent ({reason})."),
-        blocks: json!([section(&format!("*{title}*: not sent — {reason}."))]),
+        blocks: blocks::finish(vec![
+            blocks::section(&format!(":no_entry_sign: *Not sent:* {reason}.")),
+            blocks::context(&[format!("*{title}*")]),
+        ]),
     }
 }
 
@@ -196,25 +241,31 @@ pub fn refusal_text(title: &str, refusal: &Refusal) -> String {
 pub fn plain(text: &str) -> OutgoingMessage {
     OutgoingMessage {
         text: text.to_owned(),
-        blocks: json!([section(text)]),
+        blocks: json!([blocks::section(text)]),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{answered_card, not_sent_card, prompt_card};
+    use super::{CardContext, answered_card, not_sent_card, prompt_card};
     use crate::slack::actions::Refusal;
     use crate::slack::prompt::{
         parse_screen,
         tests::{CLAUDE_MENU, CLAUDE_PERMISSION, CLAUDE_QUESTION, WORKING},
     };
 
+    const CONTEXT: CardContext<'static> = CardContext {
+        ui_url: "https://yard.example.test/",
+        pane: Some("wG:p1"),
+        at_unix_ms: 1_695_900_000_000,
+    };
+
     #[test]
     fn prompt_cards_offer_only_one_time_answers_with_opaque_values() {
         let ids = vec!["a".repeat(32), "b".repeat(32)];
-        let card = prompt_card("Worker", &parse_screen(CLAUDE_PERMISSION), &ids);
+        let card = prompt_card("Worker", &parse_screen(CLAUDE_PERMISSION), &ids, &CONTEXT);
         let blocks = card.blocks.to_string();
-        let buttons = card.blocks[1]["elements"].as_array().unwrap();
+        let buttons = card.blocks[2]["elements"].as_array().unwrap();
         let labels = buttons
             .iter()
             .map(|button| button["text"]["text"].as_str().unwrap())
@@ -227,8 +278,8 @@ mod tests {
             "{blocks}"
         );
         assert!(blocks.contains("not offered in Slack"));
-        let menu = prompt_card("Worker", &parse_screen(CLAUDE_MENU), &ids);
-        let labels = menu.blocks[1]["elements"]
+        let menu = prompt_card("Worker", &parse_screen(CLAUDE_MENU), &ids, &CONTEXT);
+        let labels = menu.blocks[2]["elements"]
             .as_array()
             .unwrap()
             .iter()
@@ -236,19 +287,39 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(labels, ["1. Yard server", "2. Herdr plugin"]);
         // Without ids (RNG failure) there are no buttons at all.
-        let bare = prompt_card("Worker", &parse_screen(CLAUDE_PERMISSION), &[]);
-        assert!(!bare.blocks.to_string().contains("\"button\""));
-        let question = prompt_card("Worker", &parse_screen(CLAUDE_QUESTION), &[]);
+        let bare = prompt_card("Worker", &parse_screen(CLAUDE_PERMISSION), &[], &CONTEXT);
+        assert!(!bare.blocks.to_string().contains("\"value\""));
+        assert!(!bare.blocks.to_string().contains("yard_prompt"));
+        let question = prompt_card("Worker", &parse_screen(CLAUDE_QUESTION), &[], &CONTEXT);
         assert!(question.blocks.to_string().contains("Reply in this thread"));
-        let unparsed = prompt_card("Worker", &parse_screen(WORKING), &[]);
+        let unparsed = prompt_card("Worker", &parse_screen(WORKING), &[], &CONTEXT);
         let text = unparsed.blocks.to_string();
         assert!(
             text.contains("Open Yard") && !text.contains("xoxb-"),
             "{text}"
         );
-        assert!(!text.contains("\"button\""));
-        let answered = answered_card("Worker", "<!channel> ok");
+        assert!(!text.contains("\"value\""));
+        assert!(text.contains("https://yard.example.test/"));
+        let answered = answered_card("Worker", "<!channel> ok", 1_695_900_000_000);
         assert!(answered.blocks.to_string().contains("&lt;!channel&gt;"));
+        let line = answered.blocks[0]["text"]["text"].as_str().unwrap();
+        assert!(
+            line.starts_with(
+                ":white_check_mark: *Answered:* &lt;!channel&gt; ok by you · <!date^1695900000^"
+            ),
+            "{line}"
+        );
+        assert!(
+            !answered.blocks.to_string().contains("\"button\""),
+            "collapsed"
+        );
+        let card = prompt_card("Worker", &parse_screen(CLAUDE_PERMISSION), &ids, &CONTEXT);
+        assert_eq!(card.blocks[0]["text"]["text"], ":raised_hand: Worker");
+        assert_eq!(
+            card.blocks[3]["elements"][0]["url"],
+            "https://yard.example.test/"
+        );
+        assert!(card.blocks[4].to_string().contains("pane `wG:p1`"));
         let refused = not_sent_card("Worker", &Refusal::PromptChanged);
         assert_eq!(refused.text, "Worker: not sent (the prompt changed).");
         assert!(!refused.blocks.to_string().contains("answered"));
