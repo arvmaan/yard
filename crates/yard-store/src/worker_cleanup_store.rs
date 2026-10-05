@@ -874,6 +874,7 @@ fn select_candidates(
     select_candidates_page(connection, limit, 0, grace_period_ms, now)
 }
 
+#[allow(clippy::too_many_lines)]
 fn select_candidates_page(
     connection: &Connection,
     limit: usize,
@@ -968,6 +969,20 @@ fn select_candidates_page(
                 SELECT 1 FROM worker_cleanup_run_items pending_cleanup
                  WHERE pending_cleanup.worker_id = w.id
                    AND pending_cleanup.status = 'pending'
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM archived_projects archived
+                 WHERE archived.project_id = a.project_id
+                   AND archived.restored_at_unix_ms IS NULL
+            )
+            AND NOT EXISTS (SELECT 1 FROM deleted_workers WHERE worker_id = w.id)
+            AND NOT EXISTS (
+                SELECT 1 FROM archived_coordination_nodes archived_node
+                 WHERE archived_node.worker_id = w.id
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM transcript_capture_jobs capture
+                 WHERE capture.worker_id = w.id AND capture.status = 'pending'
             )
           ORDER BY cr.created_at_unix_ms, a.id
           LIMIT ?1 OFFSET ?2",
@@ -1360,6 +1375,16 @@ fn cleanup_item_authorized(
               AND NOT EXISTS (SELECT 1 FROM yard_orchestrator WHERE worker_id = worker.id)
               AND NOT EXISTS (SELECT 1 FROM coordination_nodes WHERE worker_id = worker.id)
               AND NOT EXISTS (SELECT 1 FROM worker_cleanup_pins WHERE worker_id = worker.id)
+              AND NOT EXISTS (
+                  SELECT 1 FROM archived_projects archived
+                   WHERE archived.project_id = item.project_id
+                     AND archived.restored_at_unix_ms IS NULL
+              )
+              AND NOT EXISTS (SELECT 1 FROM deleted_workers WHERE worker_id = worker.id)
+              AND NOT EXISTS (
+                  SELECT 1 FROM archived_coordination_nodes archived_node
+                   WHERE archived_node.worker_id = worker.id
+              )
               AND NOT EXISTS (
                   SELECT 1 FROM worker_runtime_bindings conflict
                    WHERE conflict.worker_id <> worker.id

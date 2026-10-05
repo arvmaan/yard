@@ -1072,6 +1072,22 @@ async function mockApi(
         await route.fulfill({ status: 409 })
         return
       }
+      // Like the server, refuse any save that turns a summary flag on.
+      if (
+        input.superintendent_auto_requests_project_summaries ||
+        input.project_orchestrators_auto_request_worker_summaries ||
+        input.scheduled_automatic_summaries
+      ) {
+        await route.fulfill({
+          status: 422,
+          json: {
+            code: 'automatic_summary_isolation_required',
+            message:
+              'automatic summaries require an isolated ephemeral summary worker',
+          },
+        })
+        return
+      }
       state.tokenSpendSettings = {
         superintendent_auto_requests_project_summaries:
           input.superintendent_auto_requests_project_summaries,
@@ -15506,6 +15522,44 @@ test('keeps automatic summaries isolated while manual actions remain available',
     path: testInfo.outputPath('summary-isolation-settings-mobile.png'),
     fullPage: true,
   })
+})
+
+test('clears legacy automatic summary flags with one save', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  // A database from before automatic summaries were removed can hold two of
+  // the flags on; the server accepts only a save with every flag off.
+  state.tokenSpendSettings = {
+    ...state.tokenSpendSettings,
+    superintendent_auto_requests_project_summaries: true,
+    scheduled_automatic_summaries: true,
+  }
+  await page.goto('/')
+
+  const dialog = await openSettings(page)
+  const section = dialog.getByLabel('Automatic coordination', { exact: true })
+  await expect(
+    dialog.getByText(/Automatic summaries from an earlier version are still on/),
+  ).toBeVisible()
+  await section.getByRole('button', { name: 'Turn off' }).click()
+  await expect(section.getByRole('button', { name: 'Off' })).toBeDisabled()
+  expect(state.tokenSpendSettingsUpdates).toEqual([
+    {
+      actor: 'local-user',
+      expected_version: '1',
+      superintendent_auto_requests_project_summaries: false,
+      project_orchestrators_auto_request_worker_summaries: false,
+      scheduled_automatic_summaries: false,
+    },
+  ])
+  expect(state.tokenSpendSettings).toMatchObject({
+    superintendent_auto_requests_project_summaries: false,
+    project_orchestrators_auto_request_worker_summaries: false,
+    scheduled_automatic_summaries: false,
+    version: '2',
+  })
+  await expect(dialog.getByRole('alert')).toHaveCount(0)
 })
 
 test('reloads edits and resets the server-persisted orchestrator workflow', async ({
