@@ -12869,7 +12869,7 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
             supported: SCHEMA_VERSION,
         });
     }
-    ensure_migratable_schema_lineage(connection, current)?;
+    current = bridge_fork_schema(connection, current)?;
     if current == 0 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(INITIAL_MIGRATION)?;
@@ -13235,6 +13235,7 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         current = 28;
     }
     if current == 28 {
+        ensure_mainline_step_lineage(connection, current)?;
         connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
         let migration = (|| {
             let transaction =
@@ -13253,6 +13254,7 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         current = 29;
     }
     if current == 29 {
+        ensure_mainline_step_lineage(connection, current)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(PANE_MANAGEMENT_MIGRATION)?;
         ensure_foreign_keys(&transaction)?;
@@ -13260,6 +13262,7 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         current = 30;
     }
     if current == 30 {
+        ensure_mainline_step_lineage(connection, current)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(WORKER_CLEANUP_MIGRATION)?;
         ensure_foreign_keys(&transaction)?;
@@ -13267,6 +13270,7 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         current = 31;
     }
     if current == 31 {
+        ensure_mainline_step_lineage(connection, current)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(PORTABLE_PROFILE_BUNDLES_MIGRATION)?;
         ensure_foreign_keys(&transaction)?;
@@ -13274,6 +13278,7 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
         current = 32;
     }
     if current == 32 {
+        ensure_mainline_step_lineage(connection, current)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SUMMARY_WORKER_MIGRATION)?;
         ensure_foreign_keys(&transaction)?;
@@ -13593,24 +13598,85 @@ fn invalid_schema_lineage<T>(detail: &str) -> Result<T, ProjectStoreError> {
     })
 }
 
-/// Refuses databases this build cannot migrate safely: pre-rebase fork
-/// databases (their `user_version` 29..34 names other schemas than ours) and
-/// any mix of markers that no chain produces. Runs before any step writes.
-fn ensure_migratable_schema_lineage(
+/// Mainline's five post-v28 migrations, in chain order. The fork bridge runs
+/// them verbatim on a pre-rebase fork schema: they only add objects, and none
+/// of their names exist in the fork schema.
+const MAINLINE_POST_V28_MIGRATIONS: &[&str] = &[
+    PROJECT_REPOSITORIES_MIGRATION,
+    PANE_MANAGEMENT_MIGRATION,
+    WORKER_CLEANUP_MIGRATION,
+    PORTABLE_PROFILE_BUNDLES_MIGRATION,
+    SUMMARY_WORKER_MIGRATION,
+];
+
+/// Brings a pre-rebase fork database (`feature/worker-names` @ d897fd1 and
+/// its ancestors, `user_version` 29..34) onto the rebased chain, and refuses
+/// any mix of markers that no chain produces before anything is written.
+///
+/// A fork `vN` database already holds our migrations at fork numbering, so the
+/// bridge applies mainline 0029..0033 and stamps it rebased `vN+5`, in ONE
+/// transaction: an intermediate state would be unclassifiable. Returns the
+/// version the rest of `migrate()` continues from.
+fn bridge_fork_schema(connection: &mut Connection, current: i64) -> Result<i64, ProjectStoreError> {
+    // Classify outside the write lock first, so other lineages pay nothing.
+    let SchemaLineage::Fork(_) = classify_schema_lineage(connection, current)? else {
+        return Ok(current);
+    };
+    let started = std::time::Instant::now();
+    connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let migration = (|| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Re-read under the write lock: another process may have bridged
+        // meanwhile. Dropping the transaction rolls back; nothing is written.
+        let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let SchemaLineage::Fork(fork) = classify_schema_lineage(&transaction, version)? else {
+            return Ok::<(i64, i64), ProjectStoreError>((version, version));
+        };
+        for sql in MAINLINE_POST_V28_MIGRATIONS {
+            transaction.execute_batch(sql)?;
+        }
+        // Overrides the files' own `user_version` 29..33 lines.
+        let rebased = fork + FORK_BRIDGE_OFFSET;
+        transaction.execute_batch(&format!("PRAGMA user_version = {rebased};"))?;
+        if classify_schema_lineage(&transaction, rebased)? != SchemaLineage::Rebased(rebased) {
+            return invalid_schema_lineage("fork bridge did not produce the rebased schema");
+        }
+        ensure_foreign_keys(&transaction)?;
+        transaction.commit()?;
+        Ok((fork, rebased))
+    })();
+    let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
+    let (fork, rebased) = migration?;
+    foreign_keys?;
+    if rebased != fork {
+        tracing::info!(
+            fork_version = fork,
+            rebased_version = rebased,
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "bridged fork schema v{fork} onto mainline chain as v{rebased}"
+        );
+    }
+    Ok(rebased)
+}
+
+/// Guards each mainline step (28 -> 29 .. 32 -> 33): it must only ever run on
+/// a shared or mainline schema, so a fork database that somehow skipped the
+/// bridge fails loudly before a mainline step commits on top of it.
+fn ensure_mainline_step_lineage(
     connection: &Connection,
     current: i64,
 ) -> Result<(), ProjectStoreError> {
-    let level = match classify_schema_lineage(connection, current)? {
-        SchemaLineage::Shared => current,
-        SchemaLineage::Mainline(level) | SchemaLineage::Rebased(level) => level,
-        SchemaLineage::Fork(level) => {
-            return invalid_schema_lineage(&format!(
-                "user_version {level} is a pre-rebase fork schema (fork migrations through \
-                 {level}); this build cannot migrate it yet"
-            ));
-        }
+    let expected = if current <= 28 {
+        SchemaLineage::Shared
+    } else {
+        SchemaLineage::Mainline(current)
     };
-    debug_assert_eq!(level, current);
+    let found = classify_schema_lineage(connection, current)?;
+    if found != expected {
+        return invalid_schema_lineage(&format!(
+            "mainline step from user_version {current} found {found:?}, expected {expected:?}"
+        ));
+    }
     Ok(())
 }
 
@@ -21291,16 +21357,50 @@ mod tests {
     };
 
     mod provider_continuation;
+    mod schema_bridge;
 
     const HISTORICAL_PROVIDER_NEUTRAL_WORKFLOW_V25_MIGRATION: &str =
         include_str!("../tests/fixtures/0025_provider_neutral_workflow_profiles.sql");
     /// The first 0028, shipped in commit 3fdcf5e and later rewritten in place.
     const HISTORICAL_VISIBILITY_DELETIONS_3FDCF5E_MIGRATION: &str =
         include_str!("../tests/fixtures/0028_visibility_deletions_3fdcf5e.sql");
-    /// Verbatim `crates/yard-store/migrations/0029_*.sql` from the pre-rebase
-    /// fork (d897fd1), which numbered our first migration 29.
-    const FORK_D897FD1_SNAPSHOT_EXPIRY_V29_MIGRATION: &str =
-        include_str!("../tests/fixtures/fork_d897fd1/0029_snapshot_expiry_and_delete_commands.sql");
+    /// Verbatim `crates/yard-store/migrations/0029..0034_*.sql` from the
+    /// pre-rebase fork (d897fd1), which numbered our migrations 29..34:
+    /// `(fork level, file name, sql)`.
+    const FORK_D897FD1_MIGRATIONS: &[(i64, &str, &str)] = &[
+        (
+            29,
+            "0029_snapshot_expiry_and_delete_commands.sql",
+            include_str!(
+                "../tests/fixtures/fork_d897fd1/0029_snapshot_expiry_and_delete_commands.sql"
+            ),
+        ),
+        (
+            30,
+            "0030_coordination_node_dispositions.sql",
+            include_str!("../tests/fixtures/fork_d897fd1/0030_coordination_node_dispositions.sql"),
+        ),
+        (
+            31,
+            "0031_assignment_disposition.sql",
+            include_str!("../tests/fixtures/fork_d897fd1/0031_assignment_disposition.sql"),
+        ),
+        (
+            32,
+            "0032_archive_active_work.sql",
+            include_str!("../tests/fixtures/fork_d897fd1/0032_archive_active_work.sql"),
+        ),
+        (
+            33,
+            "0033_project_restore.sql",
+            include_str!("../tests/fixtures/fork_d897fd1/0033_project_restore.sql"),
+        ),
+        (
+            34,
+            "0034_worker_display_names.sql",
+            include_str!("../tests/fixtures/fork_d897fd1/0034_worker_display_names.sql"),
+        ),
+    ];
 
     fn draft(workspace_id: &str, terminal_id: &str) -> (CreateProject, WorkerRuntimeBinding) {
         (
@@ -37563,28 +37663,33 @@ mod tests {
             .unwrap()
     }
 
-    /// A database the pre-rebase fork left at version 29: shared v28 plus the
-    /// fork's own 0029 file, with none of mainline's 0029..0033 objects.
-    fn build_fork_v29_schema(connection: &Connection) {
+    /// A database the pre-rebase fork left at `level` (29..=34): shared v28
+    /// plus the fork's own VERBATIM migration files through `level`, with none
+    /// of mainline's 0029..0033 objects. Starts from a rebased database.
+    fn build_fork_schema(connection: &Connection, level: i64) {
+        assert!((29..=34).contains(&level), "fork level {level}");
         downgrade_snapshot_expiry_schema_to_v33(connection);
         downgrade_mainline_schema_to_v28(connection);
         connection
             .execute_batch("PRAGMA foreign_keys = OFF;")
             .unwrap();
-        connection
-            .execute_batch(FORK_D897FD1_SNAPSHOT_EXPIRY_V29_MIGRATION)
-            .unwrap();
+        for (_, name, sql) in FORK_D897FD1_MIGRATIONS
+            .iter()
+            .filter(|(fork_level, _, _)| *fork_level <= level)
+        {
+            connection
+                .execute_batch(sql)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
         connection
             .execute_batch("PRAGMA foreign_keys = ON;")
             .unwrap();
-        assert_eq!(user_version(connection), 29);
-    }
-
-    #[test]
-    fn renumbered_snapshot_expiry_migration_differs_from_fork_file_only_in_version() {
-        let renumbered = super::SNAPSHOT_EXPIRY_AND_DELETE_COMMANDS_MIGRATION
-            .replace("PRAGMA user_version = 34;", "PRAGMA user_version = 29;");
-        assert_eq!(renumbered, FORK_D897FD1_SNAPSHOT_EXPIRY_V29_MIGRATION);
+        super::ensure_foreign_keys(connection).unwrap();
+        assert_eq!(user_version(connection), level);
+        assert_eq!(
+            super::classify_schema_lineage(connection, level).unwrap(),
+            super::SchemaLineage::Fork(level)
+        );
     }
 
     #[tokio::test]
@@ -37642,38 +37747,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fork_v29_database_is_refused_unchanged() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("yard.sqlite3");
-        let store = open_store(&temp).await;
-        let (draft, runtime) = draft("fork-v29", "fork-v29-terminal");
-        store.create_project(draft, runtime).await.unwrap();
-        drop(store);
-
-        let connection = Connection::open(&path).unwrap();
-        build_fork_v29_schema(&connection);
-        assert_eq!(
-            super::classify_schema_lineage(&connection, 29).unwrap(),
-            super::SchemaLineage::Fork(29)
-        );
-        let schema_before = schema_snapshot(&connection);
-        let projects_before = table_snapshot(&connection, "projects");
-        drop(connection);
-
-        let error = SqliteProjectStore::open(&path).await.unwrap_err();
-        assert!(
-            matches!(error, ProjectStoreError::InvalidSchemaLineage { .. }),
-            "{error:?}"
-        );
-
-        let connection = Connection::open(&path).unwrap();
-        assert_eq!(user_version(&connection), 29);
-        assert_eq!(schema_snapshot(&connection), schema_before);
-        assert_eq!(table_snapshot(&connection, "projects"), projects_before);
-        assert!(!super::table_exists(&connection, "project_repositories").unwrap());
-    }
-
-    #[tokio::test]
     async fn mixed_schema_lineage_markers_are_refused_unchanged() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("yard.sqlite3");
@@ -37681,7 +37754,7 @@ mod tests {
 
         // A fork v29 database that also carries a mainline object.
         let connection = Connection::open(&path).unwrap();
-        build_fork_v29_schema(&connection);
+        build_fork_schema(&connection, 29);
         connection
             .execute_batch(
                 "CREATE TABLE project_repositories (id TEXT PRIMARY KEY NOT NULL) STRICT;",
