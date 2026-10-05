@@ -36,6 +36,7 @@ import type {
   DeletedCoordinationNode,
   DeletedProject,
   DeleteWorkerInput,
+  RenameWorkerInput,
   DisposeAssignmentInput,
   DisposedAssignment,
   EndWorkerSessionInput,
@@ -596,6 +597,7 @@ interface MockState {
     input: DeleteWorkerInput
     workerId: string
   }>
+  workerRenameCommands: RenameWorkerInput[]
   profileProjectCommands: CreateProjectFromProfileInput[]
   workspaceProjectCommands: CreateWorkspaceProjectFromProfileInput[]
   promptCommands: SendAssignmentPromptInput[]
@@ -980,6 +982,7 @@ async function mockApi(
     endSessionCommands: [],
     workerEndSessionRequests: [],
     workerDeleteRequests: [],
+    workerRenameCommands: [],
     profileProjectCommands: [],
     workspaceProjectCommands: [],
     promptCommands: [],
@@ -1846,6 +1849,58 @@ async function mockApi(
         cleanup_pending: options.endSessionCleanupPending ?? false,
         replayed: false,
       },
+    })
+  })
+
+  await page.route('**/api/v1/workers/*/name', async (route) => {
+    const request = route.request()
+    const workerId = decodeURIComponent(
+      new URL(request.url()).pathname.split('/')[4],
+    )
+    const input = request.postDataJSON() as RenameWorkerInput
+    state.workerRenameCommands.push(input)
+    const index = state.workerCandidates.findIndex(
+      (candidate) => candidate.worker.id === workerId,
+    )
+    const candidate = state.workerCandidates[index]
+    if (!candidate) {
+      await route.fulfill({
+        status: 404,
+        json: {
+          error: { code: 'worker_not_found', message: 'Worker was not found' },
+        },
+      })
+      return
+    }
+    const current = candidate.worker.display_name ?? null
+    if (current !== input.expected_display_name) {
+      await route.fulfill({
+        status: 409,
+        json: {
+          error: {
+            code: 'worker_name_conflict',
+            message:
+              'The worker was renamed by someone else; review the current name and try again',
+            current_display_name: current,
+          },
+        },
+      })
+      return
+    }
+    // A rename is cosmetic: the worker version stays the same.
+    const renamed: Worker = {
+      ...candidate.worker,
+      display_name: input.display_name,
+      updated_at_unix_ms: Date.now(),
+    }
+    state.workerCandidates[index] = { ...candidate, worker: renamed }
+    state.assignments = state.assignments.map((assignment) =>
+      assignment.worker.id === workerId
+        ? { ...assignment, worker: renamed }
+        : assignment,
+    )
+    await route.fulfill({
+      json: { command_id: input.command_id, worker: renamed },
     })
   })
 
@@ -8354,6 +8409,120 @@ test('resnapshots inventory, retains stale state, and recovers after failure', a
   await expect(page.locator('.inspector .status-badge')).toHaveAttribute(
     'data-status',
     'blocked',
+  )
+})
+
+test('renames a worker from its details header and shows the name on the canvas', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  await page.goto('/')
+
+  const canvasWorker = page.locator(
+    '.react-flow__node-worker[data-id="worker:terminal-2"]',
+  )
+  await expect(canvasWorker).toContainText('worker-2')
+  await openResources(page, 'Workers')
+  // Mainline labels this live agent by its Herdr name and workspace.
+  const defaultLabel = 'worker-2 · API migration'
+  await page
+    .locator('.worker-row[data-worker-id="worker-unassigned"]')
+    .click()
+  const inspector = page.locator('.inspector.has-selection')
+  await expect(
+    inspector.getByRole('heading', { name: defaultLabel }),
+  ).toBeVisible()
+
+  await inspector
+    .getByRole('button', { name: `Rename ${defaultLabel}` })
+    .click()
+  const nameInput = inspector.getByRole('textbox', { name: 'Worker name' })
+  await expect(nameInput).toBeFocused()
+  await nameInput.fill('  BAR CDK ')
+  await nameInput.press('Enter')
+
+  await expect(
+    inspector.getByRole('heading', { name: 'BAR CDK' }),
+  ).toBeVisible()
+  await expect(inspector.locator('.worker-name__default')).toHaveText(defaultLabel)
+  await expect(
+    inspector.getByRole('button', { name: 'Rename BAR CDK' }),
+  ).toBeFocused()
+  await expect(canvasWorker).toContainText('BAR CDK')
+  await expect(canvasWorker).not.toContainText('worker-2')
+  await expect(
+    page.locator('.worker-row').filter({ hasText: `BAR CDK · ${defaultLabel}` }),
+  ).toBeVisible()
+  expect(state.workerRenameCommands).toEqual([
+    expect.objectContaining({
+      actor: 'local-user',
+      display_name: 'BAR CDK',
+      expected_display_name: null,
+    }),
+  ])
+  expect(
+    state.workerCandidates.find(
+      (candidate) => candidate.worker.id === 'worker-unassigned',
+    )?.worker.version,
+  ).toBe('1')
+
+  // Escape cancels an edit; an empty name resets to the default label.
+  await inspector.getByRole('button', { name: 'Rename BAR CDK' }).click()
+  await nameInput.fill('Something else')
+  await nameInput.press('Escape')
+  await expect(
+    inspector.getByRole('heading', { name: 'BAR CDK' }),
+  ).toBeVisible()
+  await inspector.getByRole('button', { name: 'Rename BAR CDK' }).click()
+  await nameInput.fill('')
+  await nameInput.press('Enter')
+  await expect(
+    inspector.getByRole('heading', { name: defaultLabel }),
+  ).toBeVisible()
+  await expect(canvasWorker).toContainText('worker-2')
+  expect(state.workerRenameCommands).toHaveLength(2)
+  expect(state.workerRenameCommands[1]).toMatchObject({
+    display_name: null,
+    expected_display_name: 'BAR CDK',
+  })
+})
+
+test('truncates a long Superintendent name inside the canvas hub', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  const name =
+    'Portfolio superintendent for BAR CDK and Portal ACL research lane'
+  state.yardOrchestrator = {
+    worker: {
+      ...durableWorker(
+        'worker-yard-orchestrator',
+        'terminal-yard-orchestrator',
+        state.profiles[0],
+        'workspace-yard-orchestrator',
+        'yard-orchestrator',
+      ),
+      display_name: name,
+    },
+    version: '2',
+    workflow_profile_version: '1',
+    created_at_unix_ms: Date.now(),
+    updated_at_unix_ms: Date.now(),
+  }
+  await page.setViewportSize({ width: 1200, height: 760 })
+  await page.goto('/')
+
+  const label = page.locator('.yard-orchestrator-marker__label strong')
+  await expect(label).toHaveText(name)
+  await expect(label).toHaveAttribute('title', name)
+  const labelBox = await label.boundingBox()
+  const hubBox = await page.locator('.yard-orchestrator-marker').boundingBox()
+  expect(labelBox && hubBox).toBeTruthy()
+  // One line, inside the hub card.
+  expect(labelBox!.height).toBeLessThan(20)
+  expect(labelBox!.x).toBeGreaterThanOrEqual(hubBox!.x - 1)
+  expect(labelBox!.x + labelBox!.width).toBeLessThanOrEqual(
+    hubBox!.x + hubBox!.width + 1,
   )
 })
 

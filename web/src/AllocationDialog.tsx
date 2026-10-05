@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { CircleAlert, LoaderCircle, Send, X } from 'lucide-react'
 import type { Project, WorkerCandidate, WorkerProfile } from './types'
 import { useModalDialog } from './useModalDialog'
+import { workerLabelWithDefault } from './workerDisplay'
 
 export type AllocationSubject =
   | { kind: 'profile'; profile: WorkerProfile }
@@ -32,10 +33,11 @@ function actionLabel(subject: AllocationSubject) {
 
 function subjectLabel(subject: AllocationSubject) {
   if (subject.kind === 'profile') return subject.profile.name
-  return (
-    subject.candidate.profile_name ??
-    `Worker ${subject.candidate.worker.id.slice(0, 8)}`
-  )
+  return workerLabelWithDefault({
+    displayName: subject.candidate.worker.display_name,
+    profileName: subject.candidate.profile_name,
+    workerId: subject.candidate.worker.id,
+  })
 }
 
 export function AllocationDialog({

@@ -191,6 +191,8 @@ struct RuntimeLensEntry {
     reason: String,
     worker_id: Option<String>,
     profile_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
     availability: Option<WorkerAvailability>,
     provider: Option<String>,
     display_provider: Option<String>,
@@ -1209,6 +1211,7 @@ fn entry(
         reason: reason.to_owned(),
         worker_id: durable.map(|candidate| candidate.worker.id.clone()),
         profile_name: durable.and_then(|candidate| candidate.profile_name.clone()),
+        display_name: durable.and_then(|candidate| candidate.worker.display_name.clone()),
         availability: durable.map(|candidate| candidate.availability),
         provider: worker
             .and_then(|worker| worker.provider.clone())
@@ -1388,6 +1391,7 @@ mod tests {
                 profile_id: None,
                 profile_version: None,
                 ownership_kind: yard_domain::WorkerOwnershipKind::External,
+                display_name: None,
                 desired_state: yard_domain::WorkerDesiredState::Running,
                 runtime: Some(WorkerRuntimeBinding {
                     adapter: "herdr".to_owned(),
@@ -1428,6 +1432,28 @@ mod tests {
             session: "selected".to_owned(),
             managed_workspaces: Vec::new(),
         }
+    }
+
+    #[test]
+    fn linked_entries_carry_the_durable_worker_display_name() {
+        let mut named = candidate(1, "linked");
+        named.worker.display_name = Some("BAR CDK".to_owned());
+        let entries = project_entries(
+            &inventory(vec![pane(1, "linked")], vec![observed(1, "linked")]),
+            &topology(),
+            &WorkerCandidates {
+                workers: vec![named],
+            },
+        );
+        let entry = entries
+            .iter()
+            .find(|entry| entry.terminal_id == "linked")
+            .unwrap();
+        assert_eq!(entry.display_name.as_deref(), Some("BAR CDK"));
+        assert_eq!(
+            serde_json::to_value(entry).unwrap()["display_name"],
+            "BAR CDK"
+        );
     }
 
     #[test]

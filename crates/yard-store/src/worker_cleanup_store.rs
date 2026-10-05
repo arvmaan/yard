@@ -950,7 +950,8 @@ fn select_candidates_page(
                      WHERE claim.adapter = wrb.adapter
                        AND claim.runtime_session = wrb.runtime_session
                        AND claim.pane_id = wrb.pane_id
-                )
+                ),
+                w.display_name
            FROM ranked_allocations latest
            JOIN assignments a ON a.allocation_id = latest.id
            JOIN assignment_attempts aa ON aa.assignment_id = a.id
@@ -1110,6 +1111,7 @@ fn candidate_from_row(
         public: CompletedRuntimeCleanupCandidate {
             worker_id: row.get(0)?,
             profile_name: row.get(1)?,
+            display_name: row.get(45)?,
             project_id: row.get(2)?,
             project_name: row.get(3)?,
             assignment_id: row.get(4)?,

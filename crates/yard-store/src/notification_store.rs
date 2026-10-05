@@ -47,6 +47,9 @@ pub struct AttentionRuntime {
     pub node_name: Option<String>,
     /// The pinned worker profile name, when the worker has one.
     pub profile_name: Option<String>,
+    /// The user-chosen worker name, when one is set (preferred over
+    /// `profile_name` in titles).
+    pub display_name: Option<String>,
     pub status: ObservedStatus,
     pub process_state: RuntimeProcessState,
     pub observation_state: RuntimeObservationState,
@@ -174,7 +177,7 @@ const AUTOMATIC_PROMPT_ACTOR: &str = "yard:auto:%";
 fn select_runtimes(connection: &Connection) -> Result<Vec<AttentionRuntime>, ProjectStoreError> {
     let binding_columns = "binding.observed_status, binding.process_state,
                 binding.observation_state, binding.state_change_sequence,
-                binding.provider_session_value";
+                binding.provider_session_value, worker.display_name";
     // The latest assignment prompt that did not fail, per open assignment
     // (SQLite takes the bare columns from the MAX row).
     let sql = format!(
@@ -264,9 +267,10 @@ fn select_runtimes(connection: &Connection) -> Result<Vec<AttentionRuntime>, Pro
                 observation_state: runtime_observation_state(row, 11)?,
                 state_change_sequence: row_u64(row, 12)?,
                 provider_session: row.get(13)?,
-                last_prompt_automatic: row.get::<_, i64>(14)? != 0,
+                display_name: row.get(14)?,
+                last_prompt_automatic: row.get::<_, i64>(15)? != 0,
                 last_prompt_at_unix_ms: row
-                    .get::<_, Option<i64>>(15)?
+                    .get::<_, Option<i64>>(16)?
                     .map(|value| u64::try_from(value).unwrap_or(0)),
             })
         })?
@@ -525,6 +529,45 @@ mod tests {
         assert!(!worker.last_prompt_automatic);
         assert_eq!(worker.last_prompt_at_unix_ms, None);
         assert!(records.visible_project_ids.contains(&project_id));
+    }
+
+    #[tokio::test]
+    async fn attention_runtimes_carry_the_worker_display_name() {
+        let temp = TempDir::new().unwrap();
+        let (store, _, assignment) = fixture(&temp).await;
+        let records = store.attention_records(0).await.unwrap();
+        assert!(
+            records
+                .runtimes
+                .iter()
+                .all(|runtime| runtime.display_name.is_none())
+        );
+        store
+            .rename_worker(
+                &assignment.worker.id,
+                yard_domain::RenameWorker {
+                    command_id: "attention-rename".to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_display_name: None,
+                    display_name: Some("BAR CDK".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+        let records = store.attention_records(0).await.unwrap();
+        let worker = records
+            .runtimes
+            .iter()
+            .find(|runtime| runtime.role == AttentionRuntimeRole::Assignment)
+            .unwrap();
+        assert_eq!(worker.display_name.as_deref(), Some("BAR CDK"));
+        assert_eq!(worker.profile_name.as_deref(), Some("Implementer"));
+        let orchestrator = records
+            .runtimes
+            .iter()
+            .find(|runtime| runtime.role == AttentionRuntimeRole::ProjectOrchestrator)
+            .unwrap();
+        assert_eq!(orchestrator.display_name, None);
     }
 
     #[tokio::test]

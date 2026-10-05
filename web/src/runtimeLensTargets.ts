@@ -3,6 +3,7 @@ import type {
   RuntimeLensEntry,
 } from './types'
 import type { AgentWorkspaceTarget } from './AgentWorkspaceContext'
+import { labelWithDisplayName } from './workerDisplay'
 
 export interface RuntimeLensWorkspaceGroup {
   entries: RuntimeLensEntry[]
@@ -21,12 +22,13 @@ export function runtimeLensEntryKey(entry: RuntimeLensEntry) {
 }
 
 export function runtimeLensEntryLabel(entry: RuntimeLensEntry) {
-  return (
+  return labelWithDisplayName(
+    entry.display_name,
     entry.profile_name ??
-    entry.name ??
-    entry.label ??
-    entry.worker_id ??
-    entry.terminal_id
+      entry.name ??
+      entry.label ??
+      entry.worker_id ??
+      entry.terminal_id,
   )
 }
 

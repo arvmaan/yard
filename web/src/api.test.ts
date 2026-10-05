@@ -4,6 +4,7 @@ import {
   disposeAssignment,
   fetchAssignmentTerminalOutput,
   fetchAssignmentTranscript,
+  renameWorker,
   restoreProject,
   fetchSessions,
   TERMINAL_OUTPUT_REQUEST_TIMEOUT_MS,
@@ -136,6 +137,32 @@ describe('project restore client', () => {
     expect(error).toBeInstanceOf(YardApiError)
     expect((error as YardApiError).code).toBe('project_restore_unavailable')
     expect((error as YardApiError).reason).toBe('herdr_unreachable')
+  })
+})
+
+describe('worker rename client', () => {
+  it('surfaces the current name from a worker_name_conflict', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        jsonResponse(409, {
+          error: {
+            code: 'worker_name_conflict',
+            message: 'The worker was renamed by someone else',
+            current_display_name: 'Docs',
+          },
+        }),
+      ),
+    )
+    const error = await renameWorker('worker-1', {
+      actor: 'local-user',
+      command_id: 'rename-1',
+      display_name: 'BAR CDK',
+      expected_display_name: null,
+    }).catch((caught: unknown) => caught)
+    expect(error).toBeInstanceOf(YardApiError)
+    expect((error as YardApiError).code).toBe('worker_name_conflict')
+    expect((error as YardApiError).currentDisplayName).toBe('Docs')
   })
 })
 

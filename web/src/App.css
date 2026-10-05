@@ -1543,8 +1543,13 @@ select:focus-visible {
 }
 
 .yard-orchestrator-marker__label strong {
+  /* A user-chosen name can be up to 64 characters. */
+  max-width: 99px;
+  overflow: hidden;
   font-size: 10.35px;
   font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .yard-orchestrator-marker__label small {
@@ -10287,4 +10292,70 @@ html[data-yard-allocation-dragging="true"]
   border-color: color-mix(in srgb, var(--vermilion) 45%, var(--line));
   background: var(--vermilion-soft);
   color: var(--vermilion);
+}
+
+/* Worker names: an inline rename control in worker headings. */
+.worker-name {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.worker-name__display,
+.worker-name__editor {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 6px;
+}
+
+.worker-name__display h2 {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.worker-name__rename {
+  flex: none;
+  width: 26px;
+  height: 26px;
+}
+
+.worker-name__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 32px;
+  padding: 5px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.worker-name__input:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 1px;
+}
+
+.worker-name__input[aria-invalid='true'] {
+  border-color: var(--vermilion);
+}
+
+.worker-name__reset {
+  flex: none;
+  min-height: 32px;
+}
+
+.worker-name__default {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.worker-name__error {
+  margin: 2px 0 0;
+  color: var(--vermilion);
+  font-size: 12px;
 }

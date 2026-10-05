@@ -48,8 +48,8 @@ use yard_domain::{
     ProjectRestoreUnavailableReason, ProjectRuntimeBinding, ProjectVisibility,
     ProjectWorkflowProfilePin, Projects, ProviderSessionRef, ProvisionCoordinationNode,
     ProvisionYardOrchestrator, ReceiptDetailLevel, ReceiveSummaryWorker, RecordCompletionReceipt,
-    RecordedCompletionReceipt, ReplaceProjectOrchestrator, ReplacedProjectOrchestrator,
-    RequestCoordinationSnapshot, RequestOrigin, RequestSummaryWorker,
+    RecordedCompletionReceipt, RenameWorker, RenamedWorker, ReplaceProjectOrchestrator,
+    ReplacedProjectOrchestrator, RequestCoordinationSnapshot, RequestOrigin, RequestSummaryWorker,
     ResetOrchestratorWorkflowProfile, RestoreProject, RestoredProject, RunAutomationNow,
     RuntimeInventory, RuntimeObservationState, RuntimeProcessState, RuntimeReconciliation,
     RuntimeTopology, SendAssignmentPrompt, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
@@ -102,7 +102,7 @@ pub use transcript_capture_store::{
     TranscriptCaptureGuard, TranscriptCaptureOutcome,
 };
 
-const SCHEMA_VERSION: i64 = 38;
+const SCHEMA_VERSION: i64 = 39;
 const PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS: u64 = 120_000;
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_projects.sql");
 const PROFILE_ASSIGNMENT_MIGRATION: &str =
@@ -168,6 +168,8 @@ const ASSIGNMENT_DISPOSITION_MIGRATION: &str =
 const ARCHIVE_ACTIVE_WORK_MIGRATION: &str =
     include_str!("../migrations/0037_archive_active_work.sql");
 const PROJECT_RESTORE_MIGRATION: &str = include_str!("../migrations/0038_project_restore.sql");
+const WORKER_DISPLAY_NAMES_MIGRATION: &str =
+    include_str!("../migrations/0039_worker_display_names.sql");
 const BLANK_WORKER_PROFILE_ID: &str = "yard:managed-blank-profile";
 const WORKER_CLEANUP_MIGRATION: &str = include_str!("../migrations/0031_worker_cleanup.sql");
 const PORTABLE_PROFILE_BUNDLES_MIGRATION: &str =
@@ -942,6 +944,13 @@ pub trait YardStore: Send + Sync {
         worker_id: &str,
         command: DeleteWorker,
     ) -> Result<DeletedWorker, ProjectStoreError>;
+    /// Set or clear a worker's display name. Cosmetic: never bumps the
+    /// worker's (or its runtime binding's) optimistic version.
+    async fn rename_worker(
+        &self,
+        worker_id: &str,
+        command: RenameWorker,
+    ) -> Result<RenamedWorker, ProjectStoreError>;
     async fn claim_pending_runtime_cleanups(
         &self,
         command_id: Option<&str>,
@@ -8750,6 +8759,97 @@ impl YardStore for SqliteProjectStore {
         .await
     }
 
+    async fn rename_worker(
+        &self,
+        worker_id: &str,
+        command: RenameWorker,
+    ) -> Result<RenamedWorker, ProjectStoreError> {
+        let worker_id = required_id(worker_id)?;
+        let command = command.normalize()?;
+        self.run(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(existing) = select_worker_rename_command(&transaction, &command.command_id)?
+            {
+                if !existing.matches(&worker_id, &command) {
+                    return Err(ProjectStoreError::IdempotencyConflict);
+                }
+                let worker = select_worker_candidate(&transaction, &worker_id)?
+                    .ok_or(ProjectStoreError::WorkerNotFound)?
+                    .worker;
+                transaction.commit()?;
+                return Ok(RenamedWorker {
+                    command_id: command.command_id,
+                    worker,
+                    replayed: true,
+                });
+            }
+            if command_id_exists(&transaction, &command.command_id)? {
+                return Err(ProjectStoreError::IdempotencyConflict);
+            }
+            // Deleted workers are excluded here, so they are "not found".
+            let candidate = select_worker_candidate(&transaction, &worker_id)?
+                .ok_or(ProjectStoreError::WorkerNotFound)?;
+            let previous = candidate.worker.display_name;
+            if previous != command.expected_display_name {
+                return Err(ProjectStoreError::WorkerNameConflict {
+                    current_display_name: previous,
+                });
+            }
+
+            let now = unix_time_ms()?;
+            transaction.execute(
+                "INSERT INTO command_acknowledgements (
+                    id, command_type, actor, status, error_message,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (
+                    ?1, 'worker_rename', ?2, 'succeeded', NULL, ?3, ?3
+                 )",
+                params![command.command_id, command.actor, to_i64(now)?],
+            )?;
+            // Cosmetic: `version` is deliberately untouched so in-flight
+            // commands carrying an expected worker version still apply.
+            transaction.execute(
+                "UPDATE workers SET display_name = ?1, updated_at_unix_ms = ?2
+                  WHERE id = ?3",
+                params![command.display_name, to_i64(now)?, worker_id],
+            )?;
+            transaction.execute(
+                "INSERT INTO worker_rename_commands (
+                    command_id, worker_id, expected_display_name, display_name,
+                    previous_display_name, renamed_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    command.command_id,
+                    worker_id,
+                    command.expected_display_name,
+                    command.display_name,
+                    previous,
+                    to_i64(now)?,
+                ],
+            )?;
+            insert_lifecycle_event(
+                &transaction,
+                "worker",
+                &worker_id,
+                candidate.worker.version,
+                "worker_renamed",
+                &command.actor,
+                now,
+            )?;
+            let worker = select_worker_candidate(&transaction, &worker_id)?
+                .ok_or(ProjectStoreError::WorkerNotFound)?
+                .worker;
+            transaction.commit()?;
+            Ok(RenamedWorker {
+                command_id: command.command_id,
+                worker,
+                replayed: false,
+            })
+        })
+        .await
+    }
+
     async fn claim_pending_runtime_cleanups(
         &self,
         command_id: Option<&str>,
@@ -12212,7 +12312,8 @@ fn completed_runtime_cleanup_preview(
                    a.project_id, p.name AS project_name,
                    a.id AS assignment_id, a.role,
                    cr.id AS receipt_id,
-                   cr.created_at_unix_ms AS completed_at_unix_ms
+                   cr.created_at_unix_ms AS completed_at_unix_ms,
+                   w.display_name AS display_name
               FROM ranked_allocations latest
               JOIN assignments a ON a.allocation_id = latest.allocation_id
               JOIN completion_receipts cr ON cr.assignment_id = a.id
@@ -12267,7 +12368,8 @@ fn completed_runtime_cleanup_preview(
                 EXISTS (
                     SELECT 1 FROM completion_receipt_blockers blocker
                      WHERE blocker.receipt_id = bounded.receipt_id
-                )
+                ),
+                bounded.display_name
            FROM bounded
           ORDER BY bounded.completed_at_unix_ms, bounded.assignment_id",
     )?;
@@ -12320,6 +12422,7 @@ fn completed_runtime_cleanup_candidate_from_row(
     Ok(CompletedRuntimeCleanupCandidate {
         worker_id: row.get(0)?,
         profile_name: row.get(1)?,
+        display_name: row.get(13)?,
         project_id: row.get(2)?,
         project_name: row.get(3)?,
         assignment_id: row.get(4)?,
@@ -12352,7 +12455,8 @@ const PROJECT_SELECT: &str = "
            wrb.last_observed_at_unix_ms,
            pwpp.profile_id, pwpp.profile_version,
            pwpp.pinned_by, pwpp.pinned_at_unix_ms,
-           w.ownership_kind
+           w.ownership_kind,
+           w.display_name
       FROM projects p
       JOIN project_workspace_bindings pwb ON pwb.project_id = p.id
       JOIN project_placements pp ON pp.project_id = p.id
@@ -12394,7 +12498,8 @@ const ASSIGNMENT_SELECT: &str = "
            aa.id, aa.ordinal, aa.lifecycle, aa.error_message, aa.version,
            aa.created_at_unix_ms, aa.updated_at_unix_ms,
            wa.mode, wa.started_by_command_id, wa.started_at_unix_ms,
-           w.ownership_kind
+           w.ownership_kind,
+           w.display_name
       FROM assignments a
       JOIN worker_allocations wa ON wa.id = a.allocation_id
       JOIN workers w ON w.id = a.worker_id
@@ -12474,7 +12579,8 @@ const WORKER_CANDIDATE_SELECT: &str = "
                 WHERE cleanup.worker_id = w.id
                   AND cleanup.status = 'pending'
            ),
-           w.ownership_kind
+           w.ownership_kind,
+           w.display_name
       FROM workers w
       LEFT JOIN worker_profile_revisions pr
         ON pr.profile_id = w.profile_id AND pr.version = w.profile_version
@@ -13240,6 +13346,21 @@ fn migrate(connection: &mut Connection) -> Result<(), ProjectStoreError> {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch(PROJECT_RESTORE_MIGRATION)?;
+            ensure_foreign_keys(&transaction)?;
+            transaction.commit()?;
+            Ok::<(), ProjectStoreError>(())
+        })();
+        let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
+        migration?;
+        foreign_keys?;
+        current = 38;
+    }
+    if current == 38 {
+        connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let migration = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(WORKER_DISPLAY_NAMES_MIGRATION)?;
             ensure_foreign_keys(&transaction)?;
             transaction.commit()?;
             Ok::<(), ProjectStoreError>(())
@@ -15932,6 +16053,49 @@ fn select_deleted_worker_command(
         .map_err(Into::into)
 }
 
+struct StoredWorkerRename {
+    worker_id: String,
+    actor: String,
+    expected_display_name: Option<String>,
+    display_name: Option<String>,
+}
+
+impl StoredWorkerRename {
+    fn matches(&self, worker_id: &str, command: &RenameWorker) -> bool {
+        self.worker_id == worker_id
+            && self.actor == command.actor
+            && self.expected_display_name == command.expected_display_name
+            && self.display_name == command.display_name
+    }
+}
+
+fn select_worker_rename_command(
+    connection: &Connection,
+    command_id: &str,
+) -> Result<Option<StoredWorkerRename>, ProjectStoreError> {
+    connection
+        .query_row(
+            "SELECT renamed.worker_id, command.actor,
+                    renamed.expected_display_name, renamed.display_name
+               FROM worker_rename_commands renamed
+               JOIN command_acknowledgements command
+                 ON command.id = renamed.command_id
+              WHERE renamed.command_id = ?1
+                AND command.command_type = 'worker_rename'",
+            [command_id],
+            |row| {
+                Ok(StoredWorkerRename {
+                    worker_id: row.get(0)?,
+                    actor: row.get(1)?,
+                    expected_display_name: row.get(2)?,
+                    display_name: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
 fn deleted_worker_exists(
     connection: &Connection,
     worker_id: &str,
@@ -16338,6 +16502,7 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
             profile_id: row.get(15)?,
             profile_version: row_optional_u64(row, 16)?,
             ownership_kind: worker_ownership_kind(row, 43)?,
+            display_name: row.get(44)?,
             desired_state,
             runtime,
             version: row_u64(row, 18)?,
@@ -18949,6 +19114,7 @@ fn worker_candidate_from_row(row: &Row<'_>) -> rusqlite::Result<WorkerCandidate>
             profile_id,
             profile_version: row_optional_u64(row, 2)?,
             ownership_kind: worker_ownership_kind(row, 33)?,
+            display_name: row.get(34)?,
             desired_state,
             runtime,
             version: row_u64(row, 4)?,
@@ -19251,6 +19417,7 @@ fn assignment_record_from_row(row: &Row<'_>) -> rusqlite::Result<AssignmentRecor
                 profile_id: row.get(14)?,
                 profile_version: row_optional_u64(row, 15)?,
                 ownership_kind: worker_ownership_kind(row, 48)?,
+                display_name: row.get(49)?,
                 desired_state,
                 runtime,
                 version: row_u64(row, 17)?,
@@ -20670,6 +20837,8 @@ pub enum ProjectStoreError {
     #[error(transparent)]
     InvalidWorkerSession(#[from] yard_domain::WorkerSessionValidationError),
     #[error(transparent)]
+    InvalidWorkerName(#[from] yard_domain::WorkerNameValidationError),
+    #[error(transparent)]
     InvalidOrchestratorReplacement(#[from] yard_domain::OrchestratorReplacementValidationError),
     #[error(transparent)]
     InvalidOrchestratorTransfer(#[from] yard_domain::OrchestratorTransferValidationError),
@@ -20879,6 +21048,10 @@ pub enum ProjectStoreError {
     WorkerNotEnded,
     #[error("the worker has already been deleted from the Yard UI")]
     WorkerAlreadyDeleted,
+    #[error("worker name conflict; the current name is {current_display_name:?}")]
+    WorkerNameConflict {
+        current_display_name: Option<String>,
+    },
     #[error("the project orchestrator session cannot end without a replacement")]
     OrchestratorSessionEndForbidden,
     #[error("the Yard orchestrator session cannot end without a replacement")]
@@ -31717,6 +31890,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_runtime_cleanup_candidates_carry_the_worker_display_name() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, active) = create_active_assignment(&store).await;
+        record_completed_assignment(&store, &project_id, &active, "named-completion").await;
+
+        let unnamed = store.preview_completed_runtime_cleanup(50).await.unwrap();
+        assert_eq!(unnamed.candidates[0].display_name, None);
+
+        let worker_id = active.worker.id.clone();
+        store
+            .run(move |connection| {
+                connection.execute(
+                    "UPDATE workers SET display_name = 'BAR CDK' WHERE id = ?1",
+                    [worker_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let preview = store.preview_completed_runtime_cleanup(50).await.unwrap();
+        assert_eq!(
+            preview.candidates[0].display_name.as_deref(),
+            Some("BAR CDK")
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_cleanup_candidates_carry_the_worker_display_name() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (_, assignment, _) = create_eligible_cleanup_candidate(&store, "named").await;
+        let worker_id = assignment.worker.id.clone();
+        store
+            .run(move |connection| {
+                connection.execute(
+                    "UPDATE workers SET display_name = 'BAR CDK' WHERE id = ?1",
+                    [worker_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let dashboard = store.get_worker_cleanup_dashboard(50, 20).await.unwrap();
+        let candidate = dashboard
+            .preview
+            .candidates
+            .iter()
+            .find(|candidate| candidate.worker_id == assignment.worker.id)
+            .unwrap();
+        assert_eq!(candidate.display_name.as_deref(), Some("BAR CDK"));
+    }
+
+    #[tokio::test]
     async fn completed_runtime_cleanup_preview_excludes_later_adoption() {
         let temp = TempDir::new().unwrap();
         let store = open_store(&temp).await;
@@ -36868,6 +37096,7 @@ mod tests {
     /// v37 shapes.
     #[allow(clippy::too_many_lines)]
     fn downgrade_project_restore_schema_to_v37(connection: &Connection) {
+        downgrade_worker_display_names_schema_to_v38(connection);
         let ack_rebuild = "RENAME TO command_acknowledgements;";
         let ack_rebuild_end = super::ASSIGNMENT_DISPOSITION_MIGRATION
             .find(ack_rebuild)
@@ -37364,7 +37593,7 @@ mod tests {
         drop(open_store(&temp).await);
         let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
         assert_eq!(user_version(&connection), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 38);
+        assert_eq!(SCHEMA_VERSION, 39);
         assert_eq!(
             super::classify_schema_lineage(&connection, SCHEMA_VERSION).unwrap(),
             super::SchemaLineage::Rebased(SCHEMA_VERSION)
@@ -37386,6 +37615,8 @@ mod tests {
             super::table_has_column(&connection, "archived_projects", "restored_at_unix_ms")
                 .unwrap()
         );
+        assert!(super::table_exists(&connection, "worker_rename_commands").unwrap());
+        assert!(super::table_has_column(&connection, "workers", "display_name").unwrap());
 
         downgrade_snapshot_expiry_schema_to_v33(&connection);
         assert!(!super::table_has_column(&connection, "archived_projects", "active_work").unwrap());
@@ -39434,6 +39665,29 @@ mod tests {
                 .await
                 .unwrap()
                 .replayed
+        );
+    }
+
+    #[tokio::test]
+    async fn workstream_disposition_preview_names_a_renamed_worker() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (node, _project) = provisioned_workstream(&store, &temp, "named-ws").await;
+        let worker = node.worker.clone().unwrap();
+        store
+            .rename_worker(
+                &worker.id,
+                rename_command("rename-ws-worker", None, Some("BAR CDK")),
+            )
+            .await
+            .unwrap();
+        let preview = store
+            .coordination_node_disposition_preview(&node.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            preview.worker.unwrap().display_name.as_deref(),
+            Some("BAR CDK")
         );
     }
 
@@ -43783,5 +44037,568 @@ mod tests {
             )
             .unwrap();
         assert_eq!(repaired_ack, "project_delete");
+    }
+
+    async fn worker_candidate(
+        store: &SqliteProjectStore,
+        worker_id: &str,
+    ) -> super::WorkerCandidate {
+        store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| candidate.worker.id == worker_id)
+            .unwrap()
+    }
+
+    fn rename_command(
+        command_id: &str,
+        expected: Option<&str>,
+        name: Option<&str>,
+    ) -> yard_domain::RenameWorker {
+        yard_domain::RenameWorker {
+            command_id: command_id.to_owned(),
+            actor: "local-user".to_owned(),
+            expected_display_name: expected.map(str::to_owned),
+            display_name: name.map(str::to_owned),
+        }
+    }
+
+    fn worker_renamed_events(path: &std::path::Path, worker_id: &str) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM lifecycle_events
+                  WHERE aggregate_type = 'worker' AND aggregate_id = ?1
+                    AND event_type = 'worker_renamed'",
+                [worker_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn renamed_worker_names_round_trip_through_every_worker_read() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (project_id, assignment) = create_active_assignment(&store).await;
+        let worker_id = assignment.worker.id.clone();
+        let before = worker_candidate(&store, &worker_id).await.worker;
+        assert_eq!(before.display_name, None);
+
+        let renamed = store
+            .rename_worker(
+                &worker_id,
+                rename_command("rename-1", None, Some("  BAR CDK  ")),
+            )
+            .await
+            .unwrap();
+        assert!(!renamed.replayed);
+        assert_eq!(renamed.command_id, "rename-1");
+        assert_eq!(renamed.worker.display_name.as_deref(), Some("BAR CDK"));
+        // Cosmetic: neither the worker nor its runtime binding version moves.
+        assert_eq!(renamed.worker.version, before.version);
+        assert_eq!(
+            renamed
+                .worker
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.version),
+            before.runtime.as_ref().map(|runtime| runtime.version)
+        );
+        assert_eq!(
+            worker_renamed_events(&temp.path().join("yard.sqlite3"), &worker_id),
+            1
+        );
+
+        // Worker candidates.
+        let candidate = worker_candidate(&store, &worker_id).await;
+        assert_eq!(candidate.worker.display_name.as_deref(), Some("BAR CDK"));
+        // Project assignments.
+        let assignments = store.list_project_assignments(&project_id).await.unwrap();
+        let listed = assignments
+            .assignments
+            .iter()
+            .find(|listed| listed.id == assignment.id)
+            .unwrap();
+        assert_eq!(listed.worker.display_name.as_deref(), Some("BAR CDK"));
+
+        // A project's orchestrator, through get and list.
+        let project = store.get_project(&project_id).await.unwrap();
+        assert_eq!(project.orchestrator.display_name, None);
+        store
+            .rename_worker(
+                &project.orchestrator.id,
+                rename_command("rename-orchestrator", None, Some("Lead")),
+            )
+            .await
+            .unwrap();
+        let project = store.get_project(&project_id).await.unwrap();
+        assert_eq!(project.orchestrator.display_name.as_deref(), Some("Lead"));
+        let listed = store.list_projects().await.unwrap();
+        let listed = listed
+            .projects
+            .iter()
+            .find(|listed| listed.id == project_id)
+            .unwrap();
+        assert_eq!(listed.orchestrator.display_name.as_deref(), Some("Lead"));
+        // The project archive/delete preview names the workers it ends.
+        let preview = store
+            .project_disposition_preview(&project_id)
+            .await
+            .unwrap();
+        let active = preview
+            .active_assignments
+            .iter()
+            .find(|active| active.assignment_id == assignment.id)
+            .unwrap();
+        assert_eq!(active.worker_display_name.as_deref(), Some("BAR CDK"));
+
+        // The name survives a reopen.
+        drop(store);
+        let store = open_store(&temp).await;
+        let candidate = worker_candidate(&store, &worker_id).await;
+        assert_eq!(candidate.worker.display_name.as_deref(), Some("BAR CDK"));
+
+        // Clearing restores the default label.
+        let cleared = store
+            .rename_worker(
+                &worker_id,
+                rename_command("rename-clear", Some("BAR CDK"), Some("   ")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.worker.display_name, None);
+        assert_eq!(cleared.worker.version, before.version);
+    }
+
+    #[tokio::test]
+    async fn rename_worker_is_compare_and_set_and_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (_, assignment) = create_active_assignment(&store).await;
+        let worker_id = assignment.worker.id.clone();
+        let command = rename_command("rename-1", None, Some("Reviewer"));
+        store
+            .rename_worker(&worker_id, command.clone())
+            .await
+            .unwrap();
+
+        // Same command id and payload: replay without a second event.
+        let replayed = store.rename_worker(&worker_id, command).await.unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.worker.display_name.as_deref(), Some("Reviewer"));
+        assert_eq!(
+            worker_renamed_events(&temp.path().join("yard.sqlite3"), &worker_id),
+            1
+        );
+        // Same command id, different payload.
+        assert!(matches!(
+            store
+                .rename_worker(&worker_id, rename_command("rename-1", None, Some("Other")))
+                .await,
+            Err(ProjectStoreError::IdempotencyConflict)
+        ));
+        // A command id already used by another operation.
+        assert!(matches!(
+            store
+                .rename_worker(
+                    &worker_id,
+                    rename_command("prompt-test-allocation", Some("Reviewer"), Some("X")),
+                )
+                .await,
+            Err(ProjectStoreError::IdempotencyConflict)
+        ));
+        // A stale expected name reports the current one and changes nothing.
+        let error = store
+            .rename_worker(&worker_id, rename_command("rename-2", None, Some("Mine")))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectStoreError::WorkerNameConflict {
+                current_display_name: Some(ref name)
+            } if name == "Reviewer"
+        ));
+        let candidate = worker_candidate(&store, &worker_id).await;
+        assert_eq!(candidate.worker.display_name.as_deref(), Some("Reviewer"));
+
+        // Invalid names never reach storage.
+        assert!(matches!(
+            store
+                .rename_worker(
+                    &worker_id,
+                    rename_command("rename-3", Some("Reviewer"), Some("a\u{202E}b")),
+                )
+                .await,
+            Err(ProjectStoreError::InvalidWorkerName(
+                yard_domain::WorkerNameValidationError::InvalidCharacter { .. }
+            ))
+        ));
+        assert!(matches!(
+            store
+                .rename_worker(
+                    &worker_id,
+                    rename_command("rename-4", Some("Reviewer"), Some(&"x".repeat(65))),
+                )
+                .await,
+            Err(ProjectStoreError::InvalidWorkerName(
+                yard_domain::WorkerNameValidationError::TooLong { .. }
+            ))
+        ));
+        // Unknown workers are not found.
+        assert!(matches!(
+            store
+                .rename_worker(
+                    "missing-worker",
+                    rename_command("rename-5", None, Some("A"))
+                )
+                .await,
+            Err(ProjectStoreError::WorkerNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rename_keeps_versions_and_allows_ended_but_not_deleted_workers() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let (_, assignment) = create_active_assignment(&store).await;
+        let before = worker_candidate(&store, &assignment.worker.id).await.worker;
+        store
+            .rename_worker(&before.id, rename_command("rename-1", None, Some("Named")))
+            .await
+            .unwrap();
+        let after = worker_candidate(&store, &before.id).await.worker;
+        assert_eq!(after.version, before.version);
+        assert_eq!(
+            after.runtime.as_ref().map(|runtime| runtime.version),
+            before.runtime.as_ref().map(|runtime| runtime.version)
+        );
+
+        let (ended_id, ended_version) =
+            create_ended_worker(&store, "workspace-e", "terminal-e", "end-e").await;
+        // Ended workers may be renamed (history reads well) ...
+        let renamed = store
+            .rename_worker(&ended_id, rename_command("rename-ended", None, Some("Old")))
+            .await
+            .unwrap();
+        assert_eq!(renamed.worker.display_name.as_deref(), Some("Old"));
+        assert_eq!(renamed.worker.version, ended_version);
+        // ... and a delete prepared with the pre-rename version still applies.
+        store
+            .delete_worker(
+                &ended_id,
+                DeleteWorker {
+                    command_id: "delete-ended".to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_worker_version: ended_version,
+                },
+            )
+            .await
+            .unwrap();
+        // Deleted workers are gone.
+        assert!(matches!(
+            store
+                .rename_worker(
+                    &ended_id,
+                    rename_command("rename-deleted", Some("Old"), Some("New")),
+                )
+                .await,
+            Err(ProjectStoreError::WorkerNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn end_session_with_the_pre_rename_version_still_succeeds() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        let observed_at_unix_ms = super::unix_time_ms().unwrap();
+        // Reconciliation no longer adopts agents (mainline), so seed the
+        // unassigned live worker directly.
+        seed_unassigned_worker(
+            &store,
+            observed_at_unix_ms,
+            "terminal-r",
+            "workspace-r",
+            "workspace-r-tab",
+            "workspace-r-pane",
+            Some(provider_session("workspace-r-session")),
+        )
+        .await;
+        let before = store
+            .list_worker_candidates()
+            .await
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|candidate| {
+                candidate
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.terminal_id == "terminal-r")
+            })
+            .unwrap()
+            .worker;
+        store
+            .rename_worker(&before.id, rename_command("rename-r", None, Some("Named")))
+            .await
+            .unwrap();
+        let ended = store
+            .end_worker_session(
+                &before.id,
+                EndWorkerSession {
+                    command_id: "end-r".to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_worker_version: before.version,
+                    expected_runtime_version: before
+                        .runtime
+                        .as_ref()
+                        .map(|runtime| runtime.version),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(ended.worker.display_name.as_deref(), Some("Named"));
+    }
+
+    /// Undo 0039: drop rename commands and the name column, and rebuild
+    /// acknowledgements with the exact 0038 DDL.
+    fn downgrade_worker_display_names_schema_to_v38(connection: &Connection) {
+        let ack_rebuild = "RENAME TO command_acknowledgements;";
+        let ack_rebuild_end =
+            super::PROJECT_RESTORE_MIGRATION.find(ack_rebuild).unwrap() + ack_rebuild.len();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE IF EXISTS worker_rename_commands;
+                 DELETE FROM command_acknowledgements WHERE command_type = 'worker_rename';",
+            )
+            .unwrap();
+        connection
+            .execute_batch(&super::PROJECT_RESTORE_MIGRATION[..ack_rebuild_end])
+            .unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE workers DROP COLUMN display_name;
+                 PRAGMA user_version = 38;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+    }
+
+    /// Two projects with one active assignment each. Worker set "a" (its
+    /// orchestrator and assignment worker) is named `N` and `yard_owned`; set
+    /// "b" has no name and is `external`. Written straight to the table, so
+    /// each row mapper must read `display_name` and `ownership_kind` from
+    /// their own positions: a swapped or shared index fails one of the sets.
+    async fn named_and_unnamed_workers(
+        temp: &TempDir,
+    ) -> (SqliteProjectStore, [(String, yard_domain::Assignment); 2]) {
+        let store = open_store(temp).await;
+        let named = create_active_assignment_with_suffix(&store, "a").await;
+        let unnamed = create_active_assignment_with_suffix(&store, "b").await;
+        let named_orchestrator = store.get_project(&named.0).await.unwrap().orchestrator.id;
+        let unnamed_orchestrator = store.get_project(&unnamed.0).await.unwrap().orchestrator.id;
+        drop(store);
+        let connection = Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        for (worker_id, display_name, ownership_kind) in [
+            (named.1.worker.id.as_str(), Some("N"), "yard_owned"),
+            (named_orchestrator.as_str(), Some("N"), "yard_owned"),
+            (unnamed.1.worker.id.as_str(), None, "external"),
+            (unnamed_orchestrator.as_str(), None, "external"),
+        ] {
+            let rows = connection
+                .execute(
+                    "UPDATE workers SET display_name = ?1, ownership_kind = ?2 WHERE id = ?3",
+                    params![display_name, ownership_kind, worker_id],
+                )
+                .unwrap();
+            assert_eq!(rows, 1);
+        }
+        drop(connection);
+        (open_store(temp).await, [named, unnamed])
+    }
+
+    fn assert_worker_name_and_ownership(
+        worker: &super::Worker,
+        display_name: Option<&str>,
+        ownership_kind: WorkerOwnershipKind,
+    ) {
+        assert_eq!(
+            worker.display_name.as_deref(),
+            display_name,
+            "{}",
+            worker.id
+        );
+        assert_eq!(worker.ownership_kind, ownership_kind, "{}", worker.id);
+    }
+
+    #[tokio::test]
+    async fn project_select_reads_display_name_and_ownership_kind() {
+        let temp = TempDir::new().unwrap();
+        let (store, [named, unnamed]) = named_and_unnamed_workers(&temp).await;
+        let project = store.get_project(&named.0).await.unwrap();
+        assert_worker_name_and_ownership(
+            &project.orchestrator,
+            Some("N"),
+            WorkerOwnershipKind::YardOwned,
+        );
+        let project = store.get_project(&unnamed.0).await.unwrap();
+        assert_worker_name_and_ownership(
+            &project.orchestrator,
+            None,
+            WorkerOwnershipKind::External,
+        );
+        let projects = store.list_projects().await.unwrap().projects;
+        assert_eq!(projects.len(), 2);
+        for project in projects {
+            let (name, kind) = if project.id == named.0 {
+                (Some("N"), WorkerOwnershipKind::YardOwned)
+            } else {
+                (None, WorkerOwnershipKind::External)
+            };
+            assert_worker_name_and_ownership(&project.orchestrator, name, kind);
+        }
+    }
+
+    #[tokio::test]
+    async fn assignment_select_reads_display_name_and_ownership_kind() {
+        let temp = TempDir::new().unwrap();
+        let (store, [named, unnamed]) = named_and_unnamed_workers(&temp).await;
+        for ((project_id, assignment), name, kind) in [
+            (&named, Some("N"), WorkerOwnershipKind::YardOwned),
+            (&unnamed, None, WorkerOwnershipKind::External),
+        ] {
+            let assignments = store
+                .list_project_assignments(project_id)
+                .await
+                .unwrap()
+                .assignments;
+            let listed = assignments
+                .iter()
+                .find(|listed| listed.id == assignment.id)
+                .unwrap();
+            assert_worker_name_and_ownership(&listed.worker, name, kind);
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_candidate_select_reads_display_name_and_ownership_kind() {
+        let temp = TempDir::new().unwrap();
+        let (store, [named, unnamed]) = named_and_unnamed_workers(&temp).await;
+        let candidates = store.list_worker_candidates().await.unwrap().workers;
+        let named_orchestrator = store.get_project(&named.0).await.unwrap().orchestrator.id;
+        let unnamed_orchestrator = store.get_project(&unnamed.0).await.unwrap().orchestrator.id;
+        for (worker_id, name, kind) in [
+            (
+                &named.1.worker.id,
+                Some("N"),
+                WorkerOwnershipKind::YardOwned,
+            ),
+            (
+                &named_orchestrator,
+                Some("N"),
+                WorkerOwnershipKind::YardOwned,
+            ),
+            (&unnamed.1.worker.id, None, WorkerOwnershipKind::External),
+            (&unnamed_orchestrator, None, WorkerOwnershipKind::External),
+        ] {
+            let candidate = candidates
+                .iter()
+                .find(|candidate| &candidate.worker.id == worker_id)
+                .unwrap();
+            assert_worker_name_and_ownership(&candidate.worker, name, kind);
+        }
+    }
+
+    #[tokio::test]
+    async fn populated_v38_database_migrates_to_worker_display_names() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("yard.sqlite3");
+        let store = open_store(&temp).await;
+        let (project_id, assignment) = create_active_assignment(&store).await;
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        downgrade_worker_display_names_schema_to_v38(&connection);
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 38);
+        let name_columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('workers')
+                  WHERE name = 'display_name'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name_columns, 0);
+        drop(connection);
+
+        let store = open_store(&temp).await;
+        // Existing workers have no name ...
+        let project = store.get_project(&project_id).await.unwrap();
+        assert_eq!(project.orchestrator.display_name, None);
+        let candidate = worker_candidate(&store, &assignment.worker.id).await;
+        assert_eq!(candidate.worker.display_name, None);
+        // ... and can be renamed after the upgrade.
+        store
+            .rename_worker(
+                &assignment.worker.id,
+                rename_command("v38-rename", None, Some("Upgraded")),
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let fresh_temp = TempDir::new().unwrap();
+        drop(open_store(&fresh_temp).await);
+        let fresh = Connection::open(fresh_temp.path().join("yard.sqlite3")).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        for table in [
+            "command_acknowledgements",
+            "workers",
+            "worker_rename_commands",
+        ] {
+            assert_eq!(
+                table_schema(&connection, table),
+                table_schema(&fresh, table),
+                "{table}"
+            );
+        }
+        let null_names: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM workers WHERE display_name IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let workers: i64 = connection
+            .query_row("SELECT COUNT(*) FROM workers", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(null_names, workers - 1);
+        // The byte-length backstop holds even if the domain check is bypassed.
+        assert!(
+            connection
+                .execute(
+                    "UPDATE workers SET display_name = ?1 WHERE id = ?2",
+                    params!["x".repeat(257), assignment.worker.id],
+                )
+                .is_err()
+        );
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
     }
 }

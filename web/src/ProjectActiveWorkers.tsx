@@ -1,4 +1,5 @@
 import type { ProjectDispositionPreview } from './types'
+import { workerLabelWithDefault } from './workerDisplay'
 
 // The active workers an archive or delete ends, listed in the one
 // confirmation so nothing is cancelled that the user did not see. Yard's own
@@ -27,7 +28,13 @@ export function ProjectActiveWorkers({
           >
             {active.map((assignment) => (
               <li key={assignment.assignment_id}>
-                <strong>{assignment.profile_name}</strong>
+                <strong>
+                  {workerLabelWithDefault({
+                    displayName: assignment.worker_display_name,
+                    profileName: assignment.profile_name,
+                    workerId: assignment.worker_id,
+                  })}
+                </strong>
                 {` — ${assignment.objective}`}
                 {assignment.lifecycle === 'handing_off'
                   ? ' (unresolved handoff)'

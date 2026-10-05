@@ -30,22 +30,23 @@ use yard_domain::{
     ProjectRelationships, ProjectRepositories, ProjectRepository, ProjectRestoreUnavailableReason,
     Projects, PromptAcknowledgement, ProvisionCoordinationNode, ProvisionYardOrchestrator,
     ReceiveSummaryWorker, RecordCompletionReceipt, RecordedCompletionReceipt,
-    RecoverYardOrchestrator, RecoveredYardOrchestrator, ReplaceProjectOrchestrator,
-    ReplacedProjectOrchestrator, RepositoryDiff, RepositoryFileContent, RepositoryFileMode,
-    RepositoryFiles, RequestCoordinationSnapshot, RequestOrigin, RequestSummaryWorker,
-    ResetOrchestratorWorkflowProfile, RestoreProject, RunAutomationNow, RuntimeInventory,
-    RuntimeSessions, RuntimeTopology, SendAssignmentPrompt, SendCoordinationNodePrompt,
-    SendCoordinationNodeRoute, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
-    SendYardOrchestratorRoute, SetAutomationPaused, SetProjectRepository, StartWorkerCleanupRun,
-    StorageScan, SummaryWorker, SummaryWorkers, TerminalOutput, TerminalOutputFormat,
-    TokenSpendSettings, TransferProjectOrchestrator, TransferredProjectOrchestrator,
-    UpdateAgentProfile, UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
-    UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
-    UpdateProjectWorkflowProfile, UpdateTokenSpendSettings, UpdateWorkerCleanupPolicy,
-    UpdateWorkerProfile, UploadArtifact, WorkerCandidates, WorkerCleanupDashboard,
-    WorkerCleanupPolicy, WorkerCleanupRun, WorkerCleanupRunTrigger, WorkerProfile, WorkerProfiles,
-    WorkerTranscript, YardOrchestrator, YardOrchestratorPromptAcknowledgement,
-    YardOrchestratorRoute, YardOrchestratorRoutes, YardOrchestratorTerminalOutput,
+    RecoverYardOrchestrator, RecoveredYardOrchestrator, RenameWorker, RenamedWorker,
+    ReplaceProjectOrchestrator, ReplacedProjectOrchestrator, RepositoryDiff, RepositoryFileContent,
+    RepositoryFileMode, RepositoryFiles, RequestCoordinationSnapshot, RequestOrigin,
+    RequestSummaryWorker, ResetOrchestratorWorkflowProfile, RestoreProject, RunAutomationNow,
+    RuntimeInventory, RuntimeSessions, RuntimeTopology, SendAssignmentPrompt,
+    SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
+    SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SetAutomationPaused,
+    SetProjectRepository, StartWorkerCleanupRun, StorageScan, SummaryWorker, SummaryWorkers,
+    TerminalOutput, TerminalOutputFormat, TokenSpendSettings, TransferProjectOrchestrator,
+    TransferredProjectOrchestrator, UpdateAgentProfile, UpdateAutomation,
+    UpdateAutomationPlacement, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
+    UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
+    UpdateTokenSpendSettings, UpdateWorkerCleanupPolicy, UpdateWorkerProfile, UploadArtifact,
+    WorkerCandidates, WorkerCleanupDashboard, WorkerCleanupPolicy, WorkerCleanupRun,
+    WorkerCleanupRunTrigger, WorkerProfile, WorkerProfiles, WorkerTranscript, YardOrchestrator,
+    YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute, YardOrchestratorRoutes,
+    YardOrchestratorTerminalOutput,
 };
 use yard_herdr::HerdrError;
 use yard_store::{MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT, ProjectStoreError, YardStore};
@@ -534,6 +535,10 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         .route(
             "/api/v1/workers/{worker_id}/delete",
             axum::routing::post(delete_worker),
+        )
+        .route(
+            "/api/v1/workers/{worker_id}/name",
+            axum::routing::post(rename_worker),
         )
         .route("/api/v1/projects/{project_id}", get(get_project))
         .route(
@@ -2053,6 +2058,100 @@ async fn delete_worker(
         .await
         .map(NoStoreJson)
         .map_err(ApiError::from)
+}
+
+async fn rename_worker(
+    State(state): State<AppState>,
+    Path(worker_id): Path<String>,
+    Json(command): Json<RenameWorker>,
+) -> Result<NoStoreJson<RenamedWorker>, RenameWorkerApiError> {
+    state
+        .worker_sessions
+        .rename(&worker_id, command)
+        .await
+        .map(NoStoreJson)
+        .map_err(RenameWorkerApiError::from)
+}
+
+/// Rename errors: a name conflict carries the current name so the caller can
+/// show it (and retry against it); everything else is a plain [`ApiError`].
+enum RenameWorkerApiError {
+    NameConflict {
+        current_display_name: Option<String>,
+    },
+    Api(ApiError),
+}
+
+impl From<WorkerSessionServiceError> for RenameWorkerApiError {
+    fn from(error: WorkerSessionServiceError) -> Self {
+        match error {
+            WorkerSessionServiceError::Store(ProjectStoreError::WorkerNameConflict {
+                current_display_name,
+            }) => Self::NameConflict {
+                current_display_name,
+            },
+            WorkerSessionServiceError::Store(ProjectStoreError::InvalidWorkerName(error)) => {
+                Self::Api(ApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    code: if error.is_name_error() {
+                        "invalid_worker_name"
+                    } else {
+                        "invalid_worker_rename_command"
+                    },
+                    message: error.to_string(),
+                })
+            }
+            WorkerSessionServiceError::Store(ProjectStoreError::InvalidWorkerSession(error)) => {
+                Self::Api(ApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    code: "invalid_worker_rename_command",
+                    message: error.to_string(),
+                })
+            }
+            error @ WorkerSessionServiceError::Store(_) => {
+                let mut api = ApiError::from(error);
+                if api.code == "storage_error" {
+                    "Yard could not rename the worker".clone_into(&mut api.message);
+                }
+                Self::Api(api)
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WorkerNameConflictEnvelope {
+    error: WorkerNameConflictBody,
+}
+
+#[derive(Serialize)]
+struct WorkerNameConflictBody {
+    code: &'static str,
+    message: String,
+    current_display_name: Option<String>,
+}
+
+impl IntoResponse for RenameWorkerApiError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::NameConflict {
+                current_display_name,
+            } => (
+                StatusCode::CONFLICT,
+                Json(WorkerNameConflictEnvelope {
+                    error: WorkerNameConflictBody {
+                        code: "worker_name_conflict",
+                        message: "The worker was renamed by someone else; review the current \
+                                  name and try again"
+                            .to_owned(),
+                        current_display_name,
+                    },
+                }),
+            )
+                .into_response(),
+            Self::Api(error) => error.into_response(),
+        }
+    }
 }
 
 async fn create_worker_profile(
@@ -13812,6 +13911,176 @@ done
             response_json(response).await["error"]["code"],
             "invalid_agent_profile_revision"
         );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn renames_a_worker_with_compare_and_set_and_typed_errors() {
+        let (app, _temp) = test_router().await;
+        let project = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/projects")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body("terminal-1")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(project.status(), StatusCode::CREATED);
+        let project = response_json(project).await;
+        let worker_id = project["orchestrator"]["id"].as_str().unwrap().to_owned();
+        let version = project["orchestrator"]["version"].clone();
+        assert!(project["orchestrator"]["display_name"].is_null());
+
+        let post = |uri: String, body: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let uri = format!("/api/v1/workers/{worker_id}/name");
+        let command = serde_json::json!({
+            "command_id": "rename-1",
+            "actor": "local-user",
+            "expected_display_name": null,
+            "display_name": "  BAR CDK ",
+        });
+        let renamed = post(uri.clone(), command.clone()).await;
+        assert_eq!(renamed.status(), StatusCode::OK);
+        assert_eq!(
+            renamed.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let renamed = response_json(renamed).await;
+        assert_eq!(renamed["command_id"], "rename-1");
+        assert_eq!(renamed["worker"]["id"], worker_id.as_str());
+        assert_eq!(renamed["worker"]["display_name"], "BAR CDK");
+        assert_eq!(renamed["worker"]["version"], version);
+
+        // Replay, then an idempotency conflict on the same command id.
+        let replay = post(uri.clone(), command.clone()).await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(response_json(replay).await["replayed"], true);
+        let mut changed = command.clone();
+        changed["display_name"] = serde_json::Value::String("Other".to_owned());
+        let conflict = post(uri.clone(), changed).await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(conflict).await["error"]["code"],
+            "idempotency_conflict"
+        );
+
+        // A stale expected name is a name conflict carrying the current name.
+        let stale = post(
+            uri.clone(),
+            serde_json::json!({
+                "command_id": "rename-2",
+                "actor": "local-user",
+                "expected_display_name": "Something else",
+                "display_name": "Mine",
+            }),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let stale = response_json(stale).await;
+        assert_eq!(stale["error"]["code"], "worker_name_conflict");
+        assert_eq!(stale["error"]["current_display_name"], "BAR CDK");
+
+        // Validation.
+        for (name, code) in [
+            (serde_json::json!("a\nb"), "invalid_worker_name"),
+            (serde_json::json!("x".repeat(65)), "invalid_worker_name"),
+        ] {
+            let invalid = post(
+                uri.clone(),
+                serde_json::json!({
+                    "command_id": "rename-invalid",
+                    "actor": "local-user",
+                    "expected_display_name": "BAR CDK",
+                    "display_name": name,
+                }),
+            )
+            .await;
+            assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response_json(invalid).await["error"]["code"], code);
+        }
+        let blank_actor = post(
+            uri.clone(),
+            serde_json::json!({
+                "command_id": "rename-blank-actor",
+                "actor": " ",
+                "display_name": "A",
+            }),
+        )
+        .await;
+        assert_eq!(blank_actor.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(blank_actor).await["error"]["code"],
+            "invalid_worker_rename_command"
+        );
+
+        // Unknown worker.
+        let missing = post(
+            "/api/v1/workers/missing-worker/name".to_owned(),
+            serde_json::json!({
+                "command_id": "rename-missing",
+                "actor": "local-user",
+                "display_name": "A",
+            }),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response_json(missing).await["error"]["code"],
+            "worker_not_found"
+        );
+
+        // The name shows on existing Worker responses.
+        let project_id = project["id"].as_str().unwrap();
+        let fetched = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/projects/{project_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(fetched["orchestrator"]["display_name"], "BAR CDK");
+        let candidates = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/workers")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let listed = candidates["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["worker"]["id"] == worker_id.as_str())
+            .unwrap();
+        assert_eq!(listed["worker"]["display_name"], "BAR CDK");
     }
 
     #[allow(clippy::too_many_lines)]

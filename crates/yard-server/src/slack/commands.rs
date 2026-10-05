@@ -14,7 +14,7 @@ use yard_store::{AttentionRecords, AttentionRuntime, AttentionRuntimeRole};
 
 use super::{
     actions::AgentTarget,
-    detector::{AttentionEvent, Subject},
+    detector::{AttentionEvent, Subject, worker_label},
     message::{clean, subject_label},
     prompt::cap,
 };
@@ -176,7 +176,7 @@ fn unique(records: &AttentionRecords) -> Vec<&AttentionRuntime> {
 fn subject(runtime: &AttentionRuntime) -> Subject {
     match runtime.role {
         AttentionRuntimeRole::Assignment => Subject::Worker {
-            profile_name: runtime.profile_name.clone(),
+            profile_name: worker_label(runtime),
             objective: runtime.objective.clone(),
         },
         AttentionRuntimeRole::ProjectOrchestrator => Subject::ProjectOrchestrator,
@@ -511,9 +511,11 @@ pub(crate) mod tests {
     use yard_domain::{ObservedStatus, RuntimeObservationState, RuntimeProcessState};
     use yard_store::{AttentionRecords, AttentionRuntime, AttentionRuntimeRole};
 
+    use std::collections::HashSet;
+
     use super::{
         Command, ProjectName, blocked_agents, help_text, parse, project_status_text, review_text,
-        status_text,
+        runtime_title, status_text,
     };
     use crate::slack::actions::AgentTarget;
 
@@ -537,6 +539,7 @@ pub(crate) mod tests {
             node_name: (role == AttentionRuntimeRole::CoordinationNode)
                 .then(|| "Release".to_owned()),
             profile_name: Some("Claude".to_owned()),
+            display_name: None,
             status,
             process_state: RuntimeProcessState::Running,
             observation_state: RuntimeObservationState::Observed,
@@ -667,6 +670,74 @@ pub(crate) mod tests {
             Command::AmbiguousProject("Telemetry".to_owned())
         );
         assert!(help_text().contains("`blocked`"));
+    }
+
+    #[test]
+    fn named_workers_use_their_display_name_in_titles() {
+        let mut named = runtime(
+            AttentionRuntimeRole::Assignment,
+            "w-named",
+            Some(("p-token", "Telemetry")),
+            ObservedStatus::Done,
+        );
+        named.display_name = Some("BAR CDK".to_owned());
+        let title = runtime_title(&named);
+        assert!(title.starts_with("Telemetry · BAR CDK ("), "{title}");
+        assert!(!title.contains("Claude"), "{title}");
+        let unnamed = runtime(
+            AttentionRuntimeRole::Assignment,
+            "w-plain",
+            Some(("p-token", "Telemetry")),
+            ObservedStatus::Done,
+        );
+        assert!(runtime_title(&unnamed).starts_with("Telemetry · Claude ("));
+
+        let review = review_text(&AttentionRecords {
+            runtimes: vec![named.clone(), unnamed],
+            commands: Vec::new(),
+            visible_project_ids: std::iter::once("p-token".to_owned()).collect(),
+            visible_node_ids: HashSet::new(),
+        });
+        assert!(review.contains("• Telemetry · BAR CDK ("), "{review}");
+        assert!(review.contains("• Telemetry · Claude ("), "{review}");
+
+        named.status = ObservedStatus::Blocked;
+        let blocked = blocked_agents(&AttentionRecords {
+            runtimes: vec![named],
+            commands: Vec::new(),
+            visible_project_ids: std::iter::once("p-token".to_owned()).collect(),
+            visible_node_ids: HashSet::new(),
+        });
+        assert_eq!(blocked.len(), 1);
+        assert!(blocked[0].1.contains("BAR CDK"), "{:?}", blocked[0].1);
+    }
+
+    #[test]
+    fn named_worker_titles_cannot_inject_slack_formatting_links_or_mentions() {
+        let mut named = runtime(
+            AttentionRuntimeRole::Assignment,
+            "w-named",
+            Some(("p-token", "Telemetry")),
+            ObservedStatus::Blocked,
+        );
+        named.display_name = Some("*x* _y_ ~z~ `c` <!channel> https://a.b".to_owned());
+        let title = runtime_title(&named);
+        for forbidden in ['*', '_', '~', '`', '<', '>'] {
+            assert!(!title.contains(forbidden), "{forbidden:?} in {title}");
+        }
+        assert!(!title.contains("://"), "{title}");
+        assert!(title.contains("&lt;!channel&gt;"), "{title}");
+        let card = crate::slack::cards::prompt_card(
+            &title,
+            &crate::slack::prompt::ParsedScreen::Unparsed {
+                excerpt: "x".to_owned(),
+            },
+            &[],
+        );
+        let body = card.blocks[0]["text"]["text"].as_str().unwrap();
+        // Only the card's own bold markers remain.
+        assert!(body.starts_with(&format!("*{title}* is blocked")), "{body}");
+        assert_eq!(body.matches('*').count(), 2, "{body}");
     }
 
     #[test]

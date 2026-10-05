@@ -91,11 +91,22 @@ export function WorkerInterventions({
   const terminalId = runtime?.terminal_id
   const runtimeSession = runtime?.session
   const targetKey = agentWorkspaceKey(target)
+  const displayName = (
+    assignment?.worker ??
+    project?.orchestrator ??
+    yardOrchestrator?.worker ??
+    coordinationNode?.worker
+  )?.display_name
   const label =
     target.kind === 'coordination-node'
-      ? coordinationNode?.name ?? 'Workstream orchestrator'
+      ? workerDisplayLabel({
+          displayName,
+          profileName: coordinationNode?.name ?? 'Workstream orchestrator',
+          workerId,
+        })
       : workerDisplayLabel({
           assignmentRole: assignment?.role,
+          displayName,
           profileName: assignment?.profile_name,
           projectName: assignment
             ? projects?.find(

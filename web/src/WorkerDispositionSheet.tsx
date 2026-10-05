@@ -9,6 +9,7 @@ import {
 } from 'lucide-react'
 import type { Assignment } from './types'
 import { useModalDialog } from './useModalDialog'
+import { workerLabelWithDefault } from './workerDisplay'
 
 export type WorkerDispositionMode = 'end' | 'delete'
 export type WorkerDispositionChoice = 'complete' | 'cancel'
@@ -86,7 +87,13 @@ export function WorkerDispositionSheet({
             <CircleStop aria-hidden="true" size={19} />
           )}
           <span>
-            <strong>{assignment.profile_name}</strong>
+            <strong>
+              {workerLabelWithDefault({
+                displayName: assignment.worker.display_name,
+                profileName: assignment.profile_name,
+                workerId: assignment.worker.id,
+              })}
+            </strong>
             <small>{assignment.objective}</small>
           </span>
         </div>

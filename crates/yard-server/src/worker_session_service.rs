@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use tracing::warn;
-use yard_domain::{DeleteWorker, DeletedWorker, EndWorkerSession, EndedWorkerSession};
+use yard_domain::{
+    DeleteWorker, DeletedWorker, EndWorkerSession, EndedWorkerSession, RenameWorker, RenamedWorker,
+};
 use yard_store::{ProjectStoreError, YardStore};
 
 use crate::{allocation_service::RuntimeControl, runtime_cleanup_service::RuntimeCleanupService};
@@ -72,6 +74,25 @@ impl WorkerSessionService {
     ) -> Result<DeletedWorker, WorkerSessionServiceError> {
         self.store
             .delete_worker(worker_id, command)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Set or clear a worker's display name. Cosmetic only: the runtime is
+    /// untouched and the worker's optimistic version does not change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerSessionServiceError`] when the name is invalid, the
+    /// worker is unknown, the current name differs from the expected one, the
+    /// command id was reused with different input, or persistence fails.
+    pub async fn rename(
+        &self,
+        worker_id: &str,
+        command: RenameWorker,
+    ) -> Result<RenamedWorker, WorkerSessionServiceError> {
+        self.store
+            .rename_worker(worker_id, command)
             .await
             .map_err(Into::into)
     }

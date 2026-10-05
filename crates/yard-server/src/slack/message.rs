@@ -343,6 +343,25 @@ fn strip_url_credentials(word: &str) -> String {
     }
 }
 
+/// Neutralize Slack mrkdwn in a user-chosen worker name so it reads as plain
+/// text inside a `*bold*` title: the formatting characters `*`, `_`, `~` and
+/// the backtick become lookalikes and `://` is broken so Slack does not auto-link a URL.
+/// `<`, `>` and `&` are left to [`escape`].
+#[must_use]
+pub(crate) fn plain_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '*' => '\u{2217}',
+            '_' => '\u{FF3F}',
+            '~' => '\u{223C}',
+            '`' => '\u{02CB}',
+            other => other,
+        })
+        .collect::<String>()
+        .replace("://", ": //")
+}
+
 /// Slack mrkdwn escaping: `&`, `<` and `>` are the only control characters.
 pub(crate) fn escape(value: &str) -> String {
     value

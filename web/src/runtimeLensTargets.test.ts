@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import {
   groupRuntimeLensEntries,
   runtimeLensEntryKey,
+  runtimeLensEntryLabel,
 } from "./runtimeLensTargets"
 import type { AgentWorkspaceTarget } from "./AgentWorkspaceContext"
 import type { RuntimeInventory, RuntimeLensEntry } from "./types"
@@ -118,5 +119,21 @@ describe("runtime lens grouping", () => {
         .flatMap((group) => group.entries)
         .map(runtimeLensEntryKey),
     ).toEqual([runtimeLensEntryKey(unassigned), runtimeLensEntryKey(leftover)])
+  })
+})
+
+describe("runtimeLensEntryLabel", () => {
+  it("prefers the user-chosen worker name over the profile name", () => {
+    const linked = {
+      ...entry("linked", "linked_yard_worker", "worker-1"),
+      profile_name: "Generalist",
+    }
+    expect(runtimeLensEntryLabel(linked)).toBe("Generalist")
+    expect(runtimeLensEntryLabel({ ...linked, display_name: "BAR CDK" })).toBe(
+      "BAR CDK",
+    )
+    expect(runtimeLensEntryLabel({ ...linked, display_name: "  " })).toBe(
+      "Generalist",
+    )
   })
 })

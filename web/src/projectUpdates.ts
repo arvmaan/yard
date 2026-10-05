@@ -13,6 +13,7 @@ import type {
   WorkflowStatus,
   YardOrchestratorRoute,
 } from './types'
+import { workerDisplayLabel } from './workerDisplay'
 
 export type ProjectUpdateState =
   | 'in_progress'
@@ -266,7 +267,7 @@ export function projectUpdates(
           attentionAssignment.worker.runtime,
           inventory,
         )
-        durableNext = `Review ${attentionAssignment.profile_name} (${assignmentStatus}): ${attentionAssignment.objective}`
+        durableNext = `Review ${workerDisplayLabel({ displayName: attentionAssignment.worker.display_name, profileName: attentionAssignment.profile_name, workerId: attentionAssignment.worker.id })} (${assignmentStatus}): ${attentionAssignment.objective}`
       } else if (unresolvedBlocker) {
         durableNext = `Resolve completion blocker: ${unresolvedBlocker}`
       } else if (orchestratorNeedsAction) {
