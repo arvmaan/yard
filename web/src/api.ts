@@ -123,6 +123,8 @@ import type {
   YardOrchestratorRoutes,
   YardOrchestratorTerminalOutput,
   ProjectRelationships,
+  RenamedWorker,
+  RenameWorkerInput,
 } from './types'
 
 interface ApiErrorEnvelope {
@@ -133,6 +135,7 @@ interface ApiErrorEnvelope {
     failed_session_count?: unknown
     preview?: unknown
     reason?: string
+    current_display_name?: string | null
   }
 }
 
@@ -145,6 +148,8 @@ export class YardApiError extends Error {
   preview: unknown
   // Why a recoverable refusal happened (project_restore_unavailable).
   reason: string | null
+  // The worker's name now (worker_name_conflict); `undefined` when absent.
+  currentDisplayName: string | null | undefined
 
   constructor(
     code: string,
@@ -153,6 +158,7 @@ export class YardApiError extends Error {
     failedSessions: number | null = null,
     preview: unknown = null,
     reason: string | null = null,
+    currentDisplayName: string | null | undefined = undefined,
   ) {
     super(message)
     this.name = 'YardApiError'
@@ -161,6 +167,7 @@ export class YardApiError extends Error {
     this.failedSessions = failedSessions
     this.preview = preview
     this.reason = reason
+    this.currentDisplayName = currentDisplayName
   }
 }
 
@@ -234,6 +241,7 @@ async function requestJson<T>(
           : null,
         body.error?.preview ?? null,
         body.error?.reason ?? null,
+        body.error?.current_display_name,
       )
     }
 
@@ -1062,6 +1070,22 @@ export function endWorkerSession(
 ): Promise<EndedWorkerSession> {
   return requestJson(
     `/api/v1/workers/${encodeURIComponent(workerId)}/end-session`,
+    {
+      body: JSON.stringify(command),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal,
+    },
+  )
+}
+
+export function renameWorker(
+  workerId: string,
+  command: RenameWorkerInput,
+  signal?: AbortSignal,
+): Promise<RenamedWorker> {
+  return requestJson(
+    `/api/v1/workers/${encodeURIComponent(workerId)}/name`,
     {
       body: JSON.stringify(command),
       headers: { 'Content-Type': 'application/json' },

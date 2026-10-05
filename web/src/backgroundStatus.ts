@@ -8,6 +8,7 @@ import type {
   ProjectRestoreUnavailableReason,
   RestoredProject,
 } from './types'
+import { workerLabelWithDefault } from './workerDisplay'
 
 function count(value: number, noun: string) {
   return `${value} ${noun}${value === 1 ? '' : 's'}`
@@ -145,8 +146,18 @@ export function workstreamDispositionImpact(
 ) {
   const lines: string[] = []
   const worker = preview.worker
-  const workerName = worker?.profile_name
-    ? `Dedicated worker ${worker.profile_name}`
+  // Without a name or profile the sentence says "The dedicated worker"
+  // rather than a bare worker id.
+  const workerLabel =
+    worker && (worker.display_name?.trim() || worker.profile_name)
+    ? workerLabelWithDefault({
+        displayName: worker.display_name,
+        profileName: worker.profile_name,
+        workerId: worker.worker_id,
+      })
+    : ''
+  const workerName = workerLabel
+    ? `Dedicated worker ${workerLabel}`
     : 'The dedicated worker'
   if (worker?.will_end) {
     lines.push(

@@ -1,5 +1,8 @@
 export interface WorkerLabelSource {
   assignmentRole?: string | null
+  // The user-chosen worker name (`display_name`). It wins over every other
+  // source; blank or absent falls through to the default chain below.
+  displayName?: string | null
   observedDisplayProvider?: string | null
   observedName?: string | null
   observedProvider?: string | null
@@ -59,10 +62,35 @@ function workerIdPrefix(workerId: string, peerWorkerIds: string[]) {
   return workerId.slice(0, length)
 }
 
-export function workerDisplayLabel(
+/**
+ * The one label rule: a user-chosen name, when set, wins over the default
+ * label. Blank names fall through.
+ */
+export function labelWithDisplayName(
+  displayName: string | null | undefined,
+  defaultLabel: string,
+): string {
+  return clean(displayName) ?? defaultLabel
+}
+
+/**
+ * The default label as secondary text, only when a user-chosen name replaced
+ * it, so "BAR CDK" can still show that it is a Generalist.
+ */
+export function secondaryDefaultLabel(
+  displayName: string | null | undefined,
+  defaultLabel: string | null | undefined,
+): string | null {
+  const name = clean(displayName)
+  if (!name || !defaultLabel || defaultLabel === name) return null
+  return defaultLabel
+}
+
+/** The label the worker would have without a user-chosen name. */
+export function workerDefaultLabel(
   source: WorkerLabelSource,
   peerWorkerIds: string[] = [],
-) {
+): string {
   const role = clean(source.assignmentRole)
   const project = clean(source.projectName)
   if (role && project) return `${displayRole(role)} · ${project}`
@@ -77,4 +105,25 @@ export function workerDisplayLabel(
   if (observed) return observed
 
   return `Worker ${workerIdPrefix(source.workerId, peerWorkerIds)}`
+}
+
+export function workerDisplayLabel(
+  source: WorkerLabelSource,
+  peerWorkerIds: string[] = [],
+): string {
+  return labelWithDisplayName(
+    source.displayName,
+    workerDefaultLabel(source, peerWorkerIds),
+  )
+}
+
+/** "BAR CDK · Generalist" where one line has room for both. */
+export function workerLabelWithDefault(
+  source: WorkerLabelSource,
+  peerWorkerIds: string[] = [],
+): string {
+  const fallback = workerDefaultLabel(source, peerWorkerIds)
+  const label = labelWithDisplayName(source.displayName, fallback)
+  const secondary = secondaryDefaultLabel(source.displayName, fallback)
+  return secondary ? `${label} · ${secondary}` : label
 }

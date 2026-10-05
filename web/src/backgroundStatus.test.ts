@@ -243,6 +243,17 @@ describe('workstream disposition preview', () => {
     ).toEqual(['No dedicated worker is running.', 'No projects are attached.'])
   })
 
+  it('names the dedicated worker by its chosen name', () => {
+    const worker = workstreamPreview().worker!
+    expect(
+      workstreamDispositionImpact(
+        workstreamPreview({ worker: { ...worker, display_name: 'Docs lead' } }),
+      )[0],
+    ).toBe(
+      'Dedicated worker Docs lead · Codex orchestrator will be ended — its Herdr tab stays open until you close it.',
+    )
+  })
+
   it('only mentions a Herdr tab when the worker still has one', () => {
     const worker = workstreamPreview().worker!
     expect(

@@ -143,6 +143,11 @@ pub struct Worker {
     pub profile_version: Option<u64>,
     #[serde(default)]
     pub ownership_kind: WorkerOwnershipKind,
+    /// A user-chosen label (see [`crate::normalize_worker_display_name`]).
+    /// `None` means the worker shows its default profile or agent label.
+    /// Older payloads without the field still parse.
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub desired_state: WorkerDesiredState,
     pub runtime: Option<WorkerRuntimeBinding>,
     #[serde(with = "crate::serde_u64")]
@@ -447,6 +452,9 @@ pub struct ProjectDispositionAssignment {
     pub role: String,
     pub profile_name: String,
     pub worker_id: String,
+    /// The worker's user-chosen label, if any.
+    #[serde(default)]
+    pub worker_display_name: Option<String>,
     /// Whether the worker still has a bound Herdr runtime (its tab stays
     /// open after the archive until someone closes it).
     pub runtime_present: bool,

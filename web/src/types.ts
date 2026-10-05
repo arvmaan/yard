@@ -303,6 +303,7 @@ export interface RuntimeLensEntry {
   reason: string
   worker_id: string | null
   profile_name: string | null
+  display_name?: string | null
   availability: WorkerAvailability | null
   provider: string | null
   display_provider: string | null
@@ -363,6 +364,10 @@ export interface Worker {
   profile_id: string | null
   profile_version: string | null
   ownership_kind: WorkerOwnershipKind
+  // A user-chosen label; null or absent means the default label (profile,
+  // Herdr agent name, or role). Cosmetic only: renaming never changes
+  // `version`.
+  display_name?: string | null
   desired_state: 'running' | 'ended'
   runtime: WorkerRuntimeBinding | null
   version: string
@@ -559,6 +564,7 @@ export interface ProjectDispositionAssignment {
   role: string
   profile_name: string
   worker_id: string
+  worker_display_name?: string | null
   runtime_present: boolean
 }
 
@@ -1023,6 +1029,7 @@ export type CompletedRuntimeRetentionReason =
 export interface CompletedRuntimeCleanupCandidate {
   worker_id: string
   profile_name: string
+  display_name?: string | null
   project_id: string
   project_name: string
   assignment_id: string
@@ -1054,6 +1061,20 @@ export interface EndedWorkerSession {
   worker: Worker
   cleanup_pending: boolean
   replayed: boolean
+}
+
+export interface RenameWorkerInput {
+  command_id: string
+  actor: string
+  // The name the user saw when they started editing (compare-and-set).
+  expected_display_name: string | null
+  // null clears the name back to the default label.
+  display_name: string | null
+}
+
+export interface RenamedWorker {
+  command_id: string
+  worker: Worker
 }
 
 export interface DeleteWorkerInput {
@@ -1449,6 +1470,7 @@ export interface CoordinationNodeDispositionWorker {
   worker_id: string
   worker_version: string
   profile_name: string | null
+  display_name?: string | null
   runtime_present: boolean
   will_end: boolean
 }

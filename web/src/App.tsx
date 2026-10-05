@@ -61,6 +61,7 @@ import {
   deleteWorker,
   endWorkerSession,
   fetchCompletedRuntimeCleanupPreview,
+  renameWorker,
   fetchAutomation,
   fetchAutomationRuns,
   fetchAutomations,
@@ -208,7 +209,10 @@ import {
   type ProjectOrchestratorEligibilityReason,
 } from './projectOrchestratorEligibility'
 import {
+  labelWithDisplayName,
+  workerDefaultLabel,
   workerDisplayLabel,
+  workerLabelWithDefault,
   type WorkerLabelSource,
 } from './workerDisplay'
 import {
@@ -314,7 +318,17 @@ import type {
   WorkspaceObservation,
   YardOrchestrator,
   YardOrchestratorRoute,
+  Worker,
 } from './types'
+import {
+  workerDisplayName,
+  withRenamedDisplayName,
+  type NamedWorker,
+} from './workerNames'
+import {
+  WorkerNameControl,
+  type RenameWorkerHandler,
+} from './WorkerNameControl'
 import './App.css'
 
 const INVENTORY_REFRESH_INTERVAL_MS = 1_000
@@ -489,9 +503,11 @@ function workerLabel(
   worker: ObservedWorker,
   inventory?: RuntimeInventory | null,
   peerWorkerIds: string[] = [],
+  displayName?: string | null,
 ) {
   return workerDisplayLabel(
     {
+      displayName,
       observedDisplayProvider: worker.display_provider,
       observedName: worker.name,
       observedProvider: worker.provider,
@@ -509,6 +525,7 @@ function workerLabel(
 
 function candidateLabel(candidate: WorkerCandidate) {
   return workerDisplayLabel({
+    displayName: candidate.worker.display_name,
     profileName: candidate.profile_name,
     workerId: candidate.worker.id,
   })
@@ -666,6 +683,7 @@ function workerLabelSource(
 
   return {
     assignmentRole: assignment?.role,
+    displayName: candidate.worker.display_name,
     observedDisplayProvider: observed?.display_provider,
     observedName: observed?.name,
     observedProvider: observed?.provider,
@@ -1014,11 +1032,12 @@ function WorkerCandidateInspector({
   completedAssignment,
   hideOnly,
   inventory,
-  label,
+  defaultLabel,
   onAllocate,
   onDelete,
   onEndSession,
   onRefresh,
+  onRename,
   projects,
   snapshotCurrent,
 }: {
@@ -1028,11 +1047,13 @@ function WorkerCandidateInspector({
   completedAssignment: Assignment | undefined
   hideOnly: boolean
   inventory: RuntimeInventory | null
-  label: string
+  // The label without the user-chosen name (rename field placeholder).
+  defaultLabel: string
   onAllocate: (project: Project) => void
   onDelete: () => void
   onEndSession: () => void
   onRefresh: () => void
+  onRename?: RenameWorkerHandler
   projects: Project[]
   snapshotCurrent: boolean
 }) {
@@ -1074,7 +1095,11 @@ function WorkerCandidateInspector({
           <p className="eyebrow">
             {candidate.default_role ?? 'Worker'}
           </p>
-          <h2>{label}</h2>
+          <WorkerNameControl
+            defaultLabel={defaultLabel}
+            onRename={onRename}
+            worker={candidate.worker}
+          />
           <span
             className="availability-badge"
             data-availability={candidate.availability}
@@ -1256,11 +1281,13 @@ function WorkerCandidateInspector({
 function YardOrchestratorInspector({
   busy,
   inventory,
+  defaultLabel,
   label,
   onCoordinationChange,
   onProvision,
   onRecover,
   onRefresh,
+  onRenameWorker,
   orchestrator,
   profiles,
   projects,
@@ -1270,11 +1297,14 @@ function YardOrchestratorInspector({
 }: {
   busy: boolean
   inventory: RuntimeInventory | null
+  // The label without the user-chosen name (rename field placeholder).
+  defaultLabel: string
   label: string
   onCoordinationChange: (route: YardOrchestratorRoute) => void
   onProvision: (profile: WorkerProfile) => void
   onRecover: () => void
   onRefresh: () => void
+  onRenameWorker?: RenameWorkerHandler
   orchestrator: YardOrchestrator
   profiles: WorkerProfile[]
   projects: Project[]
@@ -1336,7 +1366,15 @@ function YardOrchestratorInspector({
         </span>
         <div>
           <p className="eyebrow">Portfolio control</p>
-          <h2>{label}</h2>
+          {worker ? (
+            <WorkerNameControl
+              defaultLabel={defaultLabel}
+              onRename={onRenameWorker}
+              worker={worker}
+            />
+          ) : (
+            <h2>{label}</h2>
+          )}
         </div>
       </div>
       {worker ? (
@@ -2372,20 +2410,23 @@ function AssignmentInspector({
   assignment,
   controls,
   inventory,
-  label,
+  defaultLabel,
   onDelete,
   onEndSession,
   onRefresh,
   snapshotCurrent,
+  onRenameWorker,
 }: {
   assignment: Assignment
   controls: AssignmentDispositionControls
   inventory: RuntimeInventory | null
-  label: string
+  // The label without the user-chosen name (rename field placeholder).
+  defaultLabel: string
   onDelete?: () => void
   onEndSession?: () => void
   onRefresh: () => void
   snapshotCurrent: boolean
+  onRenameWorker?: RenameWorkerHandler
 }) {
   const [selectedArtifact, setSelectedArtifact] = useState<Artifact | null>(null)
   const artifactTrigger = useRef<HTMLButtonElement | null>(null)
@@ -2407,7 +2448,11 @@ function AssignmentInspector({
         </span>
         <div>
           <p className="eyebrow">Assignment</p>
-          <h2>{label}</h2>
+          <WorkerNameControl
+            defaultLabel={defaultLabel}
+            onRename={onRenameWorker}
+            worker={assignment.worker}
+          />
         </div>
       </div>
       <span className="runtime-badge" data-lifecycle={assignment.lifecycle}>
@@ -2819,12 +2864,14 @@ function WorkspaceInspector({
   busy,
   onCreate,
   profiles,
+  workerNames = {},
   workers,
   workspace,
 }: {
   busy: boolean
   onCreate: (details: ProjectCreationDetails) => Promise<void>
   profiles: WorkerProfile[]
+  workerNames?: Record<string, string>
   workers: ObservedWorker[]
   workspace: WorkspaceObservation
 }) {
@@ -2951,8 +2998,9 @@ function WorkspaceInspector({
             >
               {workers.map((worker) => (
                 <option key={worker.runtime_id} value={worker.runtime_id}>
-                  {workerDisplayLabel(
+                  {workerLabelWithDefault(
                     {
+                      displayName: workerNames[worker.runtime_id],
                       observedDisplayProvider: worker.display_provider,
                       observedName: worker.name,
                       observedProvider: worker.provider,
@@ -3572,6 +3620,79 @@ function App() {
     return result.workers
   }, [])
 
+  // A rename changes only the label: every copy of the worker Yard holds
+  // (candidates, assignments, orchestrators, workstreams) takes the server's
+  // answer so each view shows the same name.
+  const applyRenamedWorker = useCallback((renamed: NamedWorker & { id: string }) => {
+    const patch = <T extends Worker>(worker: T): T =>
+      withRenamedDisplayName(worker, renamed)
+    setWorkerCandidates((current) =>
+      current.map((candidate) =>
+        candidate.worker.id === renamed.id
+          ? { ...candidate, worker: patch(candidate.worker) }
+          : candidate,
+      ),
+    )
+    setAssignments((current) =>
+      current.map((assignment) =>
+        assignment.worker.id === renamed.id
+          ? { ...assignment, worker: patch(assignment.worker) }
+          : assignment,
+      ),
+    )
+    setProjects((current) =>
+      current.map((project) =>
+        project.orchestrator.id === renamed.id
+          ? { ...project, orchestrator: patch(project.orchestrator) }
+          : project,
+      ),
+    )
+    setYardOrchestrator((current) =>
+      current?.worker?.id === renamed.id
+        ? { ...current, worker: patch(current.worker) }
+        : current,
+    )
+    setCoordinationNodes((current) =>
+      current.map((node) =>
+        node.worker?.id === renamed.id
+          ? { ...node, worker: patch(node.worker) }
+          : node,
+      ),
+    )
+  }, [])
+
+  const renameWorkerLabel = useCallback<RenameWorkerHandler>(
+    async (worker, displayName, expectedDisplayName) => {
+      try {
+        const result = await renameWorker(worker.id, {
+          actor: 'local-user',
+          command_id: crypto.randomUUID(),
+          display_name: displayName,
+          expected_display_name: expectedDisplayName,
+        })
+        applyRenamedWorker(result.worker)
+        return result.worker
+      } catch (caught) {
+        if (
+          caught instanceof YardApiError &&
+          caught.code === 'worker_name_conflict'
+        ) {
+          // Show the name someone else chose rather than the stale one,
+          // in every view, so a retry sends the current name.
+          if (caught.currentDisplayName !== undefined) {
+            applyRenamedWorker({
+              display_name: caught.currentDisplayName,
+              id: worker.id,
+            })
+          }
+          void loadWorkers().catch(() => undefined)
+        }
+        throw caught
+      }
+    },
+    [applyRenamedWorker, loadWorkers],
+  )
+
   const loadInventory = useCallback(
     async (
       session: string,
@@ -4087,12 +4208,15 @@ function App() {
     }
   }, [projectStatusTargets, yardOrchestratorRoutes])
 
-  const workerLabels = useMemo(() => {
+  // Each durable worker's label (its user-chosen name first) and the label
+  // it would have without a name (shown beside the name and in the rename
+  // field), both through the one `workerDisplay` rule.
+  const [workerLabels, workerDefaultLabels, workerListLabels] = useMemo(() => {
     const peerWorkerIds = workerCandidates.map(({ worker }) => worker.id)
-    return Object.fromEntries(
-      workerCandidates.map((candidate) => [
-        candidate.worker.id,
-        workerDisplayLabel(
+    const sources = workerCandidates.map(
+      (candidate) =>
+        [
+          candidate.worker.id,
           workerLabelSource(
             candidate,
             assignments,
@@ -4100,10 +4224,33 @@ function App() {
             inventory,
             inventoryCurrent,
           ),
-          peerWorkerIds,
-        ),
-      ]),
+        ] as const,
     )
+    return [
+      Object.fromEntries(
+        sources.map(([id, source]) => [
+          id,
+          workerDisplayLabel(source, peerWorkerIds),
+        ]),
+      ),
+      Object.fromEntries(
+        sources.map(([id, source]) => [
+          id,
+          workerDefaultLabel(source, peerWorkerIds),
+        ]),
+      ),
+      // "BAR CDK · Generalist" in the worker list, where a row has room.
+      Object.fromEntries(
+        sources.map(([id, source]) => [
+          id,
+          workerLabelWithDefault(source, peerWorkerIds),
+        ]),
+      ),
+    ] as [
+      Record<string, string>,
+      Record<string, string>,
+      Record<string, string>,
+    ]
   }, [
     assignments,
     inventory,
@@ -4217,6 +4364,21 @@ function App() {
                 ],
               ]
             : []
+        }),
+      ),
+    [inventory, workerCandidates],
+  )
+  const workerDisplayNameByRuntimeId = useMemo(
+    () =>
+      Object.fromEntries(
+        (inventory?.workers ?? []).flatMap((worker) => {
+          const candidate = findCandidateForObservedWorker(
+            workerCandidates,
+            inventory,
+            worker,
+          )
+          const name = workerDisplayName(candidate?.worker)
+          return name ? [[worker.runtime_id, name]] : []
         }),
       ),
     [inventory, workerCandidates],
@@ -4417,6 +4579,7 @@ function App() {
             label:
               workerLabels[assignment.worker.id] ??
               workerDisplayLabel({
+               displayName: assignment.worker.display_name,
                 assignmentRole: assignment.role,
                 profileName: assignment.profile_name,
                 projectName: project?.name,
@@ -4445,6 +4608,7 @@ function App() {
           label:
             workerLabels[project.orchestrator.id] ??
             workerDisplayLabel({
+             displayName: project.orchestrator.display_name,
               projectOrchestratorName: project.name,
               workerId: project.orchestrator.id,
             }),
@@ -4625,6 +4789,7 @@ function App() {
         label:
           workerLabels[yardWorker.id] ??
           workerDisplayLabel({
+           displayName: yardWorker.display_name,
             projectOrchestratorName: 'Yard',
             workerId: yardWorker.id,
           }),
@@ -4662,7 +4827,7 @@ function App() {
         contextLabel:
           attachedProjects.join(', ') || 'Yard workstream',
         key: `coordination-node:${node.id}`,
-        label: node.name,
+        label: labelWithDisplayName(worker.display_name, node.name),
         role: 'workstream',
         roleLabel: 'Workstream',
         session: runtime.session,
@@ -4696,6 +4861,7 @@ function App() {
         label:
           workerLabels[project.orchestrator.id] ??
           workerDisplayLabel({
+           displayName: project.orchestrator.display_name,
             projectOrchestratorName: project.name,
             workerId: project.orchestrator.id,
           }),
@@ -4733,6 +4899,7 @@ function App() {
         label:
           workerLabels[assignment.worker.id] ??
           workerDisplayLabel({
+           displayName: assignment.worker.display_name,
             assignmentRole: assignment.role,
             profileName: assignment.profile_name,
             projectName: projectNames.get(assignment.project_id),
@@ -8022,8 +8189,8 @@ function App() {
                       />
                     </span>
                     <span>
-                      <strong title={workerLabels[candidate.worker.id]}>
-                        {workerLabels[candidate.worker.id]}
+                      <strong title={workerListLabels[candidate.worker.id]}>
+                        {workerListLabels[candidate.worker.id]}
                       </strong>
                       <small>
                         {AVAILABILITY_LABELS[candidate.availability]}
@@ -8108,6 +8275,7 @@ function App() {
         <main className="canvas-stage">
         <RuntimeCanvas
           allocationPayloadByRuntimeId={allocationPayloadByRuntimeId}
+          workerDisplayNameByRuntimeId={workerDisplayNameByRuntimeId}
           assignments={assignments}
           automations={automations}
           coordinationNodes={coordinationNodes}
@@ -8303,10 +8471,20 @@ function App() {
           <YardOrchestratorInspector
             busy={yardOrchestratorBusy}
             inventory={inventory}
+            defaultLabel={
+              selectedYardOrchestrator.worker
+                ? workerDefaultLabels[selectedYardOrchestrator.worker.id] ??
+                  workerDefaultLabel({
+                    projectOrchestratorName: 'Yard',
+                    workerId: selectedYardOrchestrator.worker.id,
+                  })
+                : 'Yard orchestrator'
+            }
             label={
               selectedYardOrchestrator.worker
                 ? workerLabels[selectedYardOrchestrator.worker.id] ??
                   workerDisplayLabel({
+                   displayName: selectedYardOrchestrator.worker.display_name,
                     projectOrchestratorName: 'Yard',
                     workerId: selectedYardOrchestrator.worker.id,
                   })
@@ -8316,6 +8494,7 @@ function App() {
             onProvision={provisionCentralOrchestrator}
             onRecover={() => void recoverCentralOrchestrator()}
             onRefresh={() => void refresh()}
+            onRenameWorker={renameWorkerLabel}
             orchestrator={selectedYardOrchestrator}
             profiles={profiles}
             projects={projects}
@@ -8373,6 +8552,7 @@ function App() {
             label={
               workerLabels[selectedProjectOrchestrator.orchestrator.id] ??
               workerDisplayLabel({
+                displayName: selectedProjectOrchestrator.orchestrator.display_name,
                 projectOrchestratorName: selectedProjectOrchestrator.name,
                 workerId: selectedProjectOrchestrator.orchestrator.id,
               })
@@ -8429,6 +8609,7 @@ function App() {
             orchestratorLabel={
               workerLabels[selectedProject.orchestrator.id] ??
               workerDisplayLabel({
+                displayName: selectedProject.orchestrator.display_name,
                 projectOrchestratorName: selectedProject.name,
                 workerId: selectedProject.orchestrator.id,
               })
@@ -8460,9 +8641,9 @@ function App() {
           <AssignmentInspector
             assignment={selectedAssignment}
             inventory={inventory}
-            label={
-              workerLabels[selectedAssignment.worker.id] ??
-              workerDisplayLabel({
+            defaultLabel={
+              workerDefaultLabels[selectedAssignment.worker.id] ??
+              workerDefaultLabel({
                 assignmentRole: selectedAssignment.role,
                 profileName: selectedAssignment.profile_name,
                 projectName: projects.find(
@@ -8471,6 +8652,7 @@ function App() {
                 workerId: selectedAssignment.worker.id,
               })
             }
+            onRenameWorker={renameWorkerLabel}
             onDelete={
               selectedAssignmentCandidate &&
               canDeleteCandidate(selectedAssignmentCandidate)
@@ -8511,7 +8693,7 @@ function App() {
             completedAssignment={selectedCandidateCompletion}
             hideOnly={selectedWorkerAttentionState === 'stale'}
             inventory={inventory}
-            label={workerLabels[selectedWorkerCandidate.worker.id]}
+            defaultLabel={workerDefaultLabels[selectedWorkerCandidate.worker.id]}
             onAllocate={(project) =>
               proposeAllocation(
                 { kind: 'worker', id: selectedWorkerCandidate.worker.id },
@@ -8528,6 +8710,7 @@ function App() {
               )
             }
             onRefresh={() => void refresh()}
+            onRename={renameWorkerLabel}
             projects={projects}
             snapshotCurrent={inventoryCurrent}
           />
@@ -8537,6 +8720,7 @@ function App() {
               selectedObservedWorker,
               inventory,
               visibleWorkers.map((worker) => worker.runtime_id),
+              workerDisplayNameByRuntimeId[selectedObservedWorker.runtime_id],
             )}
             worker={selectedObservedWorker}
           />
@@ -8550,6 +8734,7 @@ function App() {
               createWorkspaceProject(selectedWorkspace, details)
             }
             profiles={profiles}
+            workerNames={workerDisplayNameByRuntimeId}
             workers={selectedWorkspaceWorkers}
             workspace={selectedWorkspace}
           />

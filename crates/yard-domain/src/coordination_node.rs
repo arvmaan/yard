@@ -282,6 +282,9 @@ pub struct CoordinationNodeDispositionWorker {
     #[serde(with = "crate::serde_u64")]
     pub worker_version: u64,
     pub profile_name: Option<String>,
+    /// The worker's user-chosen label, if any.
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub runtime_present: bool,
     pub will_end: bool,
 }

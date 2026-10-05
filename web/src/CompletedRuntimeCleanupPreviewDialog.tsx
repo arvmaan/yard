@@ -5,6 +5,7 @@ import type {
   CompletedRuntimeRetentionReason,
 } from './types'
 import { useModalDialog } from './useModalDialog'
+import { workerLabelWithDefault } from './workerDisplay'
 
 interface CompletedRuntimeCleanupPreviewDialogProps {
   error: string | null
@@ -90,7 +91,14 @@ export function CompletedRuntimeCleanupPreviewDialog({
               <ul>
                 {preview.candidates.map((candidate) => (
                   <li key={candidate.assignment_id}>
-                    <strong>{candidate.profile_name}</strong> —{' '}
+                    <strong>
+                      {workerLabelWithDefault({
+                        displayName: candidate.display_name,
+                        profileName: candidate.profile_name,
+                        workerId: candidate.worker_id,
+                      })}
+                    </strong>{' '}
+                    —{' '}
                     {candidate.project_name} / {candidate.role}
                     <br />
                     <small>

@@ -485,6 +485,16 @@ fn automatic_turn(runtime: &AttentionRuntime, turn_after_quiet_since: Option<u64
             })
 }
 
+/// The worker's title name: its user-chosen display name (with Slack mrkdwn
+/// neutralized) when set, else its profile name.
+pub(crate) fn worker_label(runtime: &AttentionRuntime) -> Option<String> {
+    runtime
+        .display_name
+        .as_deref()
+        .map(super::message::plain_name)
+        .or_else(|| runtime.profile_name.clone())
+}
+
 fn runtime_event(
     runtime: &AttentionRuntime,
     kind: AttentionKind,
@@ -494,7 +504,7 @@ fn runtime_event(
     let (subject, view_target) = match runtime.role {
         AttentionRuntimeRole::Assignment => (
             Subject::Worker {
-                profile_name: runtime.profile_name.clone(),
+                profile_name: worker_label(runtime),
                 objective: runtime.objective.clone(),
             },
             runtime.assignment_id.clone().map(ViewTarget::Assignment),
@@ -581,7 +591,9 @@ mod tests {
         AttentionRuntimeRole,
     };
 
-    use super::{AttentionKind, COMMAND_LOOKBACK_MS, Detector, DetectorTiming, Subject};
+    use super::{
+        AttentionKind, COMMAND_LOOKBACK_MS, Detector, DetectorTiming, Subject, runtime_event,
+    };
     use crate::slack::presence::ViewTarget;
 
     const SETTLE: Duration = Duration::from_secs(15);
@@ -605,6 +617,7 @@ mod tests {
             node_id: None,
             node_name: None,
             profile_name: Some("Implementer".to_owned()),
+            display_name: None,
             status,
             process_state: RuntimeProcessState::Running,
             observation_state: RuntimeObservationState::Observed,
@@ -656,6 +669,33 @@ mod tests {
             );
         }
         emitted
+    }
+
+    #[test]
+    fn blocked_events_title_a_named_worker_by_its_display_name() {
+        let mut named = worker(ObservedStatus::Blocked, 2);
+        named.display_name = Some("BAR CDK".to_owned());
+        let event = runtime_event(&named, AttentionKind::Blocked, 0, Instant::now());
+        assert_eq!(
+            event.subject,
+            Subject::Worker {
+                profile_name: Some("BAR CDK".to_owned()),
+                objective: Some("Ship it".to_owned()),
+            }
+        );
+        let plain = runtime_event(
+            &worker(ObservedStatus::Blocked, 2),
+            AttentionKind::Blocked,
+            0,
+            Instant::now(),
+        );
+        assert_eq!(
+            plain.subject,
+            Subject::Worker {
+                profile_name: Some("Implementer".to_owned()),
+                objective: Some("Ship it".to_owned()),
+            }
+        );
     }
 
     #[test]

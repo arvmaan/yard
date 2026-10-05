@@ -112,6 +112,8 @@ import type { ThemeDefinition } from './theme'
 import type { MapVisualMode } from './mapVisualMode'
 import { workerDisplayLabel } from './workerDisplay'
 
+const NO_WORKER_NAMES: Record<string, string> = {}
+
 export type CanvasSelection =
   | { kind: 'yard-orchestrator' }
   | { kind: 'automation'; id: string }
@@ -136,6 +138,8 @@ export type CanvasAgentTarget =
 
 interface RuntimeCanvasProps {
   allocationPayloadByRuntimeId: Record<string, AllocationDragPayload>
+  // User-chosen names of durable workers shown as observed Herdr agents.
+  workerDisplayNameByRuntimeId?: Record<string, string>
   assignments: Assignment[]
   automations: Automation[]
   coordinationNodes: CoordinationNode[]
@@ -1122,8 +1126,14 @@ function YardOrchestratorMarker({
           />
         </span>
         <span className="yard-orchestrator-marker__label">
-          <strong>{label}</strong>
-          <small>{configured ? 'Portfolio control' : 'Configure'}</small>
+          <strong title={label}>{label}</strong>
+          <small>
+            {!configured
+              ? 'Configure'
+              : worker?.display_name?.trim()
+                ? 'Yard orchestrator'
+                : 'Portfolio control'}
+          </small>
         </span>
       </div>
     </div>
@@ -1838,6 +1848,7 @@ function layoutAgentTrees(
 
 function buildNodes(
   allocationPayloadByRuntimeId: Record<string, AllocationDragPayload>,
+  workerDisplayNameByRuntimeId: Record<string, string>,
   assignments: Assignment[],
   automations: Automation[],
   coordinationNodes: CoordinationNode[],
@@ -1864,6 +1875,8 @@ function buildNodes(
   const observedWorkerLabel = (worker: ObservedWorker) =>
     workerDisplayLabel(
       {
+        // The name of the durable worker bound to this agent, if any.
+        displayName: workerDisplayNameByRuntimeId[worker.runtime_id],
         observedDisplayProvider: worker.display_provider,
         observedName: worker.name,
         observedProvider: worker.provider,
@@ -2082,6 +2095,7 @@ function buildNodes(
     const orchestratorLabel =
       workerLabels[project.orchestrator.id] ??
       workerDisplayLabel({
+        displayName: project.orchestrator.display_name,
         projectOrchestratorName: project.name,
         workerId: project.orchestrator.id,
       })
@@ -2158,6 +2172,7 @@ function buildNodes(
         const label =
           workerLabels[assignment.worker.id] ??
           workerDisplayLabel({
+            displayName: assignment.worker.display_name,
             assignmentRole: assignment.role,
             profileName: assignment.profile_name,
             projectName: project.name,
@@ -2505,6 +2520,7 @@ function buildNodes(
       const label = yardWorker
         ? workerLabels[yardWorker.id] ??
           workerDisplayLabel({
+            displayName: yardWorker.display_name,
             projectOrchestratorName: 'Yard',
             workerId: yardWorker.id,
           })
@@ -2607,6 +2623,7 @@ function buildNodes(
     const label = worker
       ? workerLabels[worker.id] ??
         workerDisplayLabel({
+          displayName: worker.display_name,
           projectOrchestratorName: 'Yard',
           workerId: worker.id,
         })
@@ -2718,6 +2735,7 @@ function buildNodes(
 
 export function RuntimeCanvas({
   allocationPayloadByRuntimeId,
+  workerDisplayNameByRuntimeId = NO_WORKER_NAMES,
   assignments,
   automations,
   coordinationNodes,
@@ -3324,7 +3342,7 @@ export function RuntimeCanvas({
             reconnectable: false,
             focusable: false,
             className: 'allocation-edge',
-            ariaLabel: `${project.name} orchestrator coordinates ${assignment.profile_name}`,
+            ariaLabel: `${project.name} orchestrator coordinates ${workerDisplayLabel({ displayName: assignment.worker.display_name, profileName: assignment.profile_name, workerId: assignment.worker.id })}`,
           })),
       )
       const childEdges = nodes.flatMap((node): Edge[] => {
@@ -3883,6 +3901,7 @@ export function RuntimeCanvas({
       )
       return buildNodes(
         allocationPayloadByRuntimeId,
+        workerDisplayNameByRuntimeId,
         assignments,
         automations,
         coordinationNodes,
@@ -3921,6 +3940,7 @@ export function RuntimeCanvas({
   }, [
     allocationTargetId,
     allocationPayloadByRuntimeId,
+    workerDisplayNameByRuntimeId,
     assignments,
     automations,
     coordinationNodes,

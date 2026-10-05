@@ -2,6 +2,7 @@ import { useRef } from 'react'
 import { CircleAlert, CircleStop, LoaderCircle, X } from 'lucide-react'
 import type { WorkerCandidate } from './types'
 import { useModalDialog } from './useModalDialog'
+import { workerLabelWithDefault } from './workerDisplay'
 
 interface EndWorkerSessionDialogProps {
   busy: boolean
@@ -12,10 +13,11 @@ interface EndWorkerSessionDialogProps {
 }
 
 function candidateLabel(candidate: WorkerCandidate) {
-  return (
-    candidate.profile_name ??
-    `Worker ${candidate.worker.id.slice(0, 8)}`
-  )
+  return workerLabelWithDefault({
+    displayName: candidate.worker.display_name,
+    profileName: candidate.profile_name,
+    workerId: candidate.worker.id,
+  })
 }
 
 export function EndWorkerSessionDialog({

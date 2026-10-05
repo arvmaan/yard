@@ -1561,6 +1561,7 @@ pub(super) async fn disposition_preview(
                         worker_id: worker.id.clone(),
                         worker_version: worker.version,
                         profile_name,
+                        display_name: worker.display_name.clone(),
                         runtime_present: worker.runtime.is_some(),
                         will_end: worker.desired_state == WorkerDesiredState::Running,
                     })

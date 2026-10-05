@@ -9,6 +9,7 @@ import {
 } from 'lucide-react'
 import type { ArtifactKind, Assignment } from './types'
 import { useModalDialog } from './useModalDialog'
+import { workerLabelWithDefault } from './workerDisplay'
 
 const MAX_ARTIFACT_BYTES = 1_048_576
 const MAX_ARTIFACTS = 64
@@ -142,7 +143,13 @@ export function CompletionDialog({
           </button>
         </header>
         <div className="completion-context">
-          <strong>{assignment.profile_name}</strong>
+          <strong>
+            {workerLabelWithDefault({
+              displayName: assignment.worker.display_name,
+              profileName: assignment.profile_name,
+              workerId: assignment.worker.id,
+            })}
+          </strong>
           <span>{assignment.role}</span>
         </div>
         <form className="dialog-form" onSubmit={submit}>

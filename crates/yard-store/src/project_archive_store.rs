@@ -103,6 +103,7 @@ fn disposition_assignment(
         objective: assignment.objective,
         role: assignment.role,
         profile_name: assignment.profile_name,
+        worker_display_name: assignment.worker.display_name.clone(),
         worker_id: assignment.worker.id,
         runtime_present: assignment.worker.runtime.is_some(),
     })

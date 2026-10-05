@@ -162,8 +162,9 @@ pub use transcript::{
 pub use worker::{
     CompletedRuntimeCleanupCandidate, CompletedRuntimeCleanupPreview,
     CompletedRuntimeRetentionReason, DeleteWorker, DeletedWorker, EndWorkerSession,
-    EndedWorkerSession, WorkerAvailability, WorkerCandidate, WorkerCandidates,
-    WorkerSessionValidationError,
+    EndedWorkerSession, MAX_WORKER_DISPLAY_NAME_CHARS, RenameWorker, RenamedWorker,
+    WorkerAvailability, WorkerCandidate, WorkerCandidates, WorkerNameValidationError,
+    WorkerSessionValidationError, normalize_worker_display_name,
 };
 pub use worker_cleanup::{
     CancelWorkerCleanupRun, CleanupAdvisorArtifact, CleanupAdvisorRecommendation,
