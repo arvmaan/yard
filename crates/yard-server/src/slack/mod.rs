@@ -14,24 +14,34 @@
 //! ([`secret`]) and is held only in memory.
 
 pub mod actions;
+pub mod ask;
 pub mod audit;
+pub mod blocks;
 pub mod cards;
 pub mod client;
 pub mod commands;
 pub mod console;
+pub mod controls;
 pub mod detector;
+pub mod digest;
+pub mod held;
 pub mod inbound;
 pub mod message;
 pub mod outbox;
+pub mod policy;
 pub mod presence;
 pub mod prompt;
+pub mod quiet;
 pub mod relay;
 pub mod secret;
 pub(crate) mod socket;
 pub mod threads;
+pub mod views;
 
 mod hub;
 
+#[cfg(test)]
+mod quiet_tests;
 #[cfg(test)]
 mod socket_tests;
 #[cfg(test)]
@@ -53,6 +63,7 @@ use client::{SlackApi, SlackError, SlackIdentity};
 use detector::{Detector, DetectorTiming};
 use message::{OutgoingMessage, batch_message, test_message};
 use outbox::{Outbox, ThreadKey};
+use policy::{Policy, QuietParts};
 use presence::ViewerPresence;
 use secret::{BotToken, SecretError, SecretSource};
 use threads::ThreadStore;
@@ -127,6 +138,9 @@ pub struct SlackIntegrationStatus {
     pub restart_required: bool,
     /// Inbound Socket Mode (phase 2).
     pub inbound: hub::InboundStatusView,
+    /// Quiet hours, held notifications and mute (enabled only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quiet: Option<policy::QuietStatusView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -153,6 +167,7 @@ struct Inner {
     status: Mutex<StatusState>,
     detector: Mutex<Detector>,
     outbox: Mutex<Outbox>,
+    policy: Mutex<Policy>,
     delivery: tokio::sync::Mutex<Delivery>,
     logs: Mutex<LogThrottle>,
     store_failures: Mutex<u32>,
@@ -224,6 +239,8 @@ pub(crate) struct NotifierParts {
     pub timing: DetectorTiming,
     pub min_interval: Duration,
     pub inbound: hub::InboundParts,
+    /// Quiet hours, digests and mute ([`policy`]).
+    pub quiet: QuietParts,
 }
 
 impl SlackNotifier {
@@ -272,6 +289,12 @@ impl SlackNotifier {
             source
         });
         let inbound = hub::InboundState::new(settings.as_ref(), &parts);
+        let mut quiet = parts.quiet;
+        if settings.is_none() {
+            // Nothing is sent, so nothing is held on disk.
+            quiet.held_file = None;
+            quiet.preferences_file = None;
+        }
         let delivery = Delivery {
             api: parts.api,
             secrets,
@@ -299,6 +322,7 @@ impl SlackNotifier {
                 status: Mutex::default(),
                 detector: Mutex::new(Detector::new(parts.timing, unix_ms())),
                 outbox: Mutex::new(Outbox::with_interval(parts.min_interval)),
+                policy: Mutex::new(Policy::new(quiet)),
                 delivery: tokio::sync::Mutex::new(delivery),
                 logs: Mutex::default(),
                 store_failures: Mutex::new(0),
@@ -332,6 +356,7 @@ impl SlackNotifier {
                 last_sent_at: None,
                 restart_required: true,
                 inbound: hub::InboundStatusView::off(),
+                quiet: None,
             },
             SlackConfig::Misconfigured(reason) => SlackIntegrationStatus {
                 enabled: true,
@@ -341,6 +366,7 @@ impl SlackNotifier {
                 last_sent_at: None,
                 restart_required: true,
                 inbound: hub::InboundStatusView::off(),
+                quiet: None,
             },
             SlackConfig::Enabled(_) => {
                 let state = lock(&self.inner.status);
@@ -352,6 +378,7 @@ impl SlackNotifier {
                     last_sent_at: state.last_sent_at,
                     restart_required: false,
                     inbound: self.inbound_status(),
+                    quiet: Some(lock(&self.inner.policy).status()),
                 }
             }
         }
@@ -419,7 +446,7 @@ impl SlackNotifier {
                         "Slack notification suppressed while the agent is open in Yard"
                     );
                 }
-                lock(&self.inner.outbox).push(observation.events);
+                self.admit(observation.events).await;
             }
             Err(error) => {
                 let failures = {
@@ -443,6 +470,17 @@ impl SlackNotifier {
                 return TICK;
             }
         }
+        {
+            // Quiet hours or a mute began while events waited for the
+            // global interval: they wait for the digest instead.
+            let mut policy = lock(&self.inner.policy);
+            if policy.holding(policy.now()) {
+                let (queued, dropped) = lock(&self.inner.outbox).take_all();
+                if !queued.is_empty() || dropped > 0 {
+                    policy.hold_all(queued, dropped);
+                }
+            }
+        }
         let batch = {
             let detector = lock(&self.inner.detector);
             let presence = &self.inner.presence;
@@ -455,9 +493,16 @@ impl SlackNotifier {
             })
         };
         let Some(batch) = batch else {
+            self.deliver_digest(&mut delivery).await;
             return TICK;
         };
-        let message = batch_message(&batch);
+        let message = batch_message(
+            &batch,
+            message::CardOptions {
+                ui_url: &self.inner.inbound.ui_url,
+                inbound: self.inbound_enabled(),
+            },
+        );
         match delivery
             .post(Some(&batch.thread), &message, unix_ms())
             .await
@@ -637,6 +682,26 @@ fn loopback_endpoint(value: &str) -> Option<String> {
 
 impl NotifierParts {
     fn production(thread_file: Option<PathBuf>) -> Self {
+        let (relay, relay_warning) =
+            relay::RelayTiming::from_env(std::env::var(relay::ASK_TIMEOUT_VAR).ok().as_deref());
+        if let Some(warning) = relay_warning {
+            warn!("{warning}");
+        }
+        let (config, warnings) = quiet::QuietConfig::from_lookup(|name| std::env::var(name).ok());
+        for warning in warnings {
+            warn!("{warning}");
+        }
+        let quiet = QuietParts {
+            config,
+            noise: policy::NoiseConfig::default(),
+            clock: policy::system_clock(),
+            held_file: thread_file
+                .as_deref()
+                .map(|path| held::sibling(path, held::HELD_FILE)),
+            preferences_file: thread_file
+                .as_deref()
+                .map(|path| held::sibling(path, held::PREFERENCES_FILE)),
+        };
         #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut parts = Self {
             api: SlackApi::production(),
@@ -644,7 +709,12 @@ impl NotifierParts {
             thread_file,
             timing: DetectorTiming::default(),
             min_interval: outbox::GLOBAL_MIN_INTERVAL,
-            inbound: hub::InboundParts::default(),
+            inbound: hub::InboundParts {
+                ui_url: blocks::ui_url(std::env::var(blocks::UI_URL_VAR).ok().as_deref()),
+                relay,
+                ..hub::InboundParts::default()
+            },
+            quiet,
         };
         #[cfg(debug_assertions)]
         if let Some(value) = std::env::var_os(TEST_ENDPOINT_VAR) {

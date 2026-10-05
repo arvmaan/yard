@@ -27,26 +27,34 @@ use tracing::{debug, info, warn};
 use super::{
     NotifierParts, SlackNotifier,
     actions::{
-        self, ActionRegistry, AgentConsole, AgentTarget, CardSpec, ConsoleError, Outcome,
-        PendingAction, Refusal, TerminalIdentity,
+        self, ActionRegistry, AgentConsole, AgentTarget, CardSpec, ConsoleError, NavAction,
+        NavError, Outcome, PendingAction, Refusal, TerminalIdentity,
     },
     audit::{AuditLog, AuditRecord},
-    cards::{answered_card, not_sent_card, plain, prompt_card, refusal_text},
+    blocks,
+    cards::{
+        BUTTON_ACTION_PREFIX, CardContext, answered_card, not_sent_card, plain, prompt_card,
+        refusal_text,
+    },
     client::SlackError,
     commands::{self, Command, ProjectName},
-    detector::{AttentionKind, EventSource},
+    controls::{self, Applied, Control},
+    detector::{AttentionEvent, AttentionKind, EventSource},
     inbound::{Envelope, Inbound, InboundContext, InboundFilter, OwnerAction, OwnerMessage},
     lock,
     message::OutgoingMessage,
     outbox::Batch,
+    policy::DigestKind,
     presence::ViewTarget,
     prompt::{OptionRole, ParsedScreen, parse_screen},
     relay::{self, RelayTiming},
     secret::{AppToken, SecretError, SecretSource},
     socket::{self, SessionEnd, SessionStats, SocketEvent, UrlPolicy},
-    unix_ms,
+    unix_ms, views,
 };
 use crate::config::{SlackInbound, SlackSettings};
+
+mod asking;
 
 /// Envelopes waiting for the worker; more are dropped (already acked).
 const QUEUE_CAPACITY: usize = 64;
@@ -70,6 +78,8 @@ pub(crate) struct InboundParts {
     pub relay: RelayTiming,
     /// After keys are sent, the pane is re-read this much later.
     pub settle: Duration,
+    /// Where "Open in Yard" buttons point ([`blocks::ui_url`]).
+    pub ui_url: String,
 }
 
 impl Default for InboundParts {
@@ -80,6 +90,7 @@ impl Default for InboundParts {
             idle_timeout: socket::IDLE_TIMEOUT,
             relay: RelayTiming::default(),
             settle: SETTLE_AFTER_SEND,
+            ui_url: blocks::DEFAULT_UI_URL.to_owned(),
         }
     }
 }
@@ -125,18 +136,30 @@ pub(crate) struct InboundState {
     status: Mutex<InboundStatusView>,
     relay: RelayTiming,
     settle: Duration,
+    pub(crate) ui_url: String,
     /// Answers being watched ([`relay::MAX_WATCHERS`] at most).
     watchers: Arc<AtomicUsize>,
+    /// Answers still watched after their window ([`relay::MAX_LATE_WATCHERS`]).
+    late_watchers: Arc<AtomicUsize>,
+    /// Command ids whose answer was relayed (newest last, bounded).
+    relayed: Mutex<std::collections::VecDeque<String>>,
+    /// Questions still watched (window or late window) by command id, so
+    /// shutdown can say Yard restarted instead of leaving "Waiting…".
+    asking: Mutex<std::collections::HashMap<String, asking::Asked>>,
+    /// Set on shutdown: the socket is closed cleanly and not reopened.
+    closing: tokio::sync::watch::Sender<bool>,
+    /// A Socket Mode connection is open now.
+    socket_open: tokio::sync::watch::Sender<bool>,
 }
 
 /// One watched answer; frees its slot when dropped (also on panic).
 struct WatchSlot(Arc<AtomicUsize>);
 
 impl WatchSlot {
-    fn take(watchers: &Arc<AtomicUsize>) -> Option<Self> {
+    fn take(watchers: &Arc<AtomicUsize>, most: usize) -> Option<Self> {
         watchers
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |watching| {
-                (watching < relay::MAX_WATCHERS).then_some(watching + 1)
+                (watching < most).then_some(watching + 1)
             })
             .ok()
             .map(|_| Self(Arc::clone(watchers)))
@@ -186,9 +209,32 @@ impl InboundState {
             status: Mutex::new(status),
             relay: parts.inbound.relay,
             settle: parts.inbound.settle,
+            ui_url: parts.inbound.ui_url.clone(),
             watchers: Arc::default(),
+            late_watchers: Arc::default(),
+            relayed: Mutex::default(),
+            asking: Mutex::default(),
+            closing: tokio::sync::watch::Sender::new(false),
+            socket_open: tokio::sync::watch::Sender::new(false),
         }
     }
+}
+
+/// The agent a notification is about, for its prompt card or "Answer".
+pub(crate) fn event_target(event: &AttentionEvent) -> Option<AgentTarget> {
+    Some(match event.view_target.as_ref()? {
+        ViewTarget::Assignment(assignment_id) => AgentTarget::Assignment {
+            project_id: event.project_id.clone()?,
+            assignment_id: assignment_id.clone(),
+        },
+        ViewTarget::ProjectOrchestrator(project_id) => AgentTarget::ProjectOrchestrator {
+            project_id: project_id.clone(),
+        },
+        ViewTarget::YardOrchestrator => AgentTarget::YardOrchestrator,
+        ViewTarget::CoordinationNode(node_id) => AgentTarget::CoordinationNode {
+            node_id: node_id.clone(),
+        },
+    })
 }
 
 fn target_key(target: &AgentTarget) -> String {
@@ -241,7 +287,7 @@ impl super::Delivery {
 
     /// Post in the owner DM: in `thread_ts` quietly, or top level. Returns
     /// the posted message's ts.
-    async fn post_inbound(
+    pub(super) async fn post_inbound(
         &mut self,
         message: &OutgoingMessage,
         thread_ts: Option<&str>,
@@ -289,12 +335,20 @@ impl SlackNotifier {
         let _ = self.inner.inbound.console.set(console);
     }
 
-    #[cfg(test)]
     pub(crate) fn console(&self) -> Option<Arc<dyn AgentConsole>> {
         self.inner.inbound.console.get().cloned()
     }
 
-    fn inbound_enabled(&self) -> bool {
+    /// Occupy every watch slot (as if that many answers were watched).
+    #[cfg(test)]
+    pub(crate) fn fill_watchers(&self) {
+        self.inner
+            .inbound
+            .watchers
+            .store(relay::MAX_WATCHERS, Ordering::SeqCst);
+    }
+
+    pub(crate) fn inbound_enabled(&self) -> bool {
         self.settings().is_some() && self.inner.inbound.app_secrets.is_some()
     }
 
@@ -520,7 +574,19 @@ impl SlackNotifier {
             _ => thread_ts,
         };
         let posted = self
-            .post(&prompt_card(title, screen, &ids), thread_ts)
+            .post(
+                &prompt_card(
+                    title,
+                    screen,
+                    &ids,
+                    &CardContext {
+                        ui_url: &self.inner.inbound.ui_url,
+                        pane: Some(&identity.pane_id),
+                        at_unix_ms: unix_ms(),
+                    },
+                ),
+                thread_ts,
+            )
             .await?;
         if let ParsedScreen::Question { fingerprint, .. } = screen {
             lock(&self.inner.inbound.registry).expect_reply(
@@ -540,11 +606,27 @@ impl SlackNotifier {
             .thread_ts
             .clone()
             .unwrap_or_else(|| action.message_ts.clone());
+        let nav = lock(&self.inner.inbound.registry).take_nav(&action.action, Instant::now());
+        if let Some(nav) = nav {
+            self.handle_nav(nav, &action, user).await;
+            return;
+        }
         let taken = lock(&self.inner.inbound.registry).take(&action.action, Instant::now());
         let pending: PendingAction = match taken {
             Ok(pending) => pending,
             Err(error) => {
                 let refusal = Refusal::from(error);
+                // A navigation button Yard no longer knows (restart, or long
+                // forgotten): its card (help, status, a question's timeout)
+                // is not a prompt, so it is left as it is.
+                if matches!(refusal, Refusal::Unknown)
+                    && !action.action_id.starts_with(BUTTON_ACTION_PREFIX)
+                {
+                    self.audit("button", "nav", None, "refused:unknown", user);
+                    let text = "Yard no longer knows that button (it expired or Yard restarted), so nothing was run. Say `blocked` for the current prompts or `help` for fresh buttons.";
+                    self.post(&plain(text), Some(&thread)).await;
+                    return;
+                }
                 self.audit(
                     "button",
                     "unknown",
@@ -573,8 +655,11 @@ impl SlackNotifier {
                     OptionRole::Deny => "denied".to_owned(),
                     OptionRole::Choice => pending.label.clone(),
                 };
-                self.update(&action.message_ts, &answered_card(&pending.title, &answer))
-                    .await;
+                self.update(
+                    &action.message_ts,
+                    &answered_card(&pending.title, &answer, unix_ms()),
+                )
+                .await;
                 let reply = format!(
                     "Sent to {}: {}.",
                     pending.title,
@@ -746,22 +831,42 @@ impl SlackNotifier {
                 return;
             }
         };
+        let ui_url = self.inner.inbound.ui_url.clone();
+        let mut nav = self.nav_issuer();
         let (action, reply) = match commands::parse(&message.text, &projects) {
-            Command::Help => ("help", commands::help_text()),
-            Command::Status => ("status", commands::status_text(&records, &projects)),
+            Command::Help => ("help", views::help_card(&mut nav, &ui_url)),
+            Command::Status => (
+                "status",
+                views::status_card(&records, &projects, &mut nav, &ui_url),
+            ),
             Command::ProjectStatus(query) => (
                 "status_project",
-                commands::project_status_text(&query, &records, &projects),
+                match commands::find_project(&query, &records, &projects) {
+                    Ok(project) => views::project_card(project, &records, &mut nav, &ui_url),
+                    Err(_) => plain(&commands::project_status_text(&query, &records, &projects)),
+                },
             ),
-            Command::Review => ("review", commands::review_text(&records)),
+            Command::Review => ("review", views::review_card(&records, &mut nav, &ui_url)),
             Command::AmbiguousProject(name) => (
                 "ask",
-                format!(
+                plain(&format!(
                     "Several projects are named \"{name}\"; nothing was sent. Ask in Yard, or rename one."
-                ),
+                )),
             ),
             Command::Blocked => {
+                drop(nav);
                 self.post_blocked(&records, &thread, user).await;
+                return;
+            }
+            Command::Control(control) => {
+                drop(nav);
+                self.run_control(control, &thread, Some(user)).await;
+                return;
+            }
+            Command::ControlUsage(text) => {
+                drop(nav);
+                self.audit("message", "mute", None, "refused:invalid", user);
+                self.post(&plain(&text), Some(&thread)).await;
                 return;
             }
             Command::Ask {
@@ -769,6 +874,7 @@ impl SlackNotifier {
                 to,
                 question,
             } => {
+                drop(nav);
                 // A reply in a thread (a card, a notification, an answer)
                 // without an explicit `<Project>:` is meant for whatever
                 // that thread is about, never a new Superintendent question.
@@ -783,8 +889,176 @@ impl SlackNotifier {
                 return;
             }
         };
+        drop(nav);
         self.audit("message", action, None, "answered", user);
-        self.post(&plain(&reply), Some(&thread)).await;
+        self.post(&reply, Some(&thread)).await;
+    }
+
+    /// A quiet-hours control (typed or tapped). `audit_user` is set for a
+    /// typed command; a button click is already audited by `handle_nav`.
+    async fn run_control(&self, control: Control, thread: &str, audit_user: Option<&str>) {
+        // `digest` is answered in this thread now; holding the delivery
+        // lock first keeps the tick from posting it elsewhere meanwhile.
+        let digest_delivery = if matches!(control, Control::Digest) {
+            Some(self.inner.delivery.lock().await)
+        } else {
+            None
+        };
+        let applied = controls::apply(&mut lock(&self.inner.policy), control);
+        let requested = matches!(applied, Applied::DigestRequested);
+        let (outcome, reply) = match applied {
+            Applied::Settings(snapshot) => {
+                let ui_url = self.inner.inbound.ui_url.clone();
+                let mut nav = self.nav_issuer();
+                (
+                    "answered",
+                    Some(controls::settings_card(&snapshot, &mut nav, &ui_url)),
+                )
+            }
+            Applied::Reply { text, outcome } => (outcome, Some(plain(&text))),
+            // The digest itself is the reply, posted below in this thread.
+            Applied::DigestRequested => ("requested", None),
+        };
+        if let Some(user) = audit_user {
+            self.audit("message", control.name(), None, outcome, user);
+        }
+        match (requested, digest_delivery) {
+            (true, Some(mut delivery)) => {
+                self.send_digest(&mut delivery, DigestKind::Requested, Some(thread))
+                    .await;
+                return;
+            }
+            // Never post below while holding the delivery lock.
+            (_, delivery) => drop(delivery),
+        }
+        if let Some(reply) = reply {
+            self.post(&reply, Some(thread)).await;
+        }
+    }
+
+    /// Issues navigation ids in the registry (`None` without an RNG).
+    pub(super) fn nav_issuer(&self) -> impl FnMut(NavAction) -> Option<String> + '_ {
+        self.nav_issuer_for(None)
+    }
+
+    /// [`Self::nav_issuer`] whose buttons last `ttl` (`None`: each action's
+    /// own lifetime).
+    pub(super) fn nav_issuer_for(
+        &self,
+        ttl: Option<Duration>,
+    ) -> impl FnMut(NavAction) -> Option<String> + '_ {
+        move |action| {
+            let mut registry = lock(&self.inner.inbound.registry);
+            let issued = match ttl {
+                Some(ttl) => registry.issue_nav_for(action, Instant::now(), ttl),
+                None => registry.issue_nav(action, Instant::now()),
+            };
+            issued
+                .map_err(|error| {
+                    warn!(%error, "No random action ids; posting the card without that button");
+                })
+                .ok()
+        }
+    }
+
+    /// A navigation button (Status, Blocked, Review, Details, Answer, Ask):
+    /// already owner-filtered and audited as a click; runs the same
+    /// read-only command a typed message would and posts in the thread.
+    async fn handle_nav(&self, nav: Result<NavAction, NavError>, action: &OwnerAction, user: &str) {
+        let thread = action
+            .thread_ts
+            .clone()
+            .unwrap_or_else(|| action.message_ts.clone());
+        let nav = match nav {
+            Ok(nav) => nav,
+            Err(error) => {
+                let (outcome, text) = match error {
+                    NavError::Expired => (
+                        "refused:expired",
+                        "That button expired, so nothing was run. Say `blocked` for the current prompts or `help` for fresh buttons.",
+                    ),
+                    NavError::AlreadyUsed => (
+                        "refused:already_used",
+                        "That button was already used. Say `help` for fresh buttons.",
+                    ),
+                };
+                self.audit("button", "nav", None, outcome, user);
+                self.post(&plain(text), Some(&thread)).await;
+                return;
+            }
+        };
+        let target = match &nav {
+            NavAction::Answer { target, .. }
+            | NavAction::Retry { target, .. }
+            | NavAction::CheckAgain { target, .. } => Some(target.clone()),
+            _ => None,
+        };
+        self.audit("button", nav.name(), target.as_ref(), "answered", user);
+        let ui_url = self.inner.inbound.ui_url.clone();
+        match nav {
+            NavAction::AskHint => {
+                self.post(&views::ask_hint(), Some(&thread)).await;
+                return;
+            }
+            NavAction::Answer { target, title } => {
+                if let Err(error) = self.post_prompt_card(&target, &title, Some(&thread)).await {
+                    debug!(%error, "Reading an agent's prompt for a Slack button failed");
+                    self.post(
+                        &plain(&format!(
+                            "*{title}*: Yard could not read its prompt. Open Yard to answer it."
+                        )),
+                        Some(&thread),
+                    )
+                    .await;
+                }
+                return;
+            }
+            NavAction::Quiet(control) => {
+                self.run_control(control, &thread, None).await;
+                return;
+            }
+            nav @ (NavAction::Retry { .. } | NavAction::CheckAgain { .. }) => {
+                self.handle_ask_nav(nav, thread, user).await;
+                return;
+            }
+            NavAction::Status
+            | NavAction::Blocked
+            | NavAction::Review
+            | NavAction::ProjectStatus { .. } => {}
+        }
+        let (records, projects) = match self.durable_state().await {
+            Ok(state) => state,
+            Err(error) => {
+                debug!(%error, "Reading Yard state for a Slack button failed");
+                self.post(
+                    &plain("Yard could not read its state just now; try again."),
+                    Some(&thread),
+                )
+                .await;
+                return;
+            }
+        };
+        let reply = {
+            let mut issue = self.nav_issuer();
+            match nav {
+                NavAction::Status => views::status_card(&records, &projects, &mut issue, &ui_url),
+                NavAction::Review => views::review_card(&records, &mut issue, &ui_url),
+                NavAction::ProjectStatus { project_id } => {
+                    match projects.iter().find(|project| project.id == project_id) {
+                        Some(project) => {
+                            views::project_card(project, &records, &mut issue, &ui_url)
+                        }
+                        None => plain("That project is no longer visible in Yard."),
+                    }
+                }
+                _ => {
+                    drop(issue);
+                    self.post_blocked(&records, &thread, user).await;
+                    return;
+                }
+            }
+        };
+        self.post(&reply, Some(&thread)).await;
     }
 
     /// Visible projects and the attention records, read now.
@@ -821,15 +1095,14 @@ impl SlackNotifier {
             &format!("answered:{}", blocked.len()),
             user,
         );
+        let heading = {
+            let mut nav = self.nav_issuer();
+            views::blocked_heading(blocked.len(), &mut nav, &self.inner.inbound.ui_url)
+        };
+        self.post(&heading, Some(thread)).await;
         if blocked.is_empty() {
-            self.post(&plain("Nothing is blocked."), Some(thread)).await;
             return;
         }
-        let heading = match blocked.len() {
-            1 => "1 agent is blocked:".to_owned(),
-            count => format!("{count} agents are blocked:"),
-        };
-        self.post(&plain(&heading), Some(thread)).await;
         for (target, title) in blocked.iter().take(commands::MAX_BLOCKED_CARDS) {
             if let Err(error) = self.post_prompt_card(target, title, Some(thread)).await {
                 debug!(%error, "Reading a blocked agent's prompt failed");
@@ -853,199 +1126,7 @@ impl SlackNotifier {
     }
 }
 
-/// "the Superintendent" → "The Superintendent".
-fn capitalized(text: &str) -> String {
-    let mut chars = text.chars();
-    chars.next().map_or_else(String::new, |first| {
-        first.to_uppercase().chain(chars).collect()
-    })
-}
-
-fn minutes(duration: Duration) -> String {
-    match duration.as_secs() / 60 {
-        0 => format!("{} seconds", duration.as_secs()),
-        1 => "1 minute".to_owned(),
-        count => format!("{count} minutes"),
-    }
-}
-
 impl SlackNotifier {
-    /// A free-form question: refuse while the agent waits on a prompt, else
-    /// send it (marked as from Slack) and watch for the answer.
-    async fn ask(
-        &self,
-        console: &Arc<dyn AgentConsole>,
-        target: AgentTarget,
-        to: &str,
-        question: &str,
-        thread: &str,
-        user: &str,
-    ) {
-        let title = capitalized(to);
-        let snapshot = match console.snapshot(&target).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                let refusal = actions::console_refusal(error);
-                let outcome = format!("refused:{}", refusal_name(&refusal));
-                self.audit("message", "ask", Some(&target), &outcome, user);
-                self.post(&plain(&refusal_text(&title, &refusal)), Some(thread))
-                    .await;
-                return;
-            }
-        };
-        if snapshot.blocked {
-            self.audit("message", "ask", Some(&target), "refused:blocked", user);
-            self.post(
-                &plain(&format!(
-                    "{title} is waiting on a prompt, so your question was not sent. Answer the prompt first:"
-                )),
-                Some(thread),
-            )
-            .await;
-            if let Err(error) = self.post_prompt_card(&target, &title, Some(thread)).await {
-                debug!(%error, "Reading the orchestrator's prompt failed");
-            }
-            return;
-        }
-        let actor = format!("slack:owner:{user}");
-        let sent = console
-            .send_prompt(
-                &target,
-                &snapshot.identity,
-                &relay::question_text(question),
-                &actor,
-            )
-            .await;
-        let command_id = match sent {
-            Ok(command_id) => command_id,
-            Err(error) => {
-                let refusal = actions::console_refusal(error);
-                let outcome = format!("refused:{}", refusal_name(&refusal));
-                self.audit("message", "ask", Some(&target), &outcome, user);
-                self.post(&plain(&refusal_text(&title, &refusal)), Some(thread))
-                    .await;
-                return;
-            }
-        };
-        self.audit("message", "ask", Some(&target), "sent", user);
-        let Some(slot) = WatchSlot::take(&self.inner.inbound.watchers) else {
-            self.post(
-                &plain(&format!(
-                    "Sent to {to}. Yard is already waiting on several answers, so open Yard to follow this one."
-                )),
-                Some(thread),
-            )
-            .await;
-            return;
-        };
-        self.post(
-            &plain(&format!(
-                "Sent to {to}. Its answer will be posted in this thread."
-            )),
-            Some(thread),
-        )
-        .await;
-        let (notifier, console) = (self.clone(), Arc::clone(console));
-        let (to, thread, user) = (to.to_owned(), thread.to_owned(), user.to_owned());
-        tokio::spawn(async move {
-            let _slot = slot;
-            notifier
-                .watch_answer(console.as_ref(), &target, &to, &command_id, &thread, &user)
-                .await;
-        });
-    }
-
-    /// Re-read the pane until the status report for `command_id` appears,
-    /// then relay it (see [`relay`]).
-    async fn watch_answer(
-        &self,
-        console: &dyn AgentConsole,
-        target: &AgentTarget,
-        to: &str,
-        command_id: &str,
-        thread: &str,
-        user: &str,
-    ) {
-        let timing = self.inner.inbound.relay;
-        let started = Instant::now();
-        let mut noted = false;
-        let mut failures = 0_u32;
-        loop {
-            tokio::time::sleep(if noted {
-                timing.follow_poll
-            } else {
-                timing.poll
-            })
-            .await;
-            match console.status_report(target, command_id).await {
-                Ok(Some(report)) => {
-                    self.audit("answer", "relay", Some(target), "relayed", user);
-                    self.post(&plain(&relay::report_text(to, &report)), Some(thread))
-                        .await;
-                    return;
-                }
-                Ok(None) => failures = 0,
-                Err(ConsoleError::Gone(_) | ConsoleError::IdentityChanged(_)) => {
-                    self.audit(
-                        "answer",
-                        "relay",
-                        Some(target),
-                        "lost:terminal_changed",
-                        user,
-                    );
-                    self.post(
-                        &plain(&format!(
-                            "{}'s terminal changed before it answered. Open Yard to follow.",
-                            capitalized(to)
-                        )),
-                        Some(thread),
-                    )
-                    .await;
-                    return;
-                }
-                Err(error) => {
-                    failures = failures.saturating_add(1);
-                    debug!(%error, failures, "Reading an orchestrator's answer failed");
-                    if failures >= 5 {
-                        self.audit("answer", "relay", Some(target), "lost:unreadable", user);
-                        self.post(
-                            &plain(&format!(
-                                "Yard can't read {to}'s terminal right now. Open Yard to follow."
-                            )),
-                            Some(thread),
-                        )
-                        .await;
-                        return;
-                    }
-                }
-            }
-            let elapsed = started.elapsed();
-            if elapsed >= timing.follow {
-                self.audit("answer", "relay", Some(target), "timed_out", user);
-                self.post(
-                    &plain(&format!(
-                        "Yard found no answer from {to} after {}. Open Yard to follow.",
-                        minutes(timing.follow)
-                    )),
-                    Some(thread),
-                )
-                .await;
-                return;
-            }
-            if !noted && elapsed >= timing.wait {
-                noted = true;
-                self.post(
-                    &plain(&format!(
-                        "Yard has not found an answer from {to} yet. Open Yard to follow; if it answers within {}, the answer will still be posted here.",
-                        minutes(timing.follow)
-                    )),
-                    Some(thread),
-                )
-                .await;
-            }
-        }
-    }
-
     /// After a notification about blocked agents, post each one's prompt
     /// card in the same thread (inbound only; in the background).
     pub(crate) fn follow_with_prompt_cards(&self, batch: &Batch, root: String) {
@@ -1062,22 +1143,11 @@ impl SlackNotifier {
                 ) && matches!(event.source, EventSource::Runtime { .. })
             })
             .filter_map(|event| {
-                let target = match event.view_target.as_ref()? {
-                    ViewTarget::Assignment(assignment_id) => AgentTarget::Assignment {
-                        project_id: event.project_id.clone()?,
-                        assignment_id: assignment_id.clone(),
-                    },
-                    ViewTarget::ProjectOrchestrator(project_id) => {
-                        AgentTarget::ProjectOrchestrator {
-                            project_id: project_id.clone(),
-                        }
-                    }
-                    ViewTarget::YardOrchestrator => AgentTarget::YardOrchestrator,
-                    ViewTarget::CoordinationNode(node_id) => AgentTarget::CoordinationNode {
-                        node_id: node_id.clone(),
-                    },
-                };
-                Some((target, commands::event_title(event), event.kind))
+                Some((
+                    event_target(event)?,
+                    commands::event_title(event),
+                    event.kind,
+                ))
             })
             .take(commands::MAX_BLOCKED_CARDS)
             .collect::<Vec<_>>();
@@ -1113,16 +1183,13 @@ impl SlackNotifier {
                 lock(&self.inner.inbound.filter).set_app_id(app_id);
                 // Surfaced in the status API: Slack splits events between
                 // the connections, so another Yard would get some of them.
-                let shared = (num_connections > 1).then(|| {
-                    format!(
-                        "{num_connections} Socket Mode connections are open for this Slack app; events are split between them. Run inbound Slack on one Yard only"
-                    )
-                });
+                // Cleared by the next hello that reports one connection.
+                let shared = (num_connections > 1).then(|| shared_warning(num_connections));
                 self.set_inbound_status(InboundStatusKind::Connected, shared);
                 if num_connections > 1 {
                     warn!(
                         num_connections,
-                        "Another Socket Mode connection is open for this Slack app; events may go to it. Run inbound Slack on one Yard only"
+                        "Slack reported more than one Socket Mode connection for this app (may be stale right after a restart; otherwise another Yard gets some events). Run inbound Slack on one Yard only"
                     );
                 }
                 return;
@@ -1175,6 +1242,16 @@ impl SlackNotifier {
         }
     }
 
+    /// Shutdown: close the Socket Mode connection with a close frame (so
+    /// Slack drops it at once and the next Yard's `hello` does not count
+    /// it) and stop reconnecting. Waits at most `wait` for the close.
+    pub async fn close_inbound(&self, wait: Duration) {
+        let _ = tokio::time::timeout(wait, self.end_open_questions()).await;
+        self.inner.inbound.closing.send_replace(true);
+        let mut open = self.inner.inbound.socket_open.subscribe();
+        let _ = tokio::time::timeout(wait, open.wait_for(|open| !*open)).await;
+    }
+
     /// Supervised inbound loop; never returns. Off → pending forever.
     pub(crate) async fn run_inbound(self) {
         if !self.inbound_enabled() {
@@ -1205,9 +1282,23 @@ impl SlackNotifier {
                 (None, 0) => Duration::ZERO,
                 (end, failures) => socket::retry_delay(end.as_ref(), failures),
             };
-            tokio::time::sleep(delay).await;
+            let mut closing = self.inner.inbound.closing.subscribe();
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                _ = closing.wait_for(|closing| *closing) => {}
+            }
+            if *closing.borrow() {
+                self.set_inbound_status(
+                    InboundStatusKind::Off,
+                    Some(session_end_message(&SessionEnd::Shutdown)),
+                );
+                std::future::pending::<()>().await;
+            }
             let started = Instant::now();
             match self.socket_session(&queue).await {
+                Ok(SessionEnd::Shutdown) => {
+                    last_end = Some(SessionEnd::Shutdown);
+                }
                 Ok(end) => {
                     failures = socket::failures_after(failures, &end, started.elapsed());
                     if !end.immediate() {
@@ -1267,14 +1358,19 @@ impl SlackNotifier {
             .map_err(|error| (InboundStatusKind::Error, error.to_string()))?;
         drop(url);
         let mut stats = SessionStats::default();
+        self.inner.inbound.socket_open.send_replace(true);
+        let mut closing = self.inner.inbound.closing.subscribe();
         let end = socket::run_session(
             &mut connection,
             queue,
             self.inner.inbound.idle_timeout,
             &mut stats,
+            &mut closing,
         )
         .await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), connection.close(None)).await;
+        let frame = socket::close_frame(&end);
+        let _ = tokio::time::timeout(Duration::from_secs(2), connection.close(frame)).await;
+        self.inner.inbound.socket_open.send_replace(false);
         if stats.dropped_queue_full > 0 {
             warn!(
                 dropped = stats.dropped_queue_full,
@@ -1286,6 +1382,15 @@ impl SlackNotifier {
     }
 }
 
+/// Status text for a hello with more than one connection. Slack's count
+/// can include stale sockets of a Yard that just stopped, so it is worded
+/// as possibly stale.
+fn shared_warning(num_connections: u64) -> String {
+    format!(
+        "Slack reported {num_connections} Socket Mode connections for this app at the last connect. This may be stale (a Yard that just stopped can still be counted for a minute) and clears when a later connect reports one. If it persists, another Yard is connected: events are split between them, so run inbound Slack on one Yard only"
+    )
+}
+
 fn session_end_message(end: &SessionEnd) -> String {
     match end {
         SessionEnd::Disconnect(reason) if reason == "link_disabled" => {
@@ -1295,6 +1400,7 @@ fn session_end_message(end: &SessionEnd) -> String {
         SessionEnd::Closed => "The Socket Mode connection closed; reconnecting".to_owned(),
         SessionEnd::Idle => "The Socket Mode connection went quiet; reconnecting".to_owned(),
         SessionEnd::Error(error) => format!("Socket Mode connection lost: {error}; reconnecting"),
+        SessionEnd::Shutdown => "Inbound Slack stopped: Yard is shutting down".to_owned(),
     }
 }
 
@@ -1302,24 +1408,19 @@ fn session_end_message(end: &SessionEnd) -> String {
 mod tests {
     use std::sync::{Arc, atomic::AtomicUsize};
 
-    use super::{WatchSlot, capitalized, minutes, relay::MAX_WATCHERS};
+    use super::{WatchSlot, relay::MAX_WATCHERS};
 
     #[test]
     fn at_most_a_few_answers_are_watched_at_once() {
         let watchers = Arc::new(AtomicUsize::new(0));
         let mut slots = (0..MAX_WATCHERS)
-            .map(|_| WatchSlot::take(&watchers).expect("a free slot"))
+            .map(|_| WatchSlot::take(&watchers, MAX_WATCHERS).expect("a free slot"))
             .collect::<Vec<_>>();
-        assert!(WatchSlot::take(&watchers).is_none(), "full");
+        assert!(WatchSlot::take(&watchers, MAX_WATCHERS).is_none(), "full");
         slots.pop();
-        let again = WatchSlot::take(&watchers).expect("a freed slot");
+        let again = WatchSlot::take(&watchers, MAX_WATCHERS).expect("a freed slot");
         drop(again);
         drop(slots);
         assert_eq!(watchers.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(capitalized("the Superintendent"), "The Superintendent");
-        assert_eq!(
-            minutes(std::time::Duration::from_secs(30 * 60)),
-            "30 minutes"
-        );
     }
 }

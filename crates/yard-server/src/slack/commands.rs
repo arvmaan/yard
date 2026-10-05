@@ -14,6 +14,7 @@ use yard_store::{AttentionRecords, AttentionRuntime, AttentionRuntimeRole};
 
 use super::{
     actions::AgentTarget,
+    controls::{self, Control},
     detector::{AttentionEvent, Subject, worker_label},
     message::{clean, subject_label},
     prompt::cap,
@@ -52,6 +53,10 @@ pub enum Command {
     },
     /// `<name>: …` where several projects share the name.
     AmbiguousProject(String),
+    /// `settings` / `quiet`, `mute …`, `unmute`, `digest`.
+    Control(Control),
+    /// `mute …` that could not be read: what to say instead.
+    ControlUsage(String),
 }
 
 fn normalized(value: &str) -> String {
@@ -78,7 +83,17 @@ pub fn parse(text: &str, projects: &[ProjectName]) -> Command {
         "status" => return Command::Status,
         "blocked" => return Command::Blocked,
         "review" => return Command::Review,
+        "settings" | "quiet" | "quiet hours" => return Command::Control(Control::Settings),
+        "unmute" => return Command::Control(Control::Unmute),
+        "digest" => return Command::Control(Control::Digest),
+        "mute" => return Command::ControlUsage(controls::MUTE_USAGE.to_owned()),
         _ => {}
+    }
+    if let Some(args) = command.strip_prefix("mute ") {
+        return match controls::parse_mute(args) {
+            Ok(spec) => Command::Control(Control::Mute(spec)),
+            Err(text) => Command::ControlUsage(text),
+        };
     }
     if let Some(query) = command.strip_prefix("status ") {
         // Take the query from the original text so display keeps its case.
@@ -131,6 +146,9 @@ pub fn help_text() -> String {
         "• `blocked` — each blocked agent with its answer buttons",
         "• `review` — work that finished its turn and waits for your review",
         "• `<Project>: question` — ask that project's orchestrator",
+        "• `settings` (or `quiet`) — quiet hours, mute and the next digest",
+        "• `mute 2h` / `mute until 9am` / `mute until monday`, `unmute` — hold notifications",
+        "• `digest` — send what is held now",
         "• anything else at the top level — ask the Superintendent; the answer is posted in the thread",
         "Buttons answer once and expire in 5 minutes; \"always allow\" is never offered. Reply in a question card's thread to answer it; other thread replies are not sent.",
     ]
@@ -143,7 +161,7 @@ fn live(runtime: &AttentionRuntime) -> bool {
         && runtime.process_state != RuntimeProcessState::Exited
 }
 
-fn state_word(runtime: &AttentionRuntime) -> &'static str {
+pub(crate) fn state_word(runtime: &AttentionRuntime) -> &'static str {
     if runtime.process_state == RuntimeProcessState::Exited {
         return "exited";
     }
@@ -159,12 +177,12 @@ fn state_word(runtime: &AttentionRuntime) -> &'static str {
     }
 }
 
-fn is(runtime: &AttentionRuntime, status: ObservedStatus) -> bool {
+pub(crate) fn is(runtime: &AttentionRuntime, status: ObservedStatus) -> bool {
     live(runtime) && runtime.status == status
 }
 
 /// One entry per worker (the records may list a worker twice).
-fn unique(records: &AttentionRecords) -> Vec<&AttentionRuntime> {
+pub(crate) fn unique(records: &AttentionRecords) -> Vec<&AttentionRuntime> {
     let mut seen = HashSet::new();
     records
         .runtimes
@@ -173,7 +191,7 @@ fn unique(records: &AttentionRecords) -> Vec<&AttentionRuntime> {
         .collect()
 }
 
-fn subject(runtime: &AttentionRuntime) -> Subject {
+pub(crate) fn subject(runtime: &AttentionRuntime) -> Subject {
     match runtime.role {
         AttentionRuntimeRole::Assignment => Subject::Worker {
             profile_name: worker_label(runtime),
@@ -250,7 +268,10 @@ fn more(lines: &mut Vec<String>, total: usize) {
 }
 
 /// Visible projects sorted by name.
-fn visible<'a>(records: &AttentionRecords, projects: &'a [ProjectName]) -> Vec<&'a ProjectName> {
+pub(crate) fn visible<'a>(
+    records: &AttentionRecords,
+    projects: &'a [ProjectName],
+) -> Vec<&'a ProjectName> {
     let mut visible = projects
         .iter()
         .filter(|project| records.visible_project_ids.contains(&project.id))
@@ -259,7 +280,7 @@ fn visible<'a>(records: &AttentionRecords, projects: &'a [ProjectName]) -> Vec<&
     visible
 }
 
-fn worker_counts(workers: &[&AttentionRuntime]) -> String {
+pub(crate) fn worker_counts(workers: &[&AttentionRuntime]) -> String {
     if workers.is_empty() {
         return "no workers".to_owned();
     }
@@ -443,6 +464,12 @@ pub fn project_status_text(
             );
         }
     };
+    project_text(project, records)
+}
+
+/// `status <project>` text for a resolved project.
+#[must_use]
+pub fn project_text(project: &ProjectName, records: &AttentionRecords) -> String {
     let runtimes = unique(records)
         .into_iter()
         .filter(|runtime| runtime.project_id.as_deref() == Some(&project.id))
@@ -673,6 +700,45 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn quiet_controls_are_commands_not_questions() {
+        use crate::slack::controls::{Control, MuteSpec, UntilDay};
+        let projects = projects();
+        for (text, control) in [
+            ("settings", Control::Settings),
+            ("Quiet?", Control::Settings),
+            ("quiet hours", Control::Settings),
+            ("unmute", Control::Unmute),
+            ("Digest!", Control::Digest),
+            (
+                "mute 2h",
+                Control::Mute(MuteSpec::For(std::time::Duration::from_secs(7200))),
+            ),
+            (
+                "Mute until Monday",
+                Control::Mute(MuteSpec::Until {
+                    day: UntilDay::On(chrono::Weekday::Mon),
+                    minutes: None,
+                }),
+            ),
+        ] {
+            assert_eq!(parse(text, &projects), Command::Control(control), "{text}");
+        }
+        for text in ["mute", "mute forever", "mute until 9"] {
+            assert!(
+                matches!(parse(text, &projects), Command::ControlUsage(_)),
+                "{text}"
+            );
+        }
+        // Questions that merely mention the words still go to the Superintendent.
+        assert!(matches!(
+            parse("what does digest mean?", &projects),
+            Command::Ask { .. }
+        ));
+        assert!(help_text().contains("`mute 2h`"));
+        assert!(help_text().contains("`digest`"));
+    }
+
+    #[test]
     fn named_workers_use_their_display_name_in_titles() {
         let mut named = runtime(
             AttentionRuntimeRole::Assignment,
@@ -733,10 +799,22 @@ pub(crate) mod tests {
                 excerpt: "x".to_owned(),
             },
             &[],
+            &crate::slack::cards::CardContext {
+                ui_url: "https://yard.example.test/",
+                pane: None,
+                at_unix_ms: 0,
+            },
         );
-        let body = card.blocks[0]["text"]["text"].as_str().unwrap();
-        // Only the card's own bold markers remain.
-        assert!(body.starts_with(&format!("*{title}* is blocked")), "{body}");
+        // The name is plain text in the header (no mrkdwn, no mentions)...
+        assert_eq!(card.blocks[0]["type"], "header");
+        assert_eq!(card.blocks[0]["text"]["type"], "plain_text");
+        let header = card.blocks[0]["text"]["text"].as_str().unwrap();
+        let header = header.strip_prefix(":raised_hand: ").unwrap();
+        assert!(!header.contains(['*', '_', '~', '`']), "{header}");
+        assert!(!header.contains("://"), "{header}");
+        // ...and only the card's own bold markers are in the body.
+        let body = card.blocks[1]["text"]["text"].as_str().unwrap();
+        assert!(body.starts_with("*Blocked*"), "{body}");
         assert_eq!(body.matches('*').count(), 2, "{body}");
     }
 

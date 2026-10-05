@@ -41,6 +41,8 @@ struct MockSocket {
     push: mpsc::UnboundedSender<Option<Value>>,
     received: Received,
     connections: Arc<Mutex<usize>>,
+    /// Close frames Yard sent: `(code, reason)`.
+    closes: Arc<Mutex<Vec<(u16, String)>>>,
 }
 
 impl MockSocket {
@@ -54,7 +56,12 @@ impl MockSocket {
         let pushed = Arc::new(tokio::sync::Mutex::new(pushed));
         let received = Received::default();
         let connections = Arc::new(Mutex::new(0));
-        let (frames, count) = (received.clone(), Arc::clone(&connections));
+        let closes = Arc::new(Mutex::new(Vec::new()));
+        let (frames, count, close_log) = (
+            received.clone(),
+            Arc::clone(&connections),
+            Arc::clone(&closes),
+        );
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let Ok(mut socket) = accept_async(stream).await else {
@@ -87,6 +94,11 @@ impl MockSocket {
                                 .lock()
                                 .unwrap()
                                 .push((serde_json::from_str(text.as_str()).unwrap(), Instant::now())),
+                            Some(Ok(Message::Close(frame))) => {
+                                close_log.lock().unwrap().push(frame.map_or((0, String::new()), |frame| {
+                                    (u16::from(frame.code), frame.reason.to_string())
+                                }));
+                            }
                             Some(Ok(_)) => {}
                             _ => break,
                         },
@@ -99,6 +111,7 @@ impl MockSocket {
             push,
             received,
             connections,
+            closes,
         }
     }
 
@@ -177,6 +190,40 @@ async fn inbound_notifier_timed(
     app_exit: i32,
     timing: super::detector::DetectorTiming,
 ) -> SlackNotifier {
+    inbound_notifier_relay(
+        temp,
+        slack,
+        config,
+        app_exit,
+        timing,
+        fast_relay(),
+        super::policy::QuietParts::always(),
+    )
+    .await
+}
+
+/// Watch timings for tests (Slack posts are still paced 1/s per channel).
+fn fast_relay() -> super::relay::RelayTiming {
+    super::relay::RelayTiming {
+        poll: Duration::from_millis(50),
+        wait: Duration::from_millis(400),
+        follow_poll: Duration::from_millis(100),
+        follow: Duration::from_millis(900),
+        progress: Duration::from_millis(150),
+        late_poll: Duration::from_millis(100),
+        late: Duration::from_millis(1_500),
+    }
+}
+
+async fn inbound_notifier_relay(
+    temp: &TempDir,
+    slack: &MockSlack,
+    config: SlackConfig,
+    app_exit: i32,
+    timing: super::detector::DetectorTiming,
+    relay: super::relay::RelayTiming,
+    quiet: super::policy::QuietParts,
+) -> SlackNotifier {
     capture_logs();
     let (store, _) = store_with_project(temp).await;
     SlackNotifier::with_parts(
@@ -192,14 +239,11 @@ async fn inbound_notifier_timed(
                 audit_file: Some(temp.path().join("slack-audit.jsonl")),
                 url_policy: UrlPolicy::Loopback,
                 idle_timeout: Duration::from_secs(30),
-                relay: super::relay::RelayTiming {
-                    poll: Duration::from_millis(50),
-                    wait: Duration::from_millis(400),
-                    follow_poll: Duration::from_millis(100),
-                    follow: Duration::from_millis(900),
-                },
+                relay,
                 settle: Duration::from_millis(250),
+                ui_url: "https://yard.example.test/".to_owned(),
             },
+            quiet,
         },
     )
 }
@@ -245,6 +289,10 @@ impl AgentConsole for GatedConsole {
         self.inner.snapshot(target).await
     }
 
+    async fn sendable(&self, target: &AgentTarget) -> Result<(), ConsoleError> {
+        self.inner.sendable(target).await
+    }
+
     async fn screen(&self, target: &AgentTarget) -> Result<String, ConsoleError> {
         self.inner.screen(target).await
     }
@@ -274,6 +322,14 @@ impl AgentConsole for GatedConsole {
         command_id: &str,
     ) -> Result<Option<yard_domain::OrchestratorStatusReport>, ConsoleError> {
         self.inner.status_report(target, command_id).await
+    }
+
+    async fn watch(
+        &self,
+        target: &AgentTarget,
+        command_id: &str,
+    ) -> Result<super::relay::Watched, ConsoleError> {
+        self.inner.watch(target, command_id).await
     }
 }
 
@@ -322,7 +378,7 @@ async fn acks_every_envelope_before_work_and_answers_a_click() {
         .await
         .unwrap();
     let card = slack.calls("chat.postMessage").pop().unwrap();
-    let buttons = card.body["blocks"][1]["elements"]
+    let buttons = card.body["blocks"][2]["elements"]
         .as_array()
         .unwrap()
         .clone();
@@ -692,6 +748,34 @@ async fn connected(temp: &TempDir, slack: &MockSlack, socket: &MockSocket) -> Sl
     notifier
 }
 
+/// [`connected`] with its own watch timings.
+async fn connected_relay(
+    temp: &TempDir,
+    slack: &MockSlack,
+    socket: &MockSocket,
+    relay: super::relay::RelayTiming,
+) -> SlackNotifier {
+    slack.set_socket_url(&socket.url);
+    let config = inbound_settings(enabled());
+    let timing = super::detector::DetectorTiming::default();
+    let notifier = inbound_notifier_relay(
+        temp,
+        slack,
+        config,
+        0,
+        timing,
+        relay,
+        super::policy::QuietParts::always(),
+    )
+    .await;
+    tokio::spawn(notifier.clone().run_inbound());
+    eventually("hello", || {
+        notifier.inbound_status().status == InboundStatusKind::Connected
+    })
+    .await;
+    notifier
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn status_commands_answer_from_durable_state_without_touching_agents() {
@@ -757,11 +841,21 @@ async fn status_commands_answer_from_durable_state_without_touching_agents() {
     let posts = thread_posts(&slack, at);
     assert_eq!(posts[0]["text"], "1 agent is blocked:");
     let card = posts[1]["blocks"].to_string();
+    // Plain text in the header (Slack parses no mentions there); escaped
+    // everywhere mrkdwn is parsed.
+    assert_eq!(
+        posts[1]["blocks"][0]["text"]["text"],
+        ":raised_hand: Checkout <!channel> · The project orchestrator"
+    );
+    assert_eq!(posts[1]["blocks"][0]["text"]["type"], "plain_text");
     assert!(
-        card.contains("Checkout &lt;!channel&gt; · The project orchestrator"),
+        posts[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Checkout &lt;!channel&gt; · The project orchestrator"),
         "{card}"
     );
-    let buttons = posts[1]["blocks"][1]["elements"].as_array().unwrap();
+    let buttons = posts[1]["blocks"][2]["elements"].as_array().unwrap();
     assert_eq!(buttons.len(), 2, "Allow once + Deny: {buttons:?}");
     let labels = buttons
         .iter()
@@ -803,6 +897,7 @@ fn set_blocked(console: &GatedConsole, blocked: bool) {
     *console.inner.snapshot.lock().unwrap() = Ok(AgentSnapshot {
         identity: super::actions::tests::identity(),
         blocked,
+        health: super::actions::AgentHealth::Working,
     });
 }
 
@@ -820,7 +915,7 @@ async fn questions_go_to_the_named_orchestrator_and_the_answer_is_relayed() {
     let slack = MockSlack::start().await;
     let socket = MockSocket::start().await;
     let notifier = connected(&temp, &slack, &socket).await;
-    let console = GatedConsole::new(super::prompt::tests::WORKING, 100);
+    let console = GatedConsole::new(super::prompt::tests::WORKING, 10_000);
     set_blocked(&console, false);
     notifier.attach_console(console.clone());
     let project_id: String = rusqlite::Connection::open(temp.path().join("yard.sqlite3"))
@@ -829,7 +924,8 @@ async fn questions_go_to_the_named_orchestrator_and_the_answer_is_relayed() {
         .unwrap();
 
     // `<Project>: …` goes to that project's orchestrator, marked as from
-    // Slack, with the answer instruction; the report is relayed.
+    // Slack, with the answer instruction. The thread gets an immediate
+    // "Asking …" progress message.
     let at = now_s();
     socket.send(message(
         "env-1",
@@ -838,7 +934,7 @@ async fn questions_go_to_the_named_orchestrator_and_the_answer_is_relayed() {
         "checkout &lt;!channel&gt;: what's left? a &amp;&amp; b token=abc123",
         at,
     ));
-    eventually("sent", || thread_posts(&slack, at).len() == 1).await;
+    eventually("sent", || !console.inner.prompts.lock().unwrap().is_empty()).await;
     assert_eq!(
         console.inner.prompt_targets.lock().unwrap().clone(),
         [AgentTarget::ProjectOrchestrator {
@@ -850,14 +946,18 @@ async fn questions_go_to_the_named_orchestrator_and_the_answer_is_relayed() {
         text,
         super::relay::question_text("what's left? a && b token=abc123")
     );
+    assert!(text.contains("do not start long investigations or delegations"));
     assert_eq!(actor, "slack:owner:U01OWNER");
+    let posts = thread_posts(&slack, at);
+    assert_eq!(posts.len(), 1, "{:?}", texts(&posts));
     assert!(
-        texts(&thread_posts(&slack, at))[0]
-            .starts_with("Sent to the Checkout &lt;!channel&gt; orchestrator."),
+        texts(&posts)[0].starts_with("Asking the Checkout &lt;!channel&gt; orchestrator…"),
         "{:?}",
-        texts(&thread_posts(&slack, at))
+        texts(&posts)
     );
-    // Another command's report and prose are never relayed; ours is.
+    assert!(posts[0]["blocks"].to_string().contains(":thinking_face:"));
+    // Another command's report and prose are never relayed; ours is, as a
+    // formatted answer, and the progress message turns into "Answered".
     *console.inner.screen.lock().unwrap() = format!(
         "{}\nworking on it…",
         super::relay::tests::report_line("command-0", "not this one")
@@ -869,20 +969,36 @@ async fn questions_go_to_the_named_orchestrator_and_the_answer_is_relayed() {
         super::relay::tests::report_line(
             "command-1",
             concat!(
-                "Two tasks left; key sk-",
+                "**Two** tasks left; key sk-",
                 "ant-api03-SECRETSECRETSECRETSECRET"
             )
         )
     );
     eventually("answer", || thread_posts(&slack, at).len() == 2).await;
-    let answer = texts(&thread_posts(&slack, at))[1].clone();
+    let answer = thread_posts(&slack, at)[1].clone();
+    let fallback = answer["text"].as_str().unwrap();
     assert!(
-        answer.starts_with(
-            "*Answer from the Checkout &lt;!channel&gt; orchestrator* (working)\nTwo tasks left"
+        fallback.starts_with(
+            "*Answer from the Checkout &lt;!channel&gt; orchestrator* (working)\n**Two** tasks left"
         ),
-        "{answer}"
+        "{fallback}"
     );
-    assert!(!answer.contains("SECRETSECRET"), "redacted: {answer}");
+    assert_eq!(answer["blocks"][0]["type"], "header");
+    let body = answer["blocks"][1]["text"]["text"].as_str().unwrap();
+    assert!(body.starts_with("*Two* tasks left"), "{body}");
+    assert!(
+        !answer.to_string().contains("SECRETSECRET"),
+        "redacted: {answer}"
+    );
+    eventually("answered", || {
+        slack.calls("chat.update").iter().any(|call| {
+            call.body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("answered in")
+        })
+    })
+    .await;
     assert!(
         console
             .inner
@@ -894,30 +1010,6 @@ async fn questions_go_to_the_named_orchestrator_and_the_answer_is_relayed() {
         "only our command's report is looked for"
     );
 
-    // Anything else goes to the Superintendent; no answer → a note, then
-    // the watch ends with "open Yard".
-    *console.inner.screen.lock().unwrap() = super::prompt::tests::WORKING.to_owned();
-    let at = at + 1;
-    socket.send(message("env-2", "Ev2", "what is blocked right now?", at));
-    eventually("timed out", || thread_posts(&slack, at).len() == 3).await;
-    let posts = texts(&thread_posts(&slack, at));
-    assert_eq!(
-        console.inner.prompt_targets.lock().unwrap()[1],
-        AgentTarget::YardOrchestrator
-    );
-    assert!(
-        posts[0].starts_with("Sent to the Superintendent."),
-        "{posts:?}"
-    );
-    assert!(
-        posts[1].starts_with("Yard has not found an answer from the Superintendent yet"),
-        "{posts:?}"
-    );
-    assert!(
-        posts[2].starts_with("Yard found no answer from the Superintendent"),
-        "{posts:?}"
-    );
-
     // A blocked orchestrator gets no question: its prompt card instead.
     set_blocked(&console, true);
     *console.inner.screen.lock().unwrap() = CLAUDE_PERMISSION.to_owned();
@@ -925,31 +1017,99 @@ async fn questions_go_to_the_named_orchestrator_and_the_answer_is_relayed() {
     socket.send(message("env-3", "Ev3", "are you done?", at));
     eventually("blocked refusal", || thread_posts(&slack, at).len() == 2).await;
     let posts = thread_posts(&slack, at);
-    assert!(
-        texts(&posts)[0].contains("waiting on a prompt, so your question was not sent"),
-        "{:?}",
-        texts(&posts)
-    );
     assert_eq!(
-        posts[1]["blocks"][1]["elements"].as_array().unwrap().len(),
+        posts[1]["blocks"][2]["elements"].as_array().unwrap().len(),
         2
     );
-    assert_eq!(console.inner.prompts.lock().unwrap().len(), 2, "not sent");
+    let not_sent = |slack: &MockSlack, why: &str| {
+        slack.calls("chat.update").into_iter().find(|call| {
+            call.body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&format!("was not sent: {why}"))
+        })
+    };
+    // A card like every other ask outcome: Retry and Open in Yard.
+    let card = not_sent(&slack, "it is waiting on a prompt").unwrap().body;
+    button_value(&card, "Retry");
+    assert!(
+        card["blocks"]
+            .to_string()
+            .contains(super::blocks::OPEN_ACTION_ID)
+    );
+    assert_eq!(console.inner.prompts.lock().unwrap().len(), 1, "not sent");
 
-    // A refused prompt (terminal open in Yard) is reported, not retried.
+    // A rejected delivery (terminal open in Yard) becomes an error card
+    // with Retry and Open in Yard; nothing is retried by itself.
     set_blocked(&console, false);
     *console.inner.prompt_error.lock().unwrap() =
         Some(ConsoleError::Busy("open in Yard".to_owned()));
     let at = at + 1;
     socket.send(message("env-4", "Ev4", "hello?", at));
-    eventually("busy", || thread_posts(&slack, at).len() == 1).await;
+    let failed = |slack: &MockSlack| {
+        slack.calls("chat.update").into_iter().find(|call| {
+            call.body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("its terminal is open in Yard; answer it there")
+        })
+    };
+    eventually("busy", || failed(&slack).is_some()).await;
+    let card = failed(&slack).unwrap().body;
+    button_value(&card, "Retry");
     assert!(
-        texts(&thread_posts(&slack, at))[0].contains("open in Yard; answer it there"),
-        "{:?}",
-        texts(&thread_posts(&slack, at))
+        card["blocks"]
+            .to_string()
+            .contains(super::blocks::OPEN_ACTION_ID)
     );
+    assert_eq!(console.inner.prompts.lock().unwrap().len(), 1);
 
-    let outcomes = audit_lines(&temp)
+    // Reading the agent fails (not gone): the same card, with Retry.
+    *console.inner.prompt_error.lock().unwrap() = None;
+    let running = console.inner.snapshot.lock().unwrap().clone();
+    *console.inner.snapshot.lock().unwrap() =
+        Err(ConsoleError::Failed("herdr timed out".to_owned()));
+    let at = at + 1;
+    socket.send(message("env-5", "Ev5", "anyone?", at));
+    eventually("read failed", || {
+        not_sent(&slack, "Yard could not deliver the question").is_some()
+    })
+    .await;
+    let card = not_sent(&slack, "Yard could not deliver the question")
+        .unwrap()
+        .body;
+    button_value(&card, "Retry");
+    assert!(
+        card["blocks"]
+            .to_string()
+            .contains(super::blocks::OPEN_ACTION_ID)
+    );
+    *console.inner.snapshot.lock().unwrap() = running;
+    assert_eq!(console.inner.prompts.lock().unwrap().len(), 1);
+
+    let outcomes = outcomes(&temp);
+    assert_eq!(
+        outcomes,
+        [
+            format!("ask:orchestrator:{project_id}:sent"),
+            format!("relay:orchestrator:{project_id}:relayed"),
+            "ask:superintendent:refused:blocked".to_owned(),
+            "ask:superintendent:refused:busy".to_owned(),
+            "ask:superintendent:refused:failed".to_owned(),
+        ]
+    );
+    let audit = std::fs::read_to_string(temp.path().join("slack-audit.jsonl")).unwrap()
+        + &std::fs::read_to_string(temp.path().join("slack-audit-dropped.jsonl"))
+            .unwrap_or_default();
+    assert!(
+        !audit.contains("abc123") && !audit.contains("what's left"),
+        "no message text"
+    );
+}
+
+/// `action:target:outcome` of every non-dropped audit line.
+fn outcomes(temp: &TempDir) -> Vec<String> {
+    audit_lines(temp)
         .iter()
         .filter(|line| line["kind"] != "dropped")
         .map(|line| {
@@ -960,24 +1120,512 @@ async fn questions_go_to_the_named_orchestrator_and_the_answer_is_relayed() {
                 line["outcome"].as_str().unwrap()
             )
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+/// An owner click on `value`, on a message in the thread rooted at `at_s`.
+/// Each click gets its own fresh `action_ts` (Slack never repeats one;
+/// Yard drops a repeated one as a duplicate).
+fn thread_click(envelope: &str, value: &str, at_s: u64) -> Value {
+    static CLICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let unique = CLICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let value = with(
+        click(envelope, value, now_s()),
+        "/payload/actions/0/action_ts",
+        json!(format!("{}.{unique:06}", now_s())),
+    );
+    with(
+        value,
+        "/payload/message/thread_ts",
+        json!(format!("{at_s}.000100")),
+    )
+}
+
+/// The last chat.update whose text contains `needle`.
+fn update_with(slack: &MockSlack, needle: &str) -> Option<Value> {
+    slack
+        .calls("chat.update")
+        .into_iter()
+        .rev()
+        .find(|call| {
+            call.body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(needle)
+        })
+        .map(|call| call.body)
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn an_unanswered_question_gets_throttled_progress_a_timeout_check_again_and_late_answers() {
+    let temp = TempDir::new().unwrap();
+    let slack = MockSlack::start().await;
+    let socket = MockSocket::start().await;
+    let relay = super::relay::RelayTiming {
+        follow: Duration::from_secs(4),
+        progress: Duration::from_millis(1_200),
+        late: Duration::from_millis(2_500),
+        ..fast_relay()
+    };
+    let notifier = connected_relay(&temp, &slack, &socket, relay).await;
+    let console = GatedConsole::new(super::prompt::tests::WORKING, 10_000);
+    set_blocked(&console, false);
+    notifier.attach_console(console.clone());
+
+    let at = now_s();
+    socket.send(message("env-1", "Ev1", "what is blocked right now?", at));
+    eventually("timed out", || {
+        update_with(&slack, "No answer from the Superintendent after").is_some()
+    })
+    .await;
+    assert_eq!(
+        console.inner.prompt_targets.lock().unwrap()[0],
+        AgentTarget::YardOrchestrator
+    );
+    // One progress message, updated in place and throttled (the pane was
+    // read far more often than the message was edited).
+    let posts = thread_posts(&slack, at);
+    assert_eq!(posts.len(), 1, "{:?}", texts(&posts));
+    let progress = slack
+        .calls("chat.update")
+        .iter()
+        .filter(|call| {
+            call.body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("Still waiting for the Superintendent")
+        })
+        .count();
+    let reads = console.inner.report_reads.lock().unwrap().len();
+    assert!((2..=3).contains(&progress), "{progress} progress updates");
+    assert!(reads > progress * 2, "{reads} reads, {progress} updates");
+    let timed_out = update_with(&slack, "No answer from the Superintendent after").unwrap();
+    assert!(
+        timed_out["text"]
+            .as_str()
+            .unwrap()
+            .contains("still posted here"),
+        "{timed_out}"
+    );
+
+    // Check again before an answer: says so, with a fresh button.
+    let check = button_value(&timed_out, "Check again");
+    socket.send(thread_click("env-2", &check, at));
+    eventually("not yet", || thread_posts(&slack, at).len() == 2).await;
+    let not_yet = thread_posts(&slack, at)[1].clone();
+    assert!(
+        not_yet["text"]
+            .as_str()
+            .unwrap()
+            .contains("has not answered this question yet"),
+        "{not_yet}"
+    );
+    let fresh = button_value(&not_yet, "Check again");
+    assert_ne!(fresh, check);
+    // The same Check again id is single-use.
+    socket.send(thread_click("env-3", &check, at));
+    eventually("reused", || thread_posts(&slack, at).len() == 3).await;
+    assert!(texts(&thread_posts(&slack, at))[2].contains("already used"));
+
+    // A late answer for the same command id is still relayed, once.
+    *console.inner.screen.lock().unwrap() = format!(
+        "⏺ {}\n",
+        super::relay::tests::report_line("command-1", "Nothing is blocked.")
+    );
+    eventually("late answer", || thread_posts(&slack, at).len() == 4).await;
+    assert!(texts(&thread_posts(&slack, at))[3].contains("Nothing is blocked."));
+    eventually("answered", || update_with(&slack, "answered in").is_some()).await;
+    socket.send(thread_click("env-4", &fresh, at));
+    eventually("already", || thread_posts(&slack, at).len() == 5).await;
+    assert!(texts(&thread_posts(&slack, at))[4].contains("already answered"));
+
+    // After the late window, Check again still relays an answer it finds.
+    *console.inner.screen.lock().unwrap() = super::prompt::tests::WORKING.to_owned();
+    let at2 = at + 1;
+    socket.send(message("env-5", "Ev5", "and now?", at2));
+    eventually("second timed out", || {
+        slack
+            .calls("chat.update")
+            .iter()
+            .filter(|call| {
+                call.body["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("No answer from the Superintendent")
+            })
+            .count()
+            == 2
+    })
+    .await;
+    let timed_out = update_with(&slack, "No answer from the Superintendent after").unwrap();
+    let check = button_value(&timed_out, "Check again");
+    tokio::time::sleep(Duration::from_millis(2_700)).await;
+    *console.inner.screen.lock().unwrap() = format!(
+        "⏺ {}\n",
+        super::relay::tests::report_line("command-2", "Still nothing.")
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(thread_posts(&slack, at2).len(), 1, "late window over");
+    socket.send(thread_click("env-6", &check, at2));
+    eventually("checked", || thread_posts(&slack, at2).len() == 2).await;
+    assert!(texts(&thread_posts(&slack, at2))[1].contains("Still nothing."));
+
+    let outcomes = outcomes(&temp);
     assert_eq!(
         outcomes,
         [
-            format!("ask:orchestrator:{project_id}:sent"),
-            format!("relay:orchestrator:{project_id}:relayed"),
-            "ask:superintendent:sent".to_owned(),
-            "relay:superintendent:timed_out".to_owned(),
-            "ask:superintendent:refused:blocked".to_owned(),
-            "ask:superintendent:refused:busy".to_owned(),
+            "ask:superintendent:sent",
+            "relay:superintendent:timed_out",
+            "nav_check_again:superintendent:answered",
+            "check_again:superintendent:not_yet",
+            "nav:-:refused:already_used",
+            "relay:superintendent:relayed_late",
+            "nav_check_again:superintendent:answered",
+            "check_again:superintendent:already_relayed",
+            "ask:superintendent:sent",
+            "relay:superintendent:timed_out",
+            "nav_check_again:superintendent:answered",
+            "relay:superintendent:relayed_on_check",
         ]
     );
-    let audit = std::fs::read_to_string(temp.path().join("slack-audit.jsonl")).unwrap()
-        + &std::fs::read_to_string(temp.path().join("slack-audit-dropped.jsonl"))
-            .unwrap_or_default();
+}
+
+/// A Slack API error reply for the next `method` call.
+fn fail_next(slack: &MockSlack, method: &str) {
+    slack.script(
+        method,
+        super::tests::MockReply::Json(json!({ "ok": false, "error": "internal_error" })),
+    );
+}
+
+/// A question whose watch is running on a working Superintendent.
+async fn asked_working(
+    temp: &TempDir,
+    slack: &MockSlack,
+    socket: &MockSocket,
+    relay: super::relay::RelayTiming,
+) -> (SlackNotifier, Arc<GatedConsole>) {
+    let notifier = connected_relay(temp, slack, socket, relay).await;
+    let console = GatedConsole::new(super::prompt::tests::WORKING, 10_000);
+    set_blocked(&console, false);
+    notifier.attach_console(console.clone());
+    (notifier, console)
+}
+
+fn answer_screen(command_id: &str, last: &str) -> String {
+    format!("⏺ {}\n", super::relay::tests::report_line(command_id, last))
+}
+
+#[tokio::test]
+async fn a_failed_answer_post_is_retried_and_not_shown_as_answered() {
+    let temp = TempDir::new().unwrap();
+    let slack = MockSlack::start().await;
+    let socket = MockSocket::start().await;
+    let relay = super::relay::RelayTiming {
+        follow: Duration::from_secs(60),
+        progress: Duration::from_secs(60),
+        ..fast_relay()
+    };
+    let (_notifier, console) = asked_working(&temp, &slack, &socket, relay).await;
+    let at = now_s();
+    socket.send(message("env-1", "Ev1", "what is blocked?", at));
+    eventually("asking", || thread_posts(&slack, at).len() == 1).await;
+    eventually("sent", || console.inner.prompts.lock().unwrap().len() == 1).await;
+    // The answer's chat.postMessage fails once (429, network blip, …).
+    fail_next(&slack, "chat.postMessage");
+    *console.inner.screen.lock().unwrap() = answer_screen("command-1", "Nothing is blocked.");
+    eventually("posted on the next read", || {
+        thread_posts(&slack, at).len() == 3
+    })
+    .await;
+    let posts = texts(&thread_posts(&slack, at));
+    assert!(posts[1].contains("Nothing is blocked.") && posts[2].contains("Nothing is blocked."));
+    eventually("answered", || update_with(&slack, "answered in").is_some()).await;
+    assert_eq!(
+        slack.calls("chat.update").len(),
+        1,
+        "answered once, after the post"
+    );
+    assert_eq!(
+        outcomes(&temp),
+        [
+            "ask:superintendent:sent",
+            "relay:superintendent:post_failed",
+            "relay:superintendent:relayed",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn without_an_asking_message_progress_is_posted_once_then_updated() {
+    let temp = TempDir::new().unwrap();
+    let slack = MockSlack::start().await;
+    let socket = MockSocket::start().await;
+    let relay = super::relay::RelayTiming {
+        follow: Duration::from_secs(4),
+        progress: Duration::from_millis(1_200),
+        late: Duration::from_millis(200),
+        ..fast_relay()
+    };
+    let (_notifier, _console) = asked_working(&temp, &slack, &socket, relay).await;
+    // The "Asking…" post fails.
+    fail_next(&slack, "chat.postMessage");
+    let at = now_s();
+    socket.send(message("env-1", "Ev1", "what is blocked?", at));
+    eventually("timed out", || {
+        update_with(&slack, "No answer from the Superintendent after").is_some()
+    })
+    .await;
+    let posts = texts(&thread_posts(&slack, at));
+    assert_eq!(
+        posts.len(),
+        2,
+        "failed Asking… plus one progress message: {posts:?}"
+    );
     assert!(
-        !audit.contains("abc123") && !audit.contains("what's left"),
-        "no message text"
+        posts[1].starts_with("Still waiting for the Superintendent"),
+        "{posts:?}"
+    );
+    // The timeout edits that one message (the first successful post).
+    let timed_out = update_with(&slack, "No answer from the Superintendent after").unwrap();
+    assert_eq!(timed_out["ts"], CARD_TS);
+}
+
+#[tokio::test]
+async fn a_late_watch_survives_one_failed_pane_read() {
+    let temp = TempDir::new().unwrap();
+    let slack = MockSlack::start().await;
+    let socket = MockSocket::start().await;
+    let relay = super::relay::RelayTiming {
+        follow: Duration::from_millis(600),
+        progress: Duration::from_secs(60),
+        late: Duration::from_secs(4),
+        ..fast_relay()
+    };
+    let (_notifier, console) = asked_working(&temp, &slack, &socket, relay).await;
+    let at = now_s();
+    socket.send(message("env-1", "Ev1", "what is blocked?", at));
+    eventually("timed out", || {
+        update_with(&slack, "No answer from the Superintendent after").is_some()
+    })
+    .await;
+    // One transient read failure (herdr timeout), then the late answer.
+    *console.inner.watch_error.lock().unwrap() =
+        Some(ConsoleError::Failed("herdr read timed out".to_owned()));
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    *console.inner.watch_error.lock().unwrap() = None;
+    *console.inner.screen.lock().unwrap() = answer_screen("command-1", "Late but here.");
+    eventually("late answer", || thread_posts(&slack, at).len() == 2).await;
+    assert!(texts(&thread_posts(&slack, at))[1].contains("Late but here."));
+    assert_eq!(
+        outcomes(&temp).last().map(String::as_str),
+        Some("relay:superintendent:relayed_late")
+    );
+}
+
+#[tokio::test]
+async fn a_question_sent_with_every_watch_slot_busy_offers_check_again() {
+    let temp = TempDir::new().unwrap();
+    let slack = MockSlack::start().await;
+    let socket = MockSocket::start().await;
+    let (notifier, console) = asked_working(&temp, &slack, &socket, fast_relay()).await;
+    notifier.fill_watchers();
+    let at = now_s();
+    socket.send(message("env-1", "Ev1", "what is blocked?", at));
+    eventually("not watched", || {
+        update_with(&slack, "won't post this one by itself").is_some()
+    })
+    .await;
+    assert_eq!(console.inner.prompts.lock().unwrap().len(), 1, "still sent");
+    let card = update_with(&slack, "won't post this one by itself").unwrap();
+    let check = button_value(&card, "Check again");
+    *console.inner.screen.lock().unwrap() = answer_screen("command-1", "Nothing is blocked.");
+    socket.send(thread_click("env-2", &check, at));
+    eventually("checked", || thread_posts(&slack, at).len() == 2).await;
+    assert!(texts(&thread_posts(&slack, at))[1].contains("Nothing is blocked."));
+}
+
+fn set_health(console: &GatedConsole, health: super::actions::AgentHealth) {
+    *console.inner.snapshot.lock().unwrap() = Ok(AgentSnapshot {
+        identity: super::actions::tests::identity(),
+        blocked: false,
+        health,
+    });
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn unreachable_or_disconnected_agents_are_reported_fast_with_retry() {
+    use super::actions::AgentHealth;
+    let temp = TempDir::new().unwrap();
+    let slack = MockSlack::start().await;
+    let socket = MockSocket::start().await;
+    let relay = super::relay::RelayTiming {
+        follow: Duration::from_secs(60),
+        progress: Duration::from_secs(60),
+        ..fast_relay()
+    };
+    let notifier = connected_relay(&temp, &slack, &socket, relay).await;
+    let console = GatedConsole::new(super::prompt::tests::WORKING, 10_000);
+    notifier.attach_console(console.clone());
+
+    // Not running → said at once, nothing sent, Retry + Open in Yard.
+    set_health(
+        &console,
+        AgentHealth::NotRunning("its agent process exited".to_owned()),
+    );
+    let at = now_s();
+    socket.send(message("env-1", "Ev1", "what is blocked?", at));
+    eventually("unreachable", || {
+        update_with(&slack, "The Superintendent isn't running").is_some()
+    })
+    .await;
+    let card = update_with(&slack, "The Superintendent isn't running").unwrap();
+    assert!(
+        card["text"]
+            .as_str()
+            .unwrap()
+            .contains("(its agent process exited)")
+    );
+    assert!(
+        card["blocks"]
+            .to_string()
+            .contains(super::blocks::OPEN_ACTION_ID)
+    );
+    assert!(console.inner.prompts.lock().unwrap().is_empty(), "not sent");
+    // Retry from a stranger does nothing and keeps the id usable.
+    let retry = button_value(&card, "Retry");
+    socket.send(with(
+        thread_click("env-2", &retry, at),
+        "/payload/user/id",
+        json!("U02STRANGER"),
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(console.inner.prompts.lock().unwrap().is_empty());
+    // The owner's Retry re-sends the same question as a new command.
+    set_health(&console, AgentHealth::Working);
+    socket.send(thread_click("env-3", &retry, at));
+    eventually("retried", || {
+        console.inner.prompts.lock().unwrap().len() == 1
+    })
+    .await;
+    assert_eq!(
+        console.inner.prompts.lock().unwrap()[0].0,
+        super::relay::question_text("what is blocked?")
+    );
+    assert_eq!(
+        thread_posts(&slack, at).len(),
+        2,
+        "second Asking… in the thread"
+    );
+    // Reusing the Retry id sends nothing more.
+    socket.send(thread_click("env-4", &retry, at));
+    eventually("reused", || thread_posts(&slack, at).len() == 3).await;
+    assert_eq!(console.inner.prompts.lock().unwrap().len(), 1);
+
+    // The Codex TUI loses its app-server session while answering: the
+    // progress message becomes an error card long before the window ends.
+    let started = Instant::now();
+    *console.inner.screen.lock().unwrap() = [
+        "■ Connection lost (an older incident, above the question)",
+        "> From Slack (owner): what is blocked?",
+        "Status protocol for command \"command-1\": respond with JSON",
+        "• Working (12s • esc to interrupt)",
+        "■ Connection lost <retrying> & reconnecting. The app-server session could not be restored.",
+        "Disconnected from this task.",
+    ]
+    .join("\n");
+    eventually("disconnected", || {
+        update_with(&slack, "can't answer right now").is_some()
+    })
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "long before the window"
+    );
+    let card = update_with(&slack, "can't answer right now").unwrap();
+    assert!(
+        card["text"]
+            .as_str()
+            .unwrap()
+            .contains("Connection lost &lt;retrying&gt; &amp; reconnecting. The app-server session could not be restored."),
+        "{card}"
+    );
+    // Escaped once, in the card and its fallback text alike.
+    assert!(!card.to_string().contains("&amp;lt;"), "{card}");
+    button_value(&card, "Retry");
+
+    // The agent exits while a question is open: detected from the binding.
+    *console.inner.screen.lock().unwrap() = super::prompt::tests::WORKING.to_owned();
+    let at = at + 1;
+    socket.send(message("env-5", "Ev5", "still there?", at));
+    eventually("sent", || console.inner.prompts.lock().unwrap().len() == 2).await;
+    set_health(
+        &console,
+        AgentHealth::NotRunning("its pane is gone or no longer shows an agent".to_owned()),
+    );
+    eventually("exited", || {
+        update_with(&slack, "its pane is gone or no longer shows an agent").is_some()
+    })
+    .await;
+
+    // A pane read failing for good (binding stale) ends the watch too.
+    set_health(&console, AgentHealth::Working);
+    let at = at + 1;
+    socket.send(message("env-6", "Ev6", "and you?", at));
+    eventually("sent", || console.inner.prompts.lock().unwrap().len() == 3).await;
+    *console.inner.watch_error.lock().unwrap() = Some(ConsoleError::IdentityChanged(
+        "the runtime binding is stale".to_owned(),
+    ));
+    eventually("stale", || {
+        update_with(&slack, "binding is stale").is_some()
+    })
+    .await;
+
+    // Already disconnected before the question (the process lives on):
+    // refused at once with Retry, nothing typed.
+    *console.inner.watch_error.lock().unwrap() = None;
+    *console.inner.screen.lock().unwrap() = [
+        "• Earlier answer",
+        "■ The app-server session could not be restored.",
+        "  Disconnected from this task. Start a new session to continue <now> & retry.",
+        "",
+        "› Ask Codex to do anything",
+    ]
+    .join("\n");
+    let at = at + 1;
+    socket.send(message("env-7", "Ev7", "are you there?", at));
+    eventually("refused disconnected", || {
+        update_with(&slack, "isn't running (its terminal shows").is_some()
+    })
+    .await;
+    let card = update_with(&slack, "isn't running (its terminal shows").unwrap();
+    assert!(
+        card["text"]
+            .as_str()
+            .unwrap()
+            .contains("continue &lt;now&gt; &amp; retry"),
+        "{card}"
+    );
+    assert!(!card.to_string().contains("&amp;lt;"), "{card}");
+    button_value(&card, "Retry");
+    assert_eq!(console.inner.prompts.lock().unwrap().len(), 3, "not sent");
+
+    assert_eq!(
+        outcomes(&temp),
+        [
+            "ask:superintendent:refused:not_running",
+            "nav_retry:superintendent:answered",
+            "ask:superintendent:sent",
+            "nav:-:refused:already_used",
+            "relay:superintendent:lost:disconnected",
+            "ask:superintendent:sent",
+            "relay:superintendent:lost:not_running",
+            "ask:superintendent:sent",
+            "relay:superintendent:lost:terminal_changed",
+            "ask:superintendent:refused:disconnected",
+        ]
     );
 }
 
@@ -1020,7 +1668,7 @@ async fn blocked_notifications_get_the_prompt_card_in_their_thread_only_with_inb
         }
         assert_eq!(posts.len(), 2);
         assert_eq!(posts[1].body["thread_ts"], CARD_TS, "in the DM's thread");
-        let labels = posts[1].body["blocks"][1]["elements"]
+        let labels = posts[1].body["blocks"][2]["elements"]
             .as_array()
             .unwrap()
             .iter()
@@ -1107,6 +1755,7 @@ async fn each_question_card_is_its_own_thread_and_unblocked_agents_show_nothing(
     *console.inner.snapshot.lock().unwrap() = Ok(AgentSnapshot {
         identity: super::actions::tests::identity(),
         blocked: false,
+        health: super::actions::AgentHealth::Working,
     });
     *console.inner.screen.lock().unwrap() =
         "cat config.toml\nsecret_line = visible-live-output\n".to_owned();
@@ -1142,8 +1791,86 @@ async fn a_second_socket_connection_is_reported_in_the_status() {
             .is_some_and(|error| error.contains("one Yard only")),
         "{status:?}"
     );
+    let error = notifier.inbound_status().last_error.unwrap();
+    assert!(
+        error.contains("Slack reported 2 Socket Mode connections")
+            && error.contains("may be stale"),
+        "{error}"
+    );
+    // A later hello with one connection clears it; another stale count
+    // shows again and clears again.
     notifier.handle_socket_event(hello(1)).await;
     assert_eq!(notifier.inbound_status().last_error, None);
+    notifier.handle_socket_event(hello(3)).await;
+    assert!(
+        notifier
+            .inbound_status()
+            .last_error
+            .unwrap()
+            .contains("reported 3")
+    );
+    notifier.handle_socket_event(hello(1)).await;
+    assert_eq!(notifier.inbound_status().last_error, None);
+}
+
+#[tokio::test]
+async fn shutdown_closes_the_socket_cleanly_and_does_not_reconnect() {
+    let temp = TempDir::new().unwrap();
+    let slack = MockSlack::start().await;
+    let socket = MockSocket::start().await;
+    let notifier = connected(&temp, &slack, &socket).await;
+    assert_eq!(socket.connections(), 1);
+    assert!(socket.closes.lock().unwrap().is_empty());
+    notifier.close_inbound(Duration::from_secs(5)).await;
+    eventually("close frame", || !socket.closes.lock().unwrap().is_empty()).await;
+    assert_eq!(
+        socket.closes.lock().unwrap().clone(),
+        [(1000, "yard shutting down".to_owned())]
+    );
+    eventually("stopped", || {
+        notifier.inbound_status().status == InboundStatusKind::Off
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(socket.connections(), 1, "no reconnect after shutdown");
+    assert_eq!(slack.calls("apps.connections.open").len(), 1);
+}
+
+#[tokio::test]
+async fn shutdown_ends_open_questions_instead_of_leaving_them_waiting() {
+    let temp = TempDir::new().unwrap();
+    let slack = MockSlack::start().await;
+    let socket = MockSocket::start().await;
+    let relay = super::relay::RelayTiming {
+        follow: Duration::from_secs(60),
+        progress: Duration::from_secs(60),
+        ..fast_relay()
+    };
+    let (notifier, console) = asked_working(&temp, &slack, &socket, relay).await;
+    let at = now_s();
+    socket.send(message("env-1", "Ev1", "what is blocked?", at));
+    eventually("sent", || console.inner.prompts.lock().unwrap().len() == 1).await;
+    eventually("watching", || {
+        console.inner.report_reads.lock().unwrap().len() >= 2
+    })
+    .await;
+    notifier.close_inbound(Duration::from_secs(5)).await;
+    let card = update_with(&slack, "Yard restarted before the Superintendent answered")
+        .expect("progress message ended");
+    assert_eq!(card["ts"], CARD_TS);
+    assert!(
+        card["blocks"]
+            .to_string()
+            .contains(super::blocks::OPEN_ACTION_ID)
+    );
+    assert_eq!(
+        outcomes(&temp).last().map(String::as_str),
+        Some("relay:superintendent:ended:restart")
+    );
+    // A question that already ended is not touched again.
+    let updates = slack.calls("chat.update").len();
+    notifier.close_inbound(Duration::from_secs(1)).await;
+    assert_eq!(slack.calls("chat.update").len(), updates);
 }
 
 /// The same menu with a second question.
@@ -1172,7 +1899,7 @@ async fn after_a_click_the_next_prompt_or_a_stuck_one_is_reported() {
             .await
             .unwrap();
         let card = slack.calls("chat.postMessage").pop().unwrap();
-        let first = card.body["blocks"][1]["elements"][0]["value"]
+        let first = card.body["blocks"][2]["elements"][0]["value"]
             .as_str()
             .unwrap()
             .to_owned();
@@ -1241,7 +1968,7 @@ async fn refused_and_dead_buttons_collapse_to_not_sent() {
         .await
         .unwrap();
     let card = slack.calls("chat.postMessage").pop().unwrap();
-    let first = card.body["blocks"][1]["elements"][0]["value"]
+    let first = card.body["blocks"][2]["elements"][0]["value"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -1264,6 +1991,45 @@ async fn refused_and_dead_buttons_collapse_to_not_sent() {
     assert!(
         update.body["text"].as_str().unwrap().contains("not sent"),
         "{update:?}"
+    );
+    assert!(console.typed().is_empty());
+}
+
+#[tokio::test]
+async fn an_unknown_navigation_button_leaves_its_card_alone() {
+    let temp = TempDir::new().unwrap();
+    let slack = MockSlack::start().await;
+    let socket = MockSocket::start().await;
+    let notifier = connected(&temp, &slack, &socket).await;
+    let console = GatedConsole::new(super::prompt::tests::CLAUDE_MENU, 1000);
+    notifier.attach_console(console.clone());
+    // "Status" on a help card, "Check again" on a timeout card, after a
+    // Yard restart: Yard no longer knows the ids.
+    for (envelope, action_id) in [
+        ("env-1", "yard_nav_status_ffffffff"),
+        ("env-2", "yard_nav_check_again_eeeeeeee"),
+    ] {
+        let value = "e".repeat(31) + &envelope[4..];
+        let clicked = with(
+            card_click(envelope, &value, now_s()),
+            "/payload/actions/0/action_id",
+            json!(action_id),
+        );
+        socket.send(clicked);
+    }
+    eventually("replies", || slack.calls("chat.postMessage").len() == 2).await;
+    for text in posted_texts(&slack) {
+        assert!(text.contains("no longer knows that button"), "{text}");
+        assert!(text.contains("`help`"), "{text}");
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(slack.calls("chat.update").is_empty(), "card overwritten");
+    assert_eq!(
+        outcomes(&temp)
+            .iter()
+            .filter(|outcome| *outcome == "nav:-:refused:unknown")
+            .count(),
+        2
     );
     assert!(console.typed().is_empty());
 }
@@ -1392,4 +2158,390 @@ async fn an_agent_that_finished_by_asking_gets_a_question_card() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(slack.calls("chat.postMessage").len(), before);
+}
+
+/// The value of the button labelled `label` anywhere in `post`.
+fn button_value(post: &Value, label: &str) -> String {
+    post["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|block| {
+            block["elements"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .chain(block.get("accessory").cloned())
+        })
+        .find(|element| element["text"]["text"] == label)
+        .and_then(|element| element["value"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| panic!("no {label} button in {post}"))
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn navigation_buttons_run_commands_through_the_guarded_click_path() {
+    let temp = TempDir::new().unwrap();
+    let slack = MockSlack::start().await;
+    let socket = MockSocket::start().await;
+    let notifier = connected(&temp, &slack, &socket).await;
+    let console = GatedConsole::new(CLAUDE_PERMISSION, 100);
+    notifier.attach_console(console.clone());
+
+    let at = now_s();
+    let root = format!("{at}.000100");
+    socket.send(message("env-1", "Ev1", "help", at));
+    eventually("help card", || thread_posts(&slack, at).len() == 1).await;
+    let help = thread_posts(&slack, at).remove(0);
+    assert_eq!(help["blocks"][0]["type"], "header");
+    let status = button_value(&help, "Status");
+    let review = button_value(&help, "Review");
+    assert!(help.to_string().contains("https://yard.example.test/"));
+    let in_thread = |envelope: &str, value: &str, at_s: u64| {
+        with(
+            click(envelope, value, at_s),
+            "/payload/message/thread_ts",
+            json!(root),
+        )
+    };
+
+    // A stranger's click is dropped and does not use up the button.
+    let stranger = with(
+        in_thread("env-2", &review, at + 1),
+        "/payload/user/id",
+        json!("U02STRANGER"),
+    );
+    socket.send(stranger);
+    // "Open in Yard" only opens the browser: dropped, nothing posted.
+    let link = with(
+        in_thread("env-3", &"0".repeat(32), at + 1),
+        "/payload/actions/0",
+        json!({
+            "type": "button", "action_id": "yard_open", "url": "https://yard.example.test/",
+            "action_ts": format!("{}.123456", at + 1),
+        }),
+    );
+    socket.send(link);
+    eventually("drops audited", || {
+        audit_lines(&temp)
+            .iter()
+            .filter(|line| line["kind"] == "dropped")
+            .count()
+            == 2
+    })
+    .await;
+    assert_eq!(thread_posts(&slack, at).len(), 1, "nothing posted");
+
+    // The owner's click runs `status` in the same thread.
+    socket.send(in_thread("env-4", &status, at + 2));
+    eventually("status card", || thread_posts(&slack, at).len() == 2).await;
+    let card = thread_posts(&slack, at).remove(1);
+    assert!(
+        card["text"].as_str().unwrap().starts_with("*Yard status*"),
+        "{card}"
+    );
+    let details = button_value(&card, "Details");
+
+    // Used once: a second click runs nothing.
+    socket.send(in_thread("env-5", &status, at + 3));
+    eventually("reused", || thread_posts(&slack, at).len() == 3).await;
+    assert!(
+        texts(&thread_posts(&slack, at))[2].contains("already used"),
+        "{:?}",
+        texts(&thread_posts(&slack, at))
+    );
+
+    // "Details" runs `status <project>` for that project id.
+    socket.send(in_thread("env-6", &details, at + 4));
+    eventually("project card", || thread_posts(&slack, at).len() == 4).await;
+    let project = thread_posts(&slack, at).remove(3);
+    assert!(
+        project["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("*Checkout &lt;!channel&gt;*"),
+        "{project}"
+    );
+    assert_eq!(project["blocks"][0]["type"], "header");
+
+    // The review button still works for the owner (the stranger's click
+    // did not consume it).
+    socket.send(in_thread("env-7", &review, at + 5));
+    eventually("review", || thread_posts(&slack, at).len() == 5).await;
+    assert_eq!(
+        texts(&thread_posts(&slack, at))[4],
+        "Nothing is waiting for review."
+    );
+
+    // A made-up id is unknown to Yard and runs nothing.
+    socket.send(in_thread("env-8", &"e".repeat(32), at + 6));
+    eventually("unknown", || thread_posts(&slack, at).len() == 6).await;
+    assert!(texts(&thread_posts(&slack, at))[5].contains("does not know that button"));
+    assert!(console.typed().is_empty(), "navigation never types keys");
+
+    let audit = audit_lines(&temp)
+        .iter()
+        .map(|line| {
+            format!(
+                "{}/{}/{}",
+                line["kind"].as_str().unwrap(),
+                line["action"].as_str().unwrap(),
+                line["outcome"].as_str().unwrap()
+            )
+        })
+        .collect::<Vec<_>>();
+    for expected in [
+        "message/help/answered",
+        "dropped/not_the_owner/dropped",
+        "dropped/link_button/dropped",
+        "button/nav_status/answered",
+        "button/nav/refused:already_used",
+        "button/nav_status_project/answered",
+        "button/nav_review/answered",
+        "button/unknown/refused:unknown",
+    ] {
+        assert!(
+            audit.contains(&expected.to_owned()),
+            "{expected}: {audit:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn questions_to_agents_yard_refuses_input_for_are_not_sent() {
+    use super::actions::AgentHealth;
+    let temp = TempDir::new().unwrap();
+    let slack = MockSlack::start().await;
+    let socket = MockSocket::start().await;
+    let notifier = connected_relay(&temp, &slack, &socket, fast_relay()).await;
+    let console = GatedConsole::new(super::prompt::tests::WORKING, 10_000);
+    notifier.attach_console(console.clone());
+    set_health(&console, AgentHealth::Working);
+
+    // A managed pane whose lease needs recovery: refused before sending,
+    // with the reason, Retry and Open in Yard.
+    *console.inner.send_refusal.lock().unwrap() = Some(ConsoleError::Unavailable(
+        super::console::LEASE_RECOVERY_REQUIRED.to_owned(),
+    ));
+    let at = now_s();
+    socket.send(message("env-1", "Ev1", "what is blocked?", at));
+    eventually("refused", || update_with(&slack, "was not sent").is_some()).await;
+    let card = update_with(&slack, "was not sent").unwrap();
+    let text = card["text"].as_str().unwrap();
+    assert!(
+        text.contains("Yard lost the pane lease; recovery is required."),
+        "{text}"
+    );
+    assert!(!text.contains("required.."), "{text}");
+    assert!(
+        card["blocks"]
+            .to_string()
+            .contains(super::blocks::OPEN_ACTION_ID)
+    );
+    assert!(console.inner.prompts.lock().unwrap().is_empty(), "not sent");
+    let retry = button_value(&card, "Retry");
+
+    // Once recovered, the owner's Retry sends it.
+    *console.inner.send_refusal.lock().unwrap() = None;
+    socket.send(thread_click("env-2", &retry, at));
+    eventually("retried", || {
+        console.inner.prompts.lock().unwrap().len() == 1
+    })
+    .await;
+    assert!(
+        audit_lines(&temp)
+            .iter()
+            .any(|line| line["outcome"] == "refused:unavailable"),
+        "{:?}",
+        audit_lines(&temp)
+    );
+}
+
+/// Quiet hours never hold or delay the owner's own conversation: a command
+/// typed at 20:30 is answered at once while a blocked notification waits.
+#[tokio::test]
+async fn owner_replies_are_never_held_by_quiet_hours() {
+    let temp = TempDir::new().unwrap();
+    let slack = MockSlack::start().await;
+    let socket = MockSocket::start().await;
+    slack.set_socket_url(&socket.url);
+    let clock = super::policy::tests::TestClock::at(super::policy::tests::WORKDAY_EVENING);
+    let notifier = inbound_notifier_relay(
+        &temp,
+        &slack,
+        inbound_settings(enabled()),
+        0,
+        super::tests::instant_timing(),
+        fast_relay(),
+        super::policy::tests::parts(&clock, Some(&temp)),
+    )
+    .await;
+    tokio::spawn(notifier.clone().run_inbound());
+    eventually("hello", || {
+        notifier.inbound_status().status == InboundStatusKind::Connected
+    })
+    .await;
+    notifier.attach_console(GatedConsole::new(CLAUDE_PERMISSION, 100));
+
+    notifier.tick().await; // baseline
+    super::tests::set_orchestrator_status(&temp, "blocked", 2);
+    notifier.tick().await;
+    notifier.tick().await;
+    let quiet = notifier.status().quiet.unwrap();
+    assert!(quiet.active);
+    assert_eq!(quiet.held_count, 1);
+    assert!(slack.calls("chat.postMessage").is_empty());
+
+    let at = now_s();
+    socket.send(message("env-1", "Ev1", "status", at));
+    eventually("status reply", || thread_posts(&slack, at).len() == 1).await;
+    // Only the reply went out; the notification is still held.
+    assert_eq!(slack.calls("chat.postMessage").len(), 1);
+    assert_eq!(notifier.status().quiet.unwrap().held_count, 1);
+}
+
+/// `settings`, its buttons and the typed `mute …` / `unmute` / `digest`
+/// commands run through the owner-only, audited, single-use path.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn quiet_controls_mute_unmute_and_digest_through_the_guarded_path() {
+    let temp = TempDir::new().unwrap();
+    let slack = MockSlack::start().await;
+    let socket = MockSocket::start().await;
+    slack.set_socket_url(&socket.url);
+    let clock = super::policy::tests::TestClock::at(super::policy::tests::WORKDAY_EVENING);
+    let notifier = inbound_notifier_relay(
+        &temp,
+        &slack,
+        inbound_settings(enabled()),
+        0,
+        super::tests::instant_timing(),
+        fast_relay(),
+        super::policy::tests::parts(&clock, Some(&temp)),
+    )
+    .await;
+    tokio::spawn(notifier.clone().run_inbound());
+    eventually("hello", || {
+        notifier.inbound_status().status == InboundStatusKind::Connected
+    })
+    .await;
+    notifier.attach_console(GatedConsole::new(CLAUDE_PERMISSION, 100));
+    notifier.tick().await; // baseline
+    super::tests::set_orchestrator_status(&temp, "blocked", 2);
+    notifier.tick().await;
+    notifier.tick().await;
+    assert_eq!(notifier.status().quiet.unwrap().held_count, 1);
+
+    // The help card offers the settings card.
+    let at = now_s();
+    socket.send(message("env-0", "Ev0", "help", at - 100));
+    eventually("help", || thread_posts(&slack, at - 100).len() == 1).await;
+    let help = thread_posts(&slack, at - 100).remove(0);
+    assert!(help.to_string().contains("`mute 2h`"), "{help}");
+    button_value(&help, "Quiet hours");
+
+    socket.send(message("env-1", "Ev1", "settings", at));
+    eventually("settings card", || thread_posts(&slack, at).len() == 1).await;
+    let card = thread_posts(&slack, at).remove(0);
+    let json = card.to_string();
+    assert!(json.contains("Quiet now"), "{json}");
+    assert!(json.contains("(1 held)"), "{json}");
+    let mute = button_value(&card, "Mute 1h");
+    let unmute = button_value(&card, "Unmute");
+    assert!(
+        !json.contains("Mute(") && !json.contains("For("),
+        "opaque values only"
+    );
+    let root = format!("{at}.000100");
+    let in_thread = |envelope: &str, value: &str, at_s: u64| {
+        with(
+            click(envelope, value, at_s),
+            "/payload/message/thread_ts",
+            json!(root),
+        )
+    };
+
+    // A stranger's click is dropped and does not mute or use the button.
+    socket.send(with(
+        in_thread("env-2", &mute, at + 1),
+        "/payload/user/id",
+        json!("U02STRANGER"),
+    ));
+    eventually("stranger dropped", || {
+        audit_lines(&temp)
+            .iter()
+            .any(|line| line["kind"] == "dropped")
+    })
+    .await;
+    assert_eq!(notifier.status().quiet.unwrap().muted_until, None);
+
+    socket.send(in_thread("env-3", &mute, at + 2));
+    eventually("muted", || thread_posts(&slack, at).len() == 2).await;
+    assert!(texts(&thread_posts(&slack, at))[1].contains("Muted until"));
+    // Thursday 20:30 PDT + 1 h.
+    let muted = notifier.status().quiet.unwrap().muted_until;
+    assert_eq!(muted, Some(1_790_915_400_000));
+
+    socket.send(in_thread("env-4", &mute, at + 3));
+    eventually("reused", || thread_posts(&slack, at).len() == 3).await;
+    assert!(texts(&thread_posts(&slack, at))[2].contains("already used"));
+
+    socket.send(in_thread("env-5", &unmute, at + 4));
+    eventually("unmuted", || thread_posts(&slack, at).len() == 4).await;
+    assert!(texts(&thread_posts(&slack, at))[3].contains("outside working hours"));
+    assert_eq!(notifier.status().quiet.unwrap().muted_until, None);
+
+    // Typed commands.
+    socket.send(message("env-6", "Ev6", "mute until monday", at + 10));
+    eventually("mute until", || thread_posts(&slack, at + 10).len() == 1).await;
+    assert!(texts(&thread_posts(&slack, at + 10))[0].contains("Mon Oct 5, 9:00 AM PDT"));
+    socket.send(message("env-7", "Ev7", "mute forever", at + 20));
+    eventually("usage", || thread_posts(&slack, at + 20).len() == 1).await;
+    assert!(texts(&thread_posts(&slack, at + 20))[0].contains("mute 30m"));
+    assert!(notifier.status().quiet.unwrap().muted_until.is_some());
+
+    // `digest` while muted at night: the owner asked, so it goes out now,
+    // as the reply in the command's own thread (no tick needed).
+    let before = slack.calls("chat.postMessage").len();
+    socket.send(message("env-8", "Ev8", "digest", at + 30));
+    eventually("digest in the command thread", || {
+        thread_posts(&slack, at + 30).len() == 1
+    })
+    .await;
+    assert!(texts(&thread_posts(&slack, at + 30))[0].contains("Yard digest"));
+    eventually("digest delivered", || {
+        notifier.status().quiet.unwrap().held_count == 0
+    })
+    .await;
+    notifier.tick().await;
+    let posts = slack.calls("chat.postMessage");
+    assert_eq!(posts.len(), before + 1, "only the digest, once");
+
+    let audit = audit_lines(&temp)
+        .iter()
+        .map(|line| {
+            format!(
+                "{}/{}/{}",
+                line["kind"].as_str().unwrap(),
+                line["action"].as_str().unwrap(),
+                line["outcome"].as_str().unwrap()
+            )
+        })
+        .collect::<Vec<_>>();
+    for expected in [
+        "message/settings/answered",
+        "dropped/not_the_owner/dropped",
+        "button/nav_mute/answered",
+        "button/nav/refused:already_used",
+        "button/nav_unmute/answered",
+        "message/mute/answered",
+        "message/mute/refused:invalid",
+        "message/digest/requested",
+    ] {
+        assert!(
+            audit.contains(&expected.to_owned()),
+            "{expected}: {audit:?}"
+        );
+    }
 }

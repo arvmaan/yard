@@ -110,6 +110,9 @@ pub struct OwnerMessage {
 pub struct OwnerAction {
     /// The opaque, server-generated action id carried as the button value.
     pub action: String,
+    /// The button's `action_id` (only tells prompt buttons from
+    /// navigation buttons; never trusted for what to do).
+    pub action_id: String,
     pub action_ts: String,
     /// The message the button is on, and its thread.
     pub message_ts: String,
@@ -414,6 +417,12 @@ fn block_action(
     if text(action, "/type") != Some("button") {
         return Err("not_a_button");
     }
+    // "Open in Yard" only opens a URL in the browser; nothing to do here.
+    if action.get("url").is_some()
+        || text(action, "/action_id") == Some(super::blocks::OPEN_ACTION_ID)
+    {
+        return Err("link_button");
+    }
     let value = text(action, "/value").ok_or("missing_value")?;
     if !is_action_token(value) {
         return Err("malformed_action");
@@ -430,6 +439,7 @@ fn block_action(
     Ok((
         Inbound::Action(OwnerAction {
             action: value.to_owned(),
+            action_id: text(action, "/action_id").unwrap_or_default().to_owned(),
             action_ts: action_ts.to_owned(),
             message_ts: message_ts.to_owned(),
             thread_ts: text(payload, "/message/thread_ts").map(str::to_owned),
@@ -750,6 +760,7 @@ pub(crate) mod tests {
             accept(&mut filter, &good),
             Ok(Inbound::Action(OwnerAction {
                 action: ACTION.to_owned(),
+                action_id: "yard_prompt_0".to_owned(),
                 action_ts: format!("{}.123456", NOW_S - 5),
                 message_ts: "1799999990.000200".to_owned(),
                 thread_ts: Some("1799999900.000100".to_owned()),

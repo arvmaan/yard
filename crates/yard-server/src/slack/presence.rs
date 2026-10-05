@@ -25,7 +25,8 @@ use std::{
 pub const RECENT_VIEW_TTL: Duration = Duration::from_secs(60);
 
 /// The Yard surface a browser can have open.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "id", rename_all = "snake_case")]
 pub enum ViewTarget {
     Assignment(String),
     ProjectOrchestrator(String),

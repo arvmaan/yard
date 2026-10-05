@@ -216,6 +216,7 @@ pub(crate) fn notifier(
             timing: instant_timing(),
             min_interval: Duration::ZERO,
             inbound: super::hub::InboundParts::default(),
+            quiet: super::policy::QuietParts::always(),
         },
     )
 }
@@ -524,6 +525,7 @@ async fn connect_failures_back_off_instead_of_rerunning_aws_every_tick() {
             timing: instant_timing(),
             min_interval: Duration::ZERO,
             inbound: super::hub::InboundParts::default(),
+            quiet: super::policy::QuietParts::always(),
         },
     );
     let connecting = notifier.status();
@@ -722,6 +724,7 @@ async fn off_and_misconfigured_notifiers_never_send_and_never_return() {
             timing: instant_timing(),
             min_interval: Duration::ZERO,
             inbound: super::hub::InboundParts::default(),
+            quiet: super::policy::QuietParts::always(),
         },
     );
     assert!(

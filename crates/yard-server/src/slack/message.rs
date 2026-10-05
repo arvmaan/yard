@@ -6,18 +6,18 @@
 //! messages, file contents or loopback URLs. Every interpolated string is
 //! cleaned (control characters removed, whitespace collapsed), passed through
 //! a defensive credential redactor, truncated, and escaped for Slack mrkdwn so
-//! a project name cannot mention `@channel` or inject a link.
-
-use std::fmt::Write as _;
+//! a project name cannot mention `@channel` or inject a link. The only URL
+//! is the "Open in Yard" link button's own `url` ([`super::blocks::ui_url`]).
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
+use super::blocks;
 use super::detector::{AttentionEvent, AttentionKind, Subject};
 use super::outbox::Batch;
 
 const TITLE_CHARS: usize = 80;
-const NAME_CHARS: usize = 60;
+pub(crate) const NAME_CHARS: usize = 60;
 const MAX_DIGEST_LINES: usize = 5;
 const REDACTED: &str = "[redacted]";
 const REDACTED_PATH: &str = "[path]";
@@ -29,8 +29,20 @@ pub struct OutgoingMessage {
     pub blocks: Value,
 }
 
+/// How a notification card is decorated.
+#[derive(Debug, Clone, Copy)]
+pub struct CardOptions<'a> {
+    /// "Open in Yard" target.
+    pub ui_url: &'a str,
+    /// Inbound Slack is on: answer cards follow in the thread.
+    pub inbound: bool,
+}
+
+/// A notification: one rich card for a single event (header, fields, the
+/// assignment title as a quote, context, "Open in Yard"), else a digest.
+/// `text` stays the plain one-line fallback (mobile push shows only it).
 #[must_use]
-pub fn batch_message(batch: &Batch) -> OutgoingMessage {
+pub fn batch_message(batch: &Batch, options: CardOptions<'_>) -> OutgoingMessage {
     let lines = batch
         .events
         .iter()
@@ -38,24 +50,19 @@ pub fn batch_message(batch: &Batch) -> OutgoingMessage {
         .map(|event| event_line(event, batch.events.len() > 1 || batch.dropped > 0))
         .collect::<Vec<_>>();
     let hidden = batch.events.len().saturating_sub(MAX_DIGEST_LINES);
-    let mut body = lines.join("\n");
+    let mut notes = Vec::new();
     if hidden > 0 {
-        let _ = write!(
-            body,
-            "\n{hidden} more {} — check Yard.",
+        notes.push(format!(
+            "{hidden} more {} — check Yard.",
             plural(hidden, "update", "updates")
-        );
+        ));
     }
     if batch.dropped > 0 {
-        if !body.is_empty() {
-            body.push('\n');
-        }
-        let _ = write!(
-            body,
+        notes.push(format!(
             "{} older {} dropped while Slack was unreachable or busy — check Yard.",
             batch.dropped,
             plural(batch.dropped, "update was", "updates were")
-        );
+        ));
     }
     let text = match batch.events.as_slice() {
         [event] if batch.dropped == 0 => event_line(event, true),
@@ -71,10 +78,123 @@ pub fn batch_message(batch: &Batch) -> OutgoingMessage {
         .map(|event| event.observed_at_unix_ms)
         .max()
         .unwrap_or_default();
+    let blocks = match batch.events.as_slice() {
+        [event] if batch.dropped == 0 => event_card(event, options),
+        events => {
+            let mut blocks = vec![blocks::header(&format!(":bell: {text}"))];
+            blocks.extend(lines.iter().map(|line| blocks::section(line)));
+            if events.is_empty() && notes.is_empty() {
+                blocks.push(blocks::section("Nothing new — check Yard."));
+            }
+            notes.push(time_token(observed));
+            blocks.push(blocks::context(&notes));
+            blocks.push(blocks::actions(
+                "yard_links",
+                vec![blocks::open_in_yard(options.ui_url)],
+            ));
+            blocks
+        }
+    };
     OutgoingMessage {
         text,
-        blocks: blocks(&body, observed),
+        blocks: blocks::finish(blocks),
     }
+}
+
+/// Emoji and short status of an event kind.
+const fn kind_look(kind: AttentionKind) -> (&'static str, &'static str) {
+    match kind {
+        AttentionKind::Blocked => (":raised_hand:", "Waiting for input"),
+        AttentionKind::ReadyForReview => (":eyes:", "Ready for review"),
+        AttentionKind::CommandFailed => (":x:", "Failed"),
+        AttentionKind::CommandAmbiguous => (":grey_question:", "Outcome unclear"),
+    }
+}
+
+fn event_card(event: &AttentionEvent, options: CardOptions<'_>) -> Vec<Value> {
+    let (emoji, status) = kind_look(event.kind);
+    let name = subject_name(&event.subject);
+    let mut blocks = vec![
+        blocks::header(&format!("{emoji} {name} · {status}")),
+        blocks::section(&format!(
+            "{emoji} {}",
+            event_summary(event.kind, options.inbound)
+        )),
+    ];
+    let mut pairs = Vec::new();
+    if let Some(project) = event.project_name.as_deref() {
+        pairs.push(("Project", clean(project, NAME_CHARS)));
+    }
+    pairs.push(("Agent", name));
+    pairs.push(("Status", status.to_owned()));
+    pairs.push(("Since", since_token(event.observed_at_unix_ms)));
+    blocks.push(blocks::fields(&pairs));
+    if let Some(title) = subject_title(&event.subject) {
+        blocks.push(blocks::section(&format!(">{title}")));
+    }
+    blocks.push(blocks::context(&[time_token(event.observed_at_unix_ms)]));
+    blocks.push(blocks::actions(
+        "yard_links",
+        vec![blocks::open_in_yard(options.ui_url)],
+    ));
+    blocks
+}
+
+/// What happened and what to do, for a card whose header and fields
+/// already name the agent, its status and its title.
+const fn event_summary(kind: AttentionKind, inbound: bool) -> &'static str {
+    match kind {
+        AttentionKind::Blocked if inbound => {
+            "Waiting on a prompt in its terminal. The prompt and its answer buttons follow in this thread."
+        }
+        AttentionKind::Blocked => "Waiting on a prompt in its terminal. Answer it in Yard.",
+        AttentionKind::ReadyForReview => {
+            "Its turn finished — ready for your review. No receipt has been recorded."
+        }
+        AttentionKind::CommandFailed => "It failed. Check Yard.",
+        AttentionKind::CommandAmbiguous => {
+            "Yard can't tell whether this landed; it was not retried. Check Yard."
+        }
+    }
+}
+
+/// The agent's short name (cleaned): a worker's display or profile name,
+/// else its role.
+pub(crate) fn subject_name(subject: &Subject) -> String {
+    match subject {
+        Subject::Worker { profile_name, .. } => profile_name
+            .as_deref()
+            .map_or_else(|| "A worker".to_owned(), |name| clean(name, NAME_CHARS)),
+        Subject::ProjectOrchestrator => "Project orchestrator".to_owned(),
+        Subject::YardOrchestrator => "Superintendent".to_owned(),
+        Subject::Workstream { name } => name.as_deref().map_or_else(
+            || "A workstream".to_owned(),
+            |name| format!("Workstream {}", clean(name, NAME_CHARS)),
+        ),
+        Subject::Command { command_type, .. } => command_label(command_type).to_owned(),
+    }
+}
+
+/// The task title (cleaned) of a worker or command, if any.
+pub(crate) fn subject_title(subject: &Subject) -> Option<String> {
+    let objective = match subject {
+        Subject::Worker { objective, .. } | Subject::Command { objective, .. } => {
+            objective.as_deref()?
+        }
+        _ => return None,
+    };
+    let line = first_line(objective);
+    (!line.is_empty()).then(|| clean(line, TITLE_CHARS))
+}
+
+/// "<relative> (<absolute>)" as a Slack date token.
+pub(crate) fn since_token(unix_ms: u64) -> String {
+    let seconds = i64::try_from(unix_ms / 1000).unwrap_or_default();
+    let fallback = DateTime::<Utc>::from_timestamp(seconds, 0).map_or_else(
+        || "unknown time".to_owned(),
+        |time| time.format("%Y-%m-%d %H:%M UTC").to_string(),
+    );
+    format!("<!date^{seconds}^{{ago}} ({{date_short}} {{time}})|{fallback}>")
 }
 
 #[must_use]
@@ -94,7 +214,7 @@ fn blocks(body: &str, unix_ms: u64) -> Value {
 }
 
 /// Slack renders `<!date^…>` in the reader's own time zone.
-fn time_token(unix_ms: u64) -> String {
+pub(crate) fn time_token(unix_ms: u64) -> String {
     let seconds = i64::try_from(unix_ms / 1000).unwrap_or_default();
     let fallback = DateTime::<Utc>::from_timestamp(seconds, 0).map_or_else(
         || "unknown time".to_owned(),
@@ -195,13 +315,26 @@ fn command_label(command_type: &str) -> &'static str {
     }
 }
 
-const fn plural<'a>(count: usize, one: &'a str, many: &'a str) -> &'a str {
+pub(crate) const fn plural<'a>(count: usize, one: &'a str, many: &'a str) -> &'a str {
     if count == 1 { one } else { many }
 }
 
 /// Clean, redact, truncate and escape one user-supplied title.
 #[must_use]
 pub fn clean(value: &str, max_chars: usize) -> String {
+    escape(&clean_unescaped(value, max_chars))
+}
+
+/// What a held notification keeps of a task objective: the first line,
+/// cleaned, redacted and truncated like a card title (not escaped yet; the
+/// card escapes it when it is shown).
+#[must_use]
+pub(crate) fn held_title(objective: &str) -> Option<String> {
+    let line = first_line(objective);
+    (!line.is_empty()).then(|| clean_unescaped(line, TITLE_CHARS))
+}
+
+fn clean_unescaped(value: &str, max_chars: usize) -> String {
     let collapsed = value
         .chars()
         .map(|character| {
@@ -216,7 +349,7 @@ pub fn clean(value: &str, max_chars: usize) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     let redacted = redact(&collapsed);
-    let truncated = if redacted.chars().count() > max_chars {
+    if redacted.chars().count() > max_chars {
         let mut kept = redacted
             .chars()
             .take(max_chars.saturating_sub(1))
@@ -225,8 +358,7 @@ pub fn clean(value: &str, max_chars: usize) -> String {
         kept
     } else {
         redacted
-    };
-    escape(&truncated)
+    }
 }
 
 /// Clean one line of prompt text for display: controls removed, whitespace
@@ -551,12 +683,122 @@ mod tests {
             view_target: None,
             observed_at_unix_ms: 1_695_900_000_000,
             ready_at: Instant::now(),
+            automatic: false,
         }
+    }
+
+    fn digest(batch: &Batch) -> super::OutgoingMessage {
+        batch_message(
+            batch,
+            super::CardOptions {
+                ui_url: "https://yard.example.test/",
+                inbound: true,
+            },
+        )
+    }
+
+    #[test]
+    fn a_single_event_is_a_rich_card_with_fields_title_and_an_open_link() {
+        let mut blocked = event(
+            AttentionKind::Blocked,
+            "Check <!channel>",
+            "Ship *it*\nmore",
+        );
+        blocked.subject = Subject::Worker {
+            profile_name: Some(super::plain_name("Ada *bold* <@U1>")),
+            objective: Some("Ship *it* <!here>\nsecond line".to_owned()),
+        };
+        let message = digest(&Batch {
+            events: vec![blocked],
+            dropped: 0,
+            thread: ThreadKey::Project("p-1".to_owned()),
+        });
+        let blocks = message.blocks.as_array().unwrap();
+        let types = blocks
+            .iter()
+            .map(|block| block["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            [
+                "header", "section", "section", "section", "context", "actions"
+            ]
+        );
+        assert_eq!(
+            blocks[0]["text"]["text"],
+            ":raised_hand: Ada \u{2217}bold\u{2217} <@U1> · Waiting for input"
+        );
+        let fields = blocks[2]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field["text"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(fields[0], "*Project*\nCheck &lt;!channel&gt;");
+        assert_eq!(fields[1], "*Agent*\nAda \u{2217}bold\u{2217} &lt;@U1&gt;");
+        assert_eq!(fields[2], "*Status*\nWaiting for input");
+        assert!(
+            fields[3].starts_with("*Since*\n<!date^1695900000^{ago}"),
+            "{}",
+            fields[3]
+        );
+        assert_eq!(blocks[3]["text"]["text"], ">Ship *it* &lt;!here&gt;");
+        // The body says only what to do: no repeated name, title or a
+        // contradicting "Answer it in Yard".
+        assert_eq!(
+            blocks[1]["text"]["text"],
+            ":raised_hand: Waiting on a prompt in its terminal. The prompt and its answer buttons follow in this thread."
+        );
+        assert_eq!(message.blocks.to_string().matches("Ship *it*").count(), 1);
+        assert_eq!(
+            blocks[5]["elements"][0]["url"],
+            "https://yard.example.test/"
+        );
+        assert_eq!(blocks[5]["elements"][0]["text"]["text"], "Open in Yard");
+        assert!(!message.blocks.to_string().contains("<!channel>"));
+        // Without inbound there is no promise of buttons.
+        let quiet = batch_message(
+            &Batch {
+                events: vec![event(AttentionKind::ReadyForReview, "Checkout", "x")],
+                dropped: 0,
+                thread: ThreadKey::Project("p-1".to_owned()),
+            },
+            super::CardOptions {
+                ui_url: "https://yard.example.test/",
+                inbound: false,
+            },
+        );
+        assert!(!quiet.blocks.to_string().contains("answer buttons"));
+        let quiet_blocked = batch_message(
+            &Batch {
+                events: vec![event(AttentionKind::Blocked, "Checkout", "x")],
+                dropped: 0,
+                thread: ThreadKey::Project("p-1".to_owned()),
+            },
+            super::CardOptions {
+                ui_url: "https://yard.example.test/",
+                inbound: false,
+            },
+        );
+        assert!(
+            quiet_blocked.blocks[1]["text"]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("Answer it in Yard."),
+            "{}",
+            quiet_blocked.blocks
+        );
+        assert!(
+            quiet.blocks[0]["text"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with(":eyes:")
+        );
     }
 
     #[test]
     fn single_event_names_project_agent_objective_and_state() {
-        let message = batch_message(&Batch {
+        let message = digest(&Batch {
             events: vec![event(AttentionKind::Blocked, "Checkout", "Ship the banner")],
             dropped: 0,
             thread: ThreadKey::Project("p-1".to_owned()),
@@ -572,7 +814,7 @@ mod tests {
 
     #[test]
     fn objective_titles_keep_only_the_first_prompt_line() {
-        let message = batch_message(&Batch {
+        let message = digest(&Batch {
             events: vec![event(
                 AttentionKind::Blocked,
                 "Checkout",
@@ -591,7 +833,7 @@ mod tests {
 
     #[test]
     fn ready_for_review_never_claims_completion() {
-        let message = batch_message(&Batch {
+        let message = digest(&Batch {
             events: vec![event(AttentionKind::ReadyForReview, "Checkout", "x")],
             dropped: 0,
             thread: ThreadKey::Project("p-1".to_owned()),
@@ -606,14 +848,15 @@ mod tests {
         let events = (0..7)
             .map(|index| event(AttentionKind::Blocked, &format!("P{index}"), "x"))
             .collect::<Vec<_>>();
-        let message = batch_message(&Batch {
+        let message = digest(&Batch {
             events,
             dropped: 3,
             thread: ThreadKey::Yard,
         });
         assert_eq!(message.text, "10 Yard updates");
-        let body = message.blocks[0]["text"]["text"].as_str().unwrap();
+        let body = message.blocks.to_string();
         assert_eq!(body.matches(":raised_hand:").count(), 5, "{body}");
+        assert!(message.blocks.as_array().unwrap().len() <= 50);
         assert!(body.contains("2 more updates — check Yard."), "{body}");
         assert!(body.contains("3 older updates were dropped"), "{body}");
     }

@@ -124,6 +124,27 @@ impl Outbox {
         })
     }
 
+    /// Everything queued, oldest first, and the dropped count (quiet hours
+    /// began: the policy holds it instead, so nothing posts a lone "N
+    /// dropped" message while quiet).
+    pub fn take_all(&mut self) -> (Vec<AttentionEvent>, usize) {
+        (
+            self.queue.drain(..).collect(),
+            std::mem::take(&mut self.dropped),
+        )
+    }
+
+    /// Whether the global interval allows a message now.
+    #[must_use]
+    pub fn can_send(&self, now: Instant) -> bool {
+        self.next_send_at.is_none_or(|next| now >= next)
+    }
+
+    /// Wait until `not_before` (a digest post failed).
+    pub const fn hold_off(&mut self, not_before: Instant) {
+        self.next_send_at = Some(not_before);
+    }
+
     /// A message went out; hold the next one for the global interval.
     pub fn sent(&mut self, now: Instant) {
         self.next_send_at = Some(now + self.min_interval);
@@ -165,6 +186,7 @@ mod tests {
             view_target: None,
             observed_at_unix_ms: 0,
             ready_at,
+            automatic: false,
         }
     }
 
@@ -222,6 +244,19 @@ mod tests {
         assert!(batch.events.is_empty());
         assert_eq!(batch.dropped, 1);
         assert_eq!(batch.thread, ThreadKey::Yard);
+    }
+
+    #[test]
+    fn take_all_hands_over_the_dropped_count_so_nothing_posts_while_quiet() {
+        let now = Instant::now();
+        let mut outbox = Outbox::default();
+        outbox.push((0..MAX_QUEUED + 3).map(|_| event(Some("p-1"), now)));
+        let (events, dropped) = outbox.take_all();
+        assert_eq!(events.len(), MAX_QUEUED);
+        assert_eq!(dropped, 3);
+        // No lone "3 older updates were dropped" message during quiet hours.
+        assert!(outbox.next_batch(now, |_| true).is_none());
+        assert!(outbox.is_empty());
     }
 
     #[test]

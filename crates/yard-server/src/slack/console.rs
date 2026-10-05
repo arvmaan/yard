@@ -31,9 +31,12 @@ use yard_domain::{
 };
 
 use super::{
-    actions::{AgentConsole, AgentSnapshot, AgentTarget, ConsoleError, KeyPlan, TerminalIdentity},
+    actions::{
+        AgentConsole, AgentHealth, AgentSnapshot, AgentTarget, ConsoleError, KeyPlan,
+        TerminalIdentity,
+    },
     prompt::SCREEN_LINES,
-    relay::{REPORT_LINES, scan_report},
+    relay::{REPORT_LINES, Watched, scan_report, watched},
 };
 use yard_store::{StoredPaneManagementLease, YardStore};
 
@@ -91,6 +94,24 @@ fn is_blocked(binding: &WorkerRuntimeBinding) -> bool {
     binding.status == ObservedStatus::Blocked
         && binding.observation_state == RuntimeObservationState::Observed
         && binding.process_state != RuntimeProcessState::Exited
+}
+
+/// Whether an agent runs in the bound pane, from the durable binding.
+fn health_of(binding: &WorkerRuntimeBinding) -> AgentHealth {
+    if binding.process_state == RuntimeProcessState::Exited {
+        return AgentHealth::NotRunning("its agent process exited".to_owned());
+    }
+    if binding.observation_state == RuntimeObservationState::Missing {
+        return AgentHealth::NotRunning("its pane is gone or no longer shows an agent".to_owned());
+    }
+    if binding.observation_state != RuntimeObservationState::Observed {
+        return AgentHealth::Unknown;
+    }
+    match binding.status {
+        ObservedStatus::Working | ObservedStatus::Blocked => AgentHealth::Working,
+        ObservedStatus::Idle | ObservedStatus::Done => AgentHealth::Idle,
+        ObservedStatus::Unknown => AgentHealth::Unknown,
+    }
 }
 
 /// Only an active assignment on its active attempt can be answered.
@@ -266,6 +287,7 @@ impl YardConsole {
                     snapshot: AgentSnapshot {
                         identity: identity_of(&assignment.worker.id, binding),
                         blocked: is_blocked(binding),
+                        health: health_of(binding),
                     },
                     prompt: PromptRef::Assignment {
                         attempt_id: assignment.attempt.id.clone(),
@@ -294,6 +316,7 @@ impl YardConsole {
                     snapshot: AgentSnapshot {
                         identity: identity_of(&worker.id, binding),
                         blocked: is_blocked(binding),
+                        health: health_of(binding),
                     },
                     prompt: PromptRef::Orchestrator {
                         project_version: project.version,
@@ -324,6 +347,7 @@ impl YardConsole {
                     snapshot: AgentSnapshot {
                         identity: identity_of(&worker.id, binding),
                         blocked: is_blocked(binding),
+                        health: health_of(binding),
                     },
                     prompt: PromptRef::Yard {
                         version: orchestrator.version,
@@ -347,6 +371,7 @@ impl YardConsole {
                     snapshot: AgentSnapshot {
                         identity: identity_of(&worker.id, binding),
                         blocked: is_blocked(binding),
+                        health: health_of(binding),
                     },
                     prompt: PromptRef::Node {
                         version: node.version,
@@ -445,6 +470,11 @@ async fn drain(opened: &mut OpenedTerminal, period: Duration) {
 impl AgentConsole for YardConsole {
     async fn snapshot(&self, target: &AgentTarget) -> Result<AgentSnapshot, ConsoleError> {
         Ok(self.resolve(target).await?.snapshot)
+    }
+
+    async fn sendable(&self, target: &AgentTarget) -> Result<(), ConsoleError> {
+        self.refuse_unsafe(&self.timed_resolve(target).await?.guard)
+            .await
     }
 
     async fn screen(&self, target: &AgentTarget) -> Result<String, ConsoleError> {
@@ -671,6 +701,36 @@ impl AgentConsole for YardConsole {
         };
         Ok(scan_report(&text, command_id))
     }
+
+    async fn watch(&self, target: &AgentTarget, command_id: &str) -> Result<Watched, ConsoleError> {
+        let text = match target {
+            AgentTarget::Assignment { .. } => {
+                return Ok(Watched::default());
+            }
+            AgentTarget::ProjectOrchestrator { project_id } => {
+                self.interventions
+                    .read_orchestrator_output(project_id, REPORT_LINES, TerminalOutputFormat::Text)
+                    .await
+                    .map_err(intervention_error)?
+                    .text
+            }
+            AgentTarget::YardOrchestrator => {
+                self.interventions
+                    .read_yard_orchestrator_output(REPORT_LINES, TerminalOutputFormat::Text)
+                    .await
+                    .map_err(intervention_error)?
+                    .text
+            }
+            AgentTarget::CoordinationNode { node_id } => {
+                self.nodes
+                    .read_output(node_id, REPORT_LINES, TerminalOutputFormat::Text)
+                    .await
+                    .map_err(node_error)?
+                    .text
+            }
+        };
+        Ok(watched(&text, command_id))
+    }
 }
 
 #[cfg(test)]
@@ -680,7 +740,8 @@ mod tests {
         RuntimeProcessState, WorkerRuntimeBinding,
     };
 
-    use super::{is_blocked, require_active};
+    use super::{health_of, is_blocked, require_active};
+    use crate::slack::actions::AgentHealth;
     use crate::slack::actions::ConsoleError;
 
     fn binding() -> WorkerRuntimeBinding {
@@ -720,6 +781,29 @@ mod tests {
         let mut working = binding();
         working.status = ObservedStatus::Working;
         assert!(!is_blocked(&working));
+    }
+
+    #[test]
+    fn an_exited_or_missing_agent_is_not_running() {
+        let mut working = binding();
+        working.status = ObservedStatus::Working;
+        assert_eq!(health_of(&working), AgentHealth::Working);
+        let mut idle = binding();
+        idle.status = ObservedStatus::Idle;
+        assert_eq!(health_of(&idle), AgentHealth::Idle);
+        let mut ambiguous = binding();
+        ambiguous.observation_state = RuntimeObservationState::Ambiguous;
+        assert_eq!(health_of(&ambiguous), AgentHealth::Unknown);
+        let mut exited = binding();
+        exited.process_state = RuntimeProcessState::Exited;
+        assert!(
+            matches!(health_of(&exited), AgentHealth::NotRunning(reason) if reason.contains("exited"))
+        );
+        let mut missing = binding();
+        missing.observation_state = RuntimeObservationState::Missing;
+        assert!(
+            matches!(health_of(&missing), AgentHealth::NotRunning(reason) if reason.contains("no longer shows an agent"))
+        );
     }
 
     #[test]
