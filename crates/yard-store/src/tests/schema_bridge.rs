@@ -1342,3 +1342,36 @@ async fn live_shaped_fork_v34_database_bridges_with_every_row_intact() {
         .unwrap();
     assert!(preview.preview);
 }
+
+// S18 (D6, D9): the bridge leaves legacy automatic-summary flags as stored, so
+// the user clears them in Settings, and it never turns on worker cleanup.
+#[tokio::test]
+async fn fork_bridge_keeps_summary_flags_and_leaves_worker_cleanup_off() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("yard.sqlite3");
+    drop(open_store(&temp).await);
+    let connection = Connection::open(&path).unwrap();
+    build_fork_schema(&connection, 34);
+    connection
+        .execute(
+            "UPDATE token_spend_settings
+                SET superintendent_auto_requests_project_summaries = 1,
+                    scheduled_automatic_summaries = 1,
+                    version = 7, updated_by = 'local-user'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = SqliteProjectStore::open(&path).await.unwrap();
+    let settings = store.get_token_spend_settings().await.unwrap();
+    assert!(settings.superintendent_auto_requests_project_summaries);
+    assert!(!settings.project_orchestrators_auto_request_worker_summaries);
+    assert!(settings.scheduled_automatic_summaries);
+    assert_eq!(settings.version, 7);
+    assert_eq!(settings.updated_by, "local-user");
+    let policy = store.get_worker_cleanup_policy().await.unwrap();
+    assert!(!policy.automatic_enabled);
+    drop(store);
+    assert_rebased_head(&reopen_raw(&path).await);
+}

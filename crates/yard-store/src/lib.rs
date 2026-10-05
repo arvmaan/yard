@@ -12289,6 +12289,7 @@ fn reconciliation_event_type(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn completed_runtime_cleanup_preview(
     connection: &mut Connection,
     limit: usize,
@@ -12328,6 +12329,19 @@ fn completed_runtime_cleanup_preview(
                AND a.lifecycle = 'completed'
                AND aa.lifecycle = 'completed'
                AND w.ended_at_unix_ms IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM archived_projects archived
+                    WHERE archived.project_id = a.project_id
+                      AND archived.restored_at_unix_ms IS NULL
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM deleted_workers deleted
+                    WHERE deleted.worker_id = w.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM archived_coordination_nodes archived_node
+                    WHERE archived_node.worker_id = w.id
+               )
              ORDER BY cr.created_at_unix_ms, a.id
              LIMIT ?1
          )
@@ -21356,6 +21370,7 @@ mod tests {
         insert_worker_runtime_binding_unchecked, to_i64,
     };
 
+    mod cross_feature;
     mod provider_continuation;
     mod schema_bridge;
 
@@ -22664,7 +22679,17 @@ mod tests {
                         "UPDATE completion_receipts
                             SET created_at_unix_ms = 0
                           WHERE id = ?1",
-                        [receipt_id],
+                        [&receipt_id],
+                    )?;
+                    // The completion queued a transcript capture; cleanup
+                    // waits for it, so settle it as the capture loop would.
+                    connection.execute(
+                        "UPDATE transcript_capture_jobs
+                            SET status = 'succeeded', completed_at_unix_ms = 0
+                          WHERE command_id = (
+                              SELECT command_id FROM completion_receipts WHERE id = ?1
+                          ) AND status = 'pending'",
+                        [&receipt_id],
                     )?;
                     Ok(())
                 }

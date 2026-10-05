@@ -590,10 +590,15 @@ export function SettingsDialog({
   const dialogRef = useRef<HTMLElement>(null)
   const appearanceFocusRef = useRef<HTMLSelectElement>(null)
   const automaticFocusRef = useRef<HTMLButtonElement>(null)
-  void automaticCoordinationBusy
-  void automaticCoordinationError
-  void automaticCoordinationSettings
-  void onSaveAutomaticCoordination
+  // Automatic summaries are no longer accepted, but a database from before
+  // that change can still hold them on. Offer one save that clears them all:
+  // the server accepts only a save with every flag off.
+  const legacyAutomaticSummariesOn = Boolean(
+    automaticCoordinationSettings &&
+      (automaticCoordinationSettings.superintendent_auto_requests_project_summaries ||
+        automaticCoordinationSettings.project_orchestrators_auto_request_worker_summaries ||
+        automaticCoordinationSettings.scheduled_automatic_summaries),
+  )
   const requestClose = useModalDialog({
     canClose: !automaticCoordinationBusy,
     dialogRef,
@@ -722,20 +727,43 @@ export function SettingsDialog({
               <div>
                 <strong>Automatic summaries are unavailable</strong>
                 <small>
-                  Summaries must run in isolated ephemeral workers. Use the
-                  explicit Summarize action until isolated scheduling is
-                  available.
+                  {legacyAutomaticSummariesOn
+                    ? 'Automatic summaries from an earlier version are still on. Turn them off; use the explicit Summarize action instead.'
+                    : 'Summaries must run in isolated ephemeral workers. Use the explicit Summarize action until isolated scheduling is available.'}
                 </small>
               </div>
-              <button
-                className="secondary-button settings-action"
-                disabled
-                ref={automaticFocusRef}
-                type="button"
-              >
-                Off
-              </button>
+              {legacyAutomaticSummariesOn ? (
+                <button
+                  className="secondary-button settings-action"
+                  disabled={automaticCoordinationBusy}
+                  onClick={() =>
+                    onSaveAutomaticCoordination({
+                      projectOrchestrators: false,
+                      scheduled: false,
+                      superintendent: false,
+                    })
+                  }
+                  ref={automaticFocusRef}
+                  type="button"
+                >
+                  Turn off
+                </button>
+              ) : (
+                <button
+                  className="secondary-button settings-action"
+                  disabled
+                  ref={automaticFocusRef}
+                  type="button"
+                >
+                  Off
+                </button>
+              )}
             </div>
+            {automaticCoordinationError ? (
+              <p className="dialog-error" role="alert">
+                {automaticCoordinationError}
+              </p>
+            ) : null}
           </section>
           <section aria-labelledby={`${titleId}-coordination`}>
             <h3 id={`${titleId}-coordination`}>Coordination</h3>
