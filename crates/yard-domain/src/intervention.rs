@@ -89,6 +89,33 @@ pub struct OrchestratorPromptAcknowledgement {
     pub submitted_at_unix_ms: u64,
 }
 
+/// How a terminal-output read renders the pane.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalOutputFormat {
+    /// Plain unwrapped text, up to the full line limit.
+    #[default]
+    Text,
+    /// Rendered rows with their colours (SGR), as the pane shows them, plus
+    /// the pane's scroll position. Herdr colours at most its latest 1,000
+    /// rendered rows.
+    Ansi,
+}
+
+/// Herdr's scroll position for a pane when it was read.
+///
+/// `max_offset_from_bottom` is the scrollback Herdr holds for the active
+/// screen (zero on an alternate screen). `offset_from_bottom` is how far
+/// Herdr's own view of the pane is scrolled back; Herdr moves it only when it
+/// applies a scroll to its own scrollback, and resets it when it forwards the
+/// wheel to a mouse-reporting or alternate-scroll app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalScrollPosition {
+    pub offset_from_bottom: u64,
+    pub max_offset_from_bottom: u64,
+    pub viewport_rows: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalOutput {
     pub assignment_id: String,
@@ -100,6 +127,8 @@ pub struct TerminalOutput {
     #[serde(with = "crate::serde_u64")]
     pub revision: u64,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll: Option<TerminalScrollPosition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +143,8 @@ pub struct OrchestratorTerminalOutput {
     pub revision: u64,
     pub truncated: bool,
     pub status_report: Option<OrchestratorStatusReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll: Option<TerminalScrollPosition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

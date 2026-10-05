@@ -162,46 +162,92 @@ export class YardApiError extends Error {
   }
 }
 
+const READ_REQUEST_TIMEOUT_MS = 15_000
+// Herdr answers a history read for an idle full-screen agent only after
+// paging its alternate-screen transcript for up to 15 s plus a restore of up
+// to 5 s, and Yard's server allows 25 s for it; the browser must outwait both.
+export const TERMINAL_OUTPUT_REQUEST_TIMEOUT_MS = 30_000
+
+// `ansi` asks for Herdr's rendered rows with colours plus the pane's scroll
+// position (terminal history mode); `text` is the plain transcript.
+export type TerminalOutputFormat = 'text' | 'ansi'
+
+function terminalOutputQuery(lines: number, format: TerminalOutputFormat) {
+  return format === 'ansi' ? `lines=${lines}&format=ansi` : `lines=${lines}`
+}
+
 async function requestJson<T>(
   path: string,
   init: RequestInit = {},
+  readTimeoutMs = READ_REQUEST_TIMEOUT_MS,
 ): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    headers: {
-      Accept: 'application/json',
-      ...init.headers,
-    },
-  })
-
-  if (!response.ok) {
-    let body: ApiErrorEnvelope = {}
-    try {
-      body = (await response.json()) as ApiErrorEnvelope
-    } catch {
-      // Preserve the HTTP fallback below when an intermediary returns text.
-    }
-    const attemptedSessions = body.error?.attempted_session_count
-    const failedSessions = body.error?.failed_session_count
-    throw new YardApiError(
-      body.error?.code ?? `http_${response.status}`,
-      body.error?.message ?? `Yard returned HTTP ${response.status}`,
-      typeof attemptedSessions === 'number' &&
-        Number.isSafeInteger(attemptedSessions) &&
-        attemptedSessions >= 0
-        ? attemptedSessions
-        : null,
-      typeof failedSessions === 'number' &&
-        Number.isSafeInteger(failedSessions) &&
-        failedSessions >= 0
-        ? failedSessions
-        : null,
-      body.error?.preview ?? null,
-      body.error?.reason ?? null,
-    )
+  const callerSignal = init.signal
+  const requestController = new AbortController()
+  const abortRequest = () => requestController.abort(callerSignal?.reason)
+  if (callerSignal?.aborted) {
+    abortRequest()
+  } else {
+    callerSignal?.addEventListener('abort', abortRequest, { once: true })
   }
+  let timedOut = false
+  const timeoutId =
+    (init.method ?? 'GET').toUpperCase() === 'GET'
+      ? globalThis.setTimeout(() => {
+          timedOut = true
+          requestController.abort()
+        }, readTimeoutMs)
+      : null
 
-  return (await response.json()) as T
+  try {
+    const response = await fetch(path, {
+      ...init,
+      headers: {
+        Accept: 'application/json',
+        ...init.headers,
+      },
+      signal: requestController.signal,
+    })
+
+    if (!response.ok) {
+      let body: ApiErrorEnvelope = {}
+      try {
+        body = (await response.json()) as ApiErrorEnvelope
+      } catch {
+        // Preserve the HTTP fallback below when an intermediary returns text.
+      }
+      const attemptedSessions = body.error?.attempted_session_count
+      const failedSessions = body.error?.failed_session_count
+      throw new YardApiError(
+        body.error?.code ?? `http_${response.status}`,
+        body.error?.message ?? `Yard returned HTTP ${response.status}`,
+        typeof attemptedSessions === 'number' &&
+          Number.isSafeInteger(attemptedSessions) &&
+          attemptedSessions >= 0
+          ? attemptedSessions
+          : null,
+        typeof failedSessions === 'number' &&
+          Number.isSafeInteger(failedSessions) &&
+          failedSessions >= 0
+          ? failedSessions
+          : null,
+        body.error?.preview ?? null,
+        body.error?.reason ?? null,
+      )
+    }
+
+    return (await response.json()) as T
+  } catch (caught) {
+    if (timedOut) {
+      throw new YardApiError(
+        'request_timeout',
+        `Yard request timed out after ${Math.round(readTimeoutMs / 1_000)} seconds`,
+      )
+    }
+    throw caught
+  } finally {
+    if (timeoutId !== null) globalThis.clearTimeout(timeoutId)
+    callerSignal?.removeEventListener('abort', abortRequest)
+  }
 }
 
 export function fetchSessions(signal?: AbortSignal): Promise<RuntimeSessions> {
@@ -769,10 +815,12 @@ export function fetchCoordinationNodeTerminalOutput(
   nodeId: string,
   lines = 120,
   signal?: AbortSignal,
+  format: TerminalOutputFormat = 'text',
 ): Promise<CoordinationNodeTerminalOutput> {
   return requestJson(
-    `/api/v1/coordination-nodes/${encodeURIComponent(nodeId)}/terminal-output?lines=${lines}`,
+    `/api/v1/coordination-nodes/${encodeURIComponent(nodeId)}/terminal-output?${terminalOutputQuery(lines, format)}`,
     { signal },
+    TERMINAL_OUTPUT_REQUEST_TIMEOUT_MS,
   )
 }
 
@@ -1235,10 +1283,12 @@ export function fetchAssignmentTerminalOutput(
   assignmentId: string,
   lines = 120,
   signal?: AbortSignal,
+  format: TerminalOutputFormat = 'text',
 ): Promise<TerminalOutput> {
   return requestJson(
-    `/api/v1/projects/${encodeURIComponent(projectId)}/assignments/${encodeURIComponent(assignmentId)}/terminal-output?lines=${lines}`,
+    `/api/v1/projects/${encodeURIComponent(projectId)}/assignments/${encodeURIComponent(assignmentId)}/terminal-output?${terminalOutputQuery(lines, format)}`,
     { signal },
+    TERMINAL_OUTPUT_REQUEST_TIMEOUT_MS,
   )
 }
 
@@ -1262,10 +1312,12 @@ export function fetchOrchestratorTerminalOutput(
   projectId: string,
   lines = 120,
   signal?: AbortSignal,
+  format: TerminalOutputFormat = 'text',
 ): Promise<OrchestratorTerminalOutput> {
   return requestJson(
-    `/api/v1/projects/${encodeURIComponent(projectId)}/orchestrator/terminal-output?lines=${lines}`,
+    `/api/v1/projects/${encodeURIComponent(projectId)}/orchestrator/terminal-output?${terminalOutputQuery(lines, format)}`,
     { signal },
+    TERMINAL_OUTPUT_REQUEST_TIMEOUT_MS,
   )
 }
 
@@ -1313,10 +1365,12 @@ export function sendYardOrchestratorRoute(
 export function fetchYardOrchestratorTerminalOutput(
   lines = 120,
   signal?: AbortSignal,
+  format: TerminalOutputFormat = 'text',
 ): Promise<YardOrchestratorTerminalOutput> {
   return requestJson(
-    `/api/v1/yard/orchestrator/terminal-output?lines=${lines}`,
+    `/api/v1/yard/orchestrator/terminal-output?${terminalOutputQuery(lines, format)}`,
     { signal },
+    TERMINAL_OUTPUT_REQUEST_TIMEOUT_MS,
   )
 }
 

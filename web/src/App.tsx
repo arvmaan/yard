@@ -3358,6 +3358,10 @@ function App() {
     automationsRef.current = automations
   }, [automations])
 
+  // Set once the first session discovery settles, so an empty selection
+  // during discovery keeps Herdr in its loading state.
+  const sessionDiscoverySettledRef = useRef(false)
+
   const loadSessions = useCallback(async (signal?: AbortSignal) => {
     const result = await fetchSessions(signal)
     setSessions(result.sessions)
@@ -3547,6 +3551,9 @@ function App() {
         setInventoryCurrent(false)
         setRuntimeTopology(null)
         setLensEntries([])
+        if (!background && sessionDiscoverySettledRef.current) {
+          setRuntimeLoading(false)
+        }
         return
       }
       if (!background) {
@@ -3740,6 +3747,7 @@ function App() {
     setRuntimeLoading(true)
     loadSessions(controller.signal)
       .then((availableSessions) => {
+        sessionDiscoverySettledRef.current = true
         if (!availableSessions.some((session) => session.running)) {
           setRuntimeLoading(false)
         }
@@ -3748,6 +3756,7 @@ function App() {
         if (caught instanceof DOMException && caught.name === 'AbortError') {
           return
         }
+        sessionDiscoverySettledRef.current = true
         setRuntimeError(
           caught instanceof Error ? caught.message : 'Session discovery failed',
         )

@@ -1510,6 +1510,7 @@ export interface CoordinationNodeTerminalOutput {
   revision: string
   truncated: boolean
   status_report?: unknown
+  scroll?: TerminalScrollPosition | null
 }
 
 export interface SendCoordinationNodeRouteInput {
@@ -1779,6 +1780,13 @@ export interface YardOrchestratorPromptAcknowledgement {
   submitted_at_unix_ms: number
 }
 
+// Herdr's scroll position for the pane, returned with `format=ansi` reads.
+export interface TerminalScrollPosition {
+  offset_from_bottom: number
+  max_offset_from_bottom: number
+  viewport_rows: number
+}
+
 export interface TerminalOutput {
   assignment_id: string
   attempt_id: string
@@ -1788,6 +1796,7 @@ export interface TerminalOutput {
   text: string
   revision: string
   truncated: boolean
+  scroll?: TerminalScrollPosition | null
 }
 
 export interface OrchestratorTerminalOutput {
@@ -1800,6 +1809,7 @@ export interface OrchestratorTerminalOutput {
   revision: string
   truncated: boolean
   status_report?: unknown
+  scroll?: TerminalScrollPosition | null
 }
 
 export interface YardOrchestratorTerminalOutput {
@@ -1811,6 +1821,7 @@ export interface YardOrchestratorTerminalOutput {
   revision: string
   truncated: boolean
   status_report?: unknown
+  scroll?: TerminalScrollPosition | null
 }
 
 export interface ExternalTerminalLaunch {
@@ -1826,6 +1837,9 @@ export interface TerminalFrameMessage {
   width: number
   height: number
   full: boolean
+  // The `terminal.scroll` messages Yard had forwarded to Herdr when it read
+  // this frame.
+  scrolls?: number
 }
 
 export interface TerminalClosedMessage {
@@ -1849,11 +1863,28 @@ export interface TerminalResizeMessage {
   rows: number
 }
 
+export interface TerminalScrollMessage {
+  type: 'terminal.scroll'
+  direction: 'up' | 'down'
+  lines: number
+  source: 'wheel' | 'page_key'
+  column?: number
+  row?: number
+  // Repeat this scroll, as separate Herdr commands in one write (default 1).
+  count?: number
+}
+
 export interface TerminalReleaseMessage {
   type: 'terminal.release'
+}
+
+export interface TerminalScrollResetMessage {
+  type: 'terminal.scroll_reset'
 }
 
 export type TerminalClientMessage =
   | TerminalInputMessage
   | TerminalResizeMessage
+  | TerminalScrollMessage
+  | TerminalScrollResetMessage
   | TerminalReleaseMessage

@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use axum::serve::{ListenerExt, TapIo};
 use thiserror::Error;
 use tokio::{
     sync::watch,
@@ -277,7 +278,7 @@ where
     let (result, control_finished) = {
         let mut shutdown_observer = shutdown_receiver.clone();
         let mut server_shutdown = shutdown_receiver;
-        let server = axum::serve(listener, app)
+        let server = axum::serve(without_nagle(listener), app)
             .with_graceful_shutdown(async move {
                 let _ = server_shutdown.wait_for(|requested| *requested).await;
             })
@@ -450,6 +451,23 @@ async fn wait_for_os_signal() {
     }
 }
 
+type TcpStreamTap = fn(&mut tokio::net::TcpStream);
+
+/// Accept connections with `TCP_NODELAY`. Interactive terminals send many
+/// small, latency-bound messages (scroll commands, input echoes, pongs) that
+/// must not wait behind Nagle's algorithm for an earlier segment's ACK.
+fn without_nagle(
+    listener: tokio::net::TcpListener,
+) -> TapIo<tokio::net::TcpListener, TcpStreamTap> {
+    listener.tap_io(set_nodelay)
+}
+
+fn set_nodelay(stream: &mut tokio::net::TcpStream) {
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(%error, "could not set TCP_NODELAY on an accepted connection");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -465,6 +483,7 @@ mod tests {
     };
 
     use async_trait::async_trait;
+    use axum::serve::Listener;
     use tempfile::{TempDir, tempfile};
     use tokio::{task::JoinSet, time::timeout};
     use yard_domain::{
@@ -486,11 +505,24 @@ mod tests {
     };
     use yard_store::{SqliteProjectStore, YardStore};
 
-    use super::{BoundedLogWriter, RunMode, abort_background_tasks, run_with_services};
+    use super::{
+        BoundedLogWriter, RunMode, abort_background_tasks, run_with_services, without_nagle,
+    };
     use crate::lifecycle::{self, InstanceMode};
 
     const EXPLICIT_TERMINAL: &str = "terminal-explicit";
     const UNKNOWN_TERMINAL: &str = "terminal-unknown";
+
+    #[tokio::test]
+    async fn accepts_connections_without_nagle_delay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut listener = without_nagle(listener);
+        let client = tokio::spawn(tokio::net::TcpStream::connect(address));
+        let (accepted, _) = listener.accept().await;
+        assert!(accepted.nodelay().unwrap());
+        drop(client.await.unwrap().unwrap());
+    }
 
     struct LifecycleRuntime {
         inventory_calls: AtomicUsize,

@@ -1,8 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import {
-  parseTerminalTranscript,
-  reflowTerminalHistory,
-} from './terminalOutput'
+import { parseTerminalTranscript } from './terminalOutput'
 
 describe('parseTerminalTranscript', () => {
   it('separates Codex progress and tool activity from the final answer', () => {
@@ -406,36 +403,5 @@ describe('parseTerminalTranscript', () => {
       question: 'Audit the retry logic.',
       work: '⏺ Read(retry.ts)',
     })
-  })
-
-  it('reflows retained prose without flattening commands or trees', () => {
-    const text = [
-      'SuperNova is Amazon’s internal DNS delegation',
-      'service for names under amazon.dev and',
-      'aws.dev.',
-      '',
-      '- amazon.dev: Amazon/SuperNova-managed parent',
-      '  namespace.',
-      '',
-      'AWS_PROFILE=bis-personal-bmp \\',
-      'brazil-runtime-exec bmp-fake',
-      '',
-      'amazon.dev',
-      '└─ lionsgate.amazon.dev',
-    ].join('\n')
-
-    expect(reflowTerminalHistory(text)).toBe(
-      [
-        'SuperNova is Amazon’s internal DNS delegation service for names under amazon.dev and aws.dev.',
-        '',
-        '- amazon.dev: Amazon/SuperNova-managed parent namespace.',
-        '',
-        'AWS_PROFILE=bis-personal-bmp \\',
-        'brazil-runtime-exec bmp-fake',
-        '',
-        'amazon.dev',
-        '└─ lionsgate.amazon.dev',
-      ].join('\n'),
-    )
   })
 })

@@ -13,9 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use config::HerdrConfig;
 pub use control::{
-    BootstrapAgentRequest, HerdrControlError, PaneOutput, PrepareAgentRequest,
-    PrepareWorkspaceAgentRequest, PreparedAgent, PromptAgentRequest, PromptedAgent,
-    ProvisionAgentRequest, ProvisionedAgent, ReadPaneRequest, StartPreparedAgentRequest,
+    BootstrapAgentRequest, HerdrControlError, PaneOutput, PaneReadFormat, PaneScroll,
+    PrepareAgentRequest, PrepareWorkspaceAgentRequest, PreparedAgent, PromptAgentRequest,
+    PromptedAgent, ProvisionAgentRequest, ProvisionedAgent, ReadPaneRequest,
+    StartPreparedAgentRequest,
 };
 pub use error::HerdrError;
 pub use management::{
@@ -25,9 +26,10 @@ pub use management::{
 };
 pub use terminal::{
     HerdrTerminal, HerdrTerminalError, MAX_TERMINAL_COLS, MAX_TERMINAL_COMMAND_LINE_BYTES,
-    MAX_TERMINAL_EVENT_LINE_BYTES, MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_ROWS, MIN_TERMINAL_COLS,
-    MIN_TERMINAL_ROWS, OpenTerminalRequest, TerminalClosed, TerminalCommand, TerminalDimensions,
-    TerminalEncoding, TerminalEvent, TerminalFrame, TerminalInput,
+    MAX_TERMINAL_EVENT_LINE_BYTES, MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_ROWS,
+    MAX_TERMINAL_SCROLL_REPEAT, MIN_TERMINAL_COLS, MIN_TERMINAL_ROWS, OpenTerminalRequest,
+    TerminalClosed, TerminalCommand, TerminalDimensions, TerminalEncoding, TerminalEvent,
+    TerminalFrame, TerminalInput, TerminalScroll, TerminalScrollDirection, TerminalScrollSource,
 };
 use yard_domain::{RuntimeInventory, RuntimeSessions};
 

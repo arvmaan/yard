@@ -4,17 +4,18 @@ use async_trait::async_trait;
 use thiserror::Error;
 use yard_domain::{
     ObservedWorker, RuntimeInventory, RuntimeObservationState, RuntimeProcessState, RuntimeSession,
-    RuntimeSessions, WorkerRuntimeBinding,
+    RuntimeSessions, TerminalOutputFormat, TerminalScrollPosition, WorkerRuntimeBinding,
 };
 use yard_herdr::{
     AcquirePaneLeaseRequest, BootstrapAgentRequest, CloseLeasedPaneRequest, DiscoveredHerdrSession,
     HerdrAdapter, HerdrControlError, HerdrError, HerdrTerminal, HerdrTerminalError,
     OpenTerminalRequest as HerdrOpenTerminalRequest, PaneLease, PaneLeaseOperationResult,
     PaneLeaseStatus, PaneLeaseStatusRequest, PaneManagementCapability, PaneManagementRpcError,
-    PrepareAgentRequest, PrepareWorkspaceAgentRequest, PromptAgentRequest, ProvisionAgentRequest,
-    ReadPaneRequest, ReleasePaneLeaseRequest, RenewPaneLeaseRequest, StartPreparedAgentRequest,
-    TerminalCommand as HerdrTerminalCommand, TerminalDimensions, TerminalEncoding, TerminalEvent,
-    TerminalInput,
+    PaneReadFormat, PrepareAgentRequest, PrepareWorkspaceAgentRequest, PromptAgentRequest,
+    ProvisionAgentRequest, ReadPaneRequest, ReleasePaneLeaseRequest, RenewPaneLeaseRequest,
+    StartPreparedAgentRequest, TerminalCommand as HerdrTerminalCommand, TerminalDimensions,
+    TerminalEncoding, TerminalEvent, TerminalInput, TerminalScroll,
+    TerminalScrollDirection as HerdrScrollDirection, TerminalScrollSource as HerdrScrollSource,
 };
 
 use crate::allocation_service::{
@@ -29,7 +30,7 @@ use crate::intervention_service::{
 use crate::provider_agents::ProviderAgentObserver;
 use crate::terminal_service::{
     OpenTerminalRequest, RuntimeTerminal, RuntimeTerminalError, RuntimeTerminalSession,
-    TerminalClientMessage, TerminalServerMessage,
+    TerminalClientMessage, TerminalScrollDirection, TerminalScrollSource, TerminalServerMessage,
 };
 
 #[derive(Debug, Error)]
@@ -1009,6 +1010,10 @@ impl RuntimeIntervention for HerdrInventorySource {
                 session: request.session,
                 pane_id: request.pane_id,
                 lines: request.lines,
+                format: match request.format {
+                    TerminalOutputFormat::Text => PaneReadFormat::Text,
+                    TerminalOutputFormat::Ansi => PaneReadFormat::Ansi,
+                },
             })
             .await
             .map(|output| RuntimeOutputResult {
@@ -1020,6 +1025,11 @@ impl RuntimeIntervention for HerdrInventorySource {
                 text: output.text,
                 revision: output.revision,
                 truncated: output.truncated,
+                scroll: output.scroll.map(|scroll| TerminalScrollPosition {
+                    offset_from_bottom: scroll.offset_from_bottom,
+                    max_offset_from_bottom: scroll.max_offset_from_bottom,
+                    viewport_rows: scroll.viewport_rows,
+                }),
             })
             .map_err(|error| RuntimeInterventionError::Unavailable(error.to_string()))
     }
@@ -1116,6 +1126,31 @@ impl RuntimeTerminalSession for HerdrRuntimeTerminalSession {
                 TerminalDimensions::new(cols, rows)
                     .map_err(|error| classify_terminal_error(&error))?,
             ),
+            TerminalClientMessage::Scroll {
+                direction,
+                lines,
+                source,
+                column,
+                row,
+                count,
+            } => HerdrTerminalCommand::Scroll(
+                TerminalScroll::new(
+                    match direction {
+                        TerminalScrollDirection::Up => HerdrScrollDirection::Up,
+                        TerminalScrollDirection::Down => HerdrScrollDirection::Down,
+                    },
+                    lines,
+                    match source {
+                        TerminalScrollSource::Wheel => HerdrScrollSource::Wheel,
+                        TerminalScrollSource::PageKey => HerdrScrollSource::PageKey,
+                    },
+                    column,
+                    row,
+                )
+                .and_then(|scroll| scroll.repeated(count))
+                .map_err(|error| classify_terminal_error(&error))?,
+            ),
+            TerminalClientMessage::ScrollReset => HerdrTerminalCommand::ScrollReset,
             TerminalClientMessage::Release => HerdrTerminalCommand::Release,
             TerminalClientMessage::Input { .. } => {
                 return Err(RuntimeTerminalError::Protocol(
@@ -1151,6 +1186,7 @@ fn terminal_server_message(event: TerminalEvent) -> TerminalServerMessage {
             width: frame.width,
             height: frame.height,
             full: frame.full,
+            scrolls: None,
         },
         TerminalEvent::Closed(closed) => TerminalServerMessage::Closed {
             reason: closed.reason,
@@ -1167,6 +1203,7 @@ fn classify_terminal_error(error: &HerdrTerminalError) -> RuntimeTerminalError {
     }
     match error {
         HerdrTerminalError::EventLineTooLarge
+        | HerdrTerminalError::InvalidScroll
         | HerdrTerminalError::UnterminatedEvent
         | HerdrTerminalError::MalformedEvent(_)
         | HerdrTerminalError::InvalidEvent(_)

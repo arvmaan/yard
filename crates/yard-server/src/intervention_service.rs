@@ -6,9 +6,9 @@ use yard_domain::{
     Assignment, AssignmentLifecycle, AttemptLifecycle, OrchestratorPromptAcknowledgement,
     OrchestratorStatusReport, OrchestratorTerminalOutput, Project, PromptAcknowledgement,
     SendAssignmentPrompt, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
-    SendYardOrchestratorRoute, TerminalOutput, Worker, WorkerRuntimeBinding,
-    YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator, YardOrchestratorPromptAcknowledgement,
-    YardOrchestratorRoute, YardOrchestratorTerminalOutput,
+    SendYardOrchestratorRoute, TerminalOutput, TerminalOutputFormat, TerminalScrollPosition,
+    Worker, WorkerRuntimeBinding, YARD_STANDARD_ORCHESTRATOR_PROFILE_ID, YardOrchestrator,
+    YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute, YardOrchestratorTerminalOutput,
 };
 use yard_store::{
     BeginAssignmentPrompt, BeginOrchestratorPrompt, BeginYardOrchestratorPrompt,
@@ -42,6 +42,7 @@ pub struct RuntimeOutputRequest {
     pub session: String,
     pub pane_id: String,
     pub lines: u32,
+    pub format: TerminalOutputFormat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +55,9 @@ pub struct RuntimeOutputResult {
     pub text: String,
     pub revision: u64,
     pub truncated: bool,
+    /// Herdr's scroll position, read after the output for
+    /// [`TerminalOutputFormat::Ansi`] reads.
+    pub scroll: Option<TerminalScrollPosition>,
 }
 
 #[async_trait]
@@ -612,6 +616,7 @@ impl InterventionService {
         project_id: &str,
         assignment_id: &str,
         lines: u32,
+        format: TerminalOutputFormat,
     ) -> Result<TerminalOutput, InterventionServiceError> {
         if !(1..=MAX_TERMINAL_OUTPUT_LINES).contains(&lines) {
             return Err(InterventionServiceError::InvalidLineCount);
@@ -635,6 +640,7 @@ impl InterventionService {
                 session: runtime.session.clone(),
                 pane_id: runtime.pane_id.clone(),
                 lines,
+                format,
             })
             .await?;
         if result.pane_id != runtime.pane_id
@@ -653,6 +659,7 @@ impl InterventionService {
             text: result.text,
             revision: result.revision,
             truncated: result.truncated,
+            scroll: result.scroll,
         })
     }
 
@@ -666,6 +673,7 @@ impl InterventionService {
         &self,
         project_id: &str,
         lines: u32,
+        format: TerminalOutputFormat,
     ) -> Result<OrchestratorTerminalOutput, InterventionServiceError> {
         if !(1..=MAX_TERMINAL_OUTPUT_LINES).contains(&lines) {
             return Err(InterventionServiceError::InvalidLineCount);
@@ -684,6 +692,7 @@ impl InterventionService {
                 session: runtime.session.clone(),
                 pane_id: runtime.pane_id.clone(),
                 lines,
+                format,
             })
             .await?;
         if result.pane_id != runtime.pane_id
@@ -697,9 +706,12 @@ impl InterventionService {
             .store
             .latest_delivered_project_orchestrator_command_id(&project.id)
             .await?;
-        let status_report = expected_command_id.as_deref().and_then(|command_id| {
-            OrchestratorStatusReport::scan_terminal_output_for_command(&result.text, command_id)
-        });
+        let status_report = expected_command_id
+            .as_deref()
+            .filter(|_| format == TerminalOutputFormat::Text)
+            .and_then(|command_id| {
+                OrchestratorStatusReport::scan_terminal_output_for_command(&result.text, command_id)
+            });
         Ok(OrchestratorTerminalOutput {
             project_id: project.id,
             worker_id: project.orchestrator.id,
@@ -710,6 +722,7 @@ impl InterventionService {
             revision: result.revision,
             truncated: result.truncated,
             status_report,
+            scroll: result.scroll,
         })
     }
 
@@ -722,6 +735,7 @@ impl InterventionService {
     pub async fn read_yard_orchestrator_output(
         &self,
         lines: u32,
+        format: TerminalOutputFormat,
     ) -> Result<YardOrchestratorTerminalOutput, InterventionServiceError> {
         if !(1..=MAX_TERMINAL_OUTPUT_LINES).contains(&lines) {
             return Err(InterventionServiceError::InvalidLineCount);
@@ -745,6 +759,7 @@ impl InterventionService {
                 session: runtime.session.clone(),
                 pane_id: runtime.pane_id.clone(),
                 lines,
+                format,
             })
             .await?;
         if result.pane_id != runtime.pane_id
@@ -758,9 +773,12 @@ impl InterventionService {
             .store
             .latest_delivered_yard_orchestrator_command_id()
             .await?;
-        let status_report = expected_command_id.as_deref().and_then(|command_id| {
-            OrchestratorStatusReport::scan_terminal_output_for_command(&result.text, command_id)
-        });
+        let status_report = expected_command_id
+            .as_deref()
+            .filter(|_| format == TerminalOutputFormat::Text)
+            .and_then(|command_id| {
+                OrchestratorStatusReport::scan_terminal_output_for_command(&result.text, command_id)
+            });
         Ok(YardOrchestratorTerminalOutput {
             worker_id: worker.id.clone(),
             pane_id: result.pane_id,
@@ -770,6 +788,7 @@ impl InterventionService {
             revision: result.revision,
             truncated: result.truncated,
             status_report,
+            scroll: result.scroll,
         })
     }
 

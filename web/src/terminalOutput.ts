@@ -1,57 +1,15 @@
 import type { ObservedStatus } from './types'
 
 export const TERMINAL_OUTPUT_LINES = 1_000
-export const TERMINAL_HISTORY_LINES = 10_000
+// Herdr's pane.read returns at most 1,000 rendered rows; earlier output is
+// still in Herdr and is reachable by scrolling the interactive terminal.
 export const TRUNCATED_TERMINAL_OUTPUT_LABEL =
-  'latest 1,000 lines · earlier output unavailable'
+  'latest 1,000 lines · scroll the terminal for earlier output'
 
 export function normalizeTerminalOutput(text: string) {
   return trimBlankLines(
     text.replace(/\r\n?/g, '\n').split('\n'),
   ).join('\n')
-}
-
-const TERMINAL_STRUCTURE_LINE =
-  /^(?:\s*$|\s{4,}|[›❯•⏺└├│]|[-*+]\s|\d+[.)]\s|#{1,6}\s|`{3}|~~~|\||[$#>]\s)/
-const TERMINAL_LIST_LINE = /^(?:[-*+]\s|\d+[.)]\s)/
-const TERMINAL_PROSE_CONTINUATION = /^[A-Za-z0-9("'`]/
-const TERMINAL_SENTENCE_END = /[.!?;:)\]}>'"`]$/
-
-function canReflowTerminalLines(current: string, next: string) {
-  const currentText = current.trimEnd()
-  const nextText = next.trim()
-  if (!currentText || !nextText || currentText.length < 32) return false
-  const wrappedListItem =
-    TERMINAL_LIST_LINE.test(currentText) &&
-    /^\s{1,3}\S/.test(next) &&
-    !TERMINAL_SENTENCE_END.test(currentText)
-  if (wrappedListItem) return true
-  if (
-    currentText.endsWith('\\') ||
-    TERMINAL_SENTENCE_END.test(currentText) ||
-    TERMINAL_STRUCTURE_LINE.test(currentText)
-  ) {
-    return false
-  }
-  if (/^\s{4,}/.test(next) || !TERMINAL_PROSE_CONTINUATION.test(nextText)) {
-    return false
-  }
-  return true
-}
-
-export function reflowTerminalHistory(text: string) {
-  const lines = normalizeTerminalOutput(text).split('\n')
-  const reflowed: string[] = []
-  for (const line of lines) {
-    const previous = reflowed.at(-1)
-    if (previous !== undefined && canReflowTerminalLines(previous, line)) {
-      reflowed[reflowed.length - 1] =
-        `${previous.trimEnd()} ${line.trim()}`
-    } else {
-      reflowed.push(line)
-    }
-  }
-  return reflowed.join('\n')
 }
 
 export interface TerminalTranscriptTurn {

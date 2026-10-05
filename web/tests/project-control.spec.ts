@@ -611,6 +611,7 @@ interface MockState {
   }>
   terminalOutputRequests: Array<{
     assignmentId: string
+    format?: string
     lines: string | null
     projectId: string
   }>
@@ -799,7 +800,18 @@ async function mockApi(
     terminalOutputDelayMs?: number
     terminalOutputFails?: boolean
     terminalOutputText?: string | ((readCount: number) => string)
-    terminalOutputTruncated?: boolean
+    terminalOutputTruncated?: boolean | ((readCount: number) => boolean)
+    // Herdr's `format=ansi` answer (rendered rows and the pane's scroll
+    // position) for terminal history mode.
+    terminalHistory?: (readCount: number, lines: number) => {
+      text: string
+      truncated?: boolean
+      scroll: {
+        offset_from_bottom: number
+        max_offset_from_bottom: number
+        viewport_rows: number
+      } | null
+    }
     yardStatusReport?: unknown
     ghosttyError?:
       | 'ghostty_launch_failed'
@@ -3690,7 +3702,10 @@ async function mockApi(
           format: 'plain_text',
           text,
           revision: String(state.orchestratorTerminalOutputRequests.length),
-          truncated: options.terminalOutputTruncated ?? false,
+          truncated:
+            typeof options.terminalOutputTruncated === 'function'
+              ? options.terminalOutputTruncated(readCount)
+              : (options.terminalOutputTruncated ?? false),
           status_report:
             options.orchestratorStatusReports?.[projectId] ?? null,
         },
@@ -3706,8 +3721,10 @@ async function mockApi(
           candidate.id === assignmentId &&
           candidate.project_id === projectId,
       )
+      const outputFormat = url.searchParams.get('format')
       state.terminalOutputRequests.push({
         assignmentId,
+        ...(outputFormat ? { format: outputFormat } : {}),
         lines: url.searchParams.get('lines'),
         projectId,
       })
@@ -3739,6 +3756,26 @@ async function mockApi(
         return
       }
       const readCount = state.terminalOutputRequests.length
+      if (outputFormat === 'ansi' && options.terminalHistory) {
+        const history = options.terminalHistory(
+          readCount,
+          Number(url.searchParams.get('lines')),
+        )
+        await route.fulfill({
+          json: {
+            assignment_id: current.id,
+            attempt_id: current.attempt.id,
+            pane_id: runtime.pane_id,
+            source: 'recent',
+            format: 'ansi',
+            text: history.text,
+            revision: String(readCount),
+            truncated: history.truncated ?? false,
+            scroll: history.scroll,
+          },
+        })
+        return
+      }
       const configuredText = options.terminalOutputText
       const text =
         typeof configuredText === 'function'
@@ -3753,7 +3790,10 @@ async function mockApi(
           format: 'plain_text',
           text,
           revision: String(readCount),
-          truncated: options.terminalOutputTruncated ?? false,
+          truncated:
+            typeof options.terminalOutputTruncated === 'function'
+              ? options.terminalOutputTruncated(readCount)
+              : (options.terminalOutputTruncated ?? false),
         },
       })
       return
@@ -5906,6 +5946,54 @@ function codexTranscript({
     '',
     `• ${answer}`,
   ].join('\n')
+}
+
+// Herdr's `terminal session control` frames are cell repaints of a fixed
+// cols × rows screen: synchronized-output bracket, hidden cursor, then one
+// CUP per row followed by that row's cells. They carry no line feeds, so
+// fixtures must look the same to exercise the browser's real behavior.
+function herdrScreen(
+  rows: readonly string[],
+  { clear = false, width }: { clear?: boolean; width: number },
+) {
+  return [
+    '\u001b[?2026h\u001b[?25l\u001b]8;;\u001b\\',
+    clear ? '\u001b[2J' : '',
+    ...rows.map(
+      (text, row) =>
+        `\u001b[${row + 1};1H\u001b[0m${text.padEnd(width).slice(0, width)}`,
+    ),
+    '\u001b[?25h\u001b[?2026l',
+  ].join('')
+}
+
+function sendHerdrFrame(
+  socket: WebSocketRoute,
+  frame: {
+    bytes: string
+    full: boolean
+    height: number
+    seq: number
+    width: number
+  },
+) {
+  socket.send(
+    JSON.stringify({
+      ...frame,
+      type: 'terminal.frame',
+      bytes: Buffer.from(frame.bytes).toString('base64'),
+    }),
+  )
+}
+
+function terminalMessagesOfType<Type extends TerminalClientMessage['type']>(
+  state: MockState,
+  type: Type,
+) {
+  return state.terminalMessages.filter(
+    (message): message is Extract<TerminalClientMessage, { type: Type }> =>
+      message.type === type,
+  )
 }
 
 function seedAssignedCandidateAssignment(state: MockState) {
@@ -10093,6 +10181,107 @@ test('shows the latest answer on the full chat surface and copies it', async ({
   expect(overflow.contextHorizontal).toBeLessThanOrEqual(0)
 })
 
+test('counts order bytes instead of silently truncating a long message', async ({
+  page,
+}) => {
+  const state = await mockApi(page, {
+    terminalOutputText: codexTranscript({
+      answer: 'Latest answer is ready.',
+      question: 'What changed?',
+      work: ['checked the recent rows'],
+    }),
+    terminalOutputTruncated: true,
+  })
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open chat', exact: true }).click()
+  const conversation = page.getByLabel('Agent conversation')
+  // Herdr returned only its latest rows; the chat says so.
+  await expect(conversation.getByRole('note')).toHaveText(
+    'Showing the latest 1,000 lines. Scroll the terminal for earlier output.',
+  )
+
+  const message = page.getByLabel('Message', { exact: true })
+  const send = page.getByRole('button', { name: 'Send order', exact: true })
+  const count = page.locator('.chat-composer__limit')
+  await expect(count).toHaveText(/^\d{3} \/ 16,000 bytes$/)
+
+  // Longer than the old 16,000-character maxLength: nothing is cut off.
+  const long = 'x'.repeat(17_000)
+  await message.fill(long)
+  await expect(message).toHaveValue(long)
+  await expect(count).toHaveAttribute('data-over', 'true')
+  await expect(page.locator('.chat-composer__limit-error')).toContainText(
+    'Yard accepts at most 16,000 bytes; shorten it to send.',
+  )
+  await expect(message).toHaveAttribute('aria-invalid', 'true')
+  await expect(send).toBeDisabled()
+
+  // Multibyte text counts in UTF-8 bytes, the unit the server enforces.
+  await message.fill('é'.repeat(7_900))
+  await expect(send).toBeDisabled()
+  await expect(count).toHaveText(/^16,\d{3} \/ 16,000 bytes$/)
+
+  await message.fill('Summarize the blocker.')
+  await expect(count).not.toHaveAttribute('data-over', 'true')
+  await expect(page.locator('.chat-composer__limit-error')).toHaveCount(0)
+  await expect(send).toBeEnabled()
+  await send.click()
+  await expect(page.getByText('Order delivered to the agent.')).toBeVisible()
+  expect(state.promptCommands.at(-1)?.text).toContain('Summarize the blocker.')
+})
+
+test('counts group order bytes instead of silently truncating a long message', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page
+    .locator('.orchestrator-marker[data-project-id="project-1"]')
+    .click()
+  await page.locator('.assigned-worker-marker').click({ modifiers: ['Shift'] })
+  await page
+    .getByRole('button', { name: 'Open group chat', exact: true })
+    .click()
+  const groupChat = page.getByRole('dialog', { name: 'Group chat' })
+  const message = groupChat.getByLabel('Message', { exact: true })
+  const send = groupChat.getByRole('button', {
+    name: 'Send to 2',
+    exact: true,
+  })
+  const count = groupChat.locator('.chat-composer__limit')
+  const error = groupChat.locator('.chat-composer__limit-error')
+
+  // Longer than the old 16,000-character maxLength: nothing is cut off.
+  const long = 'x'.repeat(17_000)
+  await message.fill(long)
+  await expect(message).toHaveValue(long)
+  await expect(count).toHaveAttribute('data-over', 'true')
+  await expect(error).toHaveAttribute('role', 'alert')
+  await expect(error).toContainText(
+    'Yard accepts at most 16,000 bytes; shorten it to send.',
+  )
+  await expect(message).toHaveAttribute('aria-invalid', 'true')
+  await expect(send).toBeDisabled()
+  // The keyboard shortcut submits the form directly; it must not send either.
+  await message.press('Control+Enter')
+  await page.waitForTimeout(300)
+  await expect(message).toHaveValue(long)
+  expect(state.promptCommands).toHaveLength(0)
+  expect(state.orchestratorPromptCommands).toHaveLength(0)
+
+  await message.fill('Report current status.')
+  await expect(count).not.toHaveAttribute('data-over', 'true')
+  await expect(error).toHaveCount(0)
+  await expect(send).toBeEnabled()
+})
+
 for (const clipboardFailure of ['denied', 'unavailable'] as const) {
   test(
     `shows selectable fallback when clipboard is ${clipboardFailure}`,
@@ -10289,12 +10478,11 @@ test('shows agent activity error and empty states in chat', async ({
   await expect(emptyOutput).toContainText('No recent agent output.')
 })
 
-test('opens the terminal socket before history and replays sequenced live frames', async ({
+test('opens the terminal socket without loading history and replays sequenced live frames', async ({
   page,
 }) => {
   const state = await mockApi(page, {
-    terminalOutputDelayMs: 800,
-    terminalOutputText: 'history before the live frame',
+    terminalOutputText: 'history that must not enter the terminal',
   })
   seedActiveAssignment(state)
   await page.setViewportSize({ width: 1280, height: 800 })
@@ -10306,148 +10494,57 @@ test('opens the terminal socket before history and replays sequenced live frames
     .click()
 
   const terminal = page.locator('.terminal-session')
-  const terminalRows = terminal.locator('.xterm-accessibility-tree')
+  const terminalRows = terminal.locator('.xterm-rows')
   await expect.poll(() => state.terminalSockets.length).toBe(1)
-  await expect.poll(() => state.terminalOutputRequests.length).toBe(1)
-  expect(state.requestLog.indexOf('terminal:websocket')).toBeLessThan(
-    state.requestLog.indexOf('terminal:history'),
-  )
   await expect(terminal).toHaveAttribute('data-state', 'connected')
-  await expect(terminal).toHaveAttribute(
-    'data-history-state',
-    'loading',
-  )
 
   const terminalUrl = new URL(state.terminalConnectionUrls[0])
   const width = Number(terminalUrl.searchParams.get('cols'))
   const height = Number(terminalUrl.searchParams.get('rows'))
-  state.terminalSockets[0].send(
-    JSON.stringify({
-      type: 'terminal.frame',
-      bytes: Buffer.from('\u001b[2J\u001b[Hlive frame one').toString(
-        'base64',
-      ),
-      seq: 1,
-      width,
-      height,
-      full: true,
-    }),
-  )
-  state.terminalSockets[0].send(
-    JSON.stringify({
-      type: 'terminal.frame',
-      bytes: Buffer.from('\r\nduplicate frame').toString('base64'),
-      seq: 1,
-      width,
-      height,
-      full: false,
-    }),
-  )
-  state.terminalSockets[0].send(
-    JSON.stringify({
-      type: 'terminal.frame',
-      bytes: Buffer.from('\r\nlive frame two').toString('base64'),
-      seq: 2,
-      width,
-      height,
-      full: false,
-    }),
-  )
+  const socket = state.terminalSockets[0]
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(['live frame one'], { clear: true, width }),
+    full: true,
+    height,
+    seq: 1,
+    width,
+  })
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(['live frame one', 'duplicate frame'], { width }),
+    full: false,
+    height,
+    seq: 1,
+    width,
+  })
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(['live frame one', 'live frame two'], { width }),
+    full: false,
+    height,
+    seq: 2,
+    width,
+  })
 
-  await expect(terminal).toHaveAttribute('data-history-state', 'ready')
   await expect(terminal).toHaveAttribute('data-frame-sequence', '2')
   await expect(terminalRows).toContainText('live frame one')
   await expect(terminalRows).toContainText('live frame two')
   await expect(terminalRows).not.toContainText('duplicate frame')
-  const accessibleRows = terminalRows.locator('[role="listitem"]')
-  await expect
-    .poll(async () => {
-      const visibleRows = await accessibleRows.count()
-      const bufferRows = Number(
-        await accessibleRows.first().getAttribute('aria-setsize'),
-      )
-      return bufferRows - visibleRows
-    })
-    .toBeGreaterThan(0)
-  await terminal.locator('.terminal-session__viewport').dispatchEvent(
-    'wheel',
-    {
-      deltaMode: 0,
-      deltaY: -100_000,
-    },
-  )
-  await expect
-    .poll(() =>
-      accessibleRows.first().getAttribute('aria-posinset'),
-    )
-    .toBe('1')
-  await expect(terminalRows).toContainText(
-    'history before the live frame',
-  )
-})
-
-test('keeps live terminal output available when history loading degrades', async ({
-  page,
-}) => {
-  const state = await mockApi(page, {
-    terminalOutputFails: true,
-  })
-  seedActiveAssignment(state)
-  await page.setViewportSize({ width: 1280, height: 800 })
-  await page.goto('/')
-
-  await page.locator('.assigned-worker-marker').click()
-  await page
-    .getByRole('button', { name: 'Open terminal', exact: true })
-    .click()
-
-  const terminal = page.locator('.terminal-session')
-  const terminalRows = terminal.locator('.xterm-accessibility-tree')
-  await expect.poll(() => state.terminalSockets.length).toBe(1)
-  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  // Herdr owns scrollback; the browser keeps only the rendered screen and
+  // never replays a history snapshot into it.
   await expect(terminal).toHaveAttribute(
-    'data-history-state',
-    'degraded',
+    'data-terminal-buffer-lines',
+    String(height),
   )
-  await expect(
-    terminal.locator('.terminal-session__status-text'),
-  ).toContainText('Connected · Earlier history unavailable')
-
-  const terminalUrl = new URL(state.terminalConnectionUrls[0])
-  state.terminalSockets[0].send(
-    JSON.stringify({
-      type: 'terminal.frame',
-      bytes: Buffer.from('live output without history').toString(
-        'base64',
-      ),
-      seq: 1,
-      width: Number(terminalUrl.searchParams.get('cols')),
-      height: Number(terminalUrl.searchParams.get('rows')),
-      full: true,
-    }),
-  )
-
-  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
-  await expect(terminalRows).toContainText(
-    'live output without history',
-  )
-  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect(terminalRows.locator(':scope > div')).toHaveCount(height)
+  await page.waitForTimeout(300)
+  await expect(terminalRows).not.toContainText('history that must not enter')
+  expect(state.terminalOutputRequests).toHaveLength(0)
+  expect(state.requestLog).not.toContain('terminal:history')
 })
 
 test('connects the assignment terminal and relays frames, input, resize, and release', async ({
   page,
 }, testInfo) => {
-  const state = await mockApi(page, {
-    terminalOutputText: codexTranscript({
-      answer: 'The build is ready for owner review.',
-      question: 'Why is the build stalled?',
-      work: Array.from(
-        { length: 80 },
-        (_, index) => `seeded terminal history ${index + 1}`,
-      ),
-    }),
-    terminalOutputTruncated: true,
-  })
+  const state = await mockApi(page)
   seedActiveAssignment(state)
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto('/')
@@ -10462,17 +10559,7 @@ test('connects the assignment terminal and relays frames, input, resize, and rel
   const terminal = page.locator('.terminal-session')
   await expect(terminal).toHaveAttribute('data-state', 'connected')
   await expect(terminal.locator('.terminal-session__context')).toHaveCount(0)
-  const terminalRows = terminal.locator('.xterm-accessibility-tree')
-  await expect(terminalRows).toContainText(
-    'The build is ready for owner review.',
-  )
-  await terminal.locator('.xterm-scrollable-element').hover()
-  await page.mouse.wheel(0, -100000)
-  await expect(terminalRows).toContainText('seeded terminal history 1')
-  await page.mouse.wheel(0, 100000)
-  await expect(terminalRows).toContainText(
-    'The build is ready for owner review.',
-  )
+  const terminalRows = terminal.locator('.xterm-rows')
   const liveViewportHeight = await terminal
     .locator('.terminal-session__viewport')
     .evaluate((element) => element.getBoundingClientRect().height)
@@ -10519,11 +10606,6 @@ test('connects the assignment terminal and relays frames, input, resize, and rel
     .toBe(liveViewportHeight)
   await expect.poll(() => state.terminalSockets.length).toBe(1)
   expect(state.terminalOutputRequests).toEqual([
-    {
-      assignmentId: 'assignment-1',
-      lines: '10000',
-      projectId: 'project-1',
-    },
   ])
   await expect(
     page.getByRole('region', {
@@ -10531,10 +10613,6 @@ test('connects the assignment terminal and relays frames, input, resize, and rel
       exact: true,
     }),
   ).toBeVisible()
-  const terminalViewport = terminal.locator('.xterm-scrollable-element')
-  const historyScrollHeight = await terminalViewport.evaluate(
-    (element) => element.scrollHeight,
-  )
 
   const url = new URL(state.terminalConnectionUrls[0])
   expect(url.protocol).toBe('ws:')
@@ -10606,60 +10684,28 @@ test('connects the assignment terminal and relays frames, input, resize, and rel
     'terminal ready',
   )
   await expect(terminalRows).toContainText('terminal ready')
-  await expect
-    .poll(() =>
-      terminalViewport.evaluate((element) => element.scrollHeight),
-    )
-    .toBe(historyScrollHeight)
-  await terminal.locator('.xterm-scrollable-element').hover()
-  await page.mouse.wheel(0, -rows * 40)
-  await expect(terminalRows).not.toContainText('terminal ready')
-  await expect(terminalRows).toContainText('seeded terminal history')
-  state.terminalSockets[0].send(
-    JSON.stringify({
-      type: 'terminal.frame',
-      bytes: Buffer.from('\r\nnew output while reviewing history').toString(
-        'base64',
-      ),
-      seq: 8,
-      width: cols,
-      height: rows,
-      full: false,
-    }),
-  )
-  await expect(terminal).toHaveAttribute('data-frame-sequence', '8')
-  await expect(terminalRows).not.toContainText(
-    'new output while reviewing history',
-  )
-  await expect(terminalRows).toContainText('seeded terminal history')
 
-  state.terminalSockets[0].send(
-    JSON.stringify({
-      type: 'terminal.frame',
-      bytes: Buffer.from('\u001b[?1049hfull-screen terminal app').toString(
-        'base64',
-      ),
-      seq: 9,
-      width: cols,
-      height: rows,
-      full: false,
-    }),
-  )
-  await expect(terminalRows).toContainText('full-screen terminal app')
-  const inputCountBeforeWheel = state.terminalMessages.filter(
-    (message) => message.type === 'terminal.input',
-  ).length
+  // The wheel scrolls through Herdr, which repaints the viewport; nothing
+  // scrolls locally and no arrow-key input is synthesized.
   await terminal.locator('.xterm-screen').hover()
   await page.mouse.wheel(0, -240)
   await expect
-    .poll(
-      () =>
-        state.terminalMessages
-          .filter((message) => message.type === 'terminal.input')
-          .slice(inputCountBeforeWheel)
-          .map((message) => message.text),
-    )
-    .toContain('\u001b[A')
+    .poll(() => terminalMessagesOfType(state, 'terminal.scroll').at(-1))
+    .toMatchObject({ direction: 'up', source: 'wheel' })
+  expect(terminalMessagesOfType(state, 'terminal.input')).toHaveLength(0)
+  sendHerdrFrame(state.terminalSockets[0], {
+    bytes: herdrScreen(['earlier output from Herdr scrollback'], {
+      width: cols,
+    }),
+    full: false,
+    height: rows,
+    seq: 8,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '8')
+  await expect(terminalRows).toContainText(
+    'earlier output from Herdr scrollback',
+  )
   await page.screenshot({
     path: testInfo.outputPath('terminal-workspace-desktop.png'),
     fullPage: true,
@@ -10704,7 +10750,1931 @@ test('connects the assignment terminal and relays frames, input, resize, and rel
   await expect(openTerminal).toBeFocused()
 })
 
-test('keeps a worker terminal theme and scrollback authoritative under TUI mouse mode', async ({
+test('scrolls earlier output through Herdr instead of a stale local snapshot', async ({
+  page,
+}) => {
+  const state = await mockApi(page, {
+    terminalOutputText: [
+      ...Array.from(
+        { length: 30 },
+        (_, index) => `• snapshot answer item ${index + 1}`,
+      ),
+      '❯ stale prompt from connect time',
+      '  stale status bar · Opus 5.5',
+    ].join('\n'),
+  })
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open terminal', exact: true }).click()
+  const terminal = page.locator('.terminal-session')
+  const terminalRows = terminal.locator('.xterm-rows')
+  const rowItems = terminalRows.locator(':scope > div')
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  const socket = state.terminalSockets[0]
+  const url = new URL(state.terminalConnectionUrls[0])
+  const cols = Number(url.searchParams.get('cols'))
+  const rows = Number(url.searchParams.get('rows'))
+  const chrome = ['❯ ', '  status · Opus 5.5 · ~/yard']
+  const screenAt = (lines: readonly string[], offsetFromBottom = 0) => {
+    const all = [...lines, ...chrome]
+    const end = all.length - offsetFromBottom
+    return all.slice(end - rows, end)
+  }
+  const earlier = Array.from(
+    { length: 60 },
+    (_, index) => `• earlier answer item ${index + 1}`,
+  )
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(screenAt(earlier), { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+
+  // A long answer arrives. Herdr repaints the fixed screen row by row; the
+  // rows that leave the top never enter the browser's buffer.
+  const answer = Array.from(
+    { length: 50 },
+    (_, index) => `• new answer item ${index + 1}`,
+  )
+  const transcript = [...earlier, ...answer]
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(screenAt(transcript), { width: cols }),
+    full: false,
+      height: rows,
+    seq: 2,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '2')
+  await expect(terminalRows).toContainText('new answer item 50')
+
+  // The browser holds exactly Herdr's screen: no connect-time snapshot sits
+  // above the newer answer, and the prompt stays below it.
+  const latestScreen = screenAt(transcript)
+  await expect(terminal).toHaveAttribute(
+    'data-terminal-buffer-lines',
+    String(rows),
+  )
+  await expect(rowItems).toHaveCount(rows)
+  await expect(rowItems.first()).toHaveText(latestScreen[0])
+  await expect(rowItems.nth(rows - 3)).toContainText('new answer item 50')
+  await expect(rowItems.nth(rows - 2)).toHaveText(/^❯\s*$/)
+  await expect(terminalRows).not.toContainText('stale prompt')
+  await expect(terminalRows).not.toContainText('snapshot answer item')
+  expect(state.terminalOutputRequests).toHaveLength(0)
+
+  // The wheel asks Herdr to scroll. It is not local scrolling and not input.
+  await terminal.locator('.xterm-screen').hover()
+  await page.mouse.wheel(0, -400)
+  await expect
+    .poll(() => terminalMessagesOfType(state, 'terminal.scroll').length)
+    .toBeGreaterThan(0)
+  const wheel = terminalMessagesOfType(state, 'terminal.scroll')[0]
+  expect(wheel).toMatchObject({ direction: 'up', source: 'wheel' })
+  expect(wheel.lines).toBeGreaterThan(0)
+  expect(wheel.lines).toBeLessThanOrEqual(rows)
+  // 400 px is 9 steps of 44 px, capped at one 5-step batch. Herdr turns
+  // each command into one wheel report for a mouse-aware app, so every step
+  // is its own notch-sized command: one message that Yard repeats 5 times.
+  await expect
+    .poll(() =>
+      terminalMessagesOfType(state, 'terminal.scroll').map((message) => [
+        message.lines,
+        message.count ?? 1,
+      ]),
+    )
+    .toEqual([[3, 5]])
+  expect(wheel.column).toBeGreaterThanOrEqual(0)
+  expect(wheel.column).toBeLessThan(cols)
+  expect(wheel.row).toBeGreaterThanOrEqual(0)
+  expect(wheel.row).toBeLessThan(rows)
+  expect(terminalMessagesOfType(state, 'terminal.input')).toHaveLength(0)
+  // Nothing scrolled locally: the screen is still Herdr's last repaint.
+  await expect(rowItems.first()).toHaveText(latestScreen[0])
+
+  // Herdr scrolls its buffer and repaints the viewport with earlier output.
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(screenAt(transcript, rows), { width: cols }),
+    full: false,
+      height: rows,
+    seq: 3,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '3')
+  await expect(terminalRows).toContainText('new answer item 1')
+  await expect(terminalRows).toContainText('earlier answer item 33')
+  await expect(terminalRows).not.toContainText('new answer item 50')
+  await expect(terminalRows).not.toContainText('❯')
+
+  // PageUp and Shift+PageDown page through Herdr too.
+  await terminal.locator('.xterm-helper-textarea').focus()
+  await page.keyboard.press('PageUp')
+  await page.keyboard.press('Shift+PageDown')
+  await expect
+    .poll(() => terminalMessagesOfType(state, 'terminal.scroll').slice(-2))
+    .toEqual([
+      {
+        type: 'terminal.scroll',
+        direction: 'up',
+        lines: rows - 1,
+        source: 'page_key',
+      },
+      {
+        type: 'terminal.scroll',
+        direction: 'down',
+        lines: rows - 1,
+        source: 'page_key',
+      },
+    ])
+  expect(terminalMessagesOfType(state, 'terminal.input')).toHaveLength(0)
+
+  // Typing is unchanged keyboard input.
+  await terminal.locator('.xterm-helper-textarea').pressSequentially('ok')
+  await expect
+    .poll(() =>
+      terminalMessagesOfType(state, 'terminal.input')
+        .map((message) => message.text)
+        .join(''),
+    )
+    .toBe('ok')
+})
+
+test('shows when the Herdr view is scrolled back and jumps to the latest output', async ({
+  page,
+}) => {
+  // Herdr keeps one scroll offset per pane and resets it only on input, so
+  // a view scrolled back stays there while new output arrives below it.
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open terminal', exact: true }).click()
+  const terminal = page.locator('.terminal-session')
+  const status = terminal.getByRole('status')
+  const jump = terminal.getByRole('button', { name: 'Jump to latest' })
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  await expect(status).toHaveText('Connected')
+  await expect(jump).toHaveCount(0)
+
+  const screen = terminal.locator('.xterm-screen')
+  await screen.hover()
+  // 240 px is 5 steps of 44 px, one command each.
+  const scrollSteps = () =>
+    terminalMessagesOfType(state, 'terminal.scroll').reduce(
+      (steps, message) => steps + (message.count ?? 1),
+      0,
+    )
+  await page.mouse.wheel(0, -240)
+  await expect.poll(scrollSteps).toBe(5)
+  await expect(status).toHaveText('Connected · Scrolled back')
+  await expect(jump).toBeVisible()
+
+  await jump.click()
+  await expect
+    .poll(() => terminalMessagesOfType(state, 'terminal.scroll_reset'))
+    .toEqual([{ type: 'terminal.scroll_reset' }])
+  await expect(status).toHaveText('Connected')
+  await expect(jump).toHaveCount(0)
+  expect(terminalMessagesOfType(state, 'terminal.input')).toHaveLength(0)
+
+  // Scrolling back down by the same distance is back at the latest output.
+  await screen.hover()
+  await page.mouse.wheel(0, -240)
+  await expect(jump).toBeVisible()
+  await page.waitForTimeout(300)
+  await page.mouse.wheel(0, 240)
+  await expect.poll(scrollSteps).toBe(15)
+  await expect(jump).toHaveCount(0)
+
+  // Typing makes Herdr return to the latest output, so the notice clears.
+  await terminal.locator('.xterm-helper-textarea').focus()
+  await page.keyboard.press('PageUp')
+  await expect(jump).toBeVisible()
+  await terminal.locator('.xterm-helper-textarea').pressSequentially('x')
+  await expect(jump).toHaveCount(0)
+  await expect(status).toHaveText('Connected')
+})
+
+test('keeps one scroll batch in flight until Herdr answers, then sends the input that accumulated', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open terminal', exact: true }).click()
+  const terminal = page.locator('.terminal-session')
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  const url = new URL(state.terminalConnectionUrls[0])
+  const cols = Number(url.searchParams.get('cols'))
+  const rows = Number(url.searchParams.get('rows'))
+  sendHerdrFrame(state.terminalSockets[0], {
+    bytes: herdrScreen(['latest output'], { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+
+  // The wheel, PageUp, and Herdr's answers are driven inside the page and
+  // timed with the page clock, so the 300 ms batch timeout cannot race
+  // Playwright round trips. Yard tags each frame with the scroll messages
+  // it had forwarded to Herdr when it read the frame.
+  const herdrFrame = (seq: number, scrolls: number, line: string) =>
+    JSON.stringify({
+      type: 'terminal.frame',
+      bytes: Buffer.from(herdrScreen([line], { width: cols })).toString(
+        'base64',
+      ),
+      seq,
+      width: cols,
+      height: rows,
+      full: false,
+      scrolls,
+    })
+  // A repaint Yard read before the first batch reached Herdr (a spinner),
+  // then the answer.
+  const frames = {
+    stale: herdrFrame(2, 0, 'spinner repaint'),
+    answer: herdrFrame(3, 1, 'earlier output from Herdr'),
+  }
+  const run = await page.evaluate(async (frames) => {
+    interface SentScroll {
+      at: number
+      count?: number
+      direction: string
+      lines: number
+      source: string
+    }
+    const scrolls: SentScroll[] = []
+    const captured: { socket?: WebSocket } = {}
+    const send = WebSocket.prototype.send
+    WebSocket.prototype.send = function (
+      this: WebSocket,
+      data: Parameters<WebSocket['send']>[0],
+    ) {
+      captured.socket = this
+      if (typeof data === 'string') {
+        const message = JSON.parse(data)
+        if (message.type === 'terminal.scroll') {
+          scrolls.push({ ...message, at: performance.now() })
+        }
+      }
+      return send.call(this, data)
+    }
+    const sleep = (ms: number) =>
+      new Promise((resolve) => window.setTimeout(resolve, ms))
+    const screen = document.querySelector<HTMLElement>(
+      '.terminal-session .xterm-screen',
+    )
+    const textarea = document.querySelector<HTMLElement>(
+      '.terminal-session .xterm-helper-textarea',
+    )
+    if (!screen || !textarea) throw new Error('The terminal is not rendered')
+    const box = screen.getBoundingClientRect()
+    const wheel = (deltaY: number) =>
+      screen.dispatchEvent(
+        new WheelEvent('wheel', {
+          bubbles: true,
+          cancelable: true,
+          clientX: box.left + 10,
+          clientY: box.top + 10,
+          deltaMode: 0,
+          deltaY,
+        }),
+      )
+    try {
+      const start = performance.now()
+      // 88 px is two steps, sent with the wheel event itself.
+      wheel(-88)
+      const sentAtOnce = scrolls.length
+      // A fast fling and a PageUp while that batch waits for its answer.
+      for (let event = 0; event < 12; event += 1) wheel(-44)
+      textarea.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          bubbles: true,
+          cancelable: true,
+          code: 'PageUp',
+          key: 'PageUp',
+        }),
+      )
+      if (!captured.socket) throw new Error('No terminal socket was used')
+      const socket = captured.socket
+      await sleep(60)
+      socket.dispatchEvent(new MessageEvent('message', { data: frames.stale }))
+      await sleep(60)
+      const sentWhileWaiting = scrolls.length
+      const answeredAt = performance.now() - start
+      socket.dispatchEvent(new MessageEvent('message', { data: frames.answer }))
+      while (scrolls.length < 4 && performance.now() - start < 2_000) {
+        await sleep(2)
+      }
+      await sleep(400)
+      const flow = scrolls.slice()
+      // Jump to latest and typed input return Herdr to the latest output,
+      // so the next wheel leaves at once even while a batch is in flight.
+      wheel(-44)
+      await sleep(30)
+      const jump = Array.from(
+        document.querySelectorAll<HTMLButtonElement>(
+          '.terminal-session button',
+        ),
+      ).find((button) => button.textContent?.includes('Jump to latest'))
+      if (!jump) throw new Error('Jump to latest is not shown')
+      jump.click()
+      let before = scrolls.length
+      wheel(-44)
+      const sentAfterJump = scrolls.length - before
+      const enter = new KeyboardEvent('keydown', {
+        bubbles: true,
+        cancelable: true,
+        code: 'Enter',
+        key: 'Enter',
+      })
+      Object.defineProperty(enter, 'keyCode', { get: () => 13 })
+      Object.defineProperty(enter, 'which', { get: () => 13 })
+      textarea.dispatchEvent(enter)
+      before = scrolls.length
+      wheel(-44)
+      const sentAfterTyping = scrolls.length - before
+      return {
+        answeredAt,
+        scrolls: flow.map((scroll) => ({
+          ...scroll,
+          at: scroll.at - start,
+        })),
+        sentAfterJump,
+        sentAfterTyping,
+        sentAtOnce,
+        sentWhileWaiting,
+      }
+    } finally {
+      WebSocket.prototype.send = send
+    }
+  }, frames)
+
+  // The first batch leaves at once as one message; nothing else is sent
+  // while it waits, not even after the stale repaint.
+  expect(run.sentAtOnce).toBe(1)
+  expect(run.sentWhileWaiting).toBe(1)
+  const wheelUp = { direction: 'up', lines: 3, source: 'wheel', count: 1 }
+  const pageUp = {
+    direction: 'up',
+    lines: rows - 1,
+    source: 'page_key',
+    count: 1,
+  }
+  expect(
+    run.scrolls.map(({ count, direction, lines, source }) => ({
+      direction,
+      lines,
+      source,
+      count: count ?? 1,
+    })),
+  ).toEqual([
+    { ...wheelUp, count: 2 },
+    // The answer releases what accumulated: the PageUp, then wheel steps,
+    // at most five commands. The fling was capped at five pending steps.
+    pageUp,
+    { ...wheelUp, count: 4 },
+    // Nothing answers that batch, so the last step waits for the timeout.
+    wheelUp,
+  ])
+  const [, answerBatch, , afterTimeout] = run.scrolls
+  expect(answerBatch.at).toBeGreaterThanOrEqual(run.answeredAt)
+  expect(answerBatch.at).toBeLessThan(300)
+  expect(afterTimeout.at - answerBatch.at).toBeGreaterThanOrEqual(290)
+  expect(run.sentAfterJump).toBe(1)
+  expect(run.sentAfterTyping).toBe(1)
+  // The Enter key really was typed input.
+  await expect
+    .poll(() => terminalMessagesOfType(state, 'terminal.input').length)
+    .toBeGreaterThan(0)
+  await expect(terminal.locator('.xterm-rows')).toContainText(
+    'earlier output from Herdr',
+  )
+})
+
+// Herdr's `recent` ANSI read: one rendered row per CRLF line, with colour.
+function herdrHistoryText(rows: readonly string[]) {
+  return rows
+    .map((row, index) => `\u001b[0m\u001b[38;5;${(index % 6) + 1}m${row}\u001b[0m`)
+    .join('\r\n')
+}
+
+async function openHistoryTerminal(page: Page, state: MockState) {
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open terminal', exact: true }).click()
+  const terminal = page.locator('.terminal-session')
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  const url = new URL(state.terminalConnectionUrls[0])
+  return {
+    terminal,
+    socket: state.terminalSockets[0],
+    cols: Number(url.searchParams.get('cols')),
+    rows: Number(url.searchParams.get('rows')),
+    // The live xterm and the local history xterm.
+    liveRows: terminal.locator('.terminal-session__viewport > .xterm .xterm-rows > div'),
+    history: terminal.locator('.terminal-session__history'),
+    historyRows: terminal.locator('.terminal-session__history .xterm-rows > div'),
+  }
+}
+
+function historyReads(state: MockState) {
+  return state.terminalOutputRequests.filter((request) => request.format === 'ansi')
+}
+
+// Every row of the history view, read page by page from its bottom.
+async function allHistoryRows(
+  page: Page,
+  history: ReturnType<Page['locator']>,
+  rows: number,
+) {
+  const settle = () =>
+    page.evaluate(
+      () =>
+        new Promise((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(resolve)),
+        ),
+    )
+  const total = Number(await history.getAttribute('data-rows'))
+  // Page down to the last row (one more PageDown would leave history).
+  for (let top = Number(await history.getAttribute('data-top')); top < total - rows; ) {
+    await page.keyboard.press('PageDown')
+    await expect(history).not.toHaveAttribute('data-top', String(top))
+    top = Number(await history.getAttribute('data-top'))
+  }
+  await expect(history).toHaveAttribute('data-top', String(total - rows))
+  const seen = new Map<number, string>()
+  for (;;) {
+    await settle()
+    const top = Number(await history.getAttribute('data-top'))
+    const texts = await history
+      .locator('.xterm-rows > div')
+      .evaluateAll((elements) =>
+        elements.map((element) =>
+          (element.textContent ?? '').replace(/ /g, ' ').trimEnd(),
+        ),
+      )
+    texts.forEach((text, index) => seen.set(top + index, text))
+    if (top === 0) break
+    await page.keyboard.press('PageUp')
+    await expect(history).not.toHaveAttribute('data-top', String(top))
+  }
+  return Array.from({ length: total }, (_, index) => seen.get(index) ?? '')
+}
+
+test('opens local history on a wheel-up where Herdr owns the scrollback and scrolls it without Herdr', async ({
+  page,
+}) => {
+  const transcript = [
+    ...Array.from({ length: 300 }, (_, index) => `history line ${index + 1}`),
+    'bash-4.2$ ',
+  ]
+  let paneRows = 0
+  const state = await mockApi(page, {
+    terminalHistory: () => ({
+      text: herdrHistoryText(transcript),
+      // Herdr applied the first wheel step to its own scrollback.
+      scroll: {
+        offset_from_bottom: 3,
+        max_offset_from_bottom: transcript.length - paneRows,
+        viewport_rows: paneRows,
+      },
+    }),
+  })
+  seedActiveAssignment(state)
+  const { terminal, socket, cols, rows, liveRows, history, historyRows } =
+    await openHistoryTerminal(page, state)
+  paneRows = rows
+  const screenAt = (offset: number) =>
+    transcript.slice(transcript.length - rows - offset, transcript.length - offset)
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(screenAt(0), { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  expect(historyReads(state)).toHaveLength(0)
+
+  // The first notch still goes to Herdr, so something moves after one
+  // round trip, and the history read follows it.
+  await terminal.locator('.xterm-screen').first().hover()
+  await page.mouse.wheel(0, -44)
+  await expect
+    .poll(() => terminalMessagesOfType(state, 'terminal.scroll'))
+    .toEqual([
+      expect.objectContaining({ direction: 'up', lines: 3, source: 'wheel' }),
+    ])
+  await expect.poll(() => historyReads(state)).toEqual([
+    // A small read (two screens) so history opens after one short answer.
+    expect.objectContaining({ format: 'ansi', lines: String(rows * 2) }),
+  ])
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(screenAt(3), { width: cols }),
+    full: false,
+    height: rows,
+    seq: 2,
+    width: cols,
+  })
+
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+  await expect(terminal.getByRole('status')).toHaveText(
+    'History — scroll down or type to return to live',
+  )
+  await expect(
+    terminal.getByRole('button', { name: 'Jump to latest' }),
+  ).toBeVisible()
+  await expect(history).toHaveAttribute('data-ready', 'true')
+  // No jump at the handoff: history opens on the rows already on screen.
+  await expect(historyRows.first()).toHaveText(screenAt(3)[0])
+  await expect(historyRows.nth(rows - 1)).toHaveText(screenAt(3)[rows - 1])
+  // Herdr's own view goes back to the latest output underneath.
+  await expect
+    .poll(() => terminalMessagesOfType(state, 'terminal.scroll_reset'))
+    .toHaveLength(1)
+
+  // Scrolling is local: no terminal.scroll reaches Herdr.
+  const scrollsSent = terminalMessagesOfType(state, 'terminal.scroll').length
+  await history.hover()
+  const startTop = Number(await history.getAttribute('data-top'))
+  for (let notch = 0; notch < 12; notch += 1) await page.mouse.wheel(0, -120)
+  await expect
+    .poll(async () => Number(await history.getAttribute('data-top')))
+    .toBeLessThan(startTop - 20)
+  const top = Number(await history.getAttribute('data-top'))
+  await expect(historyRows.first()).toHaveText(transcript[top])
+  await page.keyboard.press('PageUp')
+  await expect(history).toHaveAttribute('data-top', String(Math.max(0, top - (rows - 1))))
+  await page.waitForTimeout(350)
+  expect(terminalMessagesOfType(state, 'terminal.scroll')).toHaveLength(scrollsSent)
+  expect(terminalMessagesOfType(state, 'terminal.input')).toHaveLength(0)
+
+  // History is never written into the live terminal, which still holds
+  // exactly Herdr's screen.
+  await expect(terminal).toHaveAttribute('data-terminal-buffer-lines', String(rows))
+  await expect(liveRows).toHaveCount(rows)
+  await expect(liveRows.first()).not.toHaveText(transcript[top])
+})
+
+test('leaves history on typing, scrolling past the bottom, Jump to latest, and Escape', async ({
+  page,
+}) => {
+  const transcript = Array.from({ length: 200 }, (_, index) => `line ${index + 1}`)
+  let paneRows = 0
+  const state = await mockApi(page, {
+    terminalHistory: () => ({
+      // Each entry reads Herdr again, so it sees output that arrived since.
+      text: herdrHistoryText(transcript),
+      scroll: {
+        offset_from_bottom: 3,
+        max_offset_from_bottom: transcript.length - paneRows,
+        viewport_rows: paneRows,
+      },
+    }),
+  })
+  seedActiveAssignment(state)
+  const { terminal, socket, cols, rows, history } = await openHistoryTerminal(
+    page,
+    state,
+  )
+  paneRows = rows
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(transcript.slice(-rows), { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  const status = terminal.getByRole('status')
+  const enterHistory = async (reads: number) => {
+    await terminal.locator('.xterm-screen').first().hover()
+    await page.mouse.wheel(0, -44)
+    await expect.poll(() => historyReads(state).length).toBe(reads)
+    await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+    await expect(history).toHaveAttribute('data-ready', 'true')
+  }
+
+  // Typing returns to live and reaches the pane unchanged.
+  await enterHistory(1)
+  await page.keyboard.type('x')
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live')
+  await expect(history).toHaveCount(0)
+  await expect(status).toHaveText('Connected')
+  expect(
+    terminalMessagesOfType(state, 'terminal.input').map((message) => message.text),
+  ).toEqual(['x'])
+
+  // Scrolling back down past the last row returns to live.
+  await enterHistory(2)
+  await history.hover()
+  for (let notch = 0; notch < 4; notch += 1) await page.mouse.wheel(0, 600)
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live')
+  await expect(history).toHaveCount(0)
+
+  // Jump to latest.
+  await enterHistory(3)
+  await terminal.getByRole('button', { name: 'Jump to latest' }).click()
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live')
+  await expect(history).toHaveCount(0)
+
+  // New output while live: the next entry reads it.
+  transcript.push('line 201 (new)')
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(transcript.slice(-rows), { width: cols }),
+    full: false,
+    height: rows,
+    seq: 2,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '2')
+
+  // Escape leaves history and is not sent to the pane.
+  await enterHistory(4)
+  await expect(history).toHaveAttribute('data-rows', String(transcript.length))
+  await page.keyboard.press('PageDown')
+  await expect(
+    terminal.locator('.terminal-session__history .xterm-rows'),
+  ).toContainText('line 201 (new)')
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+  await page.keyboard.press('Escape')
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live')
+  await expect(history).toHaveCount(0)
+  expect(
+    terminalMessagesOfType(state, 'terminal.input').map((message) => message.text),
+  ).toEqual(['x'])
+})
+
+test('keeps native Herdr scrolling for a full-screen pane', async ({ page }) => {
+  let paneRows = 0
+  const state = await mockApi(page, {
+    // An alternate-screen app: Herdr holds no scrollback for it and sent the
+    // wheel to the app, so its scroll position stays at 0.
+    terminalHistory: () => ({
+      text: herdrHistoryText(['tui-row-01', 'tui-row-02']),
+      scroll: {
+        offset_from_bottom: 0,
+        max_offset_from_bottom: 0,
+        viewport_rows: paneRows,
+      },
+    }),
+  })
+  seedActiveAssignment(state)
+  const { terminal, socket, cols, rows, history } = await openHistoryTerminal(
+    page,
+    state,
+  )
+  paneRows = rows
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(['tui-row-01', 'tui-row-02'], { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  await terminal.locator('.xterm-screen').first().hover()
+  await page.mouse.wheel(0, -44)
+  // Yard checked the pane and left the wheel with the app.
+  await expect.poll(() => historyReads(state)).toHaveLength(1)
+  await page.waitForTimeout(350)
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live')
+  await expect(history).toHaveCount(0)
+  await page.mouse.wheel(0, -44)
+  await expect
+    .poll(() => terminalMessagesOfType(state, 'terminal.scroll').length)
+    .toBe(2)
+  expect(terminalMessagesOfType(state, 'terminal.scroll').at(-1)).toMatchObject({
+    direction: 'up',
+    source: 'wheel',
+  })
+  expect(terminalMessagesOfType(state, 'terminal.scroll_reset')).toHaveLength(0)
+  // The next scroll does not read again right away.
+  expect(historyReads(state)).toHaveLength(1)
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live')
+})
+
+test('checks a pane that last showed a full-screen app only after Herdr answered the scroll', async ({
+  page,
+}) => {
+  let paneRows = 0
+  const state = await mockApi(page, {
+    terminalHistory: () => ({
+      text: herdrHistoryText(['tui-row-01', 'tui-row-02']),
+      scroll: {
+        offset_from_bottom: 0,
+        max_offset_from_bottom: 0,
+        viewport_rows: paneRows,
+      },
+    }),
+  })
+  seedActiveAssignment(state)
+  const { terminal, socket, cols, rows } = await openHistoryTerminal(page, state)
+  paneRows = rows
+  const frame = (seq: number) =>
+    sendHerdrFrame(socket, {
+      bytes: herdrScreen([`tui frame ${seq}`], { clear: seq === 1, width: cols }),
+      full: seq === 1,
+      height: rows,
+      seq,
+      width: cols,
+    })
+  frame(1)
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  // Nothing is known about the pane yet: the read follows the scroll.
+  await terminal.locator('.xterm-screen').first().hover()
+  await page.mouse.wheel(0, -44)
+  await expect.poll(() => historyReads(state)).toHaveLength(1)
+  frame(2)
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '2')
+
+  // Typing may have ended the app, so the next scroll-up checks again, but
+  // only once Herdr's frame has answered it: the native scroll is not held
+  // up behind the read.
+  await page.keyboard.type('x')
+  await page.mouse.wheel(0, -44)
+  await expect
+    .poll(() => terminalMessagesOfType(state, 'terminal.scroll').length)
+    .toBe(2)
+  // (Well inside the 300 ms scroll-answer timeout, which also sends it.)
+  await page.waitForTimeout(150)
+  expect(historyReads(state)).toHaveLength(1)
+  frame(3)
+  await expect.poll(() => historyReads(state)).toHaveLength(2)
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live')
+  expect(terminalMessagesOfType(state, 'terminal.scroll_reset')).toHaveLength(0)
+})
+
+test('joins history to newer live output without a stale prompt or a repeated or missing line', async ({
+  page,
+}) => {
+  let paneRows = 0
+  const answer = Array.from({ length: 120 }, (_, index) => `• answer item ${index + 1}`)
+  // What Herdr had when it read the history: the answer so far, then the
+  // agent's prompt and status line.
+  const atRead = [...answer.slice(0, 100), '❯ ', '  status · working · Opus 5.5']
+  const state = await mockApi(page, {
+    terminalHistory: () => ({
+      text: herdrHistoryText(atRead),
+      scroll: {
+        offset_from_bottom: 3,
+        max_offset_from_bottom: atRead.length - paneRows,
+        viewport_rows: paneRows,
+      },
+    }),
+  })
+  seedActiveAssignment(state)
+  const { terminal, socket, cols, rows, liveRows, history } =
+    await openHistoryTerminal(page, state)
+  paneRows = rows
+  // The live screen is newer: more of the answer arrived above a redrawn
+  // prompt and status line.
+  const latest = [...answer, '❯ ', '  status · idle · Opus 5.5']
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(latest.slice(-rows), { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  await terminal.locator('.xterm-screen').first().hover()
+  await page.mouse.wheel(0, -44)
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+  await expect(history).toHaveAttribute('data-ready', 'true')
+
+  const rowsInHistory = await allHistoryRows(page, history, rows)
+  // Every line once, in order, ending with Herdr's latest screen.
+  expect(rowsInHistory).toEqual(latest.map((row) => row.trimEnd()))
+  expect(rowsInHistory.filter((row) => row.startsWith('❯'))).toEqual(['❯'])
+  expect(rowsInHistory.some((row) => row.includes('working'))).toBe(false)
+  // The live terminal was never given history rows.
+  await expect(terminal).toHaveAttribute('data-terminal-buffer-lines', String(rows))
+  await expect(liveRows.first()).toHaveText(latest[latest.length - rows])
+})
+
+test('opens history on a small read, then puts the rest of the coloured rows above without a jump', async ({
+  page,
+}) => {
+  const transcript = [
+    ...Array.from({ length: 400 }, (_, index) => `filled row ${index + 1}`),
+    'bash-4.2$ ',
+  ]
+  let paneRows = 0
+  const state = await mockApi(page, {
+    // Herdr's read of the latest `lines` rows, truncated while it holds more.
+    terminalHistory: (_readCount, lines) => ({
+      text: herdrHistoryText(transcript.slice(-lines)),
+      truncated: lines < transcript.length,
+      scroll: {
+        offset_from_bottom: 3,
+        max_offset_from_bottom: transcript.length - paneRows,
+        viewport_rows: paneRows,
+      },
+    }),
+  })
+  seedActiveAssignment(state)
+  const { terminal, socket, cols, rows, history, historyRows } =
+    await openHistoryTerminal(page, state)
+  paneRows = rows
+  const screenAt = (offset: number) =>
+    transcript.slice(transcript.length - rows - offset, transcript.length - offset)
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(screenAt(0), { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  await terminal.locator('.xterm-screen').first().hover()
+  await page.mouse.wheel(0, -44)
+  await expect.poll(() => historyReads(state).map((read) => read.lines)).toEqual([
+    String(rows * 2),
+    '1000',
+  ])
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(screenAt(3), { width: cols }),
+    full: false,
+    height: rows,
+    seq: 2,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+  await expect(history).toHaveAttribute('data-rows', String(transcript.length))
+  // Still on the rows that were on screen at the handoff.
+  await expect(historyRows.first()).toHaveText(screenAt(3)[0])
+  await expect(history).toHaveAttribute(
+    'data-top',
+    String(transcript.length - rows - 3),
+  )
+  const rowsInHistory = await allHistoryRows(page, history, rows)
+  expect(rowsInHistory).toEqual(transcript.map((row) => row.trimEnd()))
+  expect(terminalMessagesOfType(state, 'terminal.scroll')).toHaveLength(1)
+})
+
+test('joins more than a screen of new output to history with a fresh read instead of freezing it', async ({
+  page,
+}) => {
+  let paneRows = 0
+  const output = Array.from({ length: 400 }, (_, index) => `inl-${String(index + 1).padStart(4, '0')} tool result`)
+  const painted = (count: number, status: string) => [
+    ...output.slice(0, count),
+    `⠋ Working (${status})`,
+    `  ctx 42% · n=${count}`,
+  ]
+  const atRead = painted(100, '11s')
+  const latest = painted(260, '19s')
+  const state = await mockApi(page, {
+    // The first read opens history; the second is Herdr's latest rows
+    // after a burst, capped like Herdr's read (it no longer holds the first
+    // rows).
+    terminalHistory: (readCount) => ({
+      text: herdrHistoryText(readCount === 1 ? atRead : latest.slice(40)),
+      scroll: {
+        offset_from_bottom: 3,
+        max_offset_from_bottom: atRead.length - paneRows,
+        viewport_rows: paneRows,
+      },
+    }),
+  })
+  seedActiveAssignment(state)
+  const { terminal, socket, cols, rows, history } = await openHistoryTerminal(
+    page,
+    state,
+  )
+  paneRows = rows
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(atRead.slice(-rows), { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  await terminal.locator('.xterm-screen').first().hover()
+  await page.mouse.wheel(0, -44)
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+  await expect(history).toHaveAttribute('data-ready', 'true')
+  expect(historyReads(state)).toHaveLength(1)
+
+  // A burst larger than the screen: nothing on the live screen is in
+  // history any more, so the screen alone cannot join it.
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(latest.slice(-rows), { width: cols }),
+    full: false,
+    height: rows,
+    seq: 2,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '2')
+  await expect.poll(() => historyReads(state).length).toBe(2)
+  await expect(history).toHaveAttribute('data-rows', String(latest.length))
+  await expect(terminal.getByRole('status')).toHaveText(
+    'History — scroll down or type to return to live',
+  )
+
+  // The view kept its place while rows were added below it.
+  await expect(history).not.toHaveAttribute(
+    'data-top',
+    String(latest.length - rows),
+  )
+  const rowsInHistory = await allHistoryRows(page, history, rows)
+  // Every line once, in order, ending with Herdr's latest screen and one
+  // current footer.
+  expect(rowsInHistory).toEqual(latest.map((row) => row.trimEnd()))
+  expect(rowsInHistory.filter((row) => row.includes('Working'))).toEqual([
+    '⠋ Working (19s)',
+  ])
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+  await expect(terminal).toHaveAttribute('data-terminal-buffer-lines', String(rows))
+})
+
+test('retries older lines at the next top reach when Yard could read only the capped rows', async ({
+  page,
+}) => {
+  const transcript = [
+    ...Array.from({ length: 150 }, (_, index) => `busy pane line ${index + 1}`),
+    'bash-4.2$ ',
+  ]
+  const coloured = transcript.slice(-70)
+  let paneRows = 0
+  // Whether the older-lines read being answered is the first one.
+  const firstPlainRead = () =>
+    state.terminalOutputRequests.filter(
+      (request) => request.format !== 'ansi' && request.lines === '10000',
+    ).length === 1
+  const state = await mockApi(page, {
+    terminalHistory: () => ({
+      text: herdrHistoryText(coloured),
+      truncated: true,
+      scroll: {
+        offset_from_bottom: 3,
+        max_offset_from_bottom: transcript.length - paneRows,
+        viewport_rows: paneRows,
+      },
+    }),
+    // Herdr's longer read failed the first time (the pane changed
+    // mid-read), so Yard answered with only its capped rows.
+    terminalOutputText: () =>
+      (firstPlainRead() ? coloured : transcript).join('\n'),
+    terminalOutputTruncated: () => firstPlainRead(),
+  })
+  seedActiveAssignment(state)
+  const { terminal, socket, cols, rows, history } = await openHistoryTerminal(
+    page,
+    state,
+  )
+  paneRows = rows
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(transcript.slice(-rows), { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  await terminal.locator('.xterm-screen').first().hover()
+  await page.mouse.wheel(0, -44)
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+  await expect(history).toHaveAttribute('data-ready', 'true')
+
+  const plainReads = () =>
+    state.terminalOutputRequests
+      .filter((request) => request.format !== 'ansi')
+      .map((request) => request.lines)
+  for (let press = 0; press < 4; press += 1) await page.keyboard.press('PageUp')
+  await expect.poll(plainReads).toEqual(['10000'])
+  await expect(terminal.getByRole('status')).toContainText('scroll up to retry')
+  await expect(history).toHaveAttribute('data-rows', String(coloured.length))
+
+  // The next top reach reads again and joins the older lines.
+  await page.waitForTimeout(1_100)
+  await page.keyboard.press('PageUp')
+  await expect.poll(plainReads).toEqual(['10000', '10000'])
+  await expect(terminal.getByRole('status')).toHaveText(
+    'History — scroll down or type to return to live · older lines without colour',
+  )
+  await expect(history).toHaveAttribute('data-rows', String(transcript.length))
+  const rowsInHistory = await allHistoryRows(
+    page,
+    terminal.locator('.terminal-session__history'),
+    rows,
+  )
+  expect(rowsInHistory).toEqual(transcript.map((row) => row.trimEnd()))
+})
+
+test('selects and copies text in history while typing still goes to the pane', async ({
+  page,
+}) => {
+  const transcript = Array.from({ length: 150 }, (_, index) => `copyable row ${index + 1}`)
+  let paneRows = 0
+  const state = await mockApi(page, {
+    terminalHistory: () => ({
+      text: herdrHistoryText(transcript),
+      scroll: {
+        offset_from_bottom: 3,
+        max_offset_from_bottom: transcript.length - paneRows,
+        viewport_rows: paneRows,
+      },
+    }),
+  })
+  seedActiveAssignment(state)
+  const { terminal, socket, cols, rows, history, historyRows } =
+    await openHistoryTerminal(page, state)
+  paneRows = rows
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(transcript.slice(-rows), { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  await terminal.locator('.xterm-screen').first().hover()
+  await page.mouse.wheel(0, -44)
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+  await expect(history).toHaveAttribute('data-ready', 'true')
+
+  const first = await historyRows.nth(2).boundingBox()
+  const last = await historyRows.nth(4).boundingBox()
+  if (!first || !last) throw new Error('history rows are not laid out')
+  await page.mouse.move(first.x + 1, first.y + first.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(last.x + last.width - 2, last.y + last.height / 2, {
+    steps: 8,
+  })
+  await page.mouse.up()
+  const top = Number(await history.getAttribute('data-top'))
+  const copied = await page.evaluate(() => {
+    const clipboardData = new DataTransfer()
+    document.activeElement?.dispatchEvent(
+      new ClipboardEvent('copy', { bubbles: true, cancelable: true, clipboardData }),
+    )
+    return clipboardData.getData('text/plain')
+  })
+  expect(copied).toContain(transcript[top + 2])
+  expect(copied).toContain(transcript[top + 3])
+  expect(copied).toContain(transcript[top + 4])
+  // Keyboard focus stayed on the live terminal, so typing is pane input.
+  await page.keyboard.type('y')
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live')
+  expect(
+    terminalMessagesOfType(state, 'terminal.input').map((message) => message.text),
+  ).toEqual(['y'])
+})
+
+test('extends history with older plain lines at the top without repeating the join', async ({
+  page,
+}) => {
+  const transcript = [
+    ...Array.from({ length: 150 }, (_, index) => `older or newer line ${index + 1}`),
+    'bash-4.2$ ',
+  ]
+  // Herdr colours only its latest rows: the history read is the last 70
+  // rows (truncated); the plain read has everything.
+  const coloured = transcript.slice(-70)
+  let paneRows = 0
+  const state = await mockApi(page, {
+    terminalHistory: () => ({
+      text: herdrHistoryText(coloured),
+      truncated: true,
+      scroll: {
+        offset_from_bottom: 3,
+        max_offset_from_bottom: transcript.length - paneRows,
+        viewport_rows: paneRows,
+      },
+    }),
+    terminalOutputText: () => transcript.join('\n'),
+  })
+  seedActiveAssignment(state)
+  const { terminal, socket, cols, rows, history } = await openHistoryTerminal(
+    page,
+    state,
+  )
+  paneRows = rows
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(transcript.slice(-rows), { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  await terminal.locator('.xterm-screen').first().hover()
+  await page.mouse.wheel(0, -44)
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+  await expect(history).toHaveAttribute('data-ready', 'true')
+  await expect(history).toHaveAttribute('data-rows', String(coloured.length))
+
+  // Reaching the top of the coloured rows reads the older lines once.
+  for (let press = 0; press < 4; press += 1) await page.keyboard.press('PageUp')
+  await expect
+    .poll(() =>
+      state.terminalOutputRequests
+        .filter((request) => request.format !== 'ansi')
+        .map((request) => request.lines),
+    )
+    .toEqual(['10000'])
+  await expect(terminal.getByRole('status')).toContainText(
+    'older lines without colour',
+  )
+  await expect(history).toHaveAttribute('data-rows', String(transcript.length))
+  const rowsInHistory = await allHistoryRows(
+    page,
+    terminal.locator('.terminal-session__history'),
+    rows,
+  )
+  expect(rowsInHistory).toEqual(transcript.map((row) => row.trimEnd()))
+  expect(terminalMessagesOfType(state, 'terminal.scroll')).toHaveLength(1)
+})
+
+test('keeps the rows in view when older wrapped lines would overflow the history scrollback', async ({
+  page,
+}) => {
+  let paneRows = 0
+  const shortRows = [
+    ...Array.from({ length: 150 }, (_, index) => `short row ${index + 1}`),
+    'bash-4.2$ ',
+  ]
+  const coloured = shortRows.slice(-70)
+  let older: string[] = []
+  const state = await mockApi(page, {
+    terminalHistory: () => ({
+      text: herdrHistoryText(coloured),
+      truncated: true,
+      scroll: {
+        offset_from_bottom: 3,
+        max_offset_from_bottom: 5000,
+        viewport_rows: paneRows,
+      },
+    }),
+    terminalOutputText: () => [...older, ...shortRows].join('\n'),
+  })
+  seedActiveAssignment(state)
+  const { terminal, socket, cols, rows, history, historyRows } =
+    await openHistoryTerminal(page, state)
+  paneRows = rows
+  // 5,000 older logical lines that each wrap onto 3 rows: more than the
+  // history view's 12,000 rows of scrollback.
+  older = Array.from(
+    { length: 5000 },
+    (_, index) => `older ${index} `.padEnd(cols * 2 + 10, 'x'),
+  )
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(coloured.slice(-rows), { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  await terminal.locator('.xterm-screen').first().hover()
+  await page.mouse.wheel(0, -44)
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+  await expect(history).toHaveAttribute('data-ready', 'true')
+  for (let press = 0; press < 6; press += 1) await page.keyboard.press('PageUp')
+  // The oldest lines that do not fit are left out, and the note says so.
+  await expect(terminal.getByRole('status')).toContainText(
+    /oldest [\d,]+ lines not kept; older lines without colour/,
+    { timeout: 15_000 },
+  )
+  await expect(history).toHaveCount(1)
+  // Still on the first coloured row, not thrown back to the latest screen.
+  await expect(historyRows.first()).toHaveText(coloured[0])
+  expect(Number(await history.getAttribute('data-rows'))).toBeLessThanOrEqual(12_000)
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+})
+
+test('opens history once when more scroll input leaves while the view is being built', async ({
+  page,
+}) => {
+  const transcript = [
+    ...Array.from({ length: 999 }, (_, index) => `history line ${index + 1} `.padEnd(120, '=')),
+    'bash-4.2$ ',
+  ]
+  let paneRows = 0
+  const state = await mockApi(page, {
+    terminalHistory: () => ({
+      text: herdrHistoryText(transcript),
+      scroll: {
+        offset_from_bottom: 3,
+        max_offset_from_bottom: transcript.length - paneRows,
+        viewport_rows: paneRows,
+      },
+    }),
+  })
+  seedActiveAssignment(state)
+  const releases: Array<() => void> = []
+  await page.route('**/terminal-output*', async (route) => {
+    if (new URL(route.request().url()).searchParams.get('format') === 'ansi') {
+      await new Promise<void>((resolve) => releases.push(resolve))
+    }
+    await route.fallback()
+  })
+  const { terminal, socket, cols, rows, history, historyRows } =
+    await openHistoryTerminal(page, state)
+  paneRows = rows
+  const screenAt = (offset: number) =>
+    transcript.slice(transcript.length - rows - offset, transcript.length - offset)
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(screenAt(0), { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  await terminal.locator('.xterm-screen').first().hover()
+  // The first batch leaves and the probe follows it; the probe is held.
+  await page.mouse.wheel(0, -44)
+  await expect.poll(() => releases.length).toBe(1)
+  // The user keeps scrolling: this step waits behind the first batch.
+  await page.mouse.wheel(0, -44)
+  const cdp = await page.context().newCDPSession(page)
+  await cdp.send('Emulation.setCPUThrottlingRate', { rate: 4 })
+  releases[0]()
+  // Herdr answers the first batch while the view is built (still hidden),
+  // so the second batch leaves then.
+  await expect(history).toHaveCount(1)
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(screenAt(3), { width: cols }),
+    full: false,
+    height: rows,
+    seq: 2,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+  await cdp.send('Emulation.setCPUThrottlingRate', { rate: 1 })
+  await expect(history).toHaveAttribute('data-ready', 'true')
+  // One read, no second probe; the view covers both batches.
+  await page.waitForTimeout(300)
+  expect(releases).toHaveLength(1)
+  expect(historyReads(state)).toHaveLength(1)
+  expect(terminalMessagesOfType(state, 'terminal.scroll')).toHaveLength(2)
+  await expect(historyRows.first()).toHaveText(screenAt(6)[0])
+})
+
+test('discards a history view that input overtook while it was being built', async ({
+  page,
+}) => {
+  const transcript = Array.from({ length: 300 }, (_, index) => `line ${index + 1}`)
+  let paneRows = 0
+  const state = await mockApi(page, {
+    terminalHistory: () => ({
+      text: herdrHistoryText(transcript),
+      scroll: {
+        offset_from_bottom: 3,
+        max_offset_from_bottom: transcript.length - paneRows,
+        viewport_rows: paneRows,
+      },
+    }),
+  })
+  seedActiveAssignment(state)
+  const { terminal, socket, cols, rows, history } = await openHistoryTerminal(
+    page,
+    state,
+  )
+  paneRows = rows
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(transcript.slice(-rows), { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  // Paste the moment the (hidden) history view is created, while it is
+  // still being filled.
+  await page.evaluate(() => {
+    const observer = new MutationObserver((records) => {
+      const created = records.some((record) =>
+        [...record.addedNodes].some(
+          (node) =>
+            node instanceof HTMLElement &&
+            node.classList.contains('terminal-session__history'),
+        ),
+      )
+      if (!created) return
+      observer.disconnect()
+      const textarea = document.querySelector(
+        '.terminal-session__viewport > .xterm .xterm-helper-textarea',
+      )
+      const clipboardData = new DataTransfer()
+      clipboardData.setData('text/plain', 'pasted')
+      textarea?.dispatchEvent(
+        new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData }),
+      )
+    })
+    observer.observe(document.body, { childList: true, subtree: true })
+  })
+  await terminal.locator('.xterm-screen').first().hover()
+  await page.mouse.wheel(0, -44)
+  await expect.poll(() => terminalMessagesOfType(state, 'terminal.input')).toHaveLength(1)
+  await page.waitForTimeout(400)
+  // The view built for the read is dropped; the pane got the paste once.
+  await expect(history).toHaveCount(0)
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live')
+  expect(historyReads(state)).toHaveLength(1)
+  expect(
+    terminalMessagesOfType(state, 'terminal.input').map((message) => message.text),
+  ).toEqual(['\u001b[200~pasted\u001b[201~'])
+  expect(terminalMessagesOfType(state, 'terminal.scroll_reset')).toHaveLength(0)
+})
+
+test('opens history on the rows on screen when Herdr reports another scroll position', async ({
+  page,
+}) => {
+  const transcript = Array.from({ length: 300 }, (_, index) => `located line ${index + 1}`)
+  let paneRows = 0
+  const state = await mockApi(page, {
+    terminalHistory: () => ({
+      text: herdrHistoryText(transcript),
+      // Herdr's position does not match the rows the live terminal shows.
+      scroll: {
+        offset_from_bottom: 20,
+        max_offset_from_bottom: transcript.length - paneRows,
+        viewport_rows: paneRows,
+      },
+    }),
+  })
+  seedActiveAssignment(state)
+  const releases: Array<() => void> = []
+  await page.route('**/terminal-output*', async (route) => {
+    if (new URL(route.request().url()).searchParams.get('format') === 'ansi') {
+      await new Promise<void>((resolve) => releases.push(resolve))
+    }
+    await route.fallback()
+  })
+  const { terminal, socket, cols, rows, historyRows } = await openHistoryTerminal(
+    page,
+    state,
+  )
+  paneRows = rows
+  const screenAt = (offset: number) =>
+    transcript.slice(transcript.length - rows - offset, transcript.length - offset)
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(screenAt(0), { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  await terminal.locator('.xterm-screen').first().hover()
+  await page.mouse.wheel(0, -44)
+  await expect.poll(() => releases.length).toBe(1)
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(screenAt(3), { width: cols }),
+    full: false,
+    height: rows,
+    seq: 2,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '2')
+  releases[0]()
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+  await expect(historyRows.first()).toHaveText(screenAt(3)[0])
+  await expect(historyRows.nth(rows - 1)).toHaveText(screenAt(3)[rows - 1])
+})
+
+test('leaves history on PageDown at the bottom, a resize, a paste, and a closed socket', async ({
+  page,
+}) => {
+  const transcript = Array.from({ length: 200 }, (_, index) => `line ${index + 1}`)
+  let paneRows = 0
+  const state = await mockApi(page, {
+    terminalHistory: () => ({
+      text: herdrHistoryText(transcript),
+      scroll: {
+        offset_from_bottom: 3,
+        max_offset_from_bottom: transcript.length - paneRows,
+        viewport_rows: paneRows,
+      },
+    }),
+  })
+  seedActiveAssignment(state)
+  const { terminal, socket, cols, rows, history } = await openHistoryTerminal(
+    page,
+    state,
+  )
+  paneRows = rows
+  const frame = (seq: number, width = cols, height = rows) =>
+    sendHerdrFrame(state.terminalSockets[state.terminalSockets.length - 1], {
+      bytes: herdrScreen(transcript.slice(-height), { clear: true, width }),
+      full: true,
+      height,
+      seq,
+      width,
+    })
+  frame(1)
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  let reads = 0
+  const enterHistory = async () => {
+    reads += 1
+    await terminal.locator('.xterm-screen').first().hover()
+    await page.mouse.wheel(0, -44)
+    await expect.poll(() => historyReads(state).length).toBe(reads)
+    await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+    await expect(history).toHaveAttribute('data-ready', 'true')
+  }
+
+  // PageDown past the last row returns to live and is not sent.
+  await enterHistory()
+  for (let press = 0; press < 4; press += 1) await page.keyboard.press('PageDown')
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live')
+  await expect(history).toHaveCount(0)
+
+  // A paste returns to live and reaches the pane exactly once.
+  await enterHistory()
+  await terminal
+    .locator('.terminal-session__viewport > .xterm .xterm-helper-textarea')
+    .evaluate((element) => {
+      const clipboardData = new DataTransfer()
+      clipboardData.setData('text/plain', 'pasted')
+      element.dispatchEvent(
+        new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData }),
+      )
+    })
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live')
+  await expect(history).toHaveCount(0)
+  await page.waitForTimeout(200)
+  expect(
+    terminalMessagesOfType(state, 'terminal.input').map((message) => message.text),
+  ).toEqual(['\u001b[200~pasted\u001b[201~'])
+
+  // A resize returns to live: history rows are laid out for the old grid.
+  await enterHistory()
+  await page.setViewportSize({ width: 1180, height: 760 })
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live')
+  await expect(history).toHaveCount(0)
+  await expect
+    .poll(() => terminalMessagesOfType(state, 'terminal.resize').at(-1))
+    .not.toEqual(expect.objectContaining({ cols, rows }))
+  const resized = terminalMessagesOfType(state, 'terminal.resize').at(-1)
+  if (!resized) throw new Error('No resize was sent')
+  paneRows = resized.rows
+  transcript.push('line 201 after the resize')
+  frame(2, resized.cols, resized.rows)
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '2')
+
+  // A closed socket returns to live at once, before any reconnect.
+  await enterHistory()
+  await socket.close()
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live', { timeout: 500 })
+  await expect(history).toHaveCount(0, { timeout: 100 })
+  expect(state.terminalSockets).toHaveLength(1)
+})
+
+test('keeps native Herdr scrolling for screen-reader users and while Herdr paints another grid', async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    // Opted in on the first load only, so the reload below can opt out.
+    const key = 'yard:terminal-screen-reader:v1'
+    if (!window.localStorage.getItem(key)) window.localStorage.setItem(key, 'on')
+  })
+  const transcript = Array.from({ length: 200 }, (_, index) => `line ${index + 1}`)
+  let paneRows = 0
+  const state = await mockApi(page, {
+    terminalHistory: () => ({
+      text: herdrHistoryText(transcript),
+      scroll: {
+        offset_from_bottom: 3,
+        max_offset_from_bottom: transcript.length - paneRows,
+        viewport_rows: paneRows,
+      },
+    }),
+  })
+  seedActiveAssignment(state)
+  const { terminal, socket, cols, rows, history } = await openHistoryTerminal(
+    page,
+    state,
+  )
+  paneRows = rows
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(transcript.slice(-rows), { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  await terminal.locator('.xterm-screen').first().hover()
+  await page.mouse.wheel(0, -44)
+  await expect
+    .poll(() => terminalMessagesOfType(state, 'terminal.scroll'))
+    .toHaveLength(1)
+  await page.waitForTimeout(400)
+  // The screen reader follows the live terminal, so there is no overlay.
+  expect(historyReads(state)).toHaveLength(0)
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live')
+  await expect(history).toHaveCount(0)
+
+  // Without a screen reader, a frame still laid out for another width
+  // (Herdr has not applied the resize yet) keeps scrolling native too.
+  await page.evaluate(() => {
+    window.localStorage.setItem('yard:terminal-screen-reader:v1', 'off')
+  })
+  await page.reload()
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open terminal', exact: true }).click()
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(2)
+  const next = state.terminalSockets[1]
+  sendHerdrFrame(next, {
+    bytes: herdrScreen(transcript.slice(-rows), { clear: true, width: cols - 4 }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols - 4,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  await terminal.locator('.xterm-screen').first().hover()
+  const scrolls = terminalMessagesOfType(state, 'terminal.scroll').length
+  await page.mouse.wheel(0, -44)
+  await expect
+    .poll(() => terminalMessagesOfType(state, 'terminal.scroll'))
+    .toHaveLength(scrolls + 1)
+  await page.waitForTimeout(400)
+  expect(historyReads(state)).toHaveLength(0)
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live')
+  // Once Herdr paints the terminal's grid, history mode applies.
+  sendHerdrFrame(next, {
+    bytes: herdrScreen(transcript.slice(-rows), { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 2,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '2')
+  await page.waitForTimeout(400)
+  await page.mouse.wheel(0, -44)
+  await expect.poll(() => historyReads(state).length).toBe(1)
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+})
+
+test('keeps xterm screen-reader mode off so Herdr repaints never pile up in a live region', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open terminal', exact: true }).click()
+  const terminal = page.locator('.terminal-session')
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  const url = new URL(state.terminalConnectionUrls[0])
+  const cols = Number(url.searchParams.get('cols'))
+  const rows = Number(url.searchParams.get('rows'))
+  for (let seq = 1; seq <= 30; seq += 1) {
+    sendHerdrFrame(state.terminalSockets[0], {
+      bytes: herdrScreen(
+        Array.from(
+          { length: rows },
+          (_, row) => `scroll frame ${seq} row ${row + 1}`,
+        ),
+        { clear: seq === 1, width: cols },
+      ),
+      full: seq === 1,
+      height: rows,
+      seq,
+      width: cols,
+    })
+  }
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '30')
+  await expect(terminal.locator('.xterm-rows')).toContainText(
+    'scroll frame 30 row 1',
+  )
+  // Longer than xterm's one-second announcement debounce.
+  await page.waitForTimeout(1_100)
+  await expect(terminal.locator('.xterm-accessibility-tree')).toHaveCount(0)
+  await expect(terminal.locator('.live-region')).toHaveCount(0)
+})
+
+test('keeps the opt-in screen-reader mode working without growing its live region', async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem('yard:terminal-screen-reader:v1', 'on')
+  })
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open terminal', exact: true }).click()
+  const terminal = page.locator('.terminal-session')
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  const socket = state.terminalSockets[0]
+  const url = new URL(state.terminalConnectionUrls[0])
+  const cols = Number(url.searchParams.get('cols'))
+  const rows = Number(url.searchParams.get('rows'))
+  const sendScreen = (seq: number) =>
+    sendHerdrFrame(socket, {
+      bytes: herdrScreen(
+        Array.from(
+          { length: rows },
+          (_, row) => `reader frame ${seq} row ${row + 1}`,
+        ),
+        { clear: seq === 1, width: cols },
+      ),
+      full: seq === 1,
+      height: rows,
+      seq,
+      width: cols,
+    })
+  const liveRegionLength = () =>
+    terminal
+      .locator('.live-region')
+      .evaluate((element) => element.textContent?.length ?? 0)
+
+  let seq = 0
+  for (let round = 0; round < 3; round += 1) {
+    for (let frame = 0; frame < 10; frame += 1) {
+      seq += 1
+      sendScreen(seq)
+    }
+    await expect(terminal).toHaveAttribute('data-frame-sequence', String(seq))
+    // xterm moves the characters it collected into the live region about
+    // once a second.
+    await page.waitForTimeout(1_100)
+  }
+  // The screen-reader rows still follow Herdr's screen.
+  await expect(terminal.locator('.xterm-accessibility-tree')).toContainText(
+    `reader frame ${seq} row 1`,
+  )
+  seq += 1
+  sendScreen(seq)
+  await expect(terminal).toHaveAttribute('data-frame-sequence', String(seq))
+  // Every frame empties what earlier frames added, so at most the newest
+  // screen is waiting to be read instead of 31 screens.
+  expect(await liveRegionLength()).toBeLessThanOrEqual(cols * rows)
+
+  // A sustained stream, as while scrolling (about 57 frames a second for
+  // 2.5 s): xterm adds a whole second of characters in one append after
+  // the frame writes, so the live region must never hold more than one
+  // screen, even for a moment.
+  await terminal.locator('.live-region').evaluate((element) => {
+    const record = window as unknown as { liveRegionMax: number }
+    record.liveRegionMax = 0
+    new MutationObserver(() => {
+      record.liveRegionMax = Math.max(
+        record.liveRegionMax,
+        element.textContent?.length ?? 0,
+      )
+    }).observe(element, {
+      characterData: true,
+      childList: true,
+      subtree: true,
+    })
+  })
+  const streamEnd = seq + 145
+  while (seq < streamEnd) {
+    seq += 1
+    sendScreen(seq)
+    await page.waitForTimeout(17)
+  }
+  await expect(terminal).toHaveAttribute('data-frame-sequence', String(seq))
+  await page.waitForTimeout(1_100)
+  const liveRegionMax = await page.evaluate(
+    () => (window as unknown as { liveRegionMax: number }).liveRegionMax,
+  )
+  expect(liveRegionMax).toBeGreaterThan(0)
+  expect(liveRegionMax).toBeLessThanOrEqual(cols * rows)
+  await expect(terminal.locator('.xterm-accessibility-tree')).toContainText(
+    `reader frame ${seq} row 1`,
+  )
+})
+
+test('clips a Herdr frame wider than the terminal instead of shifting its rows', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open terminal', exact: true }).click()
+  const terminal = page.locator('.terminal-session')
+  const renderedRows = terminal.locator('.xterm-rows')
+  const rowItems = renderedRows.locator(':scope > div')
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  const socket = state.terminalSockets[0]
+  const url = new URL(state.terminalConnectionUrls[0])
+  const cols = Number(url.searchParams.get('cols'))
+  const rows = Number(url.searchParams.get('rows'))
+  const label = (row: number) => String(row + 1).padStart(2, '0')
+  // A frame rendered for a wider grid, as happens between a local fit and
+  // Herdr's resized repaint: every row runs past the right edge.
+  const width = cols + 30
+  const wideRows = Array.from(
+    { length: rows },
+    (_, row) => `R${label(row)} ${'x'.repeat(width - 12)}END${label(row)}`,
+  )
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(wideRows, { clear: true, width }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+
+  await expect(terminal).toHaveAttribute(
+    'data-terminal-buffer-lines',
+    String(rows),
+  )
+  await expect(rowItems).toHaveCount(rows)
+  for (const row of [0, 1, Math.floor(rows / 2), rows - 1]) {
+    await expect(rowItems.nth(row)).toHaveText(new RegExp(`^R${label(row)} x+`))
+  }
+  await expect(renderedRows).not.toContainText('END')
+
+  // The settle-time renderer nudge must leave Herdr's full-width rows
+  // intact; Herdr will not resend cells that did not change.
+  await page.waitForTimeout(900)
+  await expect(rowItems.first()).toHaveText(/^R01 x+/)
+  await expect(rowItems.nth(rows - 1)).toHaveText(
+    new RegExp(`^R${label(rows - 1)} x+`),
+  )
+  await expect(terminal).toHaveAttribute(
+    'data-terminal-buffer-lines',
+    String(rows),
+  )
+  await expect(rowItems).toHaveCount(rows)
+
+  // A later diff still lands on the row Herdr addressed.
+  sendHerdrFrame(socket, {
+    bytes: `\u001b[3;1HR03 updated${' '.repeat(cols - 11)}`,
+    full: false,
+    height: rows,
+    seq: 2,
+    width,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '2')
+  await expect(rowItems.nth(2)).toHaveText(/^R03 updated\s*$/)
+  await expect(rowItems.nth(3)).toHaveText(/^R04 x+/)
+})
+
+test('sends a multi-line paste to Herdr as one bracketed paste', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open terminal', exact: true }).click()
+  const terminal = page.locator('.terminal-session')
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  const textarea = terminal.locator('.xterm-helper-textarea')
+  const paste = (text: string) =>
+    textarea.evaluate((element, clipboardText) => {
+      const clipboardData = new DataTransfer()
+      clipboardData.setData('text/plain', clipboardText)
+      element.dispatchEvent(
+        new ClipboardEvent('paste', {
+          bubbles: true,
+          cancelable: true,
+          clipboardData,
+        }),
+      )
+    }, text)
+
+  // Larger than one 4 KiB typing chunk, with Unix and Windows newlines.
+  const lines = Array.from(
+    { length: 400 },
+    (_, index) => `pasted line ${index + 1} keeps its place`,
+  )
+  await paste(
+    `${lines.slice(0, 200).join('\n')}\r\n${lines.slice(200).join('\n')}`,
+  )
+  await expect
+    .poll(() => terminalMessagesOfType(state, 'terminal.input').length)
+    .toBe(1)
+  await page.waitForTimeout(200)
+  const inputs = terminalMessagesOfType(state, 'terminal.input')
+  expect(inputs).toHaveLength(1)
+  expect(inputs[0].text).toBe(`\u001b[200~${lines.join('\r')}\u001b[201~`)
+
+  // Too large for one terminal message: say so instead of losing part of it.
+  await paste('y'.repeat(600 * 1024))
+  await expect(terminal.getByRole('alert')).toContainText(
+    /Paste not sent: 60\d KiB exceeds the 512 KiB terminal paste limit/,
+  )
+  await page.waitForTimeout(200)
+  expect(terminalMessagesOfType(state, 'terminal.input')).toHaveLength(1)
+})
+
+test('keeps terminal sizes inside the server range and sends only settled sizes', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  const openTerminal = page.getByRole('button', {
+    name: 'Open terminal',
+    exact: true,
+  })
+  await openTerminal.click()
+  const terminal = page.locator('.terminal-session')
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  const url = new URL(state.terminalConnectionUrls[0])
+  const cols = Number(url.searchParams.get('cols'))
+  const rows = Number(url.searchParams.get('rows'))
+  const resizes = () => terminalMessagesOfType(state, 'terminal.resize')
+
+  // The 500 ms settle fit nudges xterm's renderer by a column; that
+  // transient width must never reach the agent's PTY.
+  await page.waitForTimeout(900)
+  expect(resizes()).toEqual([{ type: 'terminal.resize', cols, rows }])
+  await expect(terminal).toHaveAttribute('data-terminal-cols', String(cols))
+  await expect(terminal).toHaveAttribute('data-terminal-rows', String(rows))
+
+  // Layout churn reaches Herdr as one settled resize, not one per frame.
+  await terminal
+    .locator('.terminal-session__viewport')
+    .evaluate(async (element) => {
+      for (const width of [1_000, 960, 920, 880, 840]) {
+        element.style.width = `${width}px`
+        await new Promise((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(resolve)),
+        )
+      }
+    })
+  await expect.poll(() => resizes().length).toBe(2)
+  await page.waitForTimeout(400)
+  expect(resizes()).toHaveLength(2)
+  const settled = resizes()[1]
+  expect(settled.cols).toBeLessThan(cols)
+  expect(settled.rows).toBe(rows)
+  await expect(terminal).toHaveAttribute(
+    'data-terminal-cols',
+    String(settled.cols),
+  )
+  await terminal.locator('.terminal-session__viewport').evaluate((element) => {
+    element.style.width = ''
+  })
+
+  // A very large window is clamped to the 400 × 200 grid the server
+  // accepts, both while open and when a terminal connects.
+  await page.setViewportSize({ width: 3440, height: 3600 })
+  await expect
+    .poll(() => resizes().at(-1))
+    .toEqual({ type: 'terminal.resize', cols: 400, rows: 200 })
+  await expect(terminal).toHaveAttribute('data-terminal-cols', '400')
+  await expect(terminal).toHaveAttribute('data-terminal-rows', '200')
+  await page.getByRole('button', { name: 'Back to Map' }).click()
+  await openTerminal.click()
+  await expect.poll(() => state.terminalSockets.length).toBe(2)
+  const wideUrl = new URL(state.terminalConnectionUrls[1])
+  expect(wideUrl.searchParams.get('cols')).toBe('400')
+  expect(wideUrl.searchParams.get('rows')).toBe('200')
+  expect(
+    resizes().every(
+      (message) =>
+        message.cols >= 20 &&
+        message.cols <= 400 &&
+        message.rows >= 5 &&
+        message.rows <= 200,
+    ),
+  ).toBe(true)
+})
+
+test('keeps a worker terminal theme authoritative and scrolls through Herdr under TUI mouse mode', async ({
   page,
 }, testInfo) => {
   await page.addInitScript(() => {
@@ -10727,16 +12697,9 @@ test('keeps a worker terminal theme and scrollback authoritative under TUI mouse
   const terminal = workerDialog.locator('.terminal-session')
   const xtermViewport = terminal.locator('.xterm-scrollable-element')
   const renderedRows = terminal.locator('.xterm-rows')
-  const firstVisibleRow = terminal
-    .locator('.xterm-accessibility-tree')
-    .getByRole('listitem')
-    .first()
+  const firstVisibleRow = renderedRows.locator(':scope > div').first()
   const xtermBackground = () =>
     xtermViewport.evaluate((element) => element.style.backgroundColor)
-  const viewportY = () =>
-    firstVisibleRow
-      .getAttribute('aria-posinset')
-      .then((position) => Number(position) - 1)
 
   await expect(terminal).toHaveAttribute('data-state', 'connected')
   await expect.poll(() => state.terminalSockets.length).toBe(1)
@@ -10753,30 +12716,28 @@ test('keeps a worker terminal theme and scrollback authoritative under TUI mouse
   const terminalUrl = new URL(state.terminalConnectionUrls[0])
   const cols = Number(terminalUrl.searchParams.get('cols'))
   const rows = Number(terminalUrl.searchParams.get('rows'))
-  state.terminalSockets[0].send(
-    JSON.stringify({
-      type: 'terminal.frame',
-      bytes: Buffer.from(
-        [
+  sendHerdrFrame(state.terminalSockets[0], {
+    bytes: [
           '\u001b]11;#ff0000\u0007',
           '\u001b[?1000h',
+      herdrScreen(
+        [
           ...Array.from(
-            { length: 180 },
-            (_, index) => `worker history line ${index + 1}\r\n`,
+            { length: rows - 1 },
+            (_, index) => `worker screen line ${index + 1}`,
           ),
           'worker terminal tail',
-        ].join(''),
-      ).toString('base64'),
-      seq: 30,
-      width: cols,
+        ],
+        { clear: true, width: cols },
+      ),
+    ].join(''),
+    full: true,
       height: rows,
-      full: true,
-    }),
-  )
+    seq: 30,
+    width: cols,
+  })
   await expect(terminal).toHaveAttribute('data-frame-sequence', '30')
-  await expect(
-    terminal.locator('.xterm-accessibility-tree'),
-  ).toContainText('worker terminal tail')
+  await expect(firstVisibleRow).toHaveText('worker screen line 1')
   await expect(renderedRows).toContainText('worker terminal tail')
   // Worker TUIs may set OSC colors after xterm is constructed. The selected
   // Yard palette remains authoritative for the renderer itself.
@@ -10797,24 +12758,20 @@ test('keeps a worker terminal theme and scrollback authoritative under TUI mouse
   await expect(terminal).toHaveAttribute('data-frame-sequence', '50')
   await expect.poll(xtermBackground).toBe('rgb(46, 52, 64)')
 
-  const bottomViewportY = await viewportY()
-  expect(bottomViewportY).toBeGreaterThan(0)
-  const inputCountBeforeWheel = state.terminalMessages.filter(
-    (message) => message.type === 'terminal.input',
-  ).length
+  // Even with a mouse mode in the stream, the wheel goes to Herdr as
+  // terminal.scroll; xterm neither scrolls locally nor reports the wheel.
   await terminal.locator('.xterm-screen').hover()
   await page.mouse.wheel(0, -1200)
-  await expect.poll(viewportY).toBeLessThan(bottomViewportY)
-  await expect(
-    terminal.locator('.xterm-accessibility-tree'),
-  ).toContainText('worker history line')
-  await expect(renderedRows).not.toContainText('worker terminal tail')
-  await expect(renderedRows).toContainText('worker history line')
-  expect(
-    state.terminalMessages.filter(
-      (message) => message.type === 'terminal.input',
-    ),
-  ).toHaveLength(inputCountBeforeWheel)
+  await expect
+    .poll(() => terminalMessagesOfType(state, 'terminal.scroll').length)
+    .toBeGreaterThan(0)
+  expect(terminalMessagesOfType(state, 'terminal.scroll')[0]).toMatchObject({
+    direction: 'up',
+    source: 'wheel',
+  })
+  await expect(firstVisibleRow).toHaveText('worker screen line 1')
+  await expect(renderedRows).toContainText('worker terminal tail')
+  expect(terminalMessagesOfType(state, 'terminal.input')).toHaveLength(0)
   await page.screenshot({
     path: testInfo.outputPath('worker-terminal-theme-scrollback.png'),
     fullPage: true,
@@ -10846,8 +12803,7 @@ test('keeps one terminal lease and viewport across Terminal and Focus presentati
 
   const shell = page.locator('.agent-workspace-shell')
   const terminal = page.locator('.terminal-session')
-  const scrollable = terminal.locator('.xterm-scrollable-element')
-  const terminalRows = terminal.locator('.xterm-accessibility-tree')
+  const terminalRows = terminal.locator('.xterm-rows')
   const presentationControl = shell.getByRole('group', {
     name: 'Terminal presentation',
   })
@@ -10865,33 +12821,25 @@ test('keeps one terminal lease and viewport across Terminal and Focus presentati
   const terminalUrl = new URL(state.terminalConnectionUrls[0])
   const cols = Number(terminalUrl.searchParams.get('cols'))
   const rows = Number(terminalUrl.searchParams.get('rows'))
-  state.terminalSockets[0].send(
-    JSON.stringify({
-      type: 'terminal.frame',
-      bytes: Buffer.from(
-        `${Array.from(
-          { length: 180 },
-          (_, index) => `focus history line ${index + 1}`,
-        ).join('\r\n')}\r\nfocus terminal tail`,
-      ).toString('base64'),
-      seq: 20,
-      width: cols,
+  sendHerdrFrame(state.terminalSockets[0], {
+    bytes: herdrScreen(
+      [
+        ...Array.from(
+          { length: rows - 1 },
+          (_, index) => `focus screen line ${index + 1}`,
+        ),
+        'focus terminal tail',
+      ],
+      { clear: true, width: cols },
+    ),
+    full: true,
       height: rows,
-      full: true,
-    }),
-  )
+    seq: 20,
+    width: cols,
+  })
   await expect(terminal).toHaveAttribute('data-frame-sequence', '20')
   await expect(terminalRows).toContainText('focus terminal tail')
-
-  await scrollable.hover()
-  await page.mouse.wheel(0, -1400)
-  await expect(terminalRows).not.toContainText('focus terminal tail')
-  await expect(terminalRows).toContainText('focus history line')
-  const firstVisibleRow = terminalRows.getByRole('listitem').first()
-  const terminalViewportPosition = Number(
-    await firstVisibleRow.getAttribute('aria-posinset'),
-  )
-  expect(terminalViewportPosition).toBeGreaterThan(1)
+  const resizes = () => terminalMessagesOfType(state, 'terminal.resize')
   await terminal.evaluate((element) => {
     element.dataset.lifecycleMarker = 'same-terminal'
   })
@@ -10913,18 +12861,14 @@ test('keeps one terminal lease and viewport across Terminal and Focus presentati
       (message) => message.type === 'terminal.release',
     ),
   ).toHaveLength(0)
-  await expect
-    .poll(() =>
-      firstVisibleRow.getAttribute('aria-posinset').then(Number),
-    )
-    .toBe(terminalViewportPosition)
-  await expect(terminalRows).not.toContainText('focus terminal tail')
-  await expect(terminalRows).toContainText('focus history line')
+  await expect(terminalRows).toContainText('focus screen line')
   await expect
     .poll(() =>
       terminal.evaluate((element) => element.getBoundingClientRect().width),
     )
     .toBeGreaterThan(terminalWidth)
+  // The wider Focus grid reaches Herdr as a resize on the same lease.
+  await expect.poll(() => resizes().at(-1)?.cols ?? 0).toBeGreaterThan(cols)
   await page.screenshot({
     path: testInfo.outputPath('terminal-focus-desktop.png'),
     fullPage: true,
@@ -10943,19 +12887,14 @@ test('keeps one terminal lease and viewport across Terminal and Focus presentati
       (message) => message.type === 'terminal.release',
     ),
   ).toHaveLength(0)
-  await expect
-    .poll(() =>
-      firstVisibleRow.getAttribute('aria-posinset').then(Number),
-    )
-    .toBe(terminalViewportPosition)
+  await expect.poll(() => resizes().at(-1)?.cols).toBe(cols)
 
   await page.setViewportSize({ width: 390, height: 844 })
   await expect(presentationControl).toBeVisible()
   await focusPresentation.click()
   await expect(shell).toHaveAttribute('data-presentation', 'focus')
   await expect.poll(() => state.terminalSockets.length).toBe(1)
-  await expect(terminalRows).not.toContainText('focus terminal tail')
-  await expect(terminalRows).toContainText('focus history line')
+  await expect(terminalRows).toContainText('focus screen line')
   const mobileLayout = await page.evaluate(() => {
     const shellElement =
       document.querySelector<HTMLElement>('.agent-workspace-shell')
@@ -11158,7 +13097,22 @@ test('applies all built-in themes to populated status and terminal surfaces', as
     .click()
 
   const terminal = page.locator('.terminal-session')
-  const terminalRows = terminal.locator('.xterm-accessibility-tree')
+  const terminalRows = terminal.locator('.xterm-rows')
+  // The terminal shows only Herdr's live frames (no connect-time history).
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  const themeTerminalUrl = new URL(state.terminalConnectionUrls.at(-1)!)
+  state.terminalSockets.at(-1)!.send(
+    JSON.stringify({
+      type: 'terminal.frame',
+      bytes: Buffer.from(
+        '\u001b[H\u001b[2J• Theme checks are green; preparing the focused follow-up commit.',
+      ).toString('base64'),
+      seq: 1,
+      width: Number(themeTerminalUrl.searchParams.get('cols')),
+      height: Number(themeTerminalUrl.searchParams.get('rows')),
+      full: true,
+    }),
+  )
   await expect(terminalRows).toContainText('Theme checks are green')
   await expect(page.getByLabel('Terminal color theme')).toHaveCount(0)
 
@@ -11271,7 +13225,35 @@ test('shows terminal closure and reopens only when requested', async ({ page }) 
   await page.waitForTimeout(400)
   expect(state.terminalConnectionUrls).toHaveLength(1)
 
-  await page.getByRole('button', { name: 'Reopen terminal' }).click()
+  await page.getByRole('button', { name: 'Reconnect terminal' }).click()
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(2)
+  expect(state.terminalConnectionUrls).toHaveLength(2)
+})
+
+test('reconnects a dropped terminal socket with backoff', async ({ page }) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1200, height: 760 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page
+    .getByRole('button', { name: 'Open terminal', exact: true })
+    .click()
+  const terminal = page.locator('.terminal-session')
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+
+  await state.terminalSockets[0].close({ code: 1011, reason: 'relay lost' })
+  await expect(terminal).toHaveAttribute('data-state', 'error')
+  await expect(
+    terminal.getByText('Terminal connection unavailable · retrying in 1s'),
+  ).toBeVisible()
+  await expect(
+    page.getByRole('button', { name: 'Reconnect terminal' }),
+  ).toBeVisible()
+
   await expect(terminal).toHaveAttribute('data-state', 'connected')
   await expect.poll(() => state.terminalSockets.length).toBe(2)
   expect(state.terminalConnectionUrls).toHaveLength(2)
@@ -11447,7 +13429,7 @@ test('provisions a dedicated Superintendent and shows project updates', async ({
   await expect(page.getByLabel('Agent conversation')).toContainText(
     'Reviewing attention across the Yard portfolio.',
   )
-  expect(state.yardOrchestratorOutputRequests).toEqual(['10000', '1000'])
+  expect(state.yardOrchestratorOutputRequests).toEqual(['1000'])
 
   await page
     .getByLabel('Message', { exact: true })
@@ -14224,7 +16206,7 @@ test('controls the project orchestrator terminal, output, and prompt idempotentl
     state.orchestratorTerminalOutputRequests.some(
       (request) => request.lines === '10000',
     ),
-  ).toBe(true)
+  ).toBe(false)
 
   const prompt = page.getByLabel('Message', { exact: true })
   const submit = page.getByRole('button', {
@@ -15951,11 +17933,6 @@ test('keeps assignment intervention controls within the mobile inspector', async
     '1',
   )
   expect(state.terminalOutputRequests).toEqual([
-    {
-      assignmentId: 'assignment-1',
-      lines: '10000',
-      projectId: 'project-1',
-    },
   ])
   const terminalOverflow = await page.evaluate(() => {
     const workspace = document.querySelector<HTMLElement>(
@@ -17801,7 +19778,7 @@ test('layers Herdr inventory above Terminal without releasing state and restores
 
   const shell = page.locator('.agent-workspace-shell')
   const terminal = page.locator('.terminal-session')
-  const terminalRows = terminal.locator('.xterm-accessibility-tree')
+  const terminalRows = terminal.locator('.xterm-rows')
   await expect.poll(() => state.terminalSockets.length).toBe(1)
   const terminalUrl = new URL(state.terminalConnectionUrls[0])
   state.terminalSockets[0].send(
@@ -17818,11 +19795,15 @@ test('layers Herdr inventory above Terminal without releasing state and restores
   )
   await expect(terminal).toHaveAttribute('data-frame-sequence', '40')
   await terminal.locator('.xterm-scrollable-element').hover()
+  // Herdr owns the scrollback: the wheel scrolls Herdr's pane, and the view
+  // stays marked as scrolled back until the user returns to the latest.
   await page.mouse.wheel(0, -1200)
-  await expect(terminalRows).toContainText('inventory history')
-  await expect(terminalRows).not.toContainText('inventory tail')
-  const firstVisibleRow = terminalRows.getByRole('listitem').first()
-  const scrollPosition = Number(await firstVisibleRow.getAttribute('aria-posinset'))
+  await expect
+    .poll(() => terminalMessagesOfType(state, 'terminal.scroll').length)
+    .toBeGreaterThan(0)
+  await expect(terminalRows).toContainText('inventory tail')
+  const jumpToLatest = terminal.getByRole('button', { name: 'Jump to latest' })
+  await expect(jumpToLatest).toBeVisible()
   await terminal.evaluate((element) => {
     element.dataset.lifecycleMarker = 'preserved-terminal'
   })
@@ -17859,10 +19840,11 @@ test('layers Herdr inventory above Terminal without releasing state and restores
   await expect(page.locator('#root')).not.toHaveAttribute('inert', '')
   await expect(page.locator('#root')).not.toHaveAttribute('aria-hidden', 'true')
   await expect(terminal).toHaveAttribute('data-lifecycle-marker', 'preserved-terminal')
-  await expect(terminalRows).toContainText('inventory history')
-  await expect.poll(() => firstVisibleRow.getAttribute('aria-posinset').then(Number)).toBe(
-    scrollPosition,
-  )
+  await expect(terminalRows).toContainText('inventory tail')
+  await expect(jumpToLatest).toBeVisible()
+  expect(
+    state.terminalMessages.filter((message) => message.type === 'terminal.scroll_reset'),
+  ).toHaveLength(0)
 
   await page.getByRole('tab', { name: 'Chat', exact: true }).click()
   const conversation = page.getByLabel('Agent conversation')
