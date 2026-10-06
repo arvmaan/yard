@@ -15,6 +15,7 @@ mod project;
 mod repository_files;
 pub mod serde_u64;
 mod status_report;
+mod storage;
 mod summary_worker;
 mod token_spend;
 mod transcript;
@@ -131,6 +132,12 @@ pub use status_report::{
     MAX_STATUS_BLOCKER_BYTES, MAX_STATUS_BLOCKERS, MAX_STATUS_COMMAND_ID_BYTES,
     MAX_STATUS_REPORT_LINE_BYTES, MAX_STATUS_TEXT_BYTES, ORCHESTRATOR_STATUS_REPORT_VERSION,
     OrchestratorStatusReport, OrchestratorStatusReportError, OrchestratorStatusState,
+};
+pub use storage::{
+    StorageCandidate, StorageClass, StorageInUseCheck, StorageOwner, StorageOwnerKind,
+    StoragePackageIssue, StoragePackageState, StorageSafety, StorageSafetyTotal, StorageScan,
+    StorageScanStatus, StorageSourceState, StorageSourceStatus, StorageTotals,
+    StorageTruncationReason, StorageWorktree,
 };
 pub use summary_worker::{
     ReceiveSummaryWorker, ReceivedSummaryWorker, RequestSummaryWorker, SummaryParentRuntimeCapture,

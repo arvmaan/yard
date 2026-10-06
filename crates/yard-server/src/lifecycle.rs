@@ -212,6 +212,11 @@ impl RuntimePaths {
         }
     }
 
+    /// The database-scoped runtime directory (excluded from storage scans).
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(crate) fn open_log(&self) -> Result<File, LifecycleError> {
         let file = open_private_file(&self.log, true, true)?
             .ok_or_else(|| Self::path_error("open managed log", &self.log, not_found()))?;
@@ -1365,6 +1370,20 @@ fn config_fingerprint(config: &ServerConfig) -> String {
     use std::os::unix::ffi::OsStrExt;
 
     let mut digest = Sha256::new();
+    let storage_roots = config.storage.roots.as_ref().map_or_else(
+        || b"<not configured>".to_vec(),
+        |roots| {
+            let mut encoded = Vec::new();
+            for root in roots {
+                let root = root.as_os_str().as_bytes();
+                encoded.extend_from_slice(&root.len().to_le_bytes());
+                encoded.extend_from_slice(root);
+            }
+            encoded
+        },
+    );
+    let log_retention = config.storage.log_retention_days.to_string();
+    let workspace_markers = config.storage.workspace_markers.join("\0");
     for value in [
         config.bind.to_string().as_bytes(),
         config.herdr_binary.as_os_str().as_bytes(),
@@ -1373,6 +1392,9 @@ fn config_fingerprint(config: &ServerConfig) -> String {
         config.orchestrator_cwd.as_os_str().as_bytes(),
         config.coordination_path.as_os_str().as_bytes(),
         config.knowledge_path.as_os_str().as_bytes(),
+        storage_roots.as_slice(),
+        log_retention.as_bytes(),
+        workspace_markers.as_bytes(),
     ] {
         digest.update(value.len().to_le_bytes());
         digest.update(value);
@@ -1584,9 +1606,53 @@ mod tests {
 
     use super::{
         ControlCommand, ControlRequestError, InstanceMetadata, InstanceMode, InstanceState,
-        LifecycleError, ManagedState, RuntimePaths, database_identity, inspect, request,
-        spawn_control, write_metadata,
+        LifecycleError, ManagedState, RuntimePaths, config_fingerprint, database_identity, inspect,
+        request, spawn_control, write_metadata,
     };
+    use yard_server::config::{ServerConfig, StorageConfig};
+
+    #[test]
+    fn config_fingerprint_covers_storage_roots_and_log_retention() {
+        let base = ServerConfig {
+            bind: "127.0.0.1:4317".parse().expect("bind"),
+            herdr_binary: "herdr".into(),
+            database_path: "/data/yard/yard.sqlite3".into(),
+            artifact_path: "/data/yard/artifacts".into(),
+            orchestrator_cwd: "/work".into(),
+            coordination_path: "/data/yard/coordination".into(),
+            knowledge_path: "/data/yard/knowledge".into(),
+            storage: StorageConfig::default(),
+        };
+        let mut configured = base.clone();
+        configured.storage.roots = Some(vec!["/work/a".into()]);
+        let mut other_roots = base.clone();
+        other_roots.storage.roots = Some(vec!["/work/b".into()]);
+        let mut empty_roots = base.clone();
+        empty_roots.storage.roots = Some(Vec::new());
+        let mut retention = base.clone();
+        retention.storage.log_retention_days = 30;
+        let mut markers = base.clone();
+        markers.storage.workspace_markers = vec!["workspace.toml".to_owned()];
+
+        let fingerprints = [
+            &base,
+            &configured,
+            &other_roots,
+            &empty_roots,
+            &retention,
+            &markers,
+        ]
+        .map(config_fingerprint);
+        for (index, fingerprint) in fingerprints.iter().enumerate() {
+            assert!(
+                fingerprints[index + 1..]
+                    .iter()
+                    .all(|other| other != fingerprint),
+                "{index}"
+            );
+        }
+        assert_eq!(config_fingerprint(&base), config_fingerprint(&base.clone()));
+    }
 
     fn metadata(instance_id: &str, mode: InstanceMode) -> InstanceMetadata {
         InstanceMetadata {

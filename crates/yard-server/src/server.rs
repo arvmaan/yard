@@ -24,6 +24,7 @@ use yard_server::{
     pane_management_service::PaneManagementService,
     reconciliation_service::ReconciliationService,
     runtime_cleanup_service::RuntimeCleanupService,
+    storage_inventory_service::StorageScanSettings,
     terminal_service::RuntimeTerminal,
     transcript_capture_service::TranscriptCaptureService,
     worker_cleanup_service::WorkerCleanupService,
@@ -206,6 +207,7 @@ where
             config.orchestrator_cwd.clone(),
             config.coordination_path.clone(),
             config.knowledge_path.clone(),
+            StorageScanSettings::from_config(&config, Some(runtime_claim.paths().root())),
             shutdown_receiver.clone(),
         );
 
@@ -266,6 +268,7 @@ where
         orchestrator_cwd = %config.orchestrator_cwd.display(),
         coordination = %config.coordination_path.display(),
         knowledge = %config.knowledge_path.display(),
+        storage_roots = config.storage.roots.as_ref().map_or(0, Vec::len),
         mode = %lifecycle_mode,
         "Yard UI available"
     );
@@ -657,6 +660,7 @@ mod tests {
             orchestrator_cwd: temp.path().to_path_buf(),
             coordination_path: temp.path().join("coordination"),
             knowledge_path: temp.path().join("knowledge"),
+            storage: yard_server::config::StorageConfig::default(),
         };
         let runtime_claim = lifecycle::claim_runtime(&database_path, InstanceMode::Managed)
             .await

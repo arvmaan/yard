@@ -79,6 +79,7 @@ mod orchestrator_workflow_profile_store;
 mod pane_management_store;
 mod project_archive_store;
 mod project_restore_store;
+mod storage_owner_store;
 mod summary_worker_store;
 mod token_spend_store;
 mod transcript_capture_store;
@@ -90,6 +91,7 @@ pub use pane_management_store::{
 pub use project_restore_store::{
     ProjectRestorePlan, ProjectRestoreRuntime, RetiredOrchestratorRuntime,
 };
+pub use storage_owner_store::{StorageOwnerPath, StorageOwnerRecords, StorageWorkspaceBinding};
 pub use transcript_capture_store::{
     CapturedTranscriptText, PendingTranscriptCapture, TranscriptCaptureExpiry,
     TranscriptCaptureGuard, TranscriptCaptureOutcome,
@@ -205,6 +207,9 @@ pub trait YardStore: Send + Sync {
         &self,
         command: UpdateTokenSpendSettings,
     ) -> Result<TokenSpendSettings, ProjectStoreError>;
+    /// Read the project and workstream paths the storage scan uses for
+    /// ownership, plus current project workspace bindings.
+    async fn storage_owner_records(&self) -> Result<StorageOwnerRecords, ProjectStoreError>;
     async fn claim_automatic_summary_request(
         &self,
         kind: AutomaticSummaryRequestKind,
@@ -1829,6 +1834,10 @@ impl YardStore for SqliteProjectStore {
         command: UpdateTokenSpendSettings,
     ) -> Result<TokenSpendSettings, ProjectStoreError> {
         token_spend_store::update_settings(self, command).await
+    }
+
+    async fn storage_owner_records(&self) -> Result<StorageOwnerRecords, ProjectStoreError> {
+        storage_owner_store::owner_records(self).await
     }
 
     async fn claim_automatic_summary_request(
@@ -20742,8 +20751,9 @@ mod tests {
         OrchestratorReplacementStartEvidence, PROFILE_ALLOCATION_RECONCILIATION_GRACE_MS,
         PROFILE_ASSIGNMENT_MIGRATION, PROJECT_ARCHIVING_MIGRATION, ProjectStoreError,
         SCHEMA_VERSION, SnapshotDeliveryResult, SnapshotProjectFolder, SqliteProjectStore,
-        TokenSpendCommandSource, VISIBILITY_DELETIONS_MIGRATION, WORKER_HANDOFF_MIGRATION,
-        YardStore, coordination_node_store, insert_worker_runtime_binding,
+        StorageOwnerPath, StorageOwnerRecords, StorageWorkspaceBinding, TokenSpendCommandSource,
+        VISIBILITY_DELETIONS_MIGRATION, WORKER_HANDOFF_MIGRATION, YardStore,
+        coordination_node_store, insert_worker_runtime_binding,
         insert_worker_runtime_binding_unchecked, to_i64,
     };
 
@@ -26476,6 +26486,89 @@ mod tests {
                 "create_new".to_owned(),
                 Some("create-workspace-project-1".to_owned()),
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_owner_records_list_recorded_checkouts_workstreams_and_bindings() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp).await;
+        assert_eq!(
+            store.storage_owner_records().await.unwrap(),
+            StorageOwnerRecords::default()
+        );
+        let profile = store
+            .create_worker_profile(CreateWorkerProfile {
+                spec: profile_spec("Orchestrator"),
+            })
+            .await
+            .unwrap();
+        let command = workspace_project_command(&profile, "storage-owner-project");
+        store
+            .begin_workspace_project_creation(command.clone())
+            .await
+            .unwrap();
+        let (_, runtime) = draft("storage-owner-workspace", "storage-owner-terminal");
+        store
+            .claim_provisioning_runtime(&command.command_id, runtime.clone())
+            .await
+            .unwrap();
+        let created = store
+            .finalize_workspace_project_creation(&command.command_id, runtime)
+            .await
+            .unwrap();
+        let unfinished = workspace_project_command(&profile, "storage-owner-unfinished");
+        store
+            .begin_workspace_project_creation(CreateWorkspaceProjectFromProfile {
+                workspace_label: "Unfinished workspace".to_owned(),
+                cwd: "/work/unfinished".to_owned(),
+                ..unfinished
+            })
+            .await
+            .unwrap();
+        let node_id = Uuid::now_v7().to_string();
+        store
+            .create_coordination_node(
+                &node_id,
+                Some("/work/workstream".to_owned()),
+                None,
+                create_node_command(
+                    "storage-owner-node",
+                    CoordinationNodeKind::Workstream,
+                    Vec::new(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let records = store.storage_owner_records().await.unwrap();
+
+        assert_eq!(
+            records.paths,
+            vec![
+                StorageOwnerPath {
+                    kind: yard_domain::StorageOwnerKind::Project,
+                    owner_id: created.project.id.clone(),
+                    owner_name: "Runtime API".to_owned(),
+                    path: "/work/runtime-api".to_owned(),
+                },
+                StorageOwnerPath {
+                    kind: yard_domain::StorageOwnerKind::CoordinationNode,
+                    owner_id: node_id,
+                    owner_name: "Release coordination".to_owned(),
+                    path: "/work/workstream".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(
+            records.bindings,
+            vec![StorageWorkspaceBinding {
+                project_id: created.project.id,
+                project_name: "Runtime API".to_owned(),
+                adapter: "herdr".to_owned(),
+                session: "default".to_owned(),
+                workspace_id: "storage-owner-workspace".to_owned(),
+            }]
         );
     }
 
