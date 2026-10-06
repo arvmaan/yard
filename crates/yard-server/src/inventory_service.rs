@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -9,13 +12,14 @@ use yard_domain::{
 use yard_herdr::{
     AcquirePaneLeaseRequest, BootstrapAgentRequest, CloseLeasedPaneRequest, DiscoveredHerdrSession,
     HerdrAdapter, HerdrControlError, HerdrError, HerdrTerminal, HerdrTerminalError,
-    OpenTerminalRequest as HerdrOpenTerminalRequest, PaneLease, PaneLeaseOperationResult,
-    PaneLeaseStatus, PaneLeaseStatusRequest, PaneManagementCapability, PaneManagementRpcError,
-    PaneReadFormat, PrepareAgentRequest, PrepareWorkspaceAgentRequest, PromptAgentRequest,
-    ProvisionAgentRequest, ReadPaneRequest, ReleasePaneLeaseRequest, RenewPaneLeaseRequest,
-    StartPreparedAgentRequest, TerminalCommand as HerdrTerminalCommand, TerminalDimensions,
-    TerminalEncoding, TerminalEvent, TerminalInput, TerminalScroll,
-    TerminalScrollDirection as HerdrScrollDirection, TerminalScrollSource as HerdrScrollSource,
+    OpenTerminalRequest as HerdrOpenTerminalRequest, PROCESS_INFO_PHASE_DEADLINE,
+    PROCESS_INFO_REQUEST_TIMEOUT, PaneLease, PaneLeaseOperationResult, PaneLeaseStatus,
+    PaneLeaseStatusRequest, PaneManagementCapability, PaneManagementRpcError, PaneReadFormat,
+    PrepareAgentRequest, PrepareWorkspaceAgentRequest, PromptAgentRequest, ProvisionAgentRequest,
+    ReadPaneRequest, ReleasePaneLeaseRequest, RenewPaneLeaseRequest, StartPreparedAgentRequest,
+    TerminalCommand as HerdrTerminalCommand, TerminalDimensions, TerminalEncoding, TerminalEvent,
+    TerminalInput, TerminalScroll, TerminalScrollDirection as HerdrScrollDirection,
+    TerminalScrollSource as HerdrScrollSource,
 };
 
 use crate::allocation_service::{
@@ -23,6 +27,8 @@ use crate::allocation_service::{
     RuntimeRetirementRequest, RuntimeSessionRequest, RuntimeWorkerRestartRequest,
     RuntimeWorkspaceProvisionRequest,
 };
+pub use crate::command_line_sessions::CommandLineRecheckBudget;
+use crate::command_line_sessions::CommandLineSessions;
 use crate::intervention_service::{
     RuntimeIntervention, RuntimeInterventionError, RuntimeOutputRequest, RuntimeOutputResult,
     RuntimePromptRequest, RuntimePromptResult,
@@ -136,6 +142,17 @@ pub trait InventorySource: Send + Sync {
         session: &RuntimeSessionDescriptor,
     ) -> Result<RuntimeInventory, InventoryServiceError> {
         self.inventory_for_descriptor(session).await
+    }
+
+    /// [`Self::fleet_inventory_for_descriptor`] for one session of a fleet
+    /// view. Every session of the view passes the same `recheck_budget`, so
+    /// the command-line re-inspection cap applies to the whole view.
+    async fn fleet_inventory_for_descriptor_with_budget(
+        &self,
+        session: &RuntimeSessionDescriptor,
+        _recheck_budget: &CommandLineRecheckBudget,
+    ) -> Result<RuntimeInventory, InventoryServiceError> {
+        self.fleet_inventory_for_descriptor(session).await
     }
 
     async fn pane_management_capability(
@@ -279,6 +296,10 @@ pub(crate) fn seed_inventory_workers(
 pub struct HerdrInventorySource {
     adapter: HerdrAdapter,
     provider_agents: Arc<ProviderAgentObserver>,
+    command_line_sessions: Arc<Mutex<CommandLineSessions>>,
+    /// Signalled after each `record`, so a snapshot that found another
+    /// caller's first-sight inspection pending can wait for its result.
+    command_line_recorded: Arc<tokio::sync::Notify>,
 }
 
 struct HerdrRuntimeTerminalSession {
@@ -292,6 +313,8 @@ impl HerdrInventorySource {
         Self {
             adapter,
             provider_agents: Arc::new(ProviderAgentObserver::from_env()),
+            command_line_sessions: Arc::default(),
+            command_line_recorded: Arc::default(),
         }
     }
 
@@ -318,11 +341,20 @@ impl InventorySource for HerdrInventorySource {
         &self,
         session_name: &str,
     ) -> Result<RuntimeInventory, InventoryServiceError> {
-        let inventory = self
+        let session = self
             .adapter
-            .inventory(session_name)
-            .await
-            .map_err(InventoryServiceError::from)?;
+            .discover_sessions()
+            .await?
+            .into_iter()
+            .find(|session| session.name() == session_name)
+            .ok_or_else(|| HerdrError::SessionNotFound(session_name.to_owned()))?;
+        let inventory = self
+            .inventory_with_command_lines(
+                &session,
+                SnapshotShape::Session,
+                &CommandLineRecheckBudget::default(),
+            )
+            .await?;
         Ok(self.observe_provider_agents(inventory).await)
     }
 
@@ -346,23 +378,35 @@ impl InventorySource for HerdrInventorySource {
         let RuntimeSessionDescriptorSource::Herdr(session) = &session.source else {
             return self.inventory(&session.summary.name).await;
         };
-        self.adapter
-            .inventory_for_discovered_session(session)
-            .await
-            .map_err(Into::into)
+        self.inventory_with_command_lines(
+            session,
+            SnapshotShape::Session,
+            &CommandLineRecheckBudget::default(),
+        )
+        .await
     }
 
     async fn fleet_inventory_for_descriptor(
         &self,
         session: &RuntimeSessionDescriptor,
     ) -> Result<RuntimeInventory, InventoryServiceError> {
+        self.fleet_inventory_for_descriptor_with_budget(
+            session,
+            &CommandLineRecheckBudget::default(),
+        )
+        .await
+    }
+
+    async fn fleet_inventory_for_descriptor_with_budget(
+        &self,
+        session: &RuntimeSessionDescriptor,
+        recheck_budget: &CommandLineRecheckBudget,
+    ) -> Result<RuntimeInventory, InventoryServiceError> {
         let RuntimeSessionDescriptorSource::Herdr(session) = &session.source else {
             return self.inventory_for_descriptor(session).await;
         };
-        self.adapter
-            .fleet_inventory_for_discovered_session(session)
+        self.inventory_with_command_lines(session, SnapshotShape::Fleet, recheck_budget)
             .await
-            .map_err(Into::into)
     }
 
     async fn pane_management_capability(
@@ -408,6 +452,96 @@ impl InventorySource for HerdrInventorySource {
     }
 }
 
+/// Which normalization a Herdr snapshot uses.
+#[derive(Debug, Clone, Copy)]
+enum SnapshotShape {
+    /// One session, as reconciliation sees it.
+    Session,
+    /// The fleet projection, which keeps duplicate and conflicting evidence.
+    Fleet,
+}
+
+impl HerdrInventorySource {
+    /// Snapshot a discovered session and apply provider session ids from the
+    /// panes' foreground command lines (see [`CommandLineSessions`]).
+    ///
+    /// Runs after normalization (which correlates agent pane instances) and
+    /// changes only `provider_session`; `pane_instance_id` is left as Herdr
+    /// reported it.
+    async fn inventory_with_command_lines(
+        &self,
+        session: &DiscoveredHerdrSession,
+        shape: SnapshotShape,
+        recheck_budget: &CommandLineRecheckBudget,
+    ) -> Result<RuntimeInventory, InventoryServiceError> {
+        let mut inventory = match shape {
+            SnapshotShape::Session => self.adapter.inventory_for_discovered_session(session).await,
+            SnapshotShape::Fleet => {
+                self.adapter
+                    .fleet_inventory_for_discovered_session(session)
+                    .await
+            }
+        }?;
+        let pane_ids = lock_command_line_sessions(&self.command_line_sessions).plan_with_budget(
+            &inventory,
+            Instant::now(),
+            recheck_budget,
+        );
+        let results = self
+            .adapter
+            .foreground_jobs_for_discovered_session(session, pane_ids)
+            .await
+            .into_iter()
+            .map(|(pane_id, result)| (pane_id, result.map_err(|error| error.to_string())))
+            .collect();
+        lock_command_line_sessions(&self.command_line_sessions).record(
+            &inventory,
+            results,
+            Instant::now(),
+        );
+        self.command_line_recorded.notify_waiters();
+        self.await_pending_command_lines(&inventory).await;
+        let applied = lock_command_line_sessions(&self.command_line_sessions).apply(&mut inventory);
+        if applied.newly_logged > 0 {
+            tracing::debug!(
+                session = %inventory.session,
+                command_line_sessions = applied.overrides.len(),
+                "Applied provider sessions from pane command lines"
+            );
+        }
+        Ok(inventory)
+    }
+
+    /// Wait, bounded by the inspection phase limit, until no agent of
+    /// `inventory` has a first-sight inspection that another concurrent
+    /// snapshot reserved. Without this a concurrent caller would reconcile
+    /// Herdr's report for a pane whose command line is being read.
+    async fn await_pending_command_lines(&self, inventory: &RuntimeInventory) {
+        let deadline = tokio::time::Instant::now()
+            + PROCESS_INFO_PHASE_DEADLINE
+            + PROCESS_INFO_REQUEST_TIMEOUT;
+        loop {
+            let notified = self.command_line_recorded.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !lock_command_line_sessions(&self.command_line_sessions).has_pending(inventory) {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+fn lock_command_line_sessions(
+    tracker: &Mutex<CommandLineSessions>,
+) -> std::sync::MutexGuard<'_, CommandLineSessions> {
+    tracker
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn prompt_delivery_error(
     source: &HerdrError,
     rollback: &str,
@@ -425,7 +559,7 @@ fn prompt_delivery_error(
     }
 }
 
-fn start_failure_error(
+pub(crate) fn start_failure_error(
     start: HerdrError,
     rollback: String,
     rollback_succeeded: bool,

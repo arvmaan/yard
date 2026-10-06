@@ -4,6 +4,7 @@ mod discovery;
 mod error;
 mod management;
 mod normalize;
+mod process_info;
 mod session;
 mod socket;
 mod terminal;
@@ -24,6 +25,9 @@ pub use management::{
     PaneLeaseOperationResult, PaneLeaseStatus, PaneLeaseStatusRequest, PaneManagementCapability,
     PaneManagementRpcError, ReleasePaneLeaseRequest, RenewPaneLeaseRequest,
 };
+pub use process_info::{
+    MAX_CONCURRENT_PROCESS_INFO_REQUESTS, PROCESS_INFO_PHASE_DEADLINE, PROCESS_INFO_REQUEST_TIMEOUT,
+};
 pub use terminal::{
     HerdrTerminal, HerdrTerminalError, MAX_TERMINAL_COLS, MAX_TERMINAL_COMMAND_LINE_BYTES,
     MAX_TERMINAL_EVENT_LINE_BYTES, MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_ROWS,
@@ -31,7 +35,10 @@ pub use terminal::{
     TerminalClosed, TerminalCommand, TerminalDimensions, TerminalEncoding, TerminalEvent,
     TerminalFrame, TerminalInput, TerminalScroll, TerminalScrollDirection, TerminalScrollSource,
 };
-use yard_domain::{RuntimeInventory, RuntimeSessions};
+use yard_domain::{PaneForegroundJob, RuntimeInventory, RuntimeSessions};
+
+/// The foreground job of each inspected pane, in the order requested.
+pub type PaneForegroundJobs = Vec<(String, Result<PaneForegroundJob, HerdrError>)>;
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredHerdrSession {
@@ -152,6 +159,24 @@ impl HerdrAdapter {
     ) -> Result<RuntimeInventory, HerdrError> {
         let (snapshot, observed_at_unix_ms) = self.snapshot_for_discovered_session(session).await?;
         normalize::normalize_fleet(snapshot, session.id(), observed_at_unix_ms, &self.config)
+    }
+
+    /// Inspect the foreground process group of `pane_ids` in a discovered
+    /// session, over the same session socket its snapshot uses.
+    ///
+    /// Each inspection is Herdr `pane.process_info`, issued with at most
+    /// [`MAX_CONCURRENT_PROCESS_INFO_REQUESTS`] in flight and bounded by
+    /// [`PROCESS_INFO_PHASE_DEADLINE`]. A failed inspection is returned per
+    /// pane and never fails the others; no panes means no requests.
+    pub async fn foreground_jobs_for_discovered_session(
+        &self,
+        session: &DiscoveredHerdrSession,
+        pane_ids: Vec<String>,
+    ) -> PaneForegroundJobs {
+        if pane_ids.is_empty() {
+            return Vec::new();
+        }
+        process_info::pane_process_infos(&self.config, &session.session.socket_path, pane_ids).await
     }
 
     async fn snapshot_for_discovered_session(

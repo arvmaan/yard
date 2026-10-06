@@ -10553,6 +10553,8 @@ fn reconcile_runtime_inventory(
 
     reconcile_stale_profile_allocations(transaction, inventory)?;
     let bindings = select_runtime_bindings(transaction, &inventory.adapter, &inventory.session)?;
+    let blocked_continuations =
+        blocked_provider_session_continuations(transaction, inventory, &bindings)?;
     let bound_terminals: HashMap<&str, &str> = bindings
         .iter()
         .map(|binding| {
@@ -10563,10 +10565,16 @@ fn reconcile_runtime_inventory(
         })
         .collect();
     for binding in &bindings {
-        let next = resolve_running_worker(binding, &bindings, inventory, &bound_terminals)
-            .unwrap_or_else(|| {
-                resolve_exited_or_missing(binding, &bindings, inventory, &bound_terminals)
-            });
+        let next = resolve_running_worker(
+            binding,
+            &bindings,
+            inventory,
+            &bound_terminals,
+            &blocked_continuations,
+        )
+        .unwrap_or_else(|| {
+            resolve_exited_or_missing(binding, &bindings, inventory, &bound_terminals)
+        });
         update_reconciliation_counts(&mut result, &next);
         if persist_reconciled_binding(transaction, binding, &next, inventory.observed_at_unix_ms)? {
             result.updated_bindings += 1;
@@ -11309,16 +11317,22 @@ fn resolve_running_worker(
     bindings: &[StoredRuntimeBinding],
     inventory: &RuntimeInventory,
     bound_terminals: &HashMap<&str, &str>,
+    blocked_continuations: &HashSet<String>,
 ) -> Option<WorkerRuntimeBinding> {
     if let Some(worker) = inventory
         .workers
         .iter()
         .find(|worker| worker.terminal_id == binding.runtime.terminal_id)
     {
-        return Some(if worker_conflicts(binding, worker) {
-            ambiguous_runtime(binding)
-        } else {
+        if restarted_after_observed_exit(binding, worker) {
+            return Some(ambiguous_exited_runtime(binding));
+        }
+        let continued = !blocked_continuations.contains(&binding.worker_id)
+            && provider_session_continues(binding, worker, bindings, inventory, bound_terminals);
+        return Some(if continued || !worker_conflicts(binding, worker) {
             runtime_from_worker(binding, worker, inventory.observed_at_unix_ms)
+        } else {
+            ambiguous_runtime(binding)
         });
     }
 
@@ -11363,12 +11377,280 @@ fn resolve_running_worker(
         .get(worker.terminal_id.as_str())
         .is_some_and(|worker_id| **worker_id != binding.worker_id);
     Some(
-        if belongs_to_other_binding || workspace_conflicts(binding, &worker.workspace_id) {
+        if belongs_to_other_binding || !provider_rebind_allowed(binding, worker, inventory) {
             ambiguous_runtime(binding)
         } else {
             runtime_from_worker(binding, worker, inventory.observed_at_unix_ms)
         },
     )
+}
+
+/// A binding may follow its provider session to another terminal only inside
+/// the worker's project workspace, and it may leave the Herdr workspace it was
+/// last observed in only when its previous terminal and pane are gone: a
+/// surviving old pane means the conversation was copied or resumed elsewhere
+/// rather than restored, so the move is left for manual resolution.
+fn provider_rebind_allowed(
+    binding: &StoredRuntimeBinding,
+    worker: &ObservedWorker,
+    inventory: &RuntimeInventory,
+) -> bool {
+    !workspace_conflicts(binding, &worker.workspace_id)
+        && (binding.runtime.workspace_id == worker.workspace_id
+            || !previous_runtime_is_present(binding, inventory))
+}
+
+fn previous_runtime_is_present(
+    binding: &StoredRuntimeBinding,
+    inventory: &RuntimeInventory,
+) -> bool {
+    let runtime = &binding.runtime;
+    inventory.workers.iter().any(|worker| {
+        worker.terminal_id == runtime.terminal_id
+            || (worker.workspace_id == runtime.workspace_id && worker.pane_id == runtime.pane_id)
+    }) || inventory.panes.iter().any(|pane| {
+        pane.terminal_id == runtime.terminal_id
+            || (pane.workspace_id == runtime.workspace_id && pane.runtime_id == runtime.pane_id)
+    })
+}
+
+/// Yard saw the bound agent process end (the terminal showed no agent), and
+/// the terminal now hosts an agent that has not reported the bound provider
+/// session: either it has reported no session yet or a different one. That is
+/// a relaunch in the same pane, which may be an unrelated conversation (a
+/// fresh `codex`, or `codex resume <other>`), so it is never treated as the
+/// bound worker or as a continuation of its conversation. The binding stays
+/// ambiguous and keeps `Exited` as the durable "restarted since the bound
+/// session was last seen" marker, so later snapshots cannot upgrade it either;
+/// only the bound session id being reported again restores it.
+fn restarted_after_observed_exit(binding: &StoredRuntimeBinding, worker: &ObservedWorker) -> bool {
+    binding.runtime.process_state == RuntimeProcessState::Exited
+        && binding
+            .runtime
+            .provider_session
+            .as_ref()
+            .is_some_and(|expected| worker.provider_session.as_ref() != Some(expected))
+}
+
+/// A provider session reported for the exact bound terminal is a continuation
+/// of the bound conversation (Codex/Claude compaction, clear, fork or resume
+/// starts a new provider thread id in the same process) when the terminal
+/// identity is otherwise unchanged. Herdr does not expose the hook's
+/// `session_start_source`, so terminal identity is the evidence: the same
+/// terminal, workspace, tab and pane, the same provider source/agent/kind, no
+/// observed process exit since the bound session was seen, a new id no other
+/// binding owns and no other terminal reports, and the old id no longer
+/// observed anywhere. Durable reservations of the new id and a changed pane
+/// instance are checked by `blocked_provider_session_continuations`.
+fn provider_session_continues(
+    binding: &StoredRuntimeBinding,
+    worker: &ObservedWorker,
+    bindings: &[StoredRuntimeBinding],
+    inventory: &RuntimeInventory,
+    bound_terminals: &HashMap<&str, &str>,
+) -> bool {
+    let (Some(expected), Some(observed)) = (
+        binding.runtime.provider_session.as_ref(),
+        worker.provider_session.as_ref(),
+    ) else {
+        return false;
+    };
+    expected != observed
+        && binding.runtime.process_state != RuntimeProcessState::Exited
+        && expected.source == observed.source
+        && expected.provider == observed.provider
+        && expected.kind == observed.kind
+        && worker
+            .provider
+            .as_deref()
+            .is_none_or(|provider| provider == observed.provider)
+        && worker.terminal_id == binding.runtime.terminal_id
+        && bound_terminals
+            .get(worker.terminal_id.as_str())
+            .is_some_and(|worker_id| *worker_id == binding.worker_id)
+        && worker_matches_stable_topology(binding, worker)
+        && !workspace_conflicts(binding, &worker.workspace_id)
+        && !bindings.iter().any(|other| {
+            other.worker_id != binding.worker_id
+                && other.runtime.provider_session.as_ref() == Some(observed)
+        })
+        && [expected, observed].into_iter().all(|session| {
+            !inventory.workers.iter().any(|other| {
+                other.terminal_id != worker.terminal_id
+                    && other.provider_session.as_ref() == Some(session)
+            }) && !inventory.panes.iter().any(|pane| {
+                pane.terminal_id != worker.terminal_id
+                    && pane.provider_session.as_ref() == Some(session)
+            })
+        })
+}
+
+/// Workers whose bound terminal now reports a different provider session that
+/// cannot be accepted as a continuation of the bound conversation: the new id
+/// is reserved by another durable identity claim (a retired binding awaiting
+/// restore, a pending handoff, cleanup, provisioning, quarantine or
+/// orchestrator replacement), persisting the changed identity would hit the
+/// pending-cleanup guard, or the pane's Herdr instance id differs from the one
+/// the worker's pane management lease holds (the pane id was reused).
+fn blocked_provider_session_continuations(
+    transaction: &Transaction<'_>,
+    inventory: &RuntimeInventory,
+    bindings: &[StoredRuntimeBinding],
+) -> Result<HashSet<String>, ProjectStoreError> {
+    let mut blocked = HashSet::new();
+    for binding in bindings {
+        let Some(expected) = binding.runtime.provider_session.as_ref() else {
+            continue;
+        };
+        let Some(worker) = inventory
+            .workers
+            .iter()
+            .find(|worker| worker.terminal_id == binding.runtime.terminal_id)
+        else {
+            continue;
+        };
+        let Some(observed) = worker.provider_session.as_ref() else {
+            continue;
+        };
+        if observed == expected {
+            continue;
+        }
+        let continued = runtime_from_worker(binding, worker, inventory.observed_at_unix_ms);
+        if provider_session_is_reserved(transaction, inventory, observed)?
+            || !runtime_update_is_unreserved(transaction, &continued)?
+            || managed_pane_instance_changed(transaction, &binding.worker_id, worker)?
+        {
+            blocked.insert(binding.worker_id.clone());
+        }
+    }
+    Ok(blocked)
+}
+
+/// Whether persisting `runtime` as a changed binding identity would pass the
+/// pending-cleanup/provisioning/quarantine guard. Continuation consults this
+/// first so that a reserved identity leaves the binding ambiguous instead of
+/// failing the whole reconciliation.
+fn runtime_update_is_unreserved(
+    transaction: &Transaction<'_>,
+    runtime: &WorkerRuntimeBinding,
+) -> Result<bool, ProjectStoreError> {
+    match ensure_runtime_not_pending_cleanup(transaction, runtime) {
+        Ok(()) => Ok(true),
+        Err(ProjectStoreError::RuntimeWorkerAlreadyBound) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn managed_pane_instance_changed(
+    transaction: &Transaction<'_>,
+    worker_id: &str,
+    worker: &ObservedWorker,
+) -> Result<bool, ProjectStoreError> {
+    let Some(observed) = worker.pane_instance_id.as_deref() else {
+        return Ok(false);
+    };
+    let leased = transaction
+        .query_row(
+            "SELECT pane_instance_id FROM pane_management_leases WHERE worker_id = ?1",
+            [worker_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(leased.is_some_and(|leased| leased != observed))
+}
+
+/// A provider session held by any durable identity claim in this Herdr
+/// session other than a live binding (live bindings are checked in memory).
+fn provider_session_is_reserved(
+    transaction: &Transaction<'_>,
+    inventory: &RuntimeInventory,
+    provider: &ProviderSessionRef,
+) -> Result<bool, ProjectStoreError> {
+    let reserved = transaction.query_row(
+        "SELECT
+            EXISTS (
+                SELECT 1 FROM retired_runtime_bindings rrb
+                 WHERE rrb.adapter = ?1 AND rrb.runtime_session = ?2
+                   AND rrb.released_at_unix_ms IS NULL
+                   AND rrb.provider_session_source = ?3
+                   AND rrb.provider_session_provider = ?4
+                   AND rrb.provider_session_kind = ?5
+                   AND rrb.provider_session_value = ?6
+            )
+            OR EXISTS (
+                SELECT 1 FROM worker_handoff_commands whc
+                 WHERE whc.finished_at_unix_ms IS NULL
+                   AND whc.target_runtime_adapter = ?1
+                   AND whc.target_runtime_session = ?2
+                   AND whc.target_provider_session_source = ?3
+                   AND whc.target_provider_session_provider = ?4
+                   AND whc.target_provider_session_kind = ?5
+                   AND whc.target_provider_session_value = ?6
+            )
+            OR EXISTS (
+                SELECT 1 FROM runtime_cleanup_jobs cleanup
+                 WHERE cleanup.status = 'pending'
+                   AND cleanup.adapter = ?1 AND cleanup.runtime_session = ?2
+                   AND cleanup.provider_session_source = ?3
+                   AND cleanup.provider_session_provider = ?4
+                   AND cleanup.provider_session_kind = ?5
+                   AND cleanup.provider_session_value = ?6
+            )
+            OR EXISTS (
+                SELECT 1
+                  FROM orchestrator_replacement_runtime_bindings snapshot
+                  JOIN command_acknowledgements command
+                    ON command.id = snapshot.command_id
+                 WHERE (
+                       command.status = 'pending'
+                       OR (
+                           command.status = 'ambiguous'
+                           AND (
+                               snapshot.recovery_outcome IS NULL
+                               OR snapshot.recovery_outcome IN (
+                                   'conflicting_reused',
+                                   'present_not_safely_retirable'
+                               )
+                           )
+                       )
+                   )
+                   AND snapshot.binding_role IN (
+                       'replacement_prepared',
+                       'replacement_started'
+                   )
+                   AND snapshot.adapter = ?1 AND snapshot.runtime_session = ?2
+                   AND snapshot.provider_session_source = ?3
+                   AND snapshot.provider_session_provider = ?4
+                   AND snapshot.provider_session_kind = ?5
+                   AND snapshot.provider_session_value = ?6
+            )",
+        params![
+            inventory.adapter,
+            inventory.session,
+            provider.source,
+            provider.provider,
+            provider.kind,
+            provider.value,
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    // The empty terminal id matches no claim, which narrows the shared
+    // provisioning and quarantine lookups to the provider session.
+    Ok(reserved
+        || runtime_identity_is_provisioning_claimed(
+            transaction,
+            &inventory.adapter,
+            &inventory.session,
+            "",
+            Some(provider),
+        )?
+        || runtime_identity_is_quarantined(
+            transaction,
+            &inventory.adapter,
+            &inventory.session,
+            "",
+            Some(provider),
+        )?)
 }
 
 fn resolve_exited_or_missing(
@@ -11382,8 +11664,22 @@ fn resolve_exited_or_missing(
         .iter()
         .find(|pane| pane.terminal_id == binding.runtime.terminal_id)
     {
+        // The bound terminal shows no agent while it reports a different
+        // provider session (a fresh agent's hook ran before Herdr detected
+        // it), or the bound process was already seen to exit: keep `Exited`
+        // on the ambiguous binding so a later agent in this pane is not taken
+        // for a continuation of the bound conversation.
         return if pane_conflicts(binding, pane, bound_terminals) {
-            ambiguous_runtime(binding)
+            if binding.runtime.process_state == RuntimeProcessState::Exited
+                || provider_conflicts(
+                    binding.runtime.provider_session.as_ref(),
+                    pane.provider_session.as_ref(),
+                )
+            {
+                ambiguous_exited_runtime(binding)
+            } else {
+                ambiguous_runtime(binding)
+            }
         } else {
             runtime_from_exited_pane(binding, pane, inventory.observed_at_unix_ms)
         };
@@ -11633,6 +11929,15 @@ fn ambiguous_runtime(binding: &StoredRuntimeBinding) -> WorkerRuntimeBinding {
     }
 }
 
+fn ambiguous_exited_runtime(binding: &StoredRuntimeBinding) -> WorkerRuntimeBinding {
+    WorkerRuntimeBinding {
+        observation_state: RuntimeObservationState::Ambiguous,
+        process_state: RuntimeProcessState::Exited,
+        status: ObservedStatus::Unknown,
+        ..binding.runtime.clone()
+    }
+}
+
 fn missing_runtime(binding: &StoredRuntimeBinding) -> WorkerRuntimeBinding {
     WorkerRuntimeBinding {
         observation_state: RuntimeObservationState::Missing,
@@ -11715,17 +12020,39 @@ fn persist_reconciled_binding(
             to_i64(binding.worker_version)?,
         ],
     )?;
+    let event_type = reconciliation_event_type(binding, runtime);
     insert_lifecycle_event(
         transaction,
         "worker",
         &binding.worker_id,
         next_worker_version,
-        reconciliation_event_type(binding, runtime),
+        event_type,
         "herdr",
         reconciled_at_unix_ms,
     )?;
+    if event_type == PROVIDER_SESSION_CONTINUED_EVENT {
+        // lifecycle_events has no payload column; the new id is durable in the
+        // binding at this version and the old id is kept in the audit log.
+        tracing::info!(
+            worker_id = %binding.worker_id,
+            worker_version = next_worker_version,
+            terminal_id = %runtime.terminal_id,
+            previous_provider_session = binding
+                .runtime
+                .provider_session
+                .as_ref()
+                .map_or("", |session| session.value.as_str()),
+            provider_session = runtime
+                .provider_session
+                .as_ref()
+                .map_or("", |session| session.value.as_str()),
+            "runtime provider session continued on the bound terminal"
+        );
+    }
     Ok(true)
 }
+
+const PROVIDER_SESSION_CONTINUED_EVENT: &str = "runtime_provider_session_continued";
 
 fn runtime_binding_changed(binding: &StoredRuntimeBinding, runtime: &WorkerRuntimeBinding) -> bool {
     binding.runtime.workspace_id != runtime.workspace_id
@@ -11810,6 +12137,20 @@ fn reconciliation_event_type(
     binding: &StoredRuntimeBinding,
     runtime: &WorkerRuntimeBinding,
 ) -> &'static str {
+    // Reconciliation replaces one known provider session with another on the
+    // same terminal only when it accepted a continuation.
+    if runtime.observation_state == RuntimeObservationState::Observed
+        && runtime.terminal_id == binding.runtime.terminal_id
+        && matches!(
+            (
+                binding.runtime.provider_session.as_ref(),
+                runtime.provider_session.as_ref(),
+            ),
+            (Some(previous), Some(current)) if previous != current
+        )
+    {
+        return PROVIDER_SESSION_CONTINUED_EVENT;
+    }
     match (
         runtime.observation_state,
         runtime.process_state,
@@ -20756,6 +21097,8 @@ mod tests {
         coordination_node_store, insert_worker_runtime_binding,
         insert_worker_runtime_binding_unchecked, to_i64,
     };
+
+    mod provider_continuation;
 
     const HISTORICAL_PROVIDER_NEUTRAL_WORKFLOW_V25_MIGRATION: &str =
         include_str!("../tests/fixtures/0025_provider_neutral_workflow_profiles.sql");

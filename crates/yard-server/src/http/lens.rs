@@ -14,6 +14,7 @@ use yard_domain::{
 };
 
 use super::{ApiError, AppState, NoStoreJson, runtime_topology_store_error};
+use crate::inventory_service::CommandLineRecheckBudget;
 
 const FLEET_SNAPSHOT_CONCURRENCY: usize = 4;
 
@@ -316,11 +317,17 @@ pub(super) async fn runtime_fleet_inventory(
     let request_count = grouped_sessions.requests.len();
     let mut pending = grouped_sessions.requests.into_iter().enumerate();
     let mut tasks = JoinSet::new();
+    // One command-line re-inspection cap for the whole fleet view.
+    let recheck_budget = CommandLineRecheckBudget::default();
     for (index, runtime_session) in pending.by_ref().take(FLEET_SNAPSHOT_CONCURRENCY) {
         let source = state.source.clone();
+        let recheck_budget = recheck_budget.clone();
         tasks.spawn(async move {
             let snapshot = source
-                .fleet_inventory_for_descriptor(&runtime_session.descriptor)
+                .fleet_inventory_for_descriptor_with_budget(
+                    &runtime_session.descriptor,
+                    &recheck_budget,
+                )
                 .await;
             (index, runtime_session, snapshot)
         });
@@ -335,9 +342,13 @@ pub(super) async fn runtime_fleet_inventory(
         snapshots[index] = Some(snapshot);
         if let Some((index, runtime_session)) = pending.next() {
             let source = state.source.clone();
+            let recheck_budget = recheck_budget.clone();
             tasks.spawn(async move {
                 let snapshot = source
-                    .fleet_inventory_for_descriptor(&runtime_session.descriptor)
+                    .fleet_inventory_for_descriptor_with_budget(
+                        &runtime_session.descriptor,
+                        &recheck_budget,
+                    )
                     .await;
                 (index, runtime_session, snapshot)
             });
