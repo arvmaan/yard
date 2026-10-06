@@ -37,15 +37,15 @@ use yard_domain::{
     RuntimeSessions, RuntimeTopology, SendAssignmentPrompt, SendCoordinationNodePrompt,
     SendCoordinationNodeRoute, SendOrchestratorPrompt, SendYardOrchestratorPrompt,
     SendYardOrchestratorRoute, SetAutomationPaused, SetProjectRepository, StartWorkerCleanupRun,
-    SummaryWorker, SummaryWorkers, TerminalOutput, TokenSpendSettings, TransferProjectOrchestrator,
-    TransferredProjectOrchestrator, UpdateAgentProfile, UpdateAutomation,
-    UpdateAutomationPlacement, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
-    UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
-    UpdateTokenSpendSettings, UpdateWorkerCleanupPolicy, UpdateWorkerProfile, UploadArtifact,
-    WorkerCandidates, WorkerCleanupDashboard, WorkerCleanupPolicy, WorkerCleanupRun,
-    WorkerCleanupRunTrigger, WorkerProfile, WorkerProfiles, WorkerTranscript, YardOrchestrator,
-    YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute, YardOrchestratorRoutes,
-    YardOrchestratorTerminalOutput,
+    StorageScan, SummaryWorker, SummaryWorkers, TerminalOutput, TokenSpendSettings,
+    TransferProjectOrchestrator, TransferredProjectOrchestrator, UpdateAgentProfile,
+    UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
+    UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
+    UpdateProjectWorkflowProfile, UpdateTokenSpendSettings, UpdateWorkerCleanupPolicy,
+    UpdateWorkerProfile, UploadArtifact, WorkerCandidates, WorkerCleanupDashboard,
+    WorkerCleanupPolicy, WorkerCleanupRun, WorkerCleanupRunTrigger, WorkerProfile, WorkerProfiles,
+    WorkerTranscript, YardOrchestrator, YardOrchestratorPromptAcknowledgement,
+    YardOrchestratorRoute, YardOrchestratorRoutes, YardOrchestratorTerminalOutput,
 };
 use yard_herdr::HerdrError;
 use yard_store::{MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT, ProjectStoreError, YardStore};
@@ -76,6 +76,7 @@ use crate::project_orchestrator_transfer_service::{
 use crate::project_service::{ProjectService, ProjectServiceError};
 use crate::reconciliation_service::{ReconciliationService, ReconciliationServiceError};
 use crate::repository_files_service::{RepositoryFilesService, RepositoryFilesServiceError};
+use crate::storage_inventory_service::{StorageScanService, StorageScanSettings};
 use crate::summary_worker_service::{SummaryWorkerService, SummaryWorkerServiceError};
 use crate::terminal_service::{RuntimeTerminal, TerminalService};
 use crate::worker_cleanup_service::WorkerCleanupService;
@@ -112,6 +113,7 @@ struct AppState {
     coordination_nodes: CoordinationNodeService,
     pane_management: PaneManagementService,
     ghostty_launcher: GhosttyLauncher,
+    storage: StorageScanService,
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
 }
@@ -133,6 +135,7 @@ pub(crate) fn router(
         store,
         artifacts,
         noop_ghostty_launcher,
+        StorageScanSettings::not_configured(),
         None,
         ConnectionTracker::default(),
     )
@@ -148,6 +151,7 @@ fn test_router_with_shutdown(
     store: Arc<dyn YardStore>,
     artifacts: ArtifactService,
     ghostty_launcher: GhosttyLauncher,
+    storage: StorageScanSettings,
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
 ) -> Router {
@@ -181,6 +185,7 @@ fn test_router_with_shutdown(
         managed_root.join("knowledge"),
         automations,
         ghostty_launcher,
+        storage,
         shutdown,
         connections,
     )
@@ -199,6 +204,7 @@ pub(crate) fn router_with_reconciliation_and_shutdown(
     coordination_path: PathBuf,
     knowledge_path: PathBuf,
     automations: AutomationService,
+    storage: StorageScanSettings,
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
 ) -> Router {
@@ -215,6 +221,7 @@ pub(crate) fn router_with_reconciliation_and_shutdown(
         knowledge_path,
         automations,
         launch_ghostty_process,
+        storage,
         shutdown,
         connections,
     )
@@ -234,9 +241,17 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
     knowledge_path: PathBuf,
     automations: AutomationService,
     ghostty_launcher: GhosttyLauncher,
+    storage: StorageScanSettings,
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
 ) -> Router {
+    let storage = StorageScanService::with_shutdown(
+        storage,
+        Arc::clone(&store),
+        Arc::clone(&source),
+        reconciliation.clone(),
+        shutdown.clone(),
+    );
     let projects = ProjectService::new(
         Arc::clone(&source),
         Arc::clone(&runtime),
@@ -616,6 +631,11 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             get(get_artifact_content),
         )
         .route(
+            "/api/v1/storage/scans",
+            axum::routing::post(start_storage_scan),
+        )
+        .route("/api/v1/storage/scans/{scan_id}", get(get_storage_scan))
+        .route(
             "/api/v1/worker-profiles",
             get(list_worker_profiles).post(create_worker_profile),
         )
@@ -663,6 +683,7 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             coordination_nodes,
             pane_management,
             ghostty_launcher,
+            storage,
             shutdown,
             connections,
         })
@@ -2291,6 +2312,41 @@ fn lifecycle_request_origin(headers: &HeaderMap) -> Result<RequestOrigin, ApiErr
                 .to_owned(),
         }),
     }
+}
+
+/// Start the single storage scan, or join the running one. The request has
+/// no body: the server scans only `YARD_STORAGE_ROOTS`, never a browser path.
+async fn start_storage_scan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    lifecycle_request_origin(&headers)?;
+    let start = state.storage.start_or_join();
+    Ok(match start.scan.id.clone() {
+        None => NoStoreJson(start.scan).into_response(),
+        Some(id) => {
+            let mut response = created_response(&format!("/api/v1/storage/scans/{id}"), start.scan);
+            *response.status_mut() = StatusCode::ACCEPTED;
+            response
+        }
+    })
+}
+
+async fn get_storage_scan(
+    State(state): State<AppState>,
+    Path(scan_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<NoStoreJson<StorageScan>, ApiError> {
+    lifecycle_request_origin(&headers)?;
+    state
+        .storage
+        .get(&scan_id)
+        .map(NoStoreJson)
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "storage_scan_not_found",
+            message: "The storage scan expired or was replaced; start a new scan".to_owned(),
+        })
 }
 
 async fn put_artifact(
@@ -6297,6 +6353,7 @@ mod tests {
                 store,
                 artifacts,
                 ghostty_launcher,
+                crate::storage_inventory_service::StorageScanSettings::not_configured(),
                 None,
                 crate::ConnectionTracker::default(),
             ),
@@ -7010,6 +7067,7 @@ mod tests {
             store,
             artifacts,
             noop_ghostty_launcher,
+            crate::storage_inventory_service::StorageScanSettings::not_configured(),
             Some(receiver),
             connections.clone(),
         );
@@ -17448,5 +17506,169 @@ mod tests {
             assignment_json(&app, &project_id, &assignment_id).await["lifecycle"],
             "cancelled"
         );
+    }
+
+    async fn storage_test_router(
+        storage: crate::storage_inventory_service::StorageScanSettings,
+    ) -> (Router, TempDir) {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = test_router_with_shutdown(
+            Arc::new(FakeInventory),
+            runtime.clone(),
+            runtime.clone(),
+            runtime,
+            store,
+            artifacts,
+            noop_ghostty_launcher,
+            storage,
+            None,
+            crate::ConnectionTracker::default(),
+        );
+        (app, temp)
+    }
+
+    async fn storage_request(
+        app: &Router,
+        method: Method,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let mut request = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        app.clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn storage_scans_are_not_configured_without_roots_and_guard_requests() {
+        let (app, _temp) = test_router().await;
+
+        let response = storage_request(&app, Method::POST, "/api/v1/storage/scans", &[]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = response_json(response).await;
+        assert_eq!(body["status"], "not_configured");
+        assert_eq!(body["id"], serde_json::Value::Null);
+        assert_eq!(body["candidates"], serde_json::json!([]));
+
+        for (method, uri) in [
+            (Method::POST, "/api/v1/storage/scans"),
+            (Method::GET, "/api/v1/storage/scans/any"),
+        ] {
+            for (headers, code) in [
+                (
+                    &[
+                        ("origin", "https://evil.example"),
+                        ("host", "127.0.0.1:4317"),
+                    ][..],
+                    "request_origin_forbidden",
+                ),
+                (
+                    &[
+                        ("origin", "http://127.0.0.1:4317"),
+                        ("host", "yard.attacker.test"),
+                    ][..],
+                    "request_host_forbidden",
+                ),
+            ] {
+                let response = storage_request(&app, method.clone(), uri, headers).await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::FORBIDDEN,
+                    "{uri} {headers:?}"
+                );
+                assert_eq!(response_json(response).await["error"]["code"], code);
+            }
+        }
+        let missing =
+            storage_request(&app, Method::GET, "/api/v1/storage/scans/missing", &[]).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response_json(missing).await["error"]["code"],
+            "storage_scan_not_found"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_scan_runs_in_the_background_and_reports_candidates() {
+        let roots = TempDir::new().unwrap();
+        let base = std::fs::canonicalize(roots.path()).unwrap();
+        let root = base.join("root");
+        let proc_root = base.join("proc");
+        std::fs::create_dir_all(root.join("app/target/debug")).unwrap();
+        std::fs::create_dir_all(&proc_root).unwrap();
+        std::fs::write(root.join("app/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(root.join("app/target/debug/app"), vec![1_u8; 8192]).unwrap();
+        let settings = crate::storage_inventory_service::StorageScanSettings {
+            roots: Some(vec![root.clone()]),
+            current_exe: Some(PathBuf::from("/nonexistent/yard-http-storage-test")),
+            proc_root,
+            git_env: vec![("GIT_CONFIG_GLOBAL".into(), "/dev/null".into())],
+            git_ceilings: vec![base.parent().unwrap().to_path_buf()],
+            ..crate::storage_inventory_service::StorageScanSettings::not_configured()
+        };
+        let (app, _temp) = storage_test_router(settings).await;
+
+        let started = storage_request(
+            &app,
+            Method::POST,
+            "/api/v1/storage/scans",
+            &[
+                ("origin", "http://127.0.0.1:4317"),
+                ("host", "127.0.0.1:4317"),
+            ],
+        )
+        .await;
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+        let location = started.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = response_json(started).await;
+        assert_eq!(body["status"], "running");
+        let id = body["id"].as_str().unwrap().to_owned();
+        assert_eq!(location, format!("/api/v1/storage/scans/{id}"));
+
+        let mut scan = serde_json::Value::Null;
+        for _ in 0..400 {
+            scan = get_json(&app, &location).await;
+            if scan["status"] != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(scan["status"], "completed", "{scan}");
+        assert_eq!(scan["roots"], serde_json::json!([root.to_string_lossy()]));
+        let candidates = scan["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1, "{scan}");
+        let target = &candidates[0];
+        assert_eq!(
+            target["path"],
+            root.join("app/target").to_string_lossy().as_ref()
+        );
+        assert_eq!(target["class"], "rust_target");
+        assert_eq!(target["safety"], "safe", "{target}");
+        assert!(target["bytes"].as_u64().unwrap() >= 8192);
+        assert!(target["id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert_eq!(scan["totals"]["safe"]["count"], 1);
+        assert!(scan["expires_at_unix_ms"].as_u64().is_some());
+
+        let replaced = storage_request(&app, Method::POST, "/api/v1/storage/scans", &[]).await;
+        assert_eq!(replaced.status(), StatusCode::ACCEPTED);
+        let replacement = response_json(replaced).await;
+        assert_ne!(replacement["id"], id.as_str());
+        let old = storage_request(&app, Method::GET, &location, &[]).await;
+        assert_eq!(old.status(), StatusCode::NOT_FOUND);
     }
 }

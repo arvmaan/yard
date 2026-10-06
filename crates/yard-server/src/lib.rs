@@ -5,6 +5,7 @@ pub mod automation_service;
 pub mod cleanup_retirement;
 pub mod config;
 pub mod coordination_node_service;
+mod git_probe;
 mod http;
 pub mod intervention_service;
 pub mod inventory_service;
@@ -20,6 +21,9 @@ pub mod reconciliation_service;
 pub mod repository_files_service;
 pub mod runtime_cleanup_service;
 mod status_protocol;
+mod storage_classify;
+pub mod storage_inventory_service;
+mod storage_walk;
 pub mod summary_worker_service;
 pub mod terminal_service;
 pub mod transcript_capture_service;
@@ -41,6 +45,7 @@ use intervention_service::{InterventionService, RuntimeIntervention};
 use inventory_service::InventorySource;
 use reconciliation_service::ReconciliationService;
 use std::path::PathBuf;
+use storage_inventory_service::StorageScanSettings;
 use terminal_service::RuntimeTerminal;
 use tokio::sync::{Notify, watch};
 use yard_store::YardStore;
@@ -230,6 +235,7 @@ pub fn app_with_reconciliation_and_paths_and_automation(
         orchestrator_cwd,
         coordination_path,
         knowledge_path,
+        StorageScanSettings::not_configured(),
         None,
         ConnectionTracker::default(),
     )
@@ -248,6 +254,7 @@ pub fn app_with_reconciliation_and_paths_and_automation_and_shutdown(
     orchestrator_cwd: PathBuf,
     coordination_path: PathBuf,
     knowledge_path: PathBuf,
+    storage: StorageScanSettings,
     shutdown: watch::Receiver<bool>,
 ) -> (Router, AutomationService, ConnectionTracker) {
     let connections = ConnectionTracker::default();
@@ -262,6 +269,7 @@ pub fn app_with_reconciliation_and_paths_and_automation_and_shutdown(
         orchestrator_cwd,
         coordination_path,
         knowledge_path,
+        storage,
         Some(shutdown),
         connections.clone(),
     );
@@ -280,6 +288,7 @@ fn build_app_with_reconciliation_and_paths_and_automation(
     orchestrator_cwd: PathBuf,
     coordination_path: PathBuf,
     knowledge_path: PathBuf,
+    storage: StorageScanSettings,
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
 ) -> (Router, AutomationService) {
@@ -314,6 +323,7 @@ fn build_app_with_reconciliation_and_paths_and_automation(
         coordination_path,
         knowledge_path,
         automations.clone(),
+        storage,
         shutdown,
         connections,
     );

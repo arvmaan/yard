@@ -56,6 +56,7 @@ tabs do not provide:
 - [Projects and workers](#projects-and-workers)
 - [Orchestration](#orchestration)
 - [Knowledge and automations](#knowledge-and-automations)
+- [Storage preview](#storage-preview)
 - [Architecture](#architecture)
 - [Configuration](#configuration)
 - [Development and verification](#development-and-verification)
@@ -331,6 +332,53 @@ Automations are recurring prompts attached to an orchestration scope:
 Schedules are daily and timezone-aware in v0.1. Every run has a durable record,
 and successful delivery means only that the prompt reached its target.
 
+## Storage preview
+
+Yard can report reclaimable build output under the directories named in
+`YARD_STORAGE_ROOTS`. This is a preview: **Yard deletes nothing yet**, and no
+API accepts a filesystem path. When the variable is unset, nothing is scanned
+and the API answers `not_configured`.
+
+- `POST /api/v1/storage/scans` starts the single scan, or joins it while it is
+  running, and answers `202 Accepted` with a `Location`. The request has no body.
+- `GET /api/v1/storage/scans/{id}` returns the scan: its status, truncation,
+  totals by safety, and candidates largest first. Each candidate has a
+  server-issued ID, canonical path, class, allocated bytes (a hard-linked file counts
+  once, and only when all of its links are inside the candidate; otherwise it
+  is reported separately as shared), newest modification time, owner, and a
+  `safe`, `review`, or `blocked` state with reasons. Only the last scan is kept,
+  in memory, for 15 minutes.
+
+Candidates need an exact directory name and a sibling marker: Rust `target/`
+(`Cargo.toml`), `node_modules/` (`package.json`, always review), Vite `dist/`
+(`vite.config.*`), Gradle `build/` and `.gradle/` (`build.gradle[.kts]` or
+`settings.gradle[.kts]`), and a marked workspace's
+`build/`, `env/`, `.build/`, and `.build-logs/` (a file named in
+`YARD_STORAGE_WORKSPACE_MARKERS` next to a `src/` directory; with no marker
+configured these workspace classes are off).
+Generated output inside a Git work tree is `safe` only when it holds no tracked
+files and Git ignores it. Nothing inside a workspace `src/` is ever a candidate; any
+uncommitted, untracked, unpushed, or stashed work in a nested package repository
+moves the workspace's `build/` and `env/` to review. Registered linked Git
+worktrees are `safe` only when Yard recorded the checkout and it is unlocked,
+clean (including untracked and ignored user files, skip-worktree or
+assume-unchanged entries, and nested repositories or submodules), pushed, and
+merged into the remote default branch (a configured root is never itself a
+candidate); otherwise they are blocked with a reason such as
+`Blocked: uncommitted changes`. Anything in use by a live Herdr pane or (on
+Linux) a process is blocked, and every candidate is blocked when that check
+cannot run (for example on macOS, which has no `/proc`). Unrecognized
+`.worktrees/*` entries are reported as `unknown` and are never cleanable.
+
+The scan never follows symlinks, never crosses into another file system, skips
+Yard's own data, runtime, and executable paths, and runs one at a time under
+entry and time budgets. It finds every candidate before sizing any, so when a
+budget runs out the unsized candidates are still listed (truncated, never better
+than `review`) and any directory that was never searched is named in `notes`.
+Stopping Yard cancels a running walk. Git
+runs read-only with no fetch. Both requests accept only a loopback `Host` and,
+from a browser, a loopback `Origin`; this is provenance, not authentication.
+
 ## Architecture
 
 Yard is a Rust workspace with a React client embedded in the `yard`
@@ -374,6 +422,9 @@ exclusively owns a database.
 | `YARD_KNOWLEDGE_PATH` | managed knowledge snapshots | `knowledge/` beside the database |
 | `YARD_ORCHESTRATOR_CWD` | working directory for the superintendent | process working directory |
 | `YARD_RUNTIME_DIR` | private base directory for database-scoped lifecycle state and logs | `$XDG_RUNTIME_DIR/yard` or UID-qualified temporary directory |
+| `YARD_STORAGE_ROOTS` | colon-separated absolute directories the read-only storage preview may scan; each must be an existing directory and not itself a symlink, including spellings such as `link/` or `link/.` (symlinked ancestors are fine), for example `/local/home/sample/workspaces:/home/sample/yard`; an invalid or missing entry stops `yard start` with a configuration error (fail closed) | unset: nothing is scanned |
+| `YARD_STORAGE_LOG_RETENTION_DAYS` | build logs newer than this many days keep a workspace candidate in review | `14` |
+| `YARD_STORAGE_WORKSPACE_MARKERS` | comma-separated file names that mark a workspace root (a directory holding one of them and a `src/` directory), for example `workspace.toml`; its `build/`, `env/`, `.build/`, and `.build-logs/` become workspace candidates | unset: workspace classes disabled |
 | `YARD_API_TARGET` | Vite development proxy target only | `http://127.0.0.1:4317` |
 
 Stop Yard before copying its database and managed directories for backup.
@@ -481,7 +532,9 @@ Yard 0.1 is an early, single-user local tool:
 - interrupted project creation, allocation, or handoff can retain a safety
   reservation without a self-service cancel or resolve workflow;
 - knowledge collection and automation delivery are transport events, not
-  completion evidence.
+  completion evidence;
+- the storage scan is a preview: it reports reclaimable output but cleanup is
+  not implemented yet.
 
 See [CHANGELOG.md](CHANGELOG.md) for the v0.1 feature summary.
 

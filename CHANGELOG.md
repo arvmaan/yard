@@ -54,6 +54,13 @@ a release is tagged.
   `project_restore_unavailable` with a `reason` (for example
   `herdr_unreachable`); retries replay by command ID. A restored project can be
   archived again.
+- Added a read-only storage preview: with `YARD_STORAGE_ROOTS` set,
+  `POST /api/v1/storage/scans` sizes Rust, Node, Vite, Gradle, and marked
+  workspace build output and registered Git worktrees, and classifies each as
+  safe, review, or blocked using Git and workspace source state and in-use
+  checks. Workspace roots are recognised only by the marker file names in
+  `YARD_STORAGE_WORKSPACE_MARKERS` (unset: workspace classes disabled).
+  Nothing is deleted yet.
 
 ### Changed
 
