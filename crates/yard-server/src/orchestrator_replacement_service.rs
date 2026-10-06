@@ -1015,7 +1015,7 @@ fn provider_displaced_runtime_cwd(
     })
 }
 
-fn verified_replacement_runtime(
+pub(crate) fn verified_replacement_runtime(
     mut runtime: WorkerRuntimeBinding,
     inventory: &RuntimeInventory,
 ) -> Result<WorkerRuntimeBinding, OrchestratorReplacementServiceError> {

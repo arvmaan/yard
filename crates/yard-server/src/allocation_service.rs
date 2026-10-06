@@ -19,6 +19,7 @@ use crate::intervention_service::{
 use crate::inventory_service::{InventoryServiceError, InventorySource};
 use crate::profile_runtime::{compile_profile_launch, materialize_profile_launch};
 use crate::runtime_cleanup_service::RuntimeCleanupService;
+use crate::runtime_identity::active_provider_session_matches;
 use crate::status_protocol::{with_orchestrator_status_contract, with_orchestrator_workflow};
 use crate::transcript_capture_service::TranscriptCaptureService;
 
@@ -1099,13 +1100,26 @@ impl AllocationService {
         if observed.workspace_id != runtime.workspace_id
             || observed.pane_id != runtime.pane_id
             || Some(observed.tab_id.as_str()) != runtime.tab_id.as_deref()
-            || runtime
-                .provider_session
-                .as_ref()
-                .is_some_and(|expected| observed.provider_session.as_ref() != Some(expected))
         {
             return Err(AllocationServiceError::RuntimeBindingUnverified(
                 "Herdr worker topology or provider identity changed".to_owned(),
+            ));
+        }
+        if !active_provider_session_matches(
+            runtime.provider_session.as_ref(),
+            observed.provider_session.as_ref(),
+        ) {
+            // Never prompt an unverified agent identity. A session Herdr reports but the
+            // binding has never recorded is adopted by worker inventory reconciliation, so a
+            // retry after the next inventory refresh passes the exact check.
+            let message = if runtime.provider_session.is_none() {
+                "Herdr reports a provider session this worker binding has not recorded yet; \
+                 refresh the runtime inventory and retry"
+            } else {
+                "Herdr worker topology or provider identity changed"
+            };
+            return Err(AllocationServiceError::RuntimeBindingUnverified(
+                message.to_owned(),
             ));
         }
         Ok(runtime.clone())
@@ -1137,6 +1151,10 @@ impl AllocationService {
                     "Provisioned Herdr terminal is not present in the fresh inventory".to_owned(),
                 )
             })?;
+        // Provisioning-time adoption, not active access: a freshly provisioned binding
+        // legitimately has no provider session until Herdr reports one, so a newly observed
+        // session is adopted below. Active prompt access uses the exact
+        // `active_provider_session_matches` (see `verify_live_worker`).
         if observed.workspace_id != runtime.workspace_id
             || observed.pane_id != runtime.pane_id
             || Some(observed.tab_id.as_str()) != runtime.tab_id.as_deref()

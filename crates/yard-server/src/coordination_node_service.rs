@@ -43,6 +43,7 @@ use crate::{
     },
     reconciliation_service::{ReconciliationService, ReconciliationServiceError},
     runtime_cleanup_service::RuntimeCleanupService,
+    runtime_identity::active_provider_session_matches,
     status_protocol::{
         validate_executable_orchestrator_workflow, with_orchestrator_status_contract,
         with_orchestrator_workflow,
@@ -945,11 +946,27 @@ impl CoordinationNodeService {
         if observed.workspace_id != runtime.workspace_id
             || observed.pane_id != runtime.pane_id
             || observed.tab_id != runtime.tab_id.as_deref().unwrap_or_default()
-            || runtime
-                .provider_session
-                .as_ref()
-                .is_some_and(|expected| observed.provider_session.as_ref() != Some(expected))
         {
+            return Err(CoordinationNodeServiceError::RuntimeBindingStale);
+        }
+        if !active_provider_session_matches(
+            runtime.provider_session.as_ref(),
+            observed.provider_session.as_ref(),
+        ) {
+            if runtime.provider_session.is_none() && observed.provider_session.is_some() {
+                // Herdr now reports a provider session this binding has never recorded.
+                // Never act on the unverified identity: reconcile now so the binding adopts
+                // the session (or is marked ambiguous), and reject this request as stale.
+                // A retry against the refreshed binding then passes the exact check.
+                if let Err(error) = self.reconciliation.refresh(&runtime.session).await {
+                    tracing::warn!(
+                        session = %runtime.session,
+                        worker_id = %worker.id,
+                        %error,
+                        "could not reconcile a newly reported provider session"
+                    );
+                }
+            }
             return Err(CoordinationNodeServiceError::RuntimeBindingStale);
         }
         Ok(())
@@ -980,6 +997,9 @@ impl CoordinationNodeService {
                         && Some(worker.tab_id.as_str()) == runtime.tab_id.as_deref()
                         && worker.pane_id == runtime.pane_id
                         && worker.interactive_ready
+                        // Provisioning-time, not active access: the binding may have no
+                        // provider session yet because Herdr has not reported one. Active
+                        // access uses the exact `active_provider_session_matches`.
                         && runtime.provider_session.as_ref().is_none_or(|expected| {
                             worker.provider_session.as_ref() == Some(expected)
                         })
@@ -1446,12 +1466,13 @@ mod tests {
     use async_trait::async_trait;
     use tempfile::TempDir;
     use yard_domain::{
-        ArchiveProject, CanvasPlacement, CoordinationDeliveryStatus, CoordinationNodeKind,
-        CreateCoordinationNode, CreateProject, CreateWorkerProfile, FocusObservation,
-        ObservedStatus, ObservedWorker, ProjectRuntimeBinding, ProviderSessionRef,
-        ProvisionCoordinationNode, RequestCoordinationSnapshot, RuntimeInventory,
-        RuntimeObservationState, RuntimeProcessState, RuntimeSession, RuntimeSessions,
-        SendCoordinationNodePrompt, SnapshotCollectionStatus, TransferProjectOrchestrator,
+        ArchiveProject, CanvasPlacement, CoordinationDeliveryStatus, CoordinationNode,
+        CoordinationNodeKind, CoordinationNodePromptAcknowledgement, CreateCoordinationNode,
+        CreateProject, CreateWorkerProfile, FocusObservation, ObservedStatus, ObservedWorker,
+        ProjectRuntimeBinding, ProviderSessionRef, ProvisionCoordinationNode,
+        RequestCoordinationSnapshot, RuntimeInventory, RuntimeObservationState,
+        RuntimeProcessState, RuntimeSession, RuntimeSessions, SendCoordinationNodePrompt,
+        SnapshotCollectionStatus, TerminalOutputFormat, TransferProjectOrchestrator,
         WorkerProfileSpec, WorkerRuntimeBinding, WorkspaceObservation,
     };
     use yard_store::{SqliteProjectStore, YardStore};
@@ -1465,7 +1486,9 @@ mod tests {
             RuntimeIntervention, RuntimeInterventionError, RuntimeOutputRequest,
             RuntimeOutputResult, RuntimePromptRequest, RuntimePromptResult,
         },
-        inventory_service::{InventoryServiceError, InventorySource, seed_inventory_workers},
+        inventory_service::{
+            InventoryServiceError, InventorySource, seed_inventory_workers, start_failure_error,
+        },
         reconciliation_service::ReconciliationService,
     };
 
@@ -1479,10 +1502,13 @@ mod tests {
     struct FakeRuntime {
         live: AtomicBool,
         omit_provider_session: AtomicBool,
+        observed_provider_session: Mutex<Option<String>>,
+        output_reads: AtomicU64,
         observed_at: AtomicU64,
         session_requests: Mutex<Vec<RuntimeSessionRequest>>,
         bootstrap: Mutex<Option<RuntimeWorkspaceProvisionRequest>>,
         provision_failure: Mutex<Option<RuntimeProvisionError>>,
+        start_failure: Mutex<Option<RuntimeProvisionError>>,
         prompts: Mutex<Vec<RuntimePromptRequest>>,
         project_mutation: Mutex<Option<(PathBuf, String, String)>>,
         project_read_failure: Mutex<Option<PathBuf>>,
@@ -1576,6 +1602,10 @@ mod tests {
                             &request.agent_name,
                             "coordination-provider-session",
                         );
+                        if let Some(value) = self.observed_provider_session.lock().unwrap().as_ref()
+                        {
+                            worker.provider_session = Some(provider_session(value));
+                        }
                         if self.omit_provider_session.load(Ordering::SeqCst) {
                             worker.provider_session = None;
                         }
@@ -1610,6 +1640,18 @@ mod tests {
                 runtime.provider_session = None;
             }
             Ok(runtime)
+        }
+
+        async fn start_prepared_workspace_worker(
+            &self,
+            _request: RuntimeWorkspaceProvisionRequest,
+            prepared: WorkerRuntimeBinding,
+        ) -> Result<WorkerRuntimeBinding, RuntimeProvisionError> {
+            if let Some(error) = self.start_failure.lock().unwrap().take() {
+                self.live.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
+            Ok(prepared)
         }
 
         async fn provision_worker(
@@ -1662,6 +1704,7 @@ mod tests {
             &self,
             request: RuntimeOutputRequest,
         ) -> Result<RuntimeOutputResult, RuntimeInterventionError> {
+            self.output_reads.fetch_add(1, Ordering::SeqCst);
             Ok(RuntimeOutputResult {
                 pane_id: request.pane_id,
                 workspace_id: "coordination-workspace".to_owned(),
@@ -1838,6 +1881,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn definite_start_rejection_with_failed_cleanup_is_not_quarantined() {
+        let (service, store, runtime, temp) = setup().await;
+        let created = service
+            .create(create_command(
+                CoordinationNodeKind::Workstream,
+                Vec::new(),
+                "create-rejected-workstream",
+            ))
+            .await
+            .unwrap();
+        let profile = store.create_worker_profile(profile()).await.unwrap();
+        // What the Herdr adapter reports for a definite `agent.start` rejection whose
+        // `workspace.close` rollback then failed.
+        let failure = start_failure_error(
+            yard_herdr::HerdrError::Api {
+                code: "agent_name_taken".to_owned(),
+                message: "agent name is already in use".to_owned(),
+            },
+            "Herdr API returned workspace_close_failed: workspace is still busy".to_owned(),
+            false,
+            None,
+        );
+        let RuntimeProvisionError::AfterPreparation {
+            ambiguous: false,
+            started_runtime: None,
+            ..
+        } = &failure
+        else {
+            panic!("expected a definite after-preparation failure, got {failure:?}");
+        };
+        // Preparation succeeds; Herdr rejects the `agent.start` that follows the claim, as
+        // `HerdrInventorySource::start_prepared_workspace_worker` does in production.
+        *runtime.start_failure.lock().unwrap() = Some(failure);
+        let command = ProvisionCoordinationNode {
+            command_id: "provision-rejected-workstream".to_owned(),
+            actor: "local-user".to_owned(),
+            profile_id: profile.id,
+            expected_profile_version: profile.version,
+            expected_node_version: created.node.version,
+        };
+
+        let error = service
+            .provision(&created.node.id, command.clone())
+            .await
+            .unwrap_err();
+
+        let CoordinationNodeServiceError::RuntimeProvision(message) = error else {
+            panic!("expected a definite provisioning failure, got {error:?}");
+        };
+        assert!(message.contains("workspace_close_failed"));
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM command_acknowledgements WHERE id = ?1",
+                [&command.command_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let quarantined: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM quarantined_provisioning_runtime_bindings",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let claims: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM provisioning_runtime_claims WHERE command_id = ?1",
+                [&command.command_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(runtime.bootstrap.lock().unwrap().is_some());
+        assert!(runtime.start_failure.lock().unwrap().is_none());
+        assert_eq!(status, "failed");
+        assert_eq!(quarantined, 0);
+        assert_eq!(claims, 0);
+        assert!(
+            service
+                .get(&created.node.id)
+                .await
+                .unwrap()
+                .worker
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn provisions_interactive_workstream_without_provider_session() {
         let (service, store, runtime, _temp) = setup().await;
         runtime.omit_provider_session.store(true, Ordering::SeqCst);
@@ -1916,6 +2047,241 @@ mod tests {
             error,
             CoordinationNodeServiceError::RuntimeBindingStale
         ));
+        assert!(runtime.prompts.lock().unwrap().is_empty());
+    }
+
+    async fn provision_workstream(
+        service: &CoordinationNodeService,
+        store: &SqliteProjectStore,
+        label: &str,
+    ) -> CoordinationNode {
+        let created = service
+            .create(create_command(
+                CoordinationNodeKind::Workstream,
+                Vec::new(),
+                &format!("create-{label}"),
+            ))
+            .await
+            .unwrap();
+        let profile = store.create_worker_profile(profile()).await.unwrap();
+        service
+            .provision(
+                &created.node.id,
+                ProvisionCoordinationNode {
+                    command_id: format!("provision-{label}"),
+                    actor: "local-user".to_owned(),
+                    profile_id: profile.id,
+                    expected_profile_version: profile.version,
+                    expected_node_version: created.node.version,
+                },
+            )
+            .await
+            .unwrap()
+            .node
+    }
+
+    async fn prompt_node(
+        service: &CoordinationNodeService,
+        node: &CoordinationNode,
+        command_id: &str,
+    ) -> Result<CoordinationNodePromptAcknowledgement, CoordinationNodeServiceError> {
+        service
+            .prompt(
+                &node.id,
+                SendCoordinationNodePrompt {
+                    command_id: command_id.to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_node_version: node.version,
+                    worker_id: node.worker.as_ref().unwrap().id.clone(),
+                    text: "Report current blockers.".to_owned(),
+                },
+            )
+            .await
+    }
+
+    fn node_provider_session(node: &CoordinationNode) -> Option<ProviderSessionRef> {
+        node.worker
+            .as_ref()
+            .and_then(|worker| worker.runtime.as_ref())
+            .and_then(|runtime| runtime.provider_session.clone())
+    }
+
+    #[tokio::test]
+    async fn rejects_workstream_prompt_when_unrecorded_provider_session_appears() {
+        let (service, store, runtime, _temp) = setup().await;
+        runtime.omit_provider_session.store(true, Ordering::SeqCst);
+        let node = provision_workstream(&service, &store, "unrecorded-session-prompt").await;
+        assert_eq!(node_provider_session(&node), None);
+        runtime.omit_provider_session.store(false, Ordering::SeqCst);
+
+        let error = prompt_node(&service, &node, "prompt-unverified-session")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CoordinationNodeServiceError::RuntimeBindingStale
+        ));
+        assert!(runtime.prompts.lock().unwrap().is_empty());
+
+        // The rejection reconciled the binding, so a retry against the re-read node sees
+        // the adopted session and passes the exact check.
+        let reconciled = service.get(&node.id).await.unwrap();
+        assert_eq!(
+            node_provider_session(&reconciled),
+            Some(provider_session("coordination-provider-session"))
+        );
+        prompt_node(&service, &reconciled, "prompt-after-reconciliation")
+            .await
+            .unwrap();
+        assert_eq!(runtime.prompts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_workstream_output_when_unrecorded_provider_session_appears() {
+        let (service, store, runtime, _temp) = setup().await;
+        runtime.omit_provider_session.store(true, Ordering::SeqCst);
+        let node = provision_workstream(&service, &store, "unrecorded-session-output").await;
+        runtime.omit_provider_session.store(false, Ordering::SeqCst);
+
+        let error = service
+            .read_output(&node.id, 20, TerminalOutputFormat::Text)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CoordinationNodeServiceError::RuntimeBindingStale
+        ));
+        assert_eq!(runtime.output_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_workstream_terminal_when_unrecorded_provider_session_appears() {
+        let (service, store, runtime, _temp) = setup().await;
+        runtime.omit_provider_session.store(true, Ordering::SeqCst);
+        let node = provision_workstream(&service, &store, "unrecorded-session-terminal").await;
+        runtime.omit_provider_session.store(false, Ordering::SeqCst);
+
+        // `TerminalService::open_coordination_node` and the Slack console gate on this.
+        let error = service.validate_node_binding(&node).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            CoordinationNodeServiceError::RuntimeBindingStale
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_workstream_access_when_provider_session_changes() {
+        let (service, store, runtime, _temp) = setup().await;
+        let node = provision_workstream(&service, &store, "changed-session").await;
+        *runtime.observed_provider_session.lock().unwrap() =
+            Some("replacement-provider-session".to_owned());
+
+        let prompt_error = prompt_node(&service, &node, "prompt-changed-session")
+            .await
+            .unwrap_err();
+        let output_error = service
+            .read_output(&node.id, 20, TerminalOutputFormat::Text)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            prompt_error,
+            CoordinationNodeServiceError::RuntimeBindingStale
+        ));
+        assert!(matches!(
+            output_error,
+            CoordinationNodeServiceError::RuntimeBindingStale
+        ));
+        assert!(runtime.prompts.lock().unwrap().is_empty());
+        assert_eq!(runtime.output_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_provider_session_allows_workstream_prompt_and_output() {
+        let (service, store, runtime, _temp) = setup().await;
+        let node = provision_workstream(&service, &store, "exact-session").await;
+        assert_eq!(
+            node_provider_session(&node),
+            Some(provider_session("coordination-provider-session"))
+        );
+
+        prompt_node(&service, &node, "prompt-exact-session")
+            .await
+            .unwrap();
+        service
+            .read_output(&node.id, 20, TerminalOutputFormat::Text)
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.prompts.lock().unwrap().len(), 1);
+        assert_eq!(runtime.output_reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_orchestrator_with_unrecorded_provider_session() {
+        let (service, store, runtime, _temp) = setup().await;
+        let mut orchestrator = binding(
+            "default",
+            "project-workspace",
+            "project-terminal",
+            "project-tab",
+            "project-pane",
+            "project-provider-session",
+        );
+        orchestrator.provider_session = None;
+        let project = store
+            .create_project(
+                CreateProject {
+                    name: "Project".to_owned(),
+                    runtime: ProjectRuntimeBinding {
+                        adapter: "herdr".to_owned(),
+                        session: "default".to_owned(),
+                        workspace_id: "project-workspace".to_owned(),
+                    },
+                    orchestrator_observed_worker_id: "project-terminal".to_owned(),
+                    placement: placement(),
+                },
+                orchestrator,
+            )
+            .await
+            .unwrap();
+        let node = service
+            .create(create_command(
+                CoordinationNodeKind::KnowledgeStore,
+                vec![project.id.clone()],
+                "create-knowledge-unrecorded-orchestrator-session",
+            ))
+            .await
+            .unwrap()
+            .node;
+
+        let snapshot = service
+            .request_snapshot(
+                &node.id,
+                RequestCoordinationSnapshot {
+                    command_id: "snapshot-unrecorded-orchestrator-session".to_owned(),
+                    actor: "local-user".to_owned(),
+                    expected_node_version: node.version,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshot.projects[0].delivery_status,
+            CoordinationDeliveryStatus::Failed
+        );
+        assert_eq!(
+            snapshot.projects[0].delivery_error.as_deref(),
+            Some(
+                CoordinationNodeServiceError::RuntimeBindingStale
+                    .to_string()
+                    .as_str()
+            )
+        );
         assert!(runtime.prompts.lock().unwrap().is_empty());
     }
 

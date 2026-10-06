@@ -8783,6 +8783,123 @@ mod tests {
         server.abort();
     }
 
+    /// `FakeInventory` whose assigned worker, once `continued` is set, reports
+    /// a new provider thread id in the same pane (a Codex context compaction).
+    struct ContinuedProviderSessionInventory {
+        continued: AtomicBool,
+    }
+
+    #[async_trait]
+    impl InventorySource for ContinuedProviderSessionInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            FakeInventory.sessions().await
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            let mut inventory = FakeInventory.inventory(session_name).await?;
+            if self.continued.load(Ordering::SeqCst) {
+                inventory.observed_at_unix_ms = 2;
+                for worker in &mut inventory.workers {
+                    if let Some(session) = worker.provider_session.as_mut()
+                        && session.value.starts_with("yard-prompta-")
+                    {
+                        session.value.push_str("-compacted");
+                    }
+                }
+            }
+            Ok(inventory)
+        }
+    }
+
+    #[tokio::test]
+    async fn assignment_terminal_and_output_survive_a_provider_session_continuation() {
+        let source = Arc::new(ContinuedProviderSessionInventory {
+            continued: AtomicBool::new(false),
+        });
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(
+            SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let runtime = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            source.clone(),
+            runtime.clone(),
+            runtime.clone(),
+            runtime,
+            store.clone(),
+            artifacts,
+        );
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, app.clone()).into_future());
+        let terminal_url = format!(
+            "ws://{address}/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal?cols=80&rows=24"
+        );
+        let open_terminal = || {
+            let mut request = terminal_url.clone().into_client_request().unwrap();
+            request.headers_mut().insert(
+                header::ORIGIN,
+                axum::http::HeaderValue::from_static("http://127.0.0.1:5173"),
+            );
+            connect_async(request)
+        };
+        let (mut open_socket, response) = open_terminal().await.unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert!(matches!(
+            open_socket.next().await.unwrap().unwrap(),
+            TungsteniteMessage::Text(_)
+        ));
+
+        source.continued.store(true, Ordering::SeqCst);
+        let reconciliation = store
+            .reconcile_runtime_inventory(source.inventory("default").await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(reconciliation.ambiguous_bindings, 0);
+        let assignments = store.list_project_assignments(&project_id).await.unwrap();
+        let continued = assignments.assignments[0].worker.runtime.as_ref().unwrap();
+        assert_eq!(
+            continued.provider_session.as_ref().unwrap().value,
+            "yard-prompta-345234a24b29951c-session-compacted"
+        );
+
+        let output = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal-output"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.status(), StatusCode::OK);
+
+        let (mut reopened, response) = open_terminal().await.unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert!(matches!(
+            reopened.next().await.unwrap().unwrap(),
+            TungsteniteMessage::Text(_)
+        ));
+
+        // The lease is revalidated every 250 ms; a continuation must not revoke it.
+        let revoked =
+            tokio::time::timeout(std::time::Duration::from_millis(750), open_socket.next()).await;
+        assert!(revoked.is_err(), "open terminal was closed: {revoked:?}");
+
+        server.abort();
+    }
+
     #[tokio::test]
     async fn orchestrator_replacement_revokes_open_project_terminal() {
         let (app, _temp, _runtime) = handoff_test_router().await;
@@ -13716,6 +13833,158 @@ done
             assigned_candidate["assignment_id"],
             assigned["assignment"]["id"]
         );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn rejects_live_worker_assignment_when_unrecorded_provider_session_appears() {
+        // The binding is persisted without a provider session, but Herdr now reports one on
+        // the same terminal, pane and tab. Yard must not prompt that unverified agent.
+        let snapshot = ProviderlessWorkerInventory
+            .inventory("default")
+            .await
+            .unwrap();
+        let (app, temp) = test_router_with_source(Arc::new(FakeInventory)).await;
+        seed_inventory_workers(
+            &temp.path().join("yard.sqlite3"),
+            &snapshot,
+            &["terminal-1", "terminal-yard-prompta-345234a24b29951c"],
+        );
+        let project = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/projects")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(create_body("terminal-1")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let profile = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/worker-profiles")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(profile_body("Implementer")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let live_candidate = |candidates: serde_json::Value| {
+            candidates["workers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|candidate| {
+                    candidate["worker"]["runtime"]["terminal_id"]
+                        == "terminal-yard-prompta-345234a24b29951c"
+                })
+                .unwrap()
+                .clone()
+        };
+        let list_workers = || {
+            app.clone().oneshot(
+                Request::builder()
+                    .uri("/api/v1/workers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        let candidate = live_candidate(response_json(list_workers().await.unwrap()).await);
+        assert_eq!(candidate["availability"], "unassigned_live");
+        assert!(candidate["worker"]["runtime"]["provider_session"].is_null());
+        let assignment_uri = format!(
+            "/api/v1/projects/{}/assignments",
+            project["id"].as_str().unwrap()
+        );
+        let assign = |command_id: &str,
+                      candidate: &serde_json::Value,
+                      project_version: &serde_json::Value| {
+            // A failed attempt pins the profile, and a pinned worker takes no profile fields.
+            let unpinned = candidate["worker"]["profile_id"].is_null();
+            let command = serde_json::json!({
+                "command_id": command_id,
+                "actor": "local-user",
+                "worker_id": candidate["worker"]["id"],
+                "expected_worker_version": candidate["worker"]["version"],
+                "profile_id": if unpinned { profile["id"].clone() } else { serde_json::Value::Null },
+                "expected_profile_version":
+                    if unpinned { profile["version"].clone() } else { serde_json::Value::Null },
+                "expected_project_version": project_version,
+                "objective": "Continue in the existing Herdr worker.",
+                "role": "implementer",
+                "isolation_policy": "project_workspace"
+            });
+            app.clone().oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&assignment_uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+        };
+
+        let response = assign("assign-unverified-live", &candidate, &project["version"])
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = response_json(response).await;
+        assert_eq!(error["error"]["code"], "command_outcome_ambiguous");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("has not recorded yet"),
+            "{error}"
+        );
+        // The assignment prompt was never delivered: the worker is still unassigned.
+        let candidate = live_candidate(response_json(list_workers().await.unwrap()).await);
+        assert_eq!(candidate["availability"], "unassigned_live");
+
+        // Inventory reconciliation adopts the observed session; a retry then passes.
+        let inventory_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/sessions/default/inventory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inventory_response.status(), StatusCode::OK);
+        let candidate = live_candidate(response_json(list_workers().await.unwrap()).await);
+        assert!(!candidate["worker"]["runtime"]["provider_session"].is_null());
+        let project = response_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/api/v1/projects/{}",
+                            project["id"].as_str().unwrap()
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let response = assign("assign-verified-live", &candidate, &project["version"])
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response_json(response).await;
+        assert_eq!(status, StatusCode::CREATED, "{body} {candidate}");
     }
 
     #[allow(clippy::too_many_lines)]

@@ -16,6 +16,7 @@ use yard_store::{
 };
 
 use crate::inventory_service::{InventoryServiceError, InventorySource};
+use crate::runtime_identity::active_provider_session_matches;
 use crate::status_protocol::{
     validate_executable_orchestrator_workflow, with_orchestrator_status_contract,
     with_orchestrator_workflow,
@@ -938,13 +939,6 @@ fn same_runtime_identity(left: &WorkerRuntimeBinding, right: &WorkerRuntimeBindi
         && left.provider_session == right.provider_session
 }
 
-fn active_provider_session_matches(
-    expected: Option<&yard_domain::ProviderSessionRef>,
-    observed: Option<&yard_domain::ProviderSessionRef>,
-) -> bool {
-    expected == observed
-}
-
 #[derive(Debug, Error)]
 pub enum RuntimeInterventionError {
     #[error("{0}")]
@@ -987,44 +981,4 @@ pub enum InterventionServiceError {
     AutomaticTokenSpendDisabled,
     #[error("lines must be between 1 and 10000")]
     InvalidLineCount,
-}
-
-#[cfg(test)]
-mod tests {
-    use yard_domain::ProviderSessionRef;
-
-    use super::active_provider_session_matches;
-
-    fn session(value: &str) -> ProviderSessionRef {
-        ProviderSessionRef {
-            source: "herdr:codex".to_owned(),
-            provider: "codex".to_owned(),
-            kind: "id".to_owned(),
-            value: value.to_owned(),
-        }
-    }
-
-    #[test]
-    fn provider_session_requires_an_exact_observation() {
-        let observed = session("observed");
-
-        assert!(active_provider_session_matches(None, None));
-        assert!(!active_provider_session_matches(None, Some(&observed)));
-    }
-
-    #[test]
-    fn known_provider_session_requires_an_exact_observation() {
-        let expected = session("expected");
-        let observed = session("observed");
-
-        assert!(active_provider_session_matches(
-            Some(&expected),
-            Some(&expected)
-        ));
-        assert!(!active_provider_session_matches(Some(&expected), None));
-        assert!(!active_provider_session_matches(
-            Some(&expected),
-            Some(&observed)
-        ));
-    }
 }

@@ -27,6 +27,7 @@ use crate::{
     intervention_service::{RuntimeIntervention, RuntimeInterventionError, RuntimePromptRequest},
     inventory_service::runtime_binding_from_observed_worker,
     reconciliation_service::{ReconciliationService, ReconciliationServiceError},
+    runtime_identity::active_provider_session_matches,
     status_protocol::{
         validate_executable_orchestrator_workflow, with_orchestrator_status_contract,
         with_orchestrator_workflow,
@@ -736,10 +737,18 @@ impl YardOrchestratorService {
             })
             .ok_or(YardOrchestratorServiceError::RecoveryBindingMissing)?
             .clone();
+        // Recovery prompts an existing pane, which is active access: the reconciled binding
+        // must carry exactly the provider session Herdr reports. The refresh that produced
+        // `restored` adopts a newly reported session, so a `None -> Some` change lands in
+        // `runtime` before this check. The `current_runtime` checks only pin a known session.
         if current_runtime
             .provider_session
             .as_ref()
             .is_some_and(|expected| runtime.provider_session.as_ref() != Some(expected))
+            || !active_provider_session_matches(
+                runtime.provider_session.as_ref(),
+                restored.provider_session.as_ref(),
+            )
         {
             return Err(YardOrchestratorServiceError::RecoveryBindingAmbiguous);
         }
@@ -978,6 +987,9 @@ impl YardOrchestratorService {
                         && Some(worker.tab_id.as_str()) == runtime.tab_id.as_deref()
                         && worker.pane_id == runtime.pane_id
                         && worker.interactive_ready
+                        // Provisioning-time, not active access: the binding may have no
+                        // provider session yet because Herdr has not reported one. Active
+                        // access uses the exact `active_provider_session_matches`.
                         && runtime.provider_session.as_ref().is_none_or(|expected| {
                             worker.provider_session.as_ref() == Some(expected)
                         })
@@ -2254,6 +2266,35 @@ mod tests {
             worker_id
         );
         assert_eq!(runtime.bootstrap_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.prompt_requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_prompt_requires_the_reconciled_provider_session() {
+        let runtime = Arc::new(DedicatedRuntime::default());
+        runtime.omit_provider_session.store(true, Ordering::SeqCst);
+        let (service, store, _temp, profile_id) = service(runtime.clone()).await;
+        let configured = service.provision(command(&profile_id)).await.unwrap();
+        runtime.prompt_requests.lock().unwrap().clear();
+        // Herdr now reports a provider session the persisted binding never recorded.
+        runtime.omit_provider_session.store(false, Ordering::SeqCst);
+
+        let recovered = service
+            .recover(yard_domain::RecoverYardOrchestrator {
+                command_id: "recover-yard-orchestrator-new-provider-session".to_owned(),
+                actor: "local-user".to_owned(),
+                expected_orchestrator_version: configured.orchestrator.version,
+            })
+            .await
+            .unwrap();
+
+        let persisted = store.get_yard_orchestrator().await.unwrap();
+        let binding = persisted.worker.unwrap().runtime.unwrap();
+        assert_eq!(
+            binding.provider_session,
+            DedicatedRuntime::binding().provider_session
+        );
+        assert!(recovered.orchestrator.worker.is_some());
         assert_eq!(runtime.prompt_requests.lock().unwrap().len(), 1);
     }
 

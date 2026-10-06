@@ -12,6 +12,7 @@ mod orchestrator_workflow_profile;
 mod pane_management;
 mod profile;
 mod project;
+mod provider_command_line;
 mod repository_files;
 pub mod serde_u64;
 mod status_report;
@@ -124,6 +125,12 @@ pub use project::{
     RestoredOrchestratorRuntime, RestoredProject, RuntimeObservationState, RuntimeProcessState,
     SetProjectRepository, UpdateProjectPlacement, UpdateProjectWorkflowProfile, Worker,
     WorkerOwnershipKind, WorkerRuntimeBinding,
+};
+pub use provider_command_line::{
+    COMMAND_LINE_SESSION_PROVIDERS, CommandLineProviderSession, CommandLineSessionOverride,
+    ForegroundProcess, PaneForegroundJob, apply_command_line_provider_sessions,
+    command_line_provider_session_ref, is_canonical_session_uuid, provider_session_from_argv,
+    provider_session_from_foreground,
 };
 pub use repository_files::{
     RepositoryDiff, RepositoryDiffHunk, RepositoryDiffLine, RepositoryDiffLineKind, RepositoryFile,

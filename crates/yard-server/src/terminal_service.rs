@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yard_domain::{
-    Assignment, AssignmentLifecycle, AttemptLifecycle, ProviderSessionRef, WorkerRuntimeBinding,
+    Assignment, AssignmentLifecycle, AttemptLifecycle, ProviderSessionRef, RuntimeObservationState,
+    WorkerRuntimeBinding,
 };
 use yard_store::ProjectStoreError;
 
@@ -568,10 +569,36 @@ impl TerminalService {
                     .ok_or(TerminalServiceError::RuntimeBindingMissing)?
             }
         };
-        if TerminalRuntimeIdentity::from(&runtime) != lease.runtime {
+        if !lease.runtime.admits(&runtime) {
             return Err(TerminalServiceError::RuntimeBindingChanged);
         }
         Ok(())
+    }
+}
+
+impl TerminalRuntimeIdentity {
+    /// A lease survives only an unchanged binding, or a provider session that
+    /// reconciliation accepted as a continuation of the conversation on the
+    /// same observed terminal (a compaction starts a new provider thread id).
+    fn admits(&self, runtime: &WorkerRuntimeBinding) -> bool {
+        let current = Self::from(runtime);
+        if *self == current {
+            return true;
+        }
+        let continued = match (&self.provider_session, &current.provider_session) {
+            (Some(leased), Some(current)) => {
+                leased.source == current.source
+                    && leased.provider == current.provider
+                    && leased.kind == current.kind
+            }
+            _ => false,
+        };
+        continued
+            && runtime.observation_state == RuntimeObservationState::Observed
+            && Self {
+                provider_session: current.provider_session.clone(),
+                ..self.clone()
+            } == current
     }
 }
 

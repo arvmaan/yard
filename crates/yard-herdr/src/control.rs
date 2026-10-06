@@ -477,17 +477,13 @@ async fn start_agent_at_socket(
     let started = match started {
         Ok(started) => started,
         Err(start) => {
-            let rollback_covers_started_runtime = rollback.covers_started_runtime();
-            let started_runtime =
-                runtime_creation_outcome_ambiguous(&start).then(|| request.prepared.clone());
             return Err(start_failure_after_rollback(
                 config,
                 socket_path,
                 &request.command_id,
                 &rollback,
                 start,
-                rollback_covers_started_runtime,
-                started_runtime,
+                StartFailureRuntime::Prepared(&request.prepared),
             )
             .await);
         }
@@ -537,12 +533,52 @@ async fn validate_started_topology(
             &request.command_id,
             rollback,
             start,
-            false,
-            Some(runtime),
+            StartFailureRuntime::OutsidePreparedTopology(Box::new(runtime)),
         )
         .await);
     }
     Ok(runtime)
+}
+
+/// The runtime an `agent.start` failure may have left behind.
+enum StartFailureRuntime<'a> {
+    /// `agent.start` itself failed. Whether it may still have started an agent in the
+    /// prepared topology is derived from the error, never chosen by the caller.
+    Prepared(&'a WorkerRuntimeBinding),
+    /// Herdr started an agent, but outside the prepared topology, so rolling back the
+    /// prepared topology does not cover it.
+    OutsidePreparedTopology(Box<WorkerRuntimeBinding>),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StartFailureRetention {
+    rollback_covers_started_runtime: bool,
+    rollback_succeeded: bool,
+    started_runtime: Option<WorkerRuntimeBinding>,
+}
+
+/// Decides what a failed start retains. Only an ambiguous start outcome (or an agent that
+/// demonstrably started) may retain a runtime: a definite `agent.start` rejection never
+/// does, whatever the rollback did.
+fn start_failure_retention(
+    start: &HerdrError,
+    runtime: StartFailureRuntime<'_>,
+    rollback: &StartRollback,
+    rollback_ok: bool,
+) -> StartFailureRetention {
+    let (rollback_covers_started_runtime, possible_runtime) = match runtime {
+        StartFailureRuntime::Prepared(prepared) => (
+            rollback.covers_started_runtime(),
+            runtime_creation_outcome_ambiguous(start).then(|| prepared.clone()),
+        ),
+        StartFailureRuntime::OutsidePreparedTopology(started) => (false, Some(*started)),
+    };
+    let rollback_succeeded = rollback_covers_started_runtime && rollback_ok;
+    StartFailureRetention {
+        rollback_covers_started_runtime,
+        rollback_succeeded,
+        started_runtime: possible_runtime.filter(|_| !rollback_succeeded),
+    }
 }
 
 async fn start_failure_after_rollback(
@@ -551,16 +587,14 @@ async fn start_failure_after_rollback(
     command_id: &str,
     rollback: &StartRollback,
     start: HerdrError,
-    rollback_covers_started_runtime: bool,
-    started_runtime: Option<WorkerRuntimeBinding>,
+    runtime: StartFailureRuntime<'_>,
 ) -> HerdrControlError {
     let rollback_result = rollback_start(config, socket_path, command_id, rollback).await;
-    let rollback_succeeded = rollback_covers_started_runtime && rollback_result.is_ok();
-    let started_runtime = if rollback_succeeded {
-        None
-    } else {
-        started_runtime
-    };
+    let StartFailureRetention {
+        rollback_covers_started_runtime,
+        rollback_succeeded,
+        started_runtime,
+    } = start_failure_retention(&start, runtime, rollback, rollback_result.is_ok());
     let rollback = rollback_result.map_or_else(
         |error| error.to_string(),
         |()| match rollback {
@@ -1270,12 +1304,14 @@ mod tests {
 
     use super::{
         BootstrapAgentRequest, HerdrControlError, PaneReadFormat, PaneScroll, PrepareAgentRequest,
-        PromptAgentRequest, ProvisionAgentRequest, ReadPaneRequest, StartPreparedAgentRequest,
-        StartRollback, bootstrap_agent_at_socket, close_tab, close_workspace,
-        deliver_prompt_when_ready, expect_tab_close_result, prepare_agent_at_socket,
-        prompt_agent_at_socket, prompt_definitely_not_submitted, prompt_failure_after_rollback,
-        provision_agent_at_socket, read_pane_at_socket, retained_prepared_topology,
-        runtime_creation_outcome_ambiguous, start_agent_at_socket, start_prepared_agent_at_socket,
+        PromptAgentRequest, ProvisionAgentRequest, ReadPaneRequest, StartFailureRuntime,
+        StartPreparedAgentRequest, StartRollback, bootstrap_agent_at_socket, close_tab,
+        close_workspace, deliver_prompt_when_ready, expect_tab_close_result,
+        prepare_agent_at_socket, prompt_agent_at_socket, prompt_definitely_not_submitted,
+        prompt_failure_after_rollback, provision_agent_at_socket, read_pane_at_socket,
+        retained_prepared_topology, runtime_creation_outcome_ambiguous, start_agent_at_socket,
+        start_failure_retention, start_prepared_agent_at_socket,
+        start_prepared_workspace_agent_at_socket,
     };
     use crate::{HerdrConfig, HerdrError};
     use yard_domain::{
@@ -1892,6 +1928,142 @@ mod tests {
         assert!(!rollback_succeeded);
         assert!(started_runtime.is_none());
         assert!(rollback.contains("tab_close_failed"));
+    }
+
+    #[tokio::test]
+    async fn definite_workspace_start_rejection_with_failed_cleanup_does_not_capture_runtime() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            for expected_method in ["agent.start", "workspace.close"] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], expected_method);
+                let id = request["id"].as_str().unwrap();
+                let response = if expected_method == "agent.start" {
+                    serde_json::json!({
+                        "id": id,
+                        "error": {
+                            "code": "agent_name_taken",
+                            "message": "agent name is already in use"
+                        }
+                    })
+                } else {
+                    assert_eq!(request["params"]["workspace_id"], "workspace-1");
+                    serde_json::json!({
+                        "id": id,
+                        "error": {
+                            "code": "workspace_close_failed",
+                            "message": "workspace is still busy"
+                        }
+                    })
+                };
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let error = start_prepared_workspace_agent_at_socket(
+            &config,
+            &socket_path,
+            StartPreparedAgentRequest {
+                command_id: "rejected-workspace-start-failed-cleanup".to_owned(),
+                prepared: runtime_topology("workspace-1", "tab-1", "pane-1", "terminal-1"),
+                agent_name: "yard-coordination-node".to_owned(),
+                kind: "codex".to_owned(),
+                args: Vec::new(),
+                prompt: "Coordinate the workstream.".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        let HerdrControlError::StartFailed {
+            rollback,
+            rollback_succeeded,
+            started_runtime,
+            ..
+        } = error
+        else {
+            panic!("expected definite workspace start rejection with failed cleanup");
+        };
+        assert!(!rollback_succeeded);
+        assert!(started_runtime.is_none());
+        assert!(rollback.contains("workspace_close_failed"));
+    }
+
+    #[test]
+    fn definite_start_outcome_never_retains_a_runtime_whatever_the_rollback_did() {
+        let prepared = runtime_topology("workspace-1", "tab-1", "pane-1", "terminal-1");
+        let definite = [
+            HerdrError::Api {
+                code: "agent_name_taken".to_owned(),
+                message: "agent name is already in use".to_owned(),
+            },
+            HerdrError::SocketConnect {
+                path: "/tmp/herdr.sock".into(),
+                source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+            },
+        ];
+        for start in &definite {
+            for rollback in [
+                StartRollback::None,
+                StartRollback::Tab("tab-1".to_owned()),
+                StartRollback::Workspace("workspace-1".to_owned()),
+            ] {
+                for rollback_ok in [true, false] {
+                    let retention = start_failure_retention(
+                        start,
+                        StartFailureRuntime::Prepared(&prepared),
+                        &rollback,
+                        rollback_ok,
+                    );
+                    assert_eq!(retention.started_runtime, None, "{start}");
+                }
+            }
+        }
+
+        // Ambiguous outcomes keep the prepared runtime unless the rollback covered it.
+        let ambiguous = HerdrError::SocketTimeout;
+        let failed_rollback = start_failure_retention(
+            &ambiguous,
+            StartFailureRuntime::Prepared(&prepared),
+            &StartRollback::Workspace("workspace-1".to_owned()),
+            false,
+        );
+        assert!(!failed_rollback.rollback_succeeded);
+        assert_eq!(failed_rollback.started_runtime, Some(prepared.clone()));
+        let covered = start_failure_retention(
+            &ambiguous,
+            StartFailureRuntime::Prepared(&prepared),
+            &StartRollback::Workspace("workspace-1".to_owned()),
+            true,
+        );
+        assert!(covered.rollback_succeeded);
+        assert_eq!(covered.started_runtime, None);
+
+        // An agent started outside the prepared topology is never covered by the rollback.
+        let started = runtime_topology("workspace-2", "tab-2", "pane-2", "terminal-2");
+        let mismatch = start_failure_retention(
+            &HerdrError::InvalidTopology("mismatch".to_owned()),
+            StartFailureRuntime::OutsidePreparedTopology(Box::new(started.clone())),
+            &StartRollback::Tab("tab-1".to_owned()),
+            true,
+        );
+        assert!(!mismatch.rollback_covers_started_runtime);
+        assert!(!mismatch.rollback_succeeded);
+        assert_eq!(mismatch.started_runtime, Some(started));
     }
 
     #[tokio::test]
