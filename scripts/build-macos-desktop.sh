@@ -10,6 +10,14 @@ if [[ "$(uname -s)" != Darwin ]]; then
   printf 'This script builds/runs the unsigned macOS Yard.app POC and must run on macOS.\n' >&2
   exit 2
 fi
+if ! command -v node >/dev/null 2>&1 || ! node -e '
+const [major, minor] = process.versions.node.split(".").map(Number)
+process.exit(major > 22 || (major === 22 && minor >= 12) || (major === 20 && minor >= 19) ? 0 : 1)
+'; then
+  printf 'Yard requires Node.js 20.19+ or 22.12+; the recommended version is 22.12.0.\n' >&2
+  printf 'Install/use it with your Node manager, for example: nvm install 22.12.0 && nvm use 22.12.0\n' >&2
+  exit 2
+fi
 if [[ "$MODE" != build && "$MODE" != dev ]]; then
   printf 'usage: %s [build|dev]\n' "$0" >&2
   exit 2
