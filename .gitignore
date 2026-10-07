@@ -1,6 +1,7 @@
 /target/
 /web/node_modules/
 /web/dist/
+/crates/yard-desktop/binaries/yard-*
 **/test-results/
 **/playwright-report/
 /docs/

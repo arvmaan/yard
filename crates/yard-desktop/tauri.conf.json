@@ -1,0 +1,22 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Yard",
+  "version": "0.1.0",
+  "identifier": "dev.yard.desktop",
+  "build": {
+    "beforeDevCommand": "npm --prefix ../../web run build",
+    "beforeBuildCommand": "npm --prefix ../../web run build",
+    "frontendDist": "../../web/dist"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:* http://[::1]:* ws://[::1]:*"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "externalBin": ["binaries/yard"]
+  }
+}

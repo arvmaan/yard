@@ -576,23 +576,46 @@ pub(crate) async fn start(no_open: bool) -> Result<ExitCode, LifecycleError> {
     }
 }
 
-pub(crate) async fn status() -> Result<ExitCode, LifecycleError> {
+#[derive(Serialize)]
+struct StatusDocument<'a> {
+    schema_version: u32,
+    state: &'a str,
+    mode: Option<InstanceMode>,
+    url: Option<&'a str>,
+    pid: Option<u32>,
+    log_path: Option<&'a Path>,
+}
+
+fn status_document<'a>(
+    state: &'a str,
+    metadata: Option<&'a InstanceMetadata>,
+    log: &'a Path,
+) -> StatusDocument<'a> {
+    StatusDocument {
+        schema_version: 1,
+        state,
+        mode: metadata.map(|value| value.mode),
+        url: metadata.map(|value| value.url.as_str()),
+        pid: metadata.map(|value| value.pid),
+        log_path: metadata
+            .filter(|value| value.mode == InstanceMode::Managed)
+            .map(|_| log),
+    }
+}
+
+pub(crate) async fn status(json: bool) -> Result<ExitCode, LifecycleError> {
     let database_path = database_path_from_env()
         .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
     let paths = RuntimePaths::discover(&database_path)?;
     if !paths.validate_existing()? {
-        println!("Yard is not running");
+        print_status(json, "stopped", None, None, false, &paths.log)?;
         return Ok(ExitCode::from(STOPPED_EXIT_CODE));
     }
     let _launch_lock = paths.lock_launch(false).await?;
 
     match inspect(&paths, false).await? {
         ManagedState::Stopped { stale } => {
-            if stale {
-                println!("Yard is not running (stale lifecycle state)");
-            } else {
-                println!("Yard is not running");
-            }
+            print_status(json, "stopped", None, None, stale, &paths.log)?;
             Ok(ExitCode::from(STOPPED_EXIT_CODE))
         }
         ManagedState::Active { metadata, state } => {
@@ -601,10 +624,40 @@ pub(crate) async fn status() -> Result<ExitCode, LifecycleError> {
             } else {
                 "Yard is stopping"
             };
-            print_instance(heading, &metadata, &paths.log);
+            if json {
+                let state = if state == InstanceState::Running {
+                    "running"
+                } else {
+                    "stopping"
+                };
+                print_status(json, state, Some(&metadata), None, false, &paths.log)?;
+            } else {
+                print_instance(heading, &metadata, &paths.log);
+            }
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+fn print_status(
+    json: bool,
+    state: &str,
+    metadata: Option<&InstanceMetadata>,
+    heading: Option<&str>,
+    has_stale_state: bool,
+    log: &Path,
+) -> Result<(), LifecycleError> {
+    if json {
+        let document = status_document(state, metadata, log);
+        println!("{}", serde_json::to_string(&document)?);
+    } else if let Some(metadata) = metadata {
+        print_instance(heading.unwrap_or("Yard is running"), metadata, log);
+    } else if has_stale_state {
+        println!("Yard is not running (stale lifecycle state)");
+    } else {
+        println!("Yard is not running");
+    }
+    Ok(())
 }
 
 pub(crate) async fn stop() -> Result<ExitCode, LifecycleError> {
@@ -1578,6 +1631,7 @@ mod tests {
             fs::{MetadataExt, PermissionsExt},
             net::UnixListener as StdUnixListener,
         },
+        path::Path,
     };
 
     use tempfile::tempdir;
@@ -1585,7 +1639,7 @@ mod tests {
     use super::{
         ControlCommand, ControlRequestError, InstanceMetadata, InstanceMode, InstanceState,
         LifecycleError, ManagedState, RuntimePaths, database_identity, inspect, request,
-        spawn_control, write_metadata,
+        spawn_control, status_document, write_metadata,
     };
 
     fn metadata(instance_id: &str, mode: InstanceMode) -> InstanceMetadata {
@@ -1600,6 +1654,44 @@ mod tests {
             url: "http://127.0.0.1:4317/".to_owned(),
             started_at: "2026-08-20T00:00:00Z".to_owned(),
         }
+    }
+
+    #[test]
+    fn status_json_serializes_stopped_managed_and_foreground_contracts() {
+        let log = Path::new("/tmp/yard.log");
+        let stopped = serde_json::to_value(status_document("stopped", None, log)).unwrap();
+        assert_eq!(
+            stopped,
+            serde_json::json!({
+                "schema_version": 1,
+                "state": "stopped",
+                "mode": null,
+                "url": null,
+                "pid": null,
+                "log_path": null
+            })
+        );
+
+        let managed = metadata(
+            "018f0000-0000-7000-8000-000000000001",
+            InstanceMode::Managed,
+        );
+        let managed =
+            serde_json::to_value(status_document("running", Some(&managed), log)).unwrap();
+        assert_eq!(managed["mode"], "managed");
+        assert_eq!(managed["state"], "running");
+        assert_eq!(managed["url"], "http://127.0.0.1:4317/");
+        assert_eq!(managed["pid"], 42);
+        assert_eq!(managed["log_path"], "/tmp/yard.log");
+
+        let foreground = metadata(
+            "018f0000-0000-7000-8000-000000000002",
+            InstanceMode::Foreground,
+        );
+        let foreground =
+            serde_json::to_value(status_document("running", Some(&foreground), log)).unwrap();
+        assert_eq!(foreground["mode"], "foreground");
+        assert_eq!(foreground["log_path"], serde_json::Value::Null);
     }
 
     #[tokio::test]
@@ -1937,6 +2029,5 @@ mod tests {
         assert!(super::LAUNCH_LOCK_TIMEOUT > super::STOP_TIMEOUT);
     }
 
-    use std::path::Path;
     use std::path::PathBuf;
 }

@@ -21,7 +21,7 @@ enum Command {
     /// Start Yard in the background and open its UI.
     Start(StartArgs),
     /// Show the current Yard lifecycle owner, URL, and PID.
-    Status,
+    Status(StatusArgs),
     /// Gracefully stop the managed Yard instance.
     Stop,
     /// Run Yard in the foreground with logs attached.
@@ -38,6 +38,13 @@ struct StartArgs {
 }
 
 #[derive(Debug, Args)]
+struct StatusArgs {
+    /// Print the verified lifecycle owner as JSON for local clients.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct ManagedRunArgs {
     #[arg(long, hide = true)]
     instance_id: String,
@@ -48,7 +55,7 @@ pub(crate) async fn execute(cli: Cli) -> ExitCode {
         Command::Start(args) => lifecycle::start(args.no_open)
             .await
             .map_err(|error| CommandFailure::lifecycle(&error)),
-        Command::Status => lifecycle::status()
+        Command::Status(args) => lifecycle::status(args.json)
             .await
             .map_err(|error| CommandFailure::lifecycle(&error)),
         Command::Stop => lifecycle::stop()
@@ -119,6 +126,15 @@ mod tests {
                 panic!("parse {command}: {error}");
             });
         }
+    }
+
+    #[test]
+    fn parses_machine_readable_status() {
+        let cli = Cli::try_parse_from(["yard", "status", "--json"]).expect("parse status");
+        assert!(matches!(
+            cli.command,
+            Command::Status(super::StatusArgs { json: true })
+        ));
     }
 
     #[test]

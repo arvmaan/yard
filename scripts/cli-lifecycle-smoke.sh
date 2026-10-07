@@ -139,6 +139,7 @@ set -e
 
 bash -c '"$1" start --no-open >"$2"' _ "$BINARY" "$ROOT/start.out"
 "$BINARY" status >"$ROOT/status.out"
+"$BINARY" status --json >"$ROOT/status.json"
 FIRST_PID=$(status_value PID "$ROOT/status.out")
 FIRST_URL=$(status_value URL "$ROOT/status.out")
 RUNTIME_LOG=$(status_value Log "$ROOT/status.out")
@@ -146,6 +147,16 @@ RUNTIME_ROOT=$(dirname "$RUNTIME_LOG")
 [[ -n "$FIRST_PID" && -n "$FIRST_URL" ]] || fail "status omitted PID or URL"
 grep -q '^  Mode: managed$' "$ROOT/status.out" ||
   fail "status did not identify the managed owner"
+node -e '
+const fs = require("fs");
+const status = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+if (status.schema_version !== 1 || status.state !== "running" ||
+    status.mode !== "managed" || status.url !== process.argv[2] ||
+    status.pid !== Number(process.argv[3]) || typeof status.log_path !== "string") {
+  process.exit(1);
+}
+' "$ROOT/status.json" "$FIRST_URL" "$FIRST_PID" ||
+  fail "JSON status did not preserve the verified managed owner contract"
 [[ "$(ps -o pgid= -p "$FIRST_PID" | tr -d ' ')" == "$FIRST_PID" ]] ||
   fail "managed child did not own a detached process group"
 curl -fsS "${FIRST_URL}health" | grep -q '"status":"ok"' ||
@@ -223,6 +234,21 @@ set -e
   fail "stopped status returned $STOPPED_EXIT instead of 1"
 grep -q '^Yard is not running$' "$ROOT/stopped-status.out" ||
   fail "stopped status output was unclear"
+set +e
+"$BINARY" status --json >"$ROOT/stopped-status.json"
+STOPPED_JSON_EXIT=$?
+set -e
+[[ "$STOPPED_JSON_EXIT" == 1 ]] ||
+  fail "stopped JSON status returned $STOPPED_JSON_EXIT instead of 1"
+node -e '
+const fs = require("fs");
+const status = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+if (status.schema_version !== 1 || status.state !== "stopped" ||
+    status.mode !== null || status.url !== null || status.pid !== null ||
+    status.log_path !== null) {
+  process.exit(1);
+}
+' "$ROOT/stopped-status.json" || fail "stopped JSON status contract changed"
 "$BINARY" stop >"$ROOT/stop-again.out"
 grep -q '^Yard is already stopped$' "$ROOT/stop-again.out" ||
   fail "repeated stop was not idempotent"

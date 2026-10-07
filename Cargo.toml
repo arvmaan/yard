@@ -3,6 +3,7 @@ members = [
     "crates/yard-domain",
     "crates/yard-herdr",
     "crates/yard-server",
+    "crates/yard-desktop",
     "crates/yard-store",
 ]
 resolver = "3"
