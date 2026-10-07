@@ -4,8 +4,6 @@
   "version": "0.1.0",
   "identifier": "dev.yard.desktop",
   "build": {
-    "beforeDevCommand": "npm --prefix ../../web run build",
-    "beforeBuildCommand": "npm --prefix ../../web run build",
     "frontendDist": "../../web/dist"
   },
   "app": {
