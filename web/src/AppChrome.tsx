@@ -154,7 +154,10 @@ export function RuntimeHealthPopover({
         className="runtime-health__trigger"
         data-health={health}
         onClick={() => setOpen((current) => !current)}
-        ref={triggerRef}
+        ref={(node) => {
+          triggerRef.current = node
+          machinesTriggerRef.current = node
+        }}
         title={`Runtime health: ${sessionLabel}, ${healthLabel}`}
         type="button"
       >
@@ -221,7 +224,7 @@ export function RuntimeHealthPopover({
             />
             <span>{busy ? 'Refreshing state' : 'Refresh state'}</span>
           </button>
-          <button aria-controls="machines-dialog" aria-expanded={machinesOpen} className="runtime-health__refresh" onClick={onOpenMachines} ref={machinesTriggerRef} type="button">
+          <button aria-controls="machines-dialog" aria-expanded={machinesOpen} className="runtime-health__refresh" onClick={() => { setOpen(false); onOpenMachines() }} type="button">
             <Server aria-hidden="true" size={15} /><span>Machines</span>
           </button>
           <button
