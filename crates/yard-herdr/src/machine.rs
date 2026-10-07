@@ -561,6 +561,10 @@ mod tests {
         assert!(matches!(error, HerdrError::MachineInventoryInvalid(_)));
         assert!(!rendered.contains(secret_id));
         assert!(!rendered.contains(ssh_stderr));
+        assert_eq!(
+            rendered,
+            "Herdr forwarded machine inventory is invalid: forwarded snapshot failed validation"
+        );
     }
 
     #[tokio::test]
