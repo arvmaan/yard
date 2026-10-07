@@ -2,7 +2,8 @@ import type { EndpointRuntimeInventory, RuntimeEndpoint, RuntimeEndpointConnecti
 const ID=/^[0-9a-f]{32}$/
 const STATES=new Set<RuntimeEndpointConnectionState>(['reachable','disabled','authentication_required','unreachable','incompatible','unknown'])
 const record=(v:unknown):v is Record<string,unknown>=>typeof v==='object'&&v!==null&&!Array.isArray(v)
-const text=(v:unknown)=>typeof v==='string'&&v.length>0&&new TextEncoder().encode(v).length<=128&&![...v].some(c=>/[\u0000-\u001f\u007f]/.test(c))
+const control=(c:string)=>{const n=c.charCodeAt(0);return n<32||n===127}
+const text=(v:unknown)=>typeof v==='string'&&v.length>0&&new TextEncoder().encode(v).length<=128&&![...v].some(control)
 export const isStableMachineId=(v:string)=>ID.test(v)
 export const endpointKey=(v:RuntimeEndpointRef)=>v.kind==='local'?'local':`machine:${v.machine_id}`
 function ref(v:unknown):RuntimeEndpointRef { if(!record(v)) throw Error('Invalid endpoint identity'); if(v.kind==='local') return {kind:'local'}; if(v.kind==='machine'&&typeof v.machine_id==='string'&&ID.test(v.machine_id)) return {kind:'machine',machine_id:v.machine_id}; throw Error('Invalid endpoint identity') }
@@ -10,7 +11,7 @@ function endpoint(v:unknown):RuntimeEndpoint { if(!record(v)||!text(v.label)||ty
 export function parseRuntimeEndpoints(v:unknown):RuntimeEndpoints { if(!record(v)||v.adapter!=='herdr'||!Array.isArray(v.endpoints)||v.endpoints.length>65) throw Error('Invalid Herdr endpoint response'); const endpoints=v.endpoints.map(endpoint), keys=endpoints.map(x=>endpointKey(x.endpoint)); if(new Set(keys).size!==keys.length||keys.filter(x=>x==='local').length!==1) throw Error('Invalid endpoint identities'); return {adapter:'herdr',endpoints} }
 function inventory(v:unknown):RuntimeInventory { if(!record(v)||v.adapter!=='herdr'||!text(v.session)||!record(v.focus)||!Array.isArray(v.workspaces)||!Array.isArray(v.tabs)||!Array.isArray(v.panes)||!Array.isArray(v.workers)||!Array.isArray(v.child_agents)) throw Error('Invalid inventory'); return v as unknown as RuntimeInventory }
 export function parseMachineInventory(v:unknown,id:string):EndpointRuntimeInventory { if(!ID.test(id)||!record(v)) throw Error('Invalid inventory'); const e=ref(v.endpoint); if(e.kind!=='machine'||e.machine_id!==id) throw Error('Remote inventory endpoint identity mismatch'); return {endpoint:e,inventory:inventory(v.inventory)} }
-function valid(v:string,name:string,optional=false){if(optional&&!v)return;if(!v)throw Error(`${name} is required.`);if(v.includes('\0')||/[\r\n]/.test(v))throw Error(`${name} cannot contain newlines or NUL characters.`);if([...v].some(c=>/[\u0000-\u001f\u007f]/.test(c)))throw Error(`${name} cannot contain control characters.`)}
+function valid(v:string,name:string,optional=false){if(optional&&!v)return;if(!v)throw Error(`${name} is required.`);if(v.includes('\0')||/[\r\n]/.test(v))throw Error(`${name} cannot contain newlines or NUL characters.`);if([...v].some(control))throw Error(`${name} cannot contain control characters.`)}
 export const quotePosixArgument=(v:string)=>`'${v.replaceAll("'",`'"'"'`)}'`
 export function buildAddMachineCommand({sshTarget,label,remoteSession}:{sshTarget:string;label:string;remoteSession:string}) { valid(sshTarget,'SSH target');valid(label,'Label',true);valid(remoteSession,'Remote session',true);return ['herdr machine add',label?`--label=${quotePosixArgument(label)}`:'',remoteSession?`--remote-session=${quotePosixArgument(remoteSession)}`:'','--',quotePosixArgument(sshTarget)].filter(Boolean).join(' ') }
 export function buildReconnectCommand(id:string){if(!ID.test(id))throw Error('Reconnect requires a validated stable machine ID.');return `herdr machine reconnect ${quotePosixArgument(id)}`}
