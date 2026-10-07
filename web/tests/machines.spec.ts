@@ -98,7 +98,7 @@ const inventory = (id: string) => ({
     ],
     workers: [
       {
-        runtime_id: 'remote-agent',
+        runtime_id: 'remote-terminal',
         terminal_id: 'remote-terminal',
         workspace_id: 'w1',
         tab_id: 'w1:t1',
@@ -122,7 +122,11 @@ const inventory = (id: string) => ({
   },
 })
 
-async function setup(page: Page, initialEndpoints?: unknown[]) {
+async function setup(
+  page: Page,
+  initialEndpoints?: unknown[],
+  inventoryOverride?: unknown,
+) {
   let endpoints =
     initialEndpoints ?? [
       local,
@@ -148,12 +152,14 @@ async function setup(page: Page, initialEndpoints?: unknown[]) {
             },
           })
         : route.fulfill({
-            json: inventory(
-              decodeURIComponent(
-                new URL(route.request().url()).pathname.split('/').at(-2) ??
-                  '',
+            json:
+              inventoryOverride ??
+              inventory(
+                decodeURIComponent(
+                  new URL(route.request().url()).pathname.split('/').at(-2) ??
+                    '',
+                ),
               ),
-            ),
           }),
   )
 
@@ -218,6 +224,25 @@ test('remote inventory is observed topology without mutation controls', async ({
   await expect(details.getByText('Remote workspace')).toBeVisible()
   await expect(details.getByText(/Observed agent: remote-agent/)).toBeVisible()
   await expectNoRemoteControls(details)
+})
+
+test('malformed remote inventory shows a safe no-fallback error', async ({
+  page,
+}) => {
+  const malformed = inventory(a)
+  malformed.inventory.workers[0].pane_id = 'missing-pane'
+  await setup(page, undefined, malformed)
+  await page.goto('/')
+  await waitForLocalSession(page)
+
+  const dialog = await openMachines(page)
+  await dialog.getByRole('button', { name: /Build box/ }).click()
+  const details = dialog.locator('.machines-dialog__details')
+  await expect(details.getByRole('alert')).toContainText(
+    'Remote inventory could not be loaded. Yard did not fall back to Local.',
+  )
+  await expect(details.getByText('Remote workspace')).toHaveCount(0)
+  await expect(details.getByText('Observed / read-only.')).toBeVisible()
 })
 
 test('refresh preserves stable identity and never falls back to Local', async ({
