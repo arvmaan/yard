@@ -15,7 +15,7 @@
   "bundle": {
     "active": true,
     "targets": ["app"],
-    "icon": ["icons/icon.png"],
+    "icon": ["icons/icon.icns"],
     "externalBin": ["binaries/yard"]
   }
 }
