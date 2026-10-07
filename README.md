@@ -1,4 +1,13 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/yard-barn-dark.svg" />
+    <img alt="Yard logo: a barn and silo with a Y-braced door" src="assets/brand/yard-barn.svg" width="160" />
+  </picture>
+</p>
+
 <h1 align="center"><code>yard</code></h1>
+
+<p align="center"><code>&gt;- a control plane for your herd</code></p>
 
 <p align="center">
   <img alt="Version" src="https://img.shields.io/badge/version-0.1.0-2f6f62?style=flat-square" />

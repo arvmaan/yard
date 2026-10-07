@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="24 74 464 390" role="img" aria-label="Yard">
+<title>Yard</title>
+<defs>
+<mask id="sg" maskUnits="userSpaceOnUse" x="0" y="0" width="512" height="512"><rect width="512" height="512" fill="#fff"/><path d="M40 448V260l44-84 132-64 132 64 44 84v188Z" fill="#000" stroke="#000" stroke-width="48" stroke-linejoin="round"/><path d="M352 236h120M352 312h120" stroke="#000" stroke-width="8"/></mask>
+<mask id="bc" maskUnits="userSpaceOnUse" x="0" y="0" width="512" height="512"><rect width="512" height="512" fill="#fff"/><path d="M146 460V312h140v148" stroke="#000" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" fill="none"/><path d="M146 312l70 60 70-60M216 372v88" stroke="#000" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" fill="none"/><path d="M184 194l24 22-24 22M208 216h44" stroke="#000" stroke-width="28" stroke-linecap="round" stroke-linejoin="round" fill="none"/></mask>
+</defs>
+<path d="M352 448V150a60 60 0 0 1 120 0v298Z" fill="#dce7e3" stroke="#dce7e3" stroke-width="20" stroke-linejoin="round" mask="url(#sg)"/>
+<path d="M40 448V260l44-84 132-64 132 64 44 84v188Z" fill="#dce7e3" stroke="#dce7e3" stroke-width="20" stroke-linejoin="round" mask="url(#bc)"/>
+<path d="M184 194l24 22-24 22M208 216h44" stroke="#e7b32b" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>
