@@ -67,4 +67,34 @@ pub enum HerdrError {
     },
     #[error("invalid Herdr topology: {0}")]
     InvalidTopology(String),
+    #[error("failed to execute a bounded Herdr machine command: {0}")]
+    MachineCommandIo(#[source] io::Error),
+    #[error("Herdr machine catalog command timed out")]
+    MachineCatalogTimeout,
+    #[error("Herdr machine status command timed out")]
+    MachineStatusTimeout,
+    #[error("Herdr machine forwarding command timed out")]
+    MachineForwardTimeout,
+    #[error("Herdr machine command output exceeded {0} bytes")]
+    MachineOutputTooLarge(usize),
+    #[error("Herdr machine catalog command failed")]
+    MachineCatalogFailed,
+    #[error("Herdr machine forwarding command failed")]
+    MachineForwardFailed,
+    #[error("Herdr machine catalog returned invalid JSON: {0}")]
+    MachineCatalogDecode(#[source] serde_json::Error),
+    #[error("Herdr machine status returned invalid JSON: {0}")]
+    MachineStatusDecode(#[source] serde_json::Error),
+    #[error("Herdr machine catalog is invalid: {0}")]
+    MachineCatalogInvalid(String),
+    #[error("Herdr forwarded machine inventory is invalid: {0}")]
+    MachineInventoryInvalid(String),
+    #[error("machine profile ID is invalid")]
+    InvalidMachineId,
+    #[error("Herdr machine profile '{0}' was not found")]
+    MachineNotFound(String),
+    #[error("Herdr machine profile '{0}' is disabled")]
+    MachineDisabled(String),
+    #[error("Herdr returned ambiguous status for machine profile '{0}'")]
+    MachineStatusAmbiguous(String),
 }

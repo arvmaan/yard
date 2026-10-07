@@ -39,6 +39,10 @@ pub(crate) async fn discover_sessions(
     config: &HerdrConfig,
 ) -> Result<Vec<HerdrSession>, HerdrError> {
     let mut command = Command::new(&config.binary);
+    #[cfg(test)]
+    if let Some(script) = &config.test_script {
+        command.arg(script);
+    }
     command
         .args(["session", "list", "--json"])
         .kill_on_drop(true)

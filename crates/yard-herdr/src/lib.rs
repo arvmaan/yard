@@ -2,6 +2,7 @@ mod config;
 mod control;
 mod discovery;
 mod error;
+mod machine;
 mod management;
 mod normalize;
 mod session;
@@ -29,7 +30,7 @@ pub use terminal::{
     MIN_TERMINAL_ROWS, OpenTerminalRequest, TerminalClosed, TerminalCommand, TerminalDimensions,
     TerminalEncoding, TerminalEvent, TerminalFrame, TerminalInput,
 };
-use yard_domain::{RuntimeInventory, RuntimeSessions};
+use yard_domain::{EndpointRuntimeInventory, RuntimeEndpoints, RuntimeInventory, RuntimeSessions};
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredHerdrSession {
@@ -89,6 +90,31 @@ impl HerdrAdapter {
                 .map(|session| session.session.into_summary())
                 .collect(),
         })
+    }
+
+    /// Discover Local and saved Herdr machine endpoints. Saved SSH targets and
+    /// credentials remain inside Herdr and are never returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HerdrError`] for bounded catalog or status command failures.
+    pub async fn endpoints(&self) -> Result<RuntimeEndpoints, HerdrError> {
+        machine::endpoints(&self.config).await
+    }
+
+    /// Read one saved machine's configured session through Herdr 0.9.3
+    /// `--machine` forwarding. The result is observation-only and carries its
+    /// structured endpoint identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HerdrError`] when the ID is absent/disabled, forwarding fails,
+    /// times out, exceeds bounds, or returns incompatible inventory.
+    pub async fn machine_inventory(
+        &self,
+        machine_id: &str,
+    ) -> Result<EndpointRuntimeInventory, HerdrError> {
+        machine::inventory(&self.config, machine_id).await
     }
 
     /// Discover session descriptors that can be snapshotted without another

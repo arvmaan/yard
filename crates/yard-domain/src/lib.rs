@@ -71,10 +71,13 @@ pub use intervention::{
     PromptAcknowledgement, SendAssignmentPrompt, SendOrchestratorPrompt, TerminalOutput,
 };
 pub use inventory::{
-    FocusObservation, ManagedRuntimeOccupant, ManagedRuntimeOccupantKind, ManagedRuntimeWorkspace,
-    ManagedRuntimeWorkspaceKind, ObservedChildAgent, ObservedStatus, ObservedWorker,
-    PaneObservation, ProviderSessionRef, RuntimeInventory, RuntimeReconciliation, RuntimeSession,
-    RuntimeSessions, RuntimeTopology, TabObservation, WorkspaceObservation, WorktreeObservation,
+    EndpointRuntimeInventory, FocusObservation, ManagedRuntimeOccupant, ManagedRuntimeOccupantKind,
+    ManagedRuntimeWorkspace, ManagedRuntimeWorkspaceKind, ObservedChildAgent, ObservedStatus,
+    ObservedWorker, PaneObservation, ProviderSessionRef, RuntimeEndpoint,
+    RuntimeEndpointBoundaryError, RuntimeEndpointCapabilities, RuntimeEndpointConnectionState,
+    RuntimeEndpointRef, RuntimeEndpointSession, RuntimeEndpoints, RuntimeInventory,
+    RuntimeReconciliation, RuntimeSession, RuntimeSessions, RuntimeTopology, TabObservation,
+    WorkspaceObservation, WorktreeObservation,
 };
 pub use orchestrator_replacement::{
     OldSessionDisposition, OrchestratorReplacementValidationError, ReplaceProjectOrchestrator,

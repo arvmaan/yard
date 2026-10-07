@@ -10,6 +10,8 @@ pub struct HerdrConfig {
     pub request_timeout: Duration,
     pub max_discovery_bytes: usize,
     pub max_response_bytes: usize,
+    #[cfg(test)]
+    pub(crate) test_script: Option<OsString>,
 }
 
 impl Default for HerdrConfig {
@@ -20,6 +22,8 @@ impl Default for HerdrConfig {
             request_timeout: Duration::from_secs(5),
             max_discovery_bytes: 1024 * 1024,
             max_response_bytes: 8 * 1024 * 1024,
+            #[cfg(test)]
+            test_script: None,
         }
     }
 }

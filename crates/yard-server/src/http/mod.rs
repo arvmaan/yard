@@ -31,18 +31,19 @@ use yard_domain::{
     RecoveredYardOrchestrator, ReplaceProjectOrchestrator, ReplacedProjectOrchestrator,
     RepositoryDiff, RepositoryFileContent, RepositoryFileMode, RepositoryFiles,
     RequestCoordinationSnapshot, RequestSummaryWorker, ResetOrchestratorWorkflowProfile,
-    RunAutomationNow, RuntimeInventory, RuntimeSessions, RuntimeTopology, SendAssignmentPrompt,
-    SendCoordinationNodePrompt, SendCoordinationNodeRoute, SendOrchestratorPrompt,
-    SendYardOrchestratorPrompt, SendYardOrchestratorRoute, SetAutomationPaused,
-    SetProjectRepository, StartWorkerCleanupRun, SummaryWorker, SummaryWorkers, TerminalOutput,
-    TokenSpendSettings, TransferProjectOrchestrator, TransferredProjectOrchestrator,
-    UpdateAgentProfile, UpdateAutomation, UpdateAutomationPlacement, UpdateCoordinationNode,
-    UpdateCoordinationNodePlacement, UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement,
-    UpdateProjectWorkflowProfile, UpdateTokenSpendSettings, UpdateWorkerCleanupPolicy,
-    UpdateWorkerProfile, UploadArtifact, WorkerCandidates, WorkerCleanupDashboard,
-    WorkerCleanupPolicy, WorkerCleanupRun, WorkerCleanupRunTrigger, WorkerProfile, WorkerProfiles,
-    YardOrchestrator, YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute,
-    YardOrchestratorRoutes, YardOrchestratorTerminalOutput,
+    RunAutomationNow, RuntimeEndpoints, RuntimeInventory, RuntimeSessions, RuntimeTopology,
+    SendAssignmentPrompt, SendCoordinationNodePrompt, SendCoordinationNodeRoute,
+    SendOrchestratorPrompt, SendYardOrchestratorPrompt, SendYardOrchestratorRoute,
+    SetAutomationPaused, SetProjectRepository, StartWorkerCleanupRun, SummaryWorker,
+    SummaryWorkers, TerminalOutput, TokenSpendSettings, TransferProjectOrchestrator,
+    TransferredProjectOrchestrator, UpdateAgentProfile, UpdateAutomation,
+    UpdateAutomationPlacement, UpdateCoordinationNode, UpdateCoordinationNodePlacement,
+    UpdateOrchestratorWorkflowProfile, UpdateProjectPlacement, UpdateProjectWorkflowProfile,
+    UpdateTokenSpendSettings, UpdateWorkerCleanupPolicy, UpdateWorkerProfile, UploadArtifact,
+    WorkerCandidates, WorkerCleanupDashboard, WorkerCleanupPolicy, WorkerCleanupRun,
+    WorkerCleanupRunTrigger, WorkerProfile, WorkerProfiles, YardOrchestrator,
+    YardOrchestratorPromptAcknowledgement, YardOrchestratorRoute, YardOrchestratorRoutes,
+    YardOrchestratorTerminalOutput,
 };
 use yard_herdr::HerdrError;
 use yard_store::{MAX_COMPLETED_RUNTIME_CLEANUP_PREVIEW_LIMIT, ProjectStoreError, YardStore};
@@ -399,6 +400,11 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         .route(
             "/api/v1/yard/orchestrator/terminal",
             get(terminal::yard_orchestrator_terminal),
+        )
+        .route("/api/v1/runtimes/herdr/endpoints", get(runtime_endpoints))
+        .route(
+            "/api/v1/runtimes/herdr/machines/{machine_id}/inventory",
+            get(machine_inventory),
         )
         .route("/api/v1/runtimes/herdr/sessions", get(sessions))
         .route(
@@ -1162,6 +1168,29 @@ async fn sessions(State(state): State<AppState>) -> Result<NoStoreJson<RuntimeSe
     state
         .source
         .sessions()
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn runtime_endpoints(
+    State(state): State<AppState>,
+) -> Result<NoStoreJson<RuntimeEndpoints>, ApiError> {
+    state
+        .source
+        .endpoints()
+        .await
+        .map(NoStoreJson)
+        .map_err(ApiError::from)
+}
+
+async fn machine_inventory(
+    State(state): State<AppState>,
+    Path(machine_id): Path<String>,
+) -> Result<NoStoreJson<yard_domain::EndpointRuntimeInventory>, ApiError> {
+    state
+        .source
+        .machine_inventory(&machine_id)
         .await
         .map(NoStoreJson)
         .map_err(ApiError::from)
@@ -2333,6 +2362,47 @@ struct ApiError {
 impl From<InventoryServiceError> for ApiError {
     fn from(error: InventoryServiceError) -> Self {
         match error {
+            InventoryServiceError::RemoteRuntimeUnsupported => Self {
+                status: StatusCode::NOT_IMPLEMENTED,
+                code: "remote_runtime_unsupported",
+                message:
+                    "Remote runtime persistence and control are not available in this backend slice"
+                        .to_owned(),
+            },
+            InventoryServiceError::Herdr(HerdrError::MachineNotFound(_)) => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "machine_not_found",
+                message: "The selected Herdr machine profile no longer exists".to_owned(),
+            },
+            InventoryServiceError::Herdr(HerdrError::MachineDisabled(_)) => Self {
+                status: StatusCode::CONFLICT,
+                code: "machine_disabled",
+                message: "The selected Herdr machine profile is disabled".to_owned(),
+            },
+            InventoryServiceError::Herdr(
+                HerdrError::InvalidMachineId | HerdrError::MachineStatusAmbiguous(_),
+            ) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid_machine_reference",
+                message: "The Herdr machine reference is invalid or ambiguous".to_owned(),
+            },
+            InventoryServiceError::Herdr(
+                HerdrError::MachineCommandIo(_)
+                | HerdrError::MachineCatalogTimeout
+                | HerdrError::MachineStatusTimeout
+                | HerdrError::MachineForwardTimeout
+                | HerdrError::MachineOutputTooLarge(_)
+                | HerdrError::MachineCatalogFailed
+                | HerdrError::MachineForwardFailed
+                | HerdrError::MachineCatalogDecode(_)
+                | HerdrError::MachineStatusDecode(_)
+                | HerdrError::MachineCatalogInvalid(_)
+                | HerdrError::MachineInventoryInvalid(_),
+            ) => Self {
+                status: StatusCode::BAD_GATEWAY,
+                code: "machine_inventory_unavailable",
+                message: "Herdr could not provide bounded machine inventory".to_owned(),
+            },
             InventoryServiceError::Herdr(HerdrError::SessionNotFound(message)) => Self {
                 status: StatusCode::NOT_FOUND,
                 code: "session_not_found",
@@ -4160,9 +4230,11 @@ mod tests {
     use yard_domain::{
         ArchiveProject, CanvasPlacement, ConfigureYardOrchestrator, CoordinationNodeKind,
         CreateCoordinationNode, CreateProject, CreateWorkerProfile, DeleteProject,
-        FocusObservation, ObservedStatus, ObservedWorker,
+        EndpointRuntimeInventory, FocusObservation, ObservedStatus, ObservedWorker,
         OrchestratorWorkflowProfileValidationError, PaneObservation, ProjectRuntimeBinding,
-        ProviderSessionRef, ProvisionCoordinationNode, RuntimeInventory, RuntimeObservationState,
+        ProviderSessionRef, ProvisionCoordinationNode, RuntimeEndpoint,
+        RuntimeEndpointCapabilities, RuntimeEndpointConnectionState, RuntimeEndpointRef,
+        RuntimeEndpointSession, RuntimeEndpoints, RuntimeInventory, RuntimeObservationState,
         RuntimeProcessState, RuntimeSession, RuntimeSessions, WorkerProfileSpec,
         WorkerRuntimeBinding, WorkspaceObservation, WorktreeObservation,
     };
@@ -4486,6 +4558,118 @@ mod tests {
                 child_agents: Vec::new(),
             })
         }
+    }
+
+    struct MachineApiInventory;
+
+    #[async_trait]
+    impl InventorySource for MachineApiInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            FakeInventory.sessions().await
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            FakeInventory.inventory(session_name).await
+        }
+
+        async fn endpoints(&self) -> Result<RuntimeEndpoints, InventoryServiceError> {
+            Ok(RuntimeEndpoints {
+                adapter: "herdr".to_owned(),
+                endpoints: vec![
+                    RuntimeEndpoint {
+                        endpoint: RuntimeEndpointRef::Local,
+                        label: "Local".to_owned(),
+                        enabled: true,
+                        connection_state: RuntimeEndpointConnectionState::Reachable,
+                        capabilities: RuntimeEndpointCapabilities {
+                            inventory_read: true,
+                            mutations: true,
+                            terminal_streaming: true,
+                        },
+                        sessions: vec![RuntimeEndpointSession {
+                            name: "default".to_owned(),
+                            is_default: true,
+                            observed_running: Some(true),
+                        }],
+                    },
+                    RuntimeEndpoint {
+                        endpoint: RuntimeEndpointRef::Machine {
+                            machine_id: "0123456789abcdef0123456789abcdef".to_owned(),
+                        },
+                        label: "Build box".to_owned(),
+                        enabled: true,
+                        connection_state: RuntimeEndpointConnectionState::Reachable,
+                        capabilities: RuntimeEndpointCapabilities {
+                            inventory_read: true,
+                            mutations: false,
+                            terminal_streaming: false,
+                        },
+                        sessions: vec![RuntimeEndpointSession {
+                            name: "default".to_owned(),
+                            is_default: true,
+                            observed_running: Some(true),
+                        }],
+                    },
+                ],
+            })
+        }
+
+        async fn machine_inventory(
+            &self,
+            machine_id: &str,
+        ) -> Result<EndpointRuntimeInventory, InventoryServiceError> {
+            let inventory = FakeInventory.inventory("default").await?;
+            Ok(EndpointRuntimeInventory {
+                endpoint: RuntimeEndpointRef::Machine {
+                    machine_id: machine_id.to_owned(),
+                },
+                inventory,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn machine_endpoints_and_inventory_have_serialization_parity() {
+        let (app, _temp) = test_router_with_source(Arc::new(MachineApiInventory)).await;
+        let endpoint_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/endpoints")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(endpoint_response.status(), StatusCode::OK);
+        let endpoints = response_json(endpoint_response).await;
+        assert_eq!(endpoints["endpoints"][0]["endpoint"]["kind"], "local");
+        assert_eq!(endpoints["endpoints"][1]["endpoint"]["kind"], "machine");
+        assert_eq!(
+            endpoints["endpoints"][1]["capabilities"]["mutations"],
+            false
+        );
+        assert_eq!(
+            endpoints["endpoints"][1]["capabilities"]["terminal_streaming"],
+            false
+        );
+
+        let inventory_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtimes/herdr/machines/0123456789abcdef0123456789abcdef/inventory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inventory_response.status(), StatusCode::OK);
+        let inventory = response_json(inventory_response).await;
+        assert_eq!(inventory["endpoint"]["kind"], "machine");
+        assert_eq!(inventory["inventory"]["workers"][0]["pane_id"], "pane-1");
     }
 
     struct ProviderlessWorkerInventory;

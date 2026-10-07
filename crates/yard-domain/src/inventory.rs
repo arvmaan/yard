@@ -26,6 +26,88 @@ pub struct RuntimeSessions {
     pub sessions: Vec<RuntimeSession>,
 }
 
+/// Stable runtime location. Machine labels are display metadata and never
+/// participate in identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuntimeEndpointRef {
+    #[default]
+    Local,
+    Machine {
+        machine_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeEndpointConnectionState {
+    Reachable,
+    Disabled,
+    AuthenticationRequired,
+    Unreachable,
+    Incompatible,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeEndpointCapabilities {
+    pub inventory_read: bool,
+    pub mutations: bool,
+    pub terminal_streaming: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeEndpointSession {
+    pub name: String,
+    pub is_default: bool,
+    /// `None` means the endpoint was not contacted successfully, not stopped.
+    pub observed_running: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeEndpoint {
+    pub endpoint: RuntimeEndpointRef,
+    pub label: String,
+    pub enabled: bool,
+    pub connection_state: RuntimeEndpointConnectionState,
+    pub capabilities: RuntimeEndpointCapabilities,
+    pub sessions: Vec<RuntimeEndpointSession>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeEndpoints {
+    pub adapter: String,
+    pub endpoints: Vec<RuntimeEndpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointRuntimeInventory {
+    pub endpoint: RuntimeEndpointRef,
+    pub inventory: RuntimeInventory,
+}
+
+impl EndpointRuntimeInventory {
+    /// Existing durable runtime bindings are Local until schema 40 adds
+    /// endpoint identity. Remote observations must not cross that boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeEndpointBoundaryError`] for every non-Local endpoint.
+    pub fn into_local_inventory(self) -> Result<RuntimeInventory, RuntimeEndpointBoundaryError> {
+        if self.endpoint == RuntimeEndpointRef::Local {
+            Ok(self.inventory)
+        } else {
+            Err(RuntimeEndpointBoundaryError::RemotePersistenceUnsupported)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RuntimeEndpointBoundaryError {
+    #[error("remote runtime persistence is not supported until endpoint identity is durable")]
+    RemotePersistenceUnsupported,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FocusObservation {
     pub workspace_id: Option<String>,
@@ -213,7 +295,10 @@ pub struct RuntimeReconciliation {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{ObservedStatus, PaneObservation};
+    use super::{
+        EndpointRuntimeInventory, FocusObservation, ObservedStatus, PaneObservation,
+        RuntimeEndpointBoundaryError, RuntimeEndpointRef, RuntimeInventory,
+    };
 
     #[test]
     fn serializes_runtime_counters_without_javascript_precision_loss() {
@@ -238,5 +323,56 @@ mod tests {
         let json = serde_json::to_value(pane).unwrap();
 
         assert_eq!(json["revision"], u64::MAX.to_string());
+    }
+
+    fn inventory() -> RuntimeInventory {
+        RuntimeInventory {
+            adapter: "herdr".to_owned(),
+            session: "default".to_owned(),
+            runtime_version: "0.9.3".to_owned(),
+            protocol: 22,
+            observed_at_unix_ms: 1,
+            focus: FocusObservation::default(),
+            workspaces: Vec::new(),
+            tabs: Vec::new(),
+            panes: Vec::new(),
+            workers: Vec::new(),
+            child_agents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn endpoint_identity_is_structured_and_label_independent() {
+        let endpoint = RuntimeEndpointRef::Machine {
+            machine_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        };
+        let encoded = serde_json::to_value(&endpoint).unwrap();
+
+        assert_eq!(encoded["kind"], "machine");
+        assert_eq!(encoded["machine_id"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(
+            serde_json::from_value::<RuntimeEndpointRef>(encoded).unwrap(),
+            endpoint
+        );
+    }
+
+    #[test]
+    fn remote_inventory_cannot_cross_local_persistence_boundary() {
+        let remote = EndpointRuntimeInventory {
+            endpoint: RuntimeEndpointRef::Machine {
+                machine_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            },
+            inventory: inventory(),
+        };
+        assert_eq!(
+            remote.into_local_inventory(),
+            Err(RuntimeEndpointBoundaryError::RemotePersistenceUnsupported)
+        );
+
+        let local = EndpointRuntimeInventory {
+            endpoint: RuntimeEndpointRef::Local,
+            inventory: inventory(),
+        };
+        assert_eq!(local.into_local_inventory().unwrap().session, "default");
     }
 }

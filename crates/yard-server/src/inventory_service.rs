@@ -3,8 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 use yard_domain::{
-    ObservedWorker, RuntimeInventory, RuntimeObservationState, RuntimeProcessState, RuntimeSession,
-    RuntimeSessions, WorkerRuntimeBinding,
+    EndpointRuntimeInventory, ObservedWorker, RuntimeEndpoints, RuntimeInventory,
+    RuntimeObservationState, RuntimeProcessState, RuntimeSession, RuntimeSessions,
+    WorkerRuntimeBinding,
 };
 use yard_herdr::{
     AcquirePaneLeaseRequest, BootstrapAgentRequest, CloseLeasedPaneRequest, DiscoveredHerdrSession,
@@ -36,6 +37,8 @@ use crate::terminal_service::{
 pub enum InventoryServiceError {
     #[error(transparent)]
     Herdr(#[from] HerdrError),
+    #[error("remote runtime persistence and control are not supported in this backend slice")]
+    RemoteRuntimeUnsupported,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +111,40 @@ pub trait InventorySource: Send + Sync {
         &self,
         session_name: &str,
     ) -> Result<RuntimeInventory, InventoryServiceError>;
+
+    async fn endpoints(&self) -> Result<RuntimeEndpoints, InventoryServiceError> {
+        let sessions = self.sessions().await?;
+        Ok(RuntimeEndpoints {
+            adapter: sessions.adapter,
+            endpoints: vec![yard_domain::RuntimeEndpoint {
+                endpoint: yard_domain::RuntimeEndpointRef::Local,
+                label: "Local".to_owned(),
+                enabled: true,
+                connection_state: yard_domain::RuntimeEndpointConnectionState::Reachable,
+                capabilities: yard_domain::RuntimeEndpointCapabilities {
+                    inventory_read: true,
+                    mutations: true,
+                    terminal_streaming: true,
+                },
+                sessions: sessions
+                    .sessions
+                    .into_iter()
+                    .map(|session| yard_domain::RuntimeEndpointSession {
+                        name: session.name,
+                        is_default: session.is_default,
+                        observed_running: Some(session.running),
+                    })
+                    .collect(),
+            }],
+        })
+    }
+
+    async fn machine_inventory(
+        &self,
+        _machine_id: &str,
+    ) -> Result<EndpointRuntimeInventory, InventoryServiceError> {
+        Err(InventoryServiceError::RemoteRuntimeUnsupported)
+    }
 
     async fn session_descriptors(
         &self,
@@ -323,6 +360,20 @@ impl InventorySource for HerdrInventorySource {
             .await
             .map_err(InventoryServiceError::from)?;
         Ok(self.observe_provider_agents(inventory).await)
+    }
+
+    async fn endpoints(&self) -> Result<RuntimeEndpoints, InventoryServiceError> {
+        self.adapter.endpoints().await.map_err(Into::into)
+    }
+
+    async fn machine_inventory(
+        &self,
+        machine_id: &str,
+    ) -> Result<EndpointRuntimeInventory, InventoryServiceError> {
+        self.adapter
+            .machine_inventory(machine_id)
+            .await
+            .map_err(Into::into)
     }
 
     async fn session_descriptors(
