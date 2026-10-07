@@ -4672,6 +4672,177 @@ mod tests {
         assert_eq!(inventory["inventory"]["workers"][0]["pane_id"], "pane-1");
     }
 
+    struct MachineRouteErrorInventory {
+        observed_machine_ids: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl InventorySource for MachineRouteErrorInventory {
+        async fn sessions(&self) -> Result<RuntimeSessions, InventoryServiceError> {
+            FakeInventory.sessions().await
+        }
+
+        async fn inventory(
+            &self,
+            session_name: &str,
+        ) -> Result<RuntimeInventory, InventoryServiceError> {
+            FakeInventory.inventory(session_name).await
+        }
+
+        async fn machine_inventory(
+            &self,
+            machine_id: &str,
+        ) -> Result<EndpointRuntimeInventory, InventoryServiceError> {
+            self.observed_machine_ids
+                .lock()
+                .unwrap()
+                .push(machine_id.to_owned());
+            let error = match machine_id {
+                "invalid@machine" => HerdrError::InvalidMachineId,
+                "00000000000000000000000000000000" => {
+                    HerdrError::MachineNotFound(machine_id.to_owned())
+                }
+                "11111111111111111111111111111111" => {
+                    HerdrError::MachineDisabled(machine_id.to_owned())
+                }
+                "22222222222222222222222222222222" => HerdrError::MachineInventoryInvalid(
+                    "untrusted ssh user@secret-host raw-id".to_owned(),
+                ),
+                _ => panic!("unexpected machine ID {machine_id}"),
+            };
+            Err(error.into())
+        }
+    }
+
+    #[tokio::test]
+    async fn machine_inventory_routes_map_decoded_ids_and_typed_failures() {
+        let source = Arc::new(MachineRouteErrorInventory {
+            observed_machine_ids: Mutex::new(Vec::new()),
+        });
+        let (app, _temp) = test_router_with_source(source.clone()).await;
+        let cases = [
+            (
+                "invalid%40machine",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_machine_reference",
+            ),
+            (
+                "00000000000000000000000000000000",
+                StatusCode::NOT_FOUND,
+                "machine_not_found",
+            ),
+            (
+                "11111111111111111111111111111111",
+                StatusCode::CONFLICT,
+                "machine_disabled",
+            ),
+            (
+                "22222222222222222222222222222222",
+                StatusCode::BAD_GATEWAY,
+                "machine_inventory_unavailable",
+            ),
+        ];
+
+        for (machine_id, expected_status, expected_code) in cases {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/api/v1/runtimes/herdr/machines/{machine_id}/inventory"
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status);
+            let rendered = response_json(response).await.to_string();
+            assert!(rendered.contains(expected_code));
+            assert!(!rendered.contains("secret-host"));
+            assert!(!rendered.contains("raw-id"));
+        }
+
+        assert_eq!(
+            source.observed_machine_ids.lock().unwrap().as_slice(),
+            [
+                "invalid@machine",
+                "00000000000000000000000000000000",
+                "11111111111111111111111111111111",
+                "22222222222222222222222222222222",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_forwarded_topology_is_sanitized_through_http() {
+        const MACHINE_ID: &str = "0123456789abcdef0123456789abcdef";
+        let source_temp = TempDir::new().unwrap();
+        let binary = source_temp.path().join("herdr-machine-fixture");
+        let snapshot_identifier = "snapshot-secret-user@raw-host";
+        let ssh_stderr = "ssh stderr from raw-secret-host";
+        let mut fixture: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../../yard-herdr/tests/fixtures/v0.8.0/snapshot.json"
+        ))
+        .unwrap();
+        fixture["result"]["snapshot"]["agents"][0]["pane_id"] = snapshot_identifier.into();
+        let fixture = serde_json::to_string(&fixture)
+            .unwrap()
+            .replace('\'', "'\\''");
+        let catalog = serde_json::json!([{
+            "id": MACHINE_ID,
+            "label": "Build box",
+            "target": "catalog-secret-host",
+            "session": "default",
+            "enabled": true,
+            "selected": false,
+        }])
+        .to_string()
+        .replace('\'', "'\\''");
+        std::fs::write(
+            &binary,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  'machine list --json') printf '%s' '{catalog}' ;;
+  '--machine {MACHINE_ID} api snapshot') printf '%s' '{fixture}'; printf '%s' '{ssh_stderr}' >&2 ;;
+  *) exit 42 ;;
+esac
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).unwrap();
+        let source = HerdrInventorySource::new(HerdrAdapter::new(HerdrConfig {
+            binary: binary.into_os_string(),
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        }));
+        let (app, _temp) = test_router_with_source(Arc::new(source)).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/runtimes/herdr/machines/{MACHINE_ID}/inventory"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let rendered = response_json(response).await.to_string();
+        assert!(rendered.contains("machine_inventory_unavailable"));
+        assert!(rendered.contains("Herdr could not provide bounded machine inventory"));
+        assert!(!rendered.contains(snapshot_identifier));
+        assert!(!rendered.contains(ssh_stderr));
+        assert!(!rendered.contains("raw-secret-host"));
+        assert!(!rendered.contains("catalog-secret-host"));
+    }
+
     struct ProviderlessWorkerInventory;
 
     #[async_trait]

@@ -1,4 +1,4 @@
-use std::{io, process::Stdio, time::SystemTime};
+use std::{collections::HashSet, io, process::Stdio, time::SystemTime};
 
 use serde::Deserialize;
 use tokio::{
@@ -137,7 +137,7 @@ pub(crate) async fn inventory(
     )
     .await?;
     let response: ApiResponse =
-        serde_json::from_slice(&stdout).map_err(HerdrError::SnapshotDecode)?;
+        serde_json::from_slice(&stdout).map_err(|_| sanitized_machine_inventory_error())?;
     if response.error.is_some() {
         return Err(HerdrError::MachineForwardFailed);
     }
@@ -151,7 +151,8 @@ pub(crate) async fn inventory(
         .map_or(0, |duration| {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         });
-    let normalized = normalize::normalize(snapshot, &session, observed_at_unix_ms, config)?;
+    let normalized = normalize::normalize(snapshot, &session, observed_at_unix_ms, config)
+        .map_err(|_| sanitized_machine_inventory_error())?;
     validate_inventory_bounds(&normalized)?;
     Ok(EndpointRuntimeInventory {
         endpoint: RuntimeEndpointRef::Machine {
@@ -177,6 +178,12 @@ pub(crate) async fn list_saved_machines(
         return Err(HerdrError::MachineCatalogInvalid(format!(
             "catalog contains more than {MAX_MACHINES} machines"
         )));
+    }
+    let mut machine_ids = HashSet::with_capacity(rows.len());
+    if rows.iter().any(|row| !machine_ids.insert(row.id.as_str())) {
+        return Err(HerdrError::MachineCatalogInvalid(
+            "catalog contains duplicate machine IDs".to_owned(),
+        ));
     }
     rows.into_iter()
         .map(|row| {
@@ -235,6 +242,10 @@ fn connection_state(status: &MachineStatusRow) -> RuntimeEndpointConnectionState
         "error" => RuntimeEndpointConnectionState::Unreachable,
         _ => RuntimeEndpointConnectionState::Unknown,
     }
+}
+
+fn sanitized_machine_inventory_error() -> HerdrError {
+    HerdrError::MachineInventoryInvalid("forwarded snapshot failed validation".to_owned())
 }
 
 fn validate_inventory_bounds(inventory: &yard_domain::RuntimeInventory) -> Result<(), HerdrError> {
@@ -517,10 +528,95 @@ mod tests {
             catalog()
         );
         let (_temp, config) = script(&malformed_body);
-        assert!(matches!(
-            inventory(&config, ID).await,
-            Err(HerdrError::SnapshotDecode(_))
-        ));
+        let error = inventory(&config, ID).await.unwrap_err();
+        assert!(matches!(error, HerdrError::MachineInventoryInvalid(_)));
+        assert_eq!(
+            error.to_string(),
+            "Herdr forwarded machine inventory is invalid: forwarded snapshot failed validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_remote_topology_is_sanitized_at_the_inventory_boundary() {
+        let secret_id = "snapshot-secret-user@raw-host";
+        let ssh_stderr = "ssh stderr from raw-secret-host";
+        let mut fixture: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/v0.8.0/snapshot.json"))
+                .unwrap();
+        fixture["result"]["snapshot"]["agents"][0]["pane_id"] = secret_id.into();
+        let fixture = serde_json::to_string(&fixture).unwrap();
+        let body = format!(
+            r#"case "$*" in
+              'machine list --json') printf '%s' '{}' ;;
+              '--machine {ID} api snapshot') printf '%s' '{}'; printf '%s' '{ssh_stderr}' >&2 ;;
+              *) exit 42 ;;
+            esac"#,
+            catalog(),
+            fixture.replace('\\', "\\\\").replace('\'', "'\\''"),
+        );
+        let (_temp, config) = script(&body);
+
+        let error = inventory(&config, ID).await.unwrap_err();
+        let rendered = error.to_string();
+        assert!(matches!(error, HerdrError::MachineInventoryInvalid(_)));
+        assert!(!rendered.contains(secret_id));
+        assert!(!rendered.contains(ssh_stderr));
+    }
+
+    #[tokio::test]
+    async fn duplicate_catalog_ids_are_rejected_before_status_or_forwarding_regardless_of_order() {
+        let second_id = "11111111111111111111111111111111";
+        let row = |id: &str, label: &str| {
+            format!(
+                r#"{{"id":"{id}","label":"{label}","target":"secret-host","session":"default","enabled":true,"selected":false}}"#
+            )
+        };
+        let duplicate_orders = [
+            format!(
+                "[{}, {}, {}]",
+                row(ID, "first"),
+                row(second_id, "other"),
+                row(ID, "last")
+            ),
+            format!(
+                "[{}, {}, {}]",
+                row(second_id, "other"),
+                row(ID, "first"),
+                row(ID, "last")
+            ),
+        ];
+
+        for (index, duplicate_catalog) in duplicate_orders.into_iter().enumerate() {
+            for operation in ["inventory", "endpoints"] {
+                let temp = tempfile::tempdir().unwrap();
+                let marker = temp.path().join(format!("unexpected-{index}-{operation}"));
+                let body = format!(
+                    r#"case "$*" in
+                      'session list --json') printf '%s' '{{"sessions":[]}}' ;;
+                      'machine list --json') printf '%s' '{duplicate_catalog}' ;;
+                      'machine status --json'|'--machine '*) printf ran > '{}' ;;
+                      *) exit 42 ;;
+                    esac"#,
+                    marker.display()
+                );
+                let (_script_temp, config) = script(&body);
+                let error = if operation == "inventory" {
+                    inventory(&config, ID).await.unwrap_err()
+                } else {
+                    super::endpoints(&config).await.unwrap_err()
+                };
+
+                assert!(matches!(error, HerdrError::MachineCatalogInvalid(_)));
+                assert_eq!(
+                    error.to_string(),
+                    "Herdr machine catalog is invalid: catalog contains duplicate machine IDs"
+                );
+                assert!(
+                    !marker.exists(),
+                    "{operation} executed after duplicate catalog"
+                );
+            }
+        }
     }
 
     #[tokio::test]
