@@ -21,6 +21,7 @@ import {
   RefreshCw,
   Settings,
   SquareTerminal,
+  Server,
   Wifi,
   WifiOff,
   Workflow,
@@ -45,7 +46,10 @@ interface RuntimeHealthPopoverProps {
   health: RuntimeHealth
   herdrInventoryOpen: boolean
   herdrInventoryTriggerRef: RefObject<HTMLButtonElement | null>
+  machinesOpen: boolean
+  machinesTriggerRef: RefObject<HTMLButtonElement | null>
   onOpenHerdrInventory: () => void
+  onOpenMachines: () => void
   onRefresh: () => void
   onSessionChange: (session: string) => void
   selectedSession: string
@@ -89,7 +93,10 @@ export function RuntimeHealthPopover({
   health,
   herdrInventoryOpen,
   herdrInventoryTriggerRef,
+  machinesOpen,
+  machinesTriggerRef,
   onOpenHerdrInventory,
+  onOpenMachines,
   onRefresh,
   onSessionChange,
   selectedSession,
@@ -214,6 +221,9 @@ export function RuntimeHealthPopover({
             />
             <span>{busy ? 'Refreshing state' : 'Refresh state'}</span>
           </button>
+          <button aria-controls="machines-dialog" aria-expanded={machinesOpen} className="runtime-health__refresh" onClick={onOpenMachines} ref={machinesTriggerRef} type="button">
+            <Server aria-hidden="true" size={15} /><span>Machines</span>
+          </button>
           <button
             aria-controls="herdr-inventory-workspace"
             aria-expanded={herdrInventoryOpen}
@@ -270,11 +280,14 @@ export function GlobalCommandBar({
   health,
   herdrInventoryOpen,
   herdrInventoryTriggerRef,
+  machinesOpen,
+  machinesTriggerRef,
   onCreateProject,
   onHome,
   onOpenAttention,
   onOpenAutomaticCoordination,
   onOpenHerdrInventory,
+  onOpenMachines,
   onOpenProjectPulse,
   onOpenSettings,
   onRefresh,
@@ -420,7 +433,10 @@ export function GlobalCommandBar({
         health={health}
         herdrInventoryOpen={herdrInventoryOpen}
         herdrInventoryTriggerRef={herdrInventoryTriggerRef}
+        machinesOpen={machinesOpen}
+        machinesTriggerRef={machinesTriggerRef}
         onOpenHerdrInventory={onOpenHerdrInventory}
+        onOpenMachines={onOpenMachines}
         onRefresh={onRefresh}
         onSessionChange={onSessionChange}
         selectedSession={selectedSession}

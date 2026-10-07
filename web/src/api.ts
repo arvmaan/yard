@@ -43,6 +43,7 @@ import type {
   DeleteWorkerInput,
   EndedWorkerSession,
   EndWorkerSessionInput,
+  EndpointRuntimeInventory,
   ExternalTerminalLaunch,
   HerdrFleetInventory,
   ManageAllAgentsInput,
@@ -70,6 +71,7 @@ import type {
   RecordedCompletionReceipt,
   RecordCompletionReceiptInput,
   RuntimeInventory,
+  RuntimeEndpoints,
   RuntimeLens,
   RuntimeSessions,
   RuntimeTopology,
@@ -180,6 +182,14 @@ async function requestJson<T>(
 
 export function fetchSessions(signal?: AbortSignal): Promise<RuntimeSessions> {
   return requestJson('/api/v1/runtimes/herdr/sessions', { signal })
+}
+
+export function fetchRuntimeEndpoints(signal?: AbortSignal): Promise<RuntimeEndpoints> {
+  return requestJson('/api/v1/runtimes/herdr/endpoints', { signal })
+}
+
+export function fetchMachineInventory(machineId: string, signal?: AbortSignal): Promise<EndpointRuntimeInventory> {
+  return requestJson(`/api/v1/runtimes/herdr/machines/${encodeURIComponent(machineId)}/inventory`, { signal })
 }
 
 export function fetchHerdrFleetInventory(

@@ -134,6 +134,7 @@ import { AgentWorkspaceShell } from './AgentWorkspaceShell'
 import { ProjectRepositoriesSection } from './RepositoryFilesWorkspace'
 import { ProjectPulseWorkspace } from './ProjectPulseWorkspace'
 import { HerdrInventoryWorkspace } from './HerdrInventoryWorkspace'
+import { MachinesDialog } from './MachinesDialog'
 import {
   resolveRuntimeCapabilities,
   runtimeBindingReason,
@@ -257,6 +258,7 @@ import type {
   YardOrchestratorRoute,
 } from './types'
 import './App.css'
+import './machines.css'
 
 const INVENTORY_REFRESH_INTERVAL_MS = 1_000
 const ASSIGNMENT_REFRESH_INTERVAL_MS = 5_000
@@ -2823,6 +2825,7 @@ function App() {
     'appearance' | 'automatic'
   >('appearance')
   const [herdrInventoryOpen, setHerdrInventoryOpen] = useState(false)
+  const [machinesOpen, setMachinesOpen] = useState(false)
   const [sessions, setSessions] = useState<RuntimeSession[]>([])
   const [selectedSession, setSelectedSession] = useState('')
   const [inventory, setInventory] = useState<RuntimeInventory | null>(null)
@@ -3052,6 +3055,7 @@ function App() {
   )
   const projectPulseTrigger = useRef<HTMLButtonElement | null>(null)
   const herdrInventoryTrigger = useRef<HTMLButtonElement | null>(null)
+  const machinesTrigger = useRef<HTMLButtonElement | null>(null)
   const resourceShelfTrigger = useRef<HTMLButtonElement | null>(null)
   const resourceShelf = useRef<HTMLElement | null>(null)
   const settingsTrigger = useRef<HTMLButtonElement | null>(null)
@@ -6669,6 +6673,8 @@ function App() {
           health={runtimeHealth}
           herdrInventoryOpen={herdrInventoryOpen}
           herdrInventoryTriggerRef={herdrInventoryTrigger}
+          machinesOpen={machinesOpen}
+          machinesTriggerRef={machinesTrigger}
           onHome={() => {
             setHerdrInventoryOpen(false)
             setAgentWorkspaceMode('map')
@@ -6681,6 +6687,7 @@ function App() {
           onOpenHerdrInventory={() =>
             setHerdrInventoryOpen((open) => !open)
           }
+          onOpenMachines={() => setMachinesOpen(true)}
           onOpenAttention={(trigger) => {
             resourceShelfTrigger.current = trigger
             setHerdrInventoryOpen(false)
@@ -7730,6 +7737,9 @@ function App() {
       ) : null}
       {herdrInventoryOpen ? (
         <HerdrInventoryWorkspace onClose={() => setHerdrInventoryOpen(false)} />
+      ) : null}
+      {machinesOpen ? (
+        <MachinesDialog onClose={() => setMachinesOpen(false)} returnFocus={machinesTrigger.current} />
       ) : null}
     </AgentWorkspaceContext.Provider>
   )

@@ -30,6 +30,14 @@ export interface RuntimeSessions {
   sessions: RuntimeSession[]
 }
 
+export type RuntimeEndpointRef = { kind: 'local' } | { kind: 'machine'; machine_id: string }
+export type RuntimeEndpointConnectionState = 'reachable' | 'disabled' | 'authentication_required' | 'unreachable' | 'incompatible' | 'unknown'
+export interface RuntimeEndpointCapabilities { inventory_read: boolean; mutations: boolean; terminal_streaming: boolean }
+export interface RuntimeEndpointSession { name: string; is_default: boolean; observed_running: boolean | null }
+export interface RuntimeEndpoint { endpoint: RuntimeEndpointRef; label: string; enabled: boolean; connection_state: RuntimeEndpointConnectionState; capabilities: RuntimeEndpointCapabilities; sessions: RuntimeEndpointSession[] }
+export interface RuntimeEndpoints { adapter: string; endpoints: RuntimeEndpoint[] }
+export interface EndpointRuntimeInventory { endpoint: RuntimeEndpointRef; inventory: RuntimeInventory }
+
 export type HerdrPaneKind = 'agent' | 'runtime'
 export type HerdrPaneObservation = 'observed' | 'unobserved' | 'ambiguous'
 
