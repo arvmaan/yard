@@ -117,6 +117,26 @@ const inventory: RuntimeInventory = {
   child_agents: [],
 }
 
+const childAgent = (overrides: Record<string, unknown> = {}) => ({
+  runtime_id: 'child-1',
+  parent_provider_session: {
+    source: 'herdr',
+    provider: 'codex',
+    kind: 'session',
+    value: 'parent-session',
+  },
+  parent_agent_id: null,
+  provider: 'codex',
+  provider_agent_id: 'provider-child-1',
+  name: 'Child',
+  description: 'Investigate the issue',
+  role: 'researcher',
+  status: 'working',
+  depth: 1,
+  updated_at_unix_ms: 1,
+  ...overrides,
+})
+
 const response = (value: unknown = inventory, id = a) => ({
   endpoint: { kind: 'machine', machine_id: id },
   inventory: value,
@@ -293,6 +313,146 @@ describe('remote machine boundary', () => {
     expect(() => parseMachineInventory(response(revision), a)).toThrow(
       'pane[0].revision',
     )
+  })
+
+  it('rejects oversized token maps and token strings by UTF-8 bytes', () => {
+    const tooMany = changedInventory((value) => {
+      value.panes[0].tokens = Object.fromEntries(
+        Array.from({ length: 257 }, (_, index) => [`token-${index}`, 'value']),
+      )
+    })
+    const longName = changedInventory((value) => {
+      value.panes[0].tokens = { ['é'.repeat(257)]: 'value' }
+    })
+    const longValue = changedInventory((value) => {
+      value.workers[0].tokens = { role: 'é'.repeat(4_097) }
+    })
+    expect(() => parseMachineInventory(response(tooMany), a)).toThrow(
+      'pane[0].tokens',
+    )
+    expect(() => parseMachineInventory(response(longName), a)).toThrow(
+      'pane[0].tokens key',
+    )
+    expect(() => parseMachineInventory(response(longValue), a)).toThrow(
+      'worker[0].tokens.role',
+    )
+  })
+
+  it('rejects overlong path, description, and role fields', () => {
+    const cwd = changedInventory((value) => {
+      value.panes[0].cwd = `/${'é'.repeat(8_192)}`
+    })
+    const worktree = changedInventory((value) => {
+      value.workspaces[0].worktree = {
+        repository_key: 'repository',
+        repository_name: 'Repository',
+        repository_root: `/${'r'.repeat(16_384)}`,
+        checkout_path: '/work',
+        is_linked: true,
+      }
+    })
+    const description = changedInventory((value) => {
+      value.child_agents = [childAgent({ description: 'é'.repeat(32_769) })]
+    })
+    const role = changedInventory((value) => {
+      value.child_agents = [childAgent({ role: 'é'.repeat(2_049) })]
+    })
+    expect(() => parseMachineInventory(response(cwd), a)).toThrow(
+      'pane[0].cwd',
+    )
+    expect(() => parseMachineInventory(response(worktree), a)).toThrow(
+      'workspace[0].worktree.repository_root',
+    )
+    expect(() => parseMachineInventory(response(description), a)).toThrow(
+      'child_agent[0].description',
+    )
+    expect(() => parseMachineInventory(response(role), a)).toThrow(
+      'child_agent[0].role',
+    )
+  })
+
+  it('rejects malformed child agents and worktrees', () => {
+    const child = changedInventory((value) => {
+      value.child_agents = [childAgent({ parent_provider_session: null })]
+    })
+    const childMember = changedInventory((value) => {
+      value.child_agents = [null]
+    })
+    const worktree = changedInventory((value) => {
+      value.workspaces[0].worktree = {
+        repository_key: 'repository',
+        repository_name: 'Repository',
+        repository_root: '/repo',
+        checkout_path: '/work',
+        is_linked: 'yes',
+      }
+    })
+    const worktreeMember = changedInventory((value) => {
+      value.workspaces[0].worktree = []
+    })
+    expect(() => parseMachineInventory(response(child), a)).toThrow(
+      'parent_provider_session',
+    )
+    expect(() => parseMachineInventory(response(childMember), a)).toThrow(
+      'child_agent[0]',
+    )
+    expect(() => parseMachineInventory(response(worktree), a)).toThrow(
+      'worktree.is_linked',
+    )
+    expect(() => parseMachineInventory(response(worktreeMember), a)).toThrow(
+      'workspace[0].worktree',
+    )
+  })
+
+  it('accepts representative exact byte and entry boundaries', () => {
+    const value = changedInventory((candidate) => {
+      candidate.workspaces[0].worktree = {
+        repository_key: 'repository',
+        repository_name: 'Repository',
+        repository_root: `/${'p'.repeat(16_383)}`,
+        checkout_path: `/${'é'.repeat(8_191)}x`,
+        is_linked: true,
+      }
+      candidate.panes[0].cwd = `/${'é'.repeat(8_191)}x`
+      candidate.panes[0].revision = '18446744073709551615'
+      candidate.workers[0].tokens = Object.fromEntries(
+        Array.from({ length: 256 }, (_, index) => [
+          index === 0 ? 'é'.repeat(256) : `token-${index}`,
+          index === 0 ? 'é'.repeat(4_096) : 'value',
+        ]),
+      )
+      candidate.child_agents = [
+        childAgent({
+          description: 'é'.repeat(32_768),
+          role: 'é'.repeat(2_048),
+        }),
+      ]
+    })
+    expect(parseMachineInventory(response(value), a).inventory).toMatchObject({
+      workspaces: [{ worktree: { is_linked: true } }],
+      panes: [{ revision: '18446744073709551615' }],
+      child_agents: [{ role: 'é'.repeat(2_048) }],
+    })
+  })
+
+  it('rejects overlong decimal counters before BigInt conversion', () => {
+    const value = changedInventory((candidate) => {
+      candidate.panes[0].revision = '9'.repeat(1_000_000)
+    })
+    const originalBigInt = globalThis.BigInt
+    let called = false
+    globalThis.BigInt = ((counter: string | number | bigint | boolean) => {
+      called = true
+      return originalBigInt(counter)
+    }) as BigIntConstructor
+    try {
+      expect(() => parseMachineInventory(response(value), a)).toThrow(
+        'pane[0].revision',
+      )
+      expect(called).toBe(false)
+    } finally {
+      globalThis.BigInt = originalBigInt
+    }
   })
 
   it('rejects duplicate topology identifiers', () => {

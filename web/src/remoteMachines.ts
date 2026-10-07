@@ -120,12 +120,22 @@ export function parseRuntimeEndpoints(value: unknown): RuntimeEndpoints {
   return { adapter: 'herdr', endpoints }
 }
 
-// Mirrors the remote boundary enforced in yard-herdr/src/machine.rs.
+// Collection, identity, display, and protocol bounds mirror yard-herdr's
+// machine/config boundaries. Herdr responses are capped at 8 MiB there; the
+// remaining per-field limits keep hostile values well below that cap while a
+// 16 KiB path remains larger than common platform absolute-path limits.
 const MAX_INVENTORY_RECORDS = 10_000
 const MAX_RUNTIME_ID_BYTES = 512
 const MAX_DISPLAY_TEXT_BYTES = 128
+const MAX_GENERIC_TEXT_BYTES = 64 * 1024
+const MAX_PATH_BYTES = 16 * 1024
+const MAX_ROLE_BYTES = 4 * 1024
+const MAX_TOKEN_ENTRIES = 256
+const MAX_TOKEN_NAME_BYTES = MAX_RUNTIME_ID_BYTES
+const MAX_TOKEN_VALUE_BYTES = 8 * 1024
 const MAX_U32 = 4_294_967_295
 const MAX_U64 = 18_446_744_073_709_551_615n
+const MAX_U64_DIGITS = 20
 const U64 = /^(0|[1-9][0-9]*)$/
 
 const STATUSES = new Set([
@@ -136,27 +146,21 @@ const STATUSES = new Set([
   'unknown',
 ])
 
-function scalarText(value: unknown, field: string) {
-  if (typeof value !== 'string' || [...value].some(control)) {
-    throw Error(`Invalid ${field}`)
-  }
-  return value
-}
-
 function boundedText(
   value: unknown,
   field: string,
   maximum: number,
   allowEmpty = false,
 ) {
-  const result = scalarText(value, field)
   if (
-    (!allowEmpty && result.length === 0) ||
-    new TextEncoder().encode(result).length > maximum
+    typeof value !== 'string' ||
+    (!allowEmpty && value.length === 0) ||
+    new TextEncoder().encode(value).length > maximum ||
+    [...value].some(control)
   ) {
     throw Error(`Invalid ${field}`)
   }
-  return result
+  return value
 }
 
 const identity = (value: unknown, field: string) =>
@@ -164,6 +168,12 @@ const identity = (value: unknown, field: string) =>
 
 const displayText = (value: unknown, field: string) =>
   boundedText(value, field, MAX_DISPLAY_TEXT_BYTES)
+
+const genericText = (value: unknown, field: string) =>
+  boundedText(value, field, MAX_GENERIC_TEXT_BYTES, true)
+
+const pathText = (value: unknown, field: string) =>
+  boundedText(value, field, MAX_PATH_BYTES)
 
 function nullable<T>(
   value: unknown,
@@ -210,7 +220,12 @@ function status(value: unknown, field: string): RuntimeInventory['panes'][number
 }
 
 function u64(value: unknown, field: string) {
-  if (typeof value !== 'string' || !U64.test(value) || BigInt(value) > MAX_U64) {
+  if (
+    typeof value !== 'string' ||
+    value.length > MAX_U64_DIGITS ||
+    !U64.test(value) ||
+    BigInt(value) > MAX_U64
+  ) {
     throw Error(`Invalid ${field}`)
   }
   return value
@@ -225,10 +240,12 @@ function collection(value: unknown, field: string) {
 
 function tokens(value: unknown, field: string) {
   if (!record(value)) throw Error(`Invalid ${field}`)
+  const entries = Object.entries(value)
+  if (entries.length > MAX_TOKEN_ENTRIES) throw Error(`Invalid ${field}`)
   return Object.fromEntries(
-    Object.entries(value).map(([key, token]) => [
-      identity(key, `${field} key`),
-      scalarText(token, `${field}.${key}`),
+    entries.map(([key, token]) => [
+      boundedText(key, `${field} key`, MAX_TOKEN_NAME_BYTES),
+      boundedText(token, `${field}.${key}`, MAX_TOKEN_VALUE_BYTES, true),
     ]),
   )
 }
@@ -257,8 +274,8 @@ function workspace(
     return {
       repository_key: identity(entry.repository_key, `${name}.repository_key`),
       repository_name: displayText(entry.repository_name, `${name}.repository_name`),
-      repository_root: scalarText(entry.repository_root, `${name}.repository_root`),
-      checkout_path: scalarText(entry.checkout_path, `${name}.checkout_path`),
+      repository_root: pathText(entry.repository_root, `${name}.repository_root`),
+      checkout_path: pathText(entry.checkout_path, `${name}.checkout_path`),
       is_linked: boolean(entry.is_linked, `${name}.is_linked`),
     }
   })
@@ -300,8 +317,8 @@ function pane(value: unknown, index: number): RuntimeInventory['panes'][number] 
     workspace_id: identity(value.workspace_id, `${field}.workspace_id`),
     tab_id: identity(value.tab_id, `${field}.tab_id`),
     focused: boolean(value.focused, `${field}.focused`),
-    cwd: nullable(value.cwd, `${field}.cwd`, scalarText),
-    foreground_cwd: nullable(value.foreground_cwd, `${field}.foreground_cwd`, scalarText),
+    cwd: nullable(value.cwd, `${field}.cwd`, pathText),
+    foreground_cwd: nullable(value.foreground_cwd, `${field}.foreground_cwd`, pathText),
     label: nullable(value.label, `${field}.label`, displayText),
     provider: nullable(value.provider, `${field}.provider`, identity),
     display_provider: nullable(value.display_provider, `${field}.display_provider`, displayText),
@@ -330,8 +347,8 @@ function worker(value: unknown, index: number): RuntimeInventory['workers'][numb
     launch_pending: boolean(value.launch_pending, `${field}.launch_pending`),
     interactive_ready: boolean(value.interactive_ready, `${field}.interactive_ready`),
     state_change_sequence: u64(value.state_change_sequence, `${field}.state_change_sequence`),
-    cwd: nullable(value.cwd, `${field}.cwd`, scalarText),
-    foreground_cwd: nullable(value.foreground_cwd, `${field}.foreground_cwd`, scalarText),
+    cwd: nullable(value.cwd, `${field}.cwd`, pathText),
+    foreground_cwd: nullable(value.foreground_cwd, `${field}.foreground_cwd`, pathText),
     tokens: tokens(value.tokens, `${field}.tokens`),
     provider_session: nullable(value.provider_session, `${field}.provider_session`, providerSession),
     revision: u64(value.revision, `${field}.revision`),
@@ -353,8 +370,9 @@ function childAgent(
     provider: identity(value.provider, `${field}.provider`),
     provider_agent_id: identity(value.provider_agent_id, `${field}.provider_agent_id`),
     name: nullable(value.name, `${field}.name`, displayText),
-    description: nullable(value.description, `${field}.description`, scalarText),
-    role: nullable(value.role, `${field}.role`, scalarText),
+    description: nullable(value.description, `${field}.description`, genericText),
+    role: nullable(value.role, `${field}.role`, (entry, name) =>
+      boundedText(entry, name, MAX_ROLE_BYTES, true)),
     status: status(value.status, `${field}.status`),
     depth: integer(value.depth, `${field}.depth`, MAX_U32),
     updated_at_unix_ms: integer(value.updated_at_unix_ms, `${field}.updated_at_unix_ms`),
