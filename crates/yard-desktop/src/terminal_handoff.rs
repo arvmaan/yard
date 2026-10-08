@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
+use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RenameFlags};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 #[cfg(target_os = "macos")]
@@ -19,6 +19,7 @@ const EXECUTABLE_MODE: Mode = DIRECTORY_MODE;
 const HANDOFF_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_HANDOFFS: usize = 16;
 const MAX_CREATE_ATTEMPTS: usize = 32;
+const MAX_QUARANTINE_ATTEMPTS: usize = 32;
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
@@ -33,6 +34,7 @@ const ERROR: &str = "could not open the secure Terminal handoff";
 
 struct HandoffDirectory {
     fd: OwnedFd,
+    home: PathBuf,
     path: PathBuf,
 }
 
@@ -49,6 +51,14 @@ struct FileIdentity {
     uid: u32,
     links: u64,
 }
+
+/// The handoff directory is private against other OS users, malformed input
+/// never controls paths, and descriptor-relative operations narrow accidental
+/// races among Yard-owned work. A malicious process running as this same UID
+/// is deliberately outside Yard's local single-owner threat model: it can
+/// already control Yard, Terminal, Herdr state, credentials, and these files.
+/// In particular, Terminal.app must resolve the verified pathname after
+/// `/usr/bin/open`; the checks below cannot atomically bind that later lookup.
 
 #[cfg(target_os = "macos")]
 pub(super) fn launch(herdr: &Path, arguments: &[String]) -> Result<(), String> {
@@ -80,6 +90,14 @@ fn open_handoff_directory_from_home() -> io::Result<HandoffDirectory> {
 }
 
 fn open_handoff_directory(home: &Path) -> io::Result<HandoffDirectory> {
+    walk_handoff_directory(home, true)
+}
+
+fn reopen_handoff_directory(home: &Path) -> io::Result<HandoffDirectory> {
+    walk_handoff_directory(home, false)
+}
+
+fn walk_handoff_directory(home: &Path, create_missing: bool) -> io::Result<HandoffDirectory> {
     if !home.is_absolute() {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
@@ -94,11 +112,19 @@ fn open_handoff_directory(home: &Path) -> io::Result<HandoffDirectory> {
             _ => b"terminal-handoffs\0",
         })
         .expect("static directory component is valid");
-        fd = open_or_create_directory(&fd, name)?;
+        fd = if create_missing {
+            open_or_create_directory(&fd, name)?
+        } else {
+            fs::openat(&fd, name, DIRECTORY_FLAGS, Mode::empty())?
+        };
         validate_directory_fd(&fd)?;
         path.push(component);
     }
-    Ok(HandoffDirectory { fd, path })
+    Ok(HandoffDirectory {
+        fd,
+        home: home.to_owned(),
+        path,
+    })
 }
 
 fn open_or_create_directory(parent: &OwnedFd, name: &CStr) -> io::Result<OwnedFd> {
@@ -226,9 +252,13 @@ fn verify_created_handoff(
     directory: &HandoffDirectory,
     handoff: &CreatedHandoff,
 ) -> io::Result<()> {
-    validate_directory_fd(&directory.fd)?;
+    // Re-walk every fixed component immediately before `open`, rather than
+    // trusting only the descriptor retained since creation. This catches
+    // accidental ancestor replacement but does not claim to bind Terminal's
+    // later pathname lookup against an out-of-scope same-UID process.
+    let launch_directory = reopen_handoff_directory(&directory.home)?;
     let stat = fs::statat(
-        &directory.fd,
+        &launch_directory.fd,
         handoff.name.as_c_str(),
         AtFlags::SYMLINK_NOFOLLOW,
     )?;
@@ -254,14 +284,14 @@ fn cleanup(directory: &HandoffDirectory, now: SystemTime) -> io::Result<()> {
     let mut files = eligible_handoffs(directory)?;
     for file in &files {
         if file.expired(now) {
-            remove_if_identity_matches(directory, &file.name, file.identity)?;
+            quarantine_and_remove(directory, &file.name, file.identity)?;
         }
     }
     files = eligible_handoffs(directory)?;
     files.sort_by_key(|file| file.modified_seconds);
     let remove_count = files.len().saturating_sub(MAX_HANDOFFS - 1);
     for file in files.into_iter().take(remove_count) {
-        remove_if_identity_matches(directory, &file.name, file.identity)?;
+        quarantine_and_remove(directory, &file.name, file.identity)?;
     }
     Ok(())
 }
@@ -308,6 +338,93 @@ fn eligible_handoffs(directory: &HandoffDirectory) -> io::Result<Vec<ExistingHan
 
 fn cleanup_stat_is_eligible(stat: &fs::Stat, uid: u32) -> bool {
     FileType::from_raw_mode(stat.st_mode).is_file() && stat.st_uid == uid && stat.st_nlink == 1
+}
+
+/// Cleanup first moves an eligible file with same-directory
+/// `renameat_with(NOREPLACE)` to a fresh `.yard-quarantine-*` name. It then
+/// revalidates owner, type, link count, device, and inode at the quarantined
+/// name before unlinking. A mismatch remains safely quarantined and is ignored
+/// by later cleanup scans; no replacement is deleted or overwritten.
+fn quarantine_and_remove(
+    directory: &HandoffDirectory,
+    original_name: &CStr,
+    expected: FileIdentity,
+) -> io::Result<()> {
+    validate_directory_fd(&directory.fd)?;
+    for attempt in 0..MAX_QUARANTINE_ATTEMPTS {
+        let quarantine_name = fresh_quarantine_name_with_attempt(attempt);
+        match fs::renameat_with(
+            &directory.fd,
+            original_name,
+            &directory.fd,
+            quarantine_name.as_c_str(),
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => {
+                return finish_quarantine_with_hook(
+                    directory,
+                    quarantine_name.as_c_str(),
+                    expected,
+                    || {},
+                );
+            }
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not reserve quarantine name",
+    ))
+}
+
+#[cfg(test)]
+fn finish_quarantine(
+    directory: &HandoffDirectory,
+    quarantine_name: &CStr,
+    expected: FileIdentity,
+) -> io::Result<()> {
+    finish_quarantine_with_hook(directory, quarantine_name, expected, || {})
+}
+
+fn finish_quarantine_with_hook(
+    directory: &HandoffDirectory,
+    quarantine_name: &CStr,
+    expected: FileIdentity,
+    after_verify: impl FnOnce(),
+) -> io::Result<()> {
+    let quarantined = fs::statat(&directory.fd, quarantine_name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if cleanup_stat_is_eligible(&quarantined, rustix::process::getuid().as_raw())
+        && expected.matches(&quarantined)
+    {
+        after_verify();
+        let final_stat = fs::statat(&directory.fd, quarantine_name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if cleanup_stat_is_eligible(&final_stat, rustix::process::getuid().as_raw())
+            && expected.matches(&final_stat)
+        {
+            return remove_entry(&directory.fd, quarantine_name);
+        }
+    }
+
+    // Preserve any unexpected object under the ignored quarantine name. A
+    // mismatched identity is not safe to restore under the original handoff
+    // name, and later cleanup scans deliberately ignore quarantine artifacts.
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "quarantined handoff identity changed",
+    ))
+}
+
+fn fresh_quarantine_name_with_attempt(attempt: usize) -> CString {
+    CString::new(format!(
+        ".yard-quarantine-{}-{}-{attempt}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ))
+    .expect("generated quarantine name has no NUL")
 }
 
 fn remove_if_identity_matches(
@@ -508,6 +625,96 @@ mod tests {
         assert!(directory.path.join("handoff-link.command").exists());
         assert!(hardlink.exists());
         assert_eq!(stdfs::read(target).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn cleanup_quarantines_then_unlinks_matching_identity() {
+        let temp = TestDirectory::new("quarantine-delete");
+        let directory = temp.handoffs();
+        let handoff = create_handoff(&directory, b"old").unwrap();
+        let quarantine = cstring(".yard-quarantine-test-delete");
+        fs::renameat_with(
+            &directory.fd,
+            handoff.name.as_c_str(),
+            &directory.fd,
+            quarantine.as_c_str(),
+            RenameFlags::NOREPLACE,
+        )
+        .unwrap();
+        finish_quarantine(&directory, quarantine.as_c_str(), handoff.identity).unwrap();
+        assert!(!directory.path.join(".yard-quarantine-test-delete").exists());
+    }
+
+    #[test]
+    fn quarantine_identity_mismatch_is_preserved_without_deleting_replacement() {
+        let temp = TestDirectory::new("quarantine-mismatch");
+        let directory = temp.handoffs();
+        let handoff = create_handoff(&directory, b"old").unwrap();
+        let original = handoff.path.clone();
+        let quarantine = cstring(".yard-quarantine-test-mismatch");
+        fs::renameat_with(
+            &directory.fd,
+            handoff.name.as_c_str(),
+            &directory.fd,
+            quarantine.as_c_str(),
+            RenameFlags::NOREPLACE,
+        )
+        .unwrap();
+        stdfs::write(&original, b"replacement").unwrap();
+
+        assert!(
+            finish_quarantine(
+                &directory,
+                quarantine.as_c_str(),
+                FileIdentity {
+                    inode: handoff.identity.inode.wrapping_add(1),
+                    ..handoff.identity
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(stdfs::read(original).unwrap(), b"replacement");
+        assert_eq!(
+            stdfs::read(directory.path.join(".yard-quarantine-test-mismatch")).unwrap(),
+            b"old"
+        );
+        assert!(
+            eligible_handoffs(&directory)
+                .unwrap()
+                .iter()
+                .all(|entry| !entry.name.to_bytes().starts_with(b".yard-quarantine-"))
+        );
+    }
+
+    #[test]
+    fn replacement_after_quarantine_verification_is_preserved() {
+        let temp = TestDirectory::new("quarantine-concurrent-replacement");
+        let directory = temp.handoffs();
+        let handoff = create_handoff(&directory, b"old").unwrap();
+        let quarantine = cstring(".yard-quarantine-test-concurrent");
+        fs::renameat_with(
+            &directory.fd,
+            handoff.name.as_c_str(),
+            &directory.fd,
+            quarantine.as_c_str(),
+            RenameFlags::NOREPLACE,
+        )
+        .unwrap();
+        let quarantine_path = directory.path.join(".yard-quarantine-test-concurrent");
+
+        assert!(
+            finish_quarantine_with_hook(
+                &directory,
+                quarantine.as_c_str(),
+                handoff.identity,
+                || {
+                    stdfs::remove_file(&quarantine_path).unwrap();
+                    stdfs::write(&quarantine_path, b"replacement").unwrap();
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(stdfs::read(quarantine_path).unwrap(), b"replacement");
     }
 
     #[test]

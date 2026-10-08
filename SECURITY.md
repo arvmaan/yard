@@ -28,6 +28,17 @@ instance lock for its lifetime. Stored PIDs are diagnostic: `yard stop`
 requests shutdown through the authenticated control channel and never signals
 a PID loaded from lifecycle metadata.
 
+Yard's macOS Terminal handoff has the same local single-owner boundary. Its
+`0700`, current-UID-owned cache directory and no-follow ancestry checks protect
+handoff contents from other OS users and reject accidental symlink or
+permissive-path configuration. Descriptor-relative creation, pre-launch
+identity checks, and quarantine-before-delete cleanup narrow ordinary
+Yard-owned races. They do not defend against an actively malicious process
+running as the same UID, which can already control Yard and Terminal, access
+Herdr configuration and credentials, and modify the user's files. Terminal.app
+must resolve a pathname after launch, so Yard does not claim an atomic binding
+between its final descriptor checks and Terminal's later lookup.
+
 ## Live Harness Warning
 
 `scripts/live-v1-acceptance.sh` starts authenticated Codex agents with

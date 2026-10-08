@@ -417,6 +417,10 @@ pub fn quote_posix_argument(value: &str) -> String {
 
 /// Generate the fixed executable handoff body. The executable and every
 /// argument are quoted separately; request data never becomes shell syntax.
+/// The generated script's `rm -f -- "$0"` is same-owner cleanup after
+/// Terminal resolves the handoff pathname. It is intentionally outside the
+/// descriptor-relative stale-file quarantine protocol and is not treated as
+/// an authorization boundary.
 #[must_use]
 pub fn terminal_handoff_script(executable: &Path, arguments: &[String]) -> String {
     let command = std::iter::once(executable.to_string_lossy().into_owned())

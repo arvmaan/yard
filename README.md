@@ -393,6 +393,29 @@ replacing it and shows a window-title notice that **Stop Yard Service**, then
 Foreground-owned services remain browser/terminal-managed and Yard.app reports
 that incompatibility without enabling its Stop operation.
 
+The local Terminal handoff follows Yard's single-owner threat model. Generated
+handoffs live under the current user's
+`~/Library/Caches/dev.yard.desktop/terminal-handoffs` directory; fixed
+ancestors are opened without following symlinks, must be owned by the current
+UID, and must not be group/other writable. The final directory is `0700`, so
+other OS users cannot read or replace its files. Yard creates handoffs
+relative to an open directory descriptor, validates their owner, type, mode,
+link count, device, and inode, and re-walks the fixed ancestry immediately
+before asking `/usr/bin/open` to launch Terminal. Cleanup first atomically
+renames an eligible entry to a fresh same-directory quarantine name, verifies
+that quarantined identity, and only then unlinks it. An identity mismatch is
+preserved under its quarantine name and ignored by later cleanup scans, so no
+replacement is deleted or overwritten. The generated script also
+removes its own same-UID pathname after Terminal starts; that is ordinary
+owner cleanup, not an authorization boundary.
+
+An actively malicious process running as the same OS UID is out of scope: such
+a process can already control Yard state and memory, Terminal, Herdr
+configuration and credentials, and the user's files. Terminal.app necessarily
+resolves the handed-off pathname after `/usr/bin/open`; descriptor and
+pre-launch identity checks narrow accidental races but do not atomically bind
+that later lookup or claim protection from a same-UID attacker.
+
 Install Xcode command-line tools, supported Rust and Node.js versions, Herdr
 0.9.3 or newer for the Mac architecture being built, and the pinned Tauri CLI
 once:
