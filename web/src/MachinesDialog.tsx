@@ -20,6 +20,11 @@ import {
   type FormEvent,
 } from 'react'
 import { createPortal } from 'react-dom'
+import {
+  hasDesktopMachineHandoff,
+  launchMachineAdd,
+  launchMachineReconnect,
+} from './desktopBridge'
 import { fetchMachineInventory, fetchRuntimeEndpoints } from './api'
 import {
   buildAddMachineCommand,
@@ -144,6 +149,10 @@ function AddMachineDialog({
   const [command, setCommand] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
+  const pendingRef = useRef(false)
+  const [pending, setPending] = useState(false)
+  const [launched, setLaunched] = useState(false)
+  const desktop = hasDesktopMachineHandoff()
   const close = useModalDialog({
     dialogRef: dialog,
     initialFocusRef: targetRef,
@@ -151,19 +160,43 @@ function AddMachineDialog({
     returnFocus,
   })
 
-  const submit = (event: FormEvent) => {
+  const submit = async (event: FormEvent) => {
     event.preventDefault()
+    if (pendingRef.current) return
     try {
-      setCommand(
-        buildAddMachineCommand({ sshTarget: target, label, remoteSession }),
-      )
+      const nextCommand = buildAddMachineCommand({
+        sshTarget: target,
+        label,
+        remoteSession,
+      })
       setError(null)
       setCopied(false)
+      setLaunched(false)
+      if (!desktop) {
+        setCommand(nextCommand)
+        return
+      }
+      setCommand(null)
+      pendingRef.current = true
+      setPending(true)
+      await launchMachineAdd({
+        ssh_target: target,
+        ...(label.trim() ? { label } : {}),
+        ...(remoteSession.trim() ? { session: remoteSession } : {}),
+      })
+      setLaunched(true)
     } catch (caught) {
       setCommand(null)
       setError(
-        caught instanceof Error ? caught.message : 'Invalid machine details.',
+        desktop
+          ? 'Terminal could not be opened. Try again, or use Yard in a browser to copy the command.'
+          : caught instanceof Error
+            ? caught.message
+            : 'Invalid machine details.',
       )
+    } finally {
+      pendingRef.current = false
+      setPending(false)
     }
   }
 
@@ -196,8 +229,9 @@ function AddMachineDialog({
         <form className="dialog-form" onSubmit={submit}>
           <p className="machines-dialog__guidance">
             Yard does not collect credentials or edit Herdr configuration.
-            Enter only connection metadata to prepare a command for a trusted
-            terminal.
+            {desktop
+              ? ' Terminal opens visibly so Herdr and SSH can prompt you directly.'
+              : ' Enter only connection metadata to prepare a command for a trusted terminal.'}
           </p>
           <label>
             <span>SSH target</span>
@@ -228,6 +262,12 @@ function AddMachineDialog({
           {error ? (
             <p className="dialog-error" role="alert">
               {error}
+            </p>
+          ) : null}
+          {launched ? (
+            <p className="machines-dialog__guidance" role="status">
+              Terminal opened. Complete Herdr setup there, then close this
+              dialog and Refresh saved machines.
             </p>
           ) : null}
           {command ? (
@@ -272,8 +312,11 @@ function AddMachineDialog({
             >
               Cancel
             </button>
-            <button className="primary-button" type="submit">
-              Prepare command
+            <button className="primary-button" disabled={pending} type="submit">
+              {pending ? (
+                <LoaderCircle aria-hidden="true" className="status-spin" size={14} />
+              ) : null}{' '}
+              {desktop ? 'Open setup in Terminal' : 'Prepare command'}
             </button>
           </footer>
         </form>
@@ -301,6 +344,11 @@ export function MachinesDialog({
   const [addOpen, setAddOpen] = useState(false)
   const [remote, setRemote] = useState<Record<string, RemoteState>>({})
   const [copied, setCopied] = useState(false)
+  const reconnectPendingRef = useRef(false)
+  const [reconnectPending, setReconnectPending] = useState(false)
+  const [reconnectLaunched, setReconnectLaunched] = useState(false)
+  const [reconnectError, setReconnectError] = useState<string | null>(null)
+  const desktop = hasDesktopMachineHandoff()
   const close = useModalDialog({
     active: !addOpen,
     dialogRef: dialog,
@@ -481,6 +529,8 @@ export function MachinesDialog({
                   onClick={() => {
                     setSelectedKey(key)
                     setCopied(false)
+                    setReconnectLaunched(false)
+                    setReconnectError(null)
                   }}
                   type="button"
                 >
@@ -567,22 +617,70 @@ export function MachinesDialog({
                             : 'This saved profile is disabled. Enable it with Herdr, then refresh.'}
                         </p>
                         <div className="machines-dialog__command">
-                          <code>{buildReconnectCommand(id)}</code>
+                          {!desktop ? <code>{buildReconnectCommand(id)}</code> : null}
                           <p>
-                            Run this in a trusted terminal to complete SSH
-                            authentication. Copying does not execute it.
+                            {desktop
+                              ? 'Terminal opens visibly for SSH authentication. After reconnecting, Refresh saved machines.'
+                              : 'Run this in a trusted terminal to complete SSH authentication. Copying does not execute it.'}
                           </p>
+                          {reconnectError ? (
+                            <p className="dialog-error" role="alert">
+                              {reconnectError}
+                            </p>
+                          ) : null}
+                          {reconnectLaunched ? (
+                            <p role="status">
+                              Terminal opened. Complete authentication there,
+                              then Refresh saved machines.
+                            </p>
+                          ) : null}
                           <button
                             className="secondary-button"
-                            onClick={() =>
-                              void copy(buildReconnectCommand(id))
-                                .then(() => setCopied(true))
-                                .catch(() => undefined)
-                            }
+                            disabled={reconnectPending}
+                            onClick={() => {
+                              if (reconnectPendingRef.current) return
+                              if (!desktop) {
+                                void copy(buildReconnectCommand(id))
+                                  .then(() => setCopied(true))
+                                  .catch(() => undefined)
+                                return
+                              }
+                              reconnectPendingRef.current = true
+                              setReconnectPending(true)
+                              setReconnectError(null)
+                              setReconnectLaunched(false)
+                              void launchMachineReconnect({ machine_id: id })
+                                .then(() => setReconnectLaunched(true))
+                                .catch(() =>
+                                  setReconnectError(
+                                    'Terminal could not be opened. Try again, or use Yard in a browser to copy the command.',
+                                  ),
+                                )
+                                .finally(() => {
+                                  reconnectPendingRef.current = false
+                                  setReconnectPending(false)
+                                })
+                            }}
                             type="button"
                           >
-                            <Clipboard aria-hidden="true" size={14} />{' '}
-                            {copied ? 'Copied' : 'Copy reconnect command'}
+                            {desktop ? (
+                              reconnectPending ? (
+                                <LoaderCircle
+                                  aria-hidden="true"
+                                  className="status-spin"
+                                  size={14}
+                                />
+                              ) : null
+                            ) : (
+                              <Clipboard aria-hidden="true" size={14} />
+                            )}{' '}
+                            {desktop
+                              ? reconnectPending
+                                ? 'Opening Terminal…'
+                                : 'Open Terminal to reconnect'
+                              : copied
+                                ? 'Copied'
+                                : 'Copy reconnect command'}
                           </button>
                         </div>
                       </section>

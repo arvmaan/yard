@@ -126,7 +126,24 @@ async function setup(
   page: Page,
   initialEndpoints?: unknown[],
   inventoryOverride?: unknown,
+  desktopInvoke?: boolean,
 ) {
+  if (desktopInvoke) {
+    await page.addInitScript(() => {
+      const calls: Array<{ command: string; payload: unknown }> = []
+      Object.defineProperty(window, '__yardDesktopCalls', { value: calls })
+      Object.defineProperty(window, '__TAURI_INTERNALS__', {
+        value: {
+          invoke(command: string, payload: unknown) {
+            calls.push({ command, payload })
+            return new Promise((resolve) => {
+              window.setTimeout(() => resolve({ launched: true }), 40)
+            })
+          },
+        },
+      })
+    })
+  }
   let endpoints =
     initialEndpoints ?? [
       local,
@@ -300,6 +317,57 @@ test('shows an explicit empty state when Herdr returns no endpoints', async ({
     dialog.getByText('No saved endpoints were returned by Herdr.'),
   ).toBeVisible()
   await expect(dialog.getByText('Select a machine.')).toBeVisible()
+})
+
+test('desktop handoff invokes typed add and reconnect payloads without opening a terminal', async ({
+  page,
+}) => {
+  await setup(page, undefined, undefined, true)
+  await page.goto('/')
+  await waitForLocalSession(page)
+
+  const dialog = await openMachines(page)
+  await dialog.getByRole('button', { name: 'Add machine' }).click()
+  const add = page.getByRole('dialog', { name: 'Add saved machine' })
+  await add.getByLabel('SSH target').fill('-host name')
+  await add.getByLabel('Label (optional)').fill("Builder's box")
+  await add.getByLabel('Remote session (optional)').fill('release one')
+  const launch = add.getByRole('button', { name: 'Open setup in Terminal' })
+  await launch.dblclick()
+  await expect(add.getByText(/Terminal opened/)).toBeVisible()
+
+  await page.keyboard.press('Escape')
+  await dialog.getByRole('button', { name: /Offline box/ }).click()
+  const reconnect = dialog.getByRole('button', {
+    name: 'Open Terminal to reconnect',
+  })
+  await reconnect.dblclick()
+  await expect(dialog.getByText(/Complete authentication there/)).toBeVisible()
+
+  const calls = await page.evaluate(
+    () =>
+      (
+        window as unknown as {
+          __yardDesktopCalls: Array<{ command: string; payload: unknown }>
+        }
+      ).__yardDesktopCalls,
+  )
+  expect(calls).toEqual([
+    {
+      command: 'launch_machine_add',
+      payload: {
+        request: {
+          ssh_target: '-host name',
+          label: "Builder's box",
+          session: 'release one',
+        },
+      },
+    },
+    {
+      command: 'launch_machine_reconnect',
+      payload: { request: { machine_id: b } },
+    },
+  ])
 })
 
 test('add handoff traps focus, resets target, escapes arguments, and fits 390px', async ({

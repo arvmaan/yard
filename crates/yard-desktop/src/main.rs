@@ -1,5 +1,7 @@
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "macos", test))]
+mod terminal_handoff;
 
 #[cfg(target_os = "macos")]
 fn main() {

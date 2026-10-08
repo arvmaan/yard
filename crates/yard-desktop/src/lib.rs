@@ -222,6 +222,42 @@ pub struct ReadyService {
     pub url: String,
 }
 
+/// Return the canonical service origin and the exact `URLPattern` used for
+/// navigation and remote-command authorization.
+///
+/// # Errors
+///
+/// Returns an error unless `value` is a validated loopback service URL.
+pub fn service_origin_and_pattern(value: &str) -> Result<(String, String), String> {
+    validate_loopback_url(value)?;
+    let url = Url::parse(value).map_err(|_| "yard service URL is invalid".to_owned())?;
+    let host = match url.host() {
+        Some(Host::Ipv4(address)) => address.to_string(),
+        Some(Host::Ipv6(address)) => format!("[{address}]"),
+        Some(Host::Domain(_)) | None => {
+            return Err("yard service URL must use a loopback host".to_owned());
+        }
+    };
+    let port = url
+        .port()
+        .ok_or_else(|| "yard service URL must include its dynamic port".to_owned())?;
+    let origin = format!("http://{host}:{port}");
+    Ok((origin.clone(), format!("{origin}/*")))
+}
+
+/// Decide whether a desktop main-frame navigation stays on an internal Yard
+/// page or the single currently discovered service origin.
+#[must_use]
+pub fn desktop_navigation_allowed(value: &str, service_origin: Option<&str>) -> bool {
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    if url.scheme() == "tauri" && url.host_str() == Some("localhost") {
+        return true;
+    }
+    service_origin.is_some_and(|origin| url.origin().ascii_serialization() == origin)
+}
+
 /// Validate that service discovery returned a dynamic loopback HTTP URL.
 ///
 /// # Errors
@@ -245,6 +281,138 @@ pub fn validate_loopback_url(value: &str) -> Result<(), String> {
         return Err("yard service URL must include its dynamic port".to_owned());
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AddMachineRequest {
+    pub ssh_target: String,
+    pub label: Option<String>,
+    pub session: Option<String>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReconnectMachineRequest {
+    pub machine_id: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ValidatedAddMachine {
+    pub ssh_target: String,
+    pub label: Option<String>,
+    pub session: Option<String>,
+}
+
+const MAX_SSH_TARGET_BYTES: usize = 512;
+const MAX_MACHINE_LABEL_BYTES: usize = 128;
+const MAX_SESSION_BYTES: usize = 128;
+const MACHINE_ID_BYTES: usize = 32;
+
+fn normalize_required(value: &str, maximum: usize) -> Result<String, &'static str> {
+    if value.len() > maximum || value.chars().any(char::is_control) {
+        return Err("invalid machine handoff request");
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        Err("invalid machine handoff request")
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+fn normalize_optional(
+    value: Option<String>,
+    maximum: usize,
+) -> Result<Option<String>, &'static str> {
+    match value {
+        Some(value) => {
+            if value.len() > maximum || value.chars().any(char::is_control) {
+                return Err("invalid machine handoff request");
+            }
+            if value.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(value.trim().to_owned()))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+impl AddMachineRequest {
+    /// Validate and normalize webview-provided connection metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fixed, non-sensitive error for empty, oversized, or
+    /// control-character-bearing fields.
+    pub fn validate(self) -> Result<ValidatedAddMachine, &'static str> {
+        Ok(ValidatedAddMachine {
+            ssh_target: normalize_required(&self.ssh_target, MAX_SSH_TARGET_BYTES)?,
+            label: normalize_optional(self.label, MAX_MACHINE_LABEL_BYTES)?,
+            session: normalize_optional(self.session, MAX_SESSION_BYTES)?,
+        })
+    }
+}
+
+impl ReconnectMachineRequest {
+    /// Validate the stable machine ID accepted by Herdr.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fixed, non-sensitive error unless the ID is exactly 32
+    /// lowercase hexadecimal bytes.
+    pub fn validate(self) -> Result<String, &'static str> {
+        if self.machine_id.len() == MACHINE_ID_BYTES
+            && self
+                .machine_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            Ok(self.machine_id)
+        } else {
+            Err("invalid machine handoff request")
+        }
+    }
+}
+
+#[must_use]
+pub fn add_machine_arguments(request: &ValidatedAddMachine) -> Vec<String> {
+    let mut arguments = vec!["machine".to_owned(), "add".to_owned()];
+    if let Some(label) = &request.label {
+        arguments.extend(["--label".to_owned(), label.clone()]);
+    }
+    if let Some(session) = &request.session {
+        arguments.extend(["--remote-session".to_owned(), session.clone()]);
+    }
+    arguments.extend(["--".to_owned(), request.ssh_target.clone()]);
+    arguments
+}
+
+#[must_use]
+pub fn reconnect_machine_arguments(machine_id: String) -> Vec<String> {
+    vec!["machine".to_owned(), "reconnect".to_owned(), machine_id]
+}
+
+/// Quote one already-validated argument for a generated POSIX handoff file.
+#[must_use]
+pub fn quote_posix_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// Generate the fixed executable handoff body. The executable and every
+/// argument are quoted separately; request data never becomes shell syntax.
+#[must_use]
+pub fn terminal_handoff_script(executable: &Path, arguments: &[String]) -> String {
+    let command = std::iter::once(executable.to_string_lossy().into_owned())
+        .chain(arguments.iter().cloned())
+        .map(|argument| quote_posix_argument(&argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "#!/bin/sh\n{command}\nyard_status=$?\nrm -f -- \"$0\"\nif [ \"$yard_status\" -eq 0 ]; then\n  printf '\\nYard: Herdr operation completed.\\n'\nelse\n  printf '\\nYard: Herdr operation failed (status %s).\\n' \"$yard_status\"\nfi\nprintf 'Press Return to close this Terminal window. '\nIFS= read -r _yard_reply\nexit \"$yard_status\"\n"
+    )
 }
 
 #[derive(Debug)]
@@ -420,9 +588,12 @@ mod tests {
     };
 
     use super::{
-        ExitDecision, HERDR_ENVIRONMENT, MAX_COMMAND_OUTPUT_BYTES, ServiceAction, ServiceMode,
-        ServiceState, ServiceStatus, can_stop_service, exit_decision, fresh_service_environment,
-        resolve_sidecar, run_bounded_command, service_action, validate_loopback_url,
+        AddMachineRequest, ExitDecision, HERDR_ENVIRONMENT, MAX_COMMAND_OUTPUT_BYTES,
+        ReconnectMachineRequest, ServiceAction, ServiceMode, ServiceState, ServiceStatus,
+        ValidatedAddMachine, add_machine_arguments, can_stop_service, desktop_navigation_allowed,
+        exit_decision, fresh_service_environment, quote_posix_argument,
+        reconnect_machine_arguments, resolve_sidecar, run_bounded_command, service_action,
+        service_origin_and_pattern, terminal_handoff_script, validate_loopback_url,
     };
 
     struct TestDirectory(PathBuf);
@@ -601,6 +772,168 @@ mod tests {
         ] {
             assert!(status(document).ready().is_err());
         }
+    }
+
+    #[test]
+    fn exact_service_origin_and_acl_pattern_preserve_host_and_port() {
+        assert_eq!(
+            service_origin_and_pattern("http://127.0.0.1:43210/deep?q=1").unwrap(),
+            (
+                "http://127.0.0.1:43210".to_owned(),
+                "http://127.0.0.1:43210/*".to_owned()
+            )
+        );
+        assert_eq!(
+            service_origin_and_pattern("http://[::1]:43210/").unwrap(),
+            (
+                "http://[::1]:43210".to_owned(),
+                "http://[::1]:43210/*".to_owned()
+            )
+        );
+        assert!(service_origin_and_pattern("http://127.0.0.1:*/").is_err());
+    }
+
+    #[test]
+    fn desktop_navigation_is_internal_or_exact_active_origin_only() {
+        let origin = Some("http://127.0.0.1:43210");
+        assert!(desktop_navigation_allowed(
+            "tauri://localhost/loading.html",
+            origin
+        ));
+        assert!(desktop_navigation_allowed(
+            "http://127.0.0.1:43210/machines?q=1",
+            origin
+        ));
+        for rejected in [
+            "http://127.0.0.1:43211/",
+            "http://localhost:43210/",
+            "https://127.0.0.1:43210/",
+            "tauri://external/loading.html",
+            "https://example.com/",
+        ] {
+            assert!(!desktop_navigation_allowed(rejected, origin), "{rejected}");
+        }
+        assert!(!desktop_navigation_allowed("http://127.0.0.1:43210/", None));
+    }
+
+    #[test]
+    fn machine_requests_deny_unknown_fields_normalize_and_bound_values() {
+        let request: AddMachineRequest = serde_json::from_str(
+            r#"{"ssh_target":"  user@host  ","label":"  Build box ","session":" "}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            request.validate().unwrap(),
+            ValidatedAddMachine {
+                ssh_target: "user@host".to_owned(),
+                label: Some("Build box".to_owned()),
+                session: None,
+            }
+        );
+        assert!(
+            serde_json::from_str::<AddMachineRequest>(
+                r#"{"ssh_target":"host","label":null,"session":null,"argv":[]}"#
+            )
+            .is_err()
+        );
+        for value in [
+            "",
+            "host\nsecret",
+            "host\rsecret",
+            "host\0secret",
+            "host\u{7f}",
+            "\nhost",
+            "host\n",
+        ] {
+            assert_eq!(
+                AddMachineRequest {
+                    ssh_target: value.to_owned(),
+                    label: None,
+                    session: None,
+                }
+                .validate()
+                .unwrap_err(),
+                "invalid machine handoff request"
+            );
+        }
+        assert!(
+            AddMachineRequest {
+                ssh_target: "host".to_owned(),
+                label: Some("\n".to_owned()),
+                session: None,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            AddMachineRequest {
+                ssh_target: "x".repeat(513),
+                label: None,
+                session: None,
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reconnect_requires_exact_lowercase_stable_id_without_leaking_it() {
+        let id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            ReconnectMachineRequest {
+                machine_id: id.to_owned()
+            }
+            .validate()
+            .unwrap(),
+            id
+        );
+        for invalid in [
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "--label=0123456789abcdef01234567",
+        ] {
+            let error = ReconnectMachineRequest {
+                machine_id: invalid.to_owned(),
+            }
+            .validate()
+            .unwrap_err();
+            assert_eq!(error, "invalid machine handoff request");
+            assert!(!error.contains(invalid));
+        }
+    }
+
+    #[test]
+    fn argv_and_script_quote_hostile_values_and_place_option_terminator() {
+        let request = ValidatedAddMachine {
+            ssh_target: "-host $(touch nope)".to_owned(),
+            label: Some("Builder's `box`".to_owned()),
+            session: Some("release one".to_owned()),
+        };
+        let arguments = add_machine_arguments(&request);
+        assert_eq!(
+            arguments,
+            [
+                "machine",
+                "add",
+                "--label",
+                "Builder's `box`",
+                "--remote-session",
+                "release one",
+                "--",
+                "-host $(touch nope)",
+            ]
+        );
+        assert_eq!(quote_posix_argument("a'b"), "'a'\"'\"'b'");
+        let script = terminal_handoff_script(Path::new("/Applications/Yard's/herdr"), &arguments);
+        assert!(script.contains("'/Applications/Yard'\"'\"'s/herdr' 'machine' 'add'"));
+        assert!(script.contains("'--' '-host $(touch nope)'"));
+        assert!(!script.contains("sh -c"));
+        assert!(script.contains("rm -f -- \"$0\""));
+        assert_eq!(
+            reconnect_machine_arguments("0123456789abcdef0123456789abcdef".to_owned()),
+            ["machine", "reconnect", "0123456789abcdef0123456789abcdef"]
+        );
     }
 
     #[cfg(unix)]
