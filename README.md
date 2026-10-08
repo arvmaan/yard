@@ -397,8 +397,10 @@ The local Terminal handoff follows Yard's single-owner threat model. Generated
 handoffs live under the current user's
 `~/Library/Caches/dev.yard.desktop/terminal-handoffs` directory; fixed
 ancestors are opened without following symlinks, must be owned by the current
-UID, and must not be group/other writable. The final directory is `0700`, so
-other OS users cannot read or replace its files. Yard creates handoffs
+UID, and must not be group/other writable. Yard creates missing cache
+components as `0700`; it accepts pre-existing current-UID directories with no
+group/other write permission. Handoff files themselves are `0700`, so other
+OS users cannot read or replace them. Yard creates handoffs
 relative to an open directory descriptor, validates their owner, type, mode,
 link count, device, and inode, and re-walks the fixed ancestry immediately
 before asking `/usr/bin/open` to launch Terminal. Cleanup first atomically
