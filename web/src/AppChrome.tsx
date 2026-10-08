@@ -322,7 +322,7 @@ export function GlobalCommandBar({
         type="button"
       >
         <span className="brand__mark" aria-hidden="true">
-          Y
+          <img alt="" src="/favicon.svg" />
         </span>
         <strong>Yard</strong>
       </button>

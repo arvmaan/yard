@@ -92,14 +92,18 @@ button {
 
 .brand__mark {
   display: grid;
-  width: 28px;
-  height: 28px;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
   place-items: center;
-  background: var(--ink);
-  color: var(--paper);
-  font-family: "IBM Plex Mono", monospace;
-  font-size: 16px;
-  font-weight: 600;
+  color: var(--ink);
+}
+
+.brand__mark img {
+  display: block;
+  width: 28px;
+  height: 24px;
+  object-fit: contain;
 }
 
 .brand strong {
