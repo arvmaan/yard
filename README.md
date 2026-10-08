@@ -317,7 +317,8 @@ exclusively owns a database.
 | `YARD_BIND` | UI and API socket; loopback addresses only | `127.0.0.1:4317` |
 | `YARD_HERDR_BIN` | Herdr executable | `herdr` |
 | `YARD_GHOSTTY_BIN` | Ghostty executable | macOS app bundle, then `ghostty` |
-| `YARD_DESKTOP_SERVICE_BIN` | development override used by the Tauri shell to locate `yard` | bundled executable, then `PATH` |
+| `YARD_DESKTOP_SERVICE_BIN` | absolute development override used by the Tauri shell to locate the `yard` sidecar | bundled executable |
+| `YARD_DESKTOP_HERDR_BIN` | absolute development override used by the Tauri shell to locate the Herdr sidecar | bundled executable |
 | `YARD_DATABASE_PATH` | SQLite control database | `$XDG_DATA_HOME/yard/yard.sqlite3` or `$HOME/.local/share/yard/yard.sqlite3` |
 | `YARD_ARTIFACT_PATH` | managed artifact bytes | `artifacts/` beside the database |
 | `YARD_COORDINATION_PATH` | managed workstream directories | `coordination/` beside the database |
@@ -375,18 +376,26 @@ into the client.
 
 The Tauri shell is a lifecycle client: it invokes the same database-scoped
 `yard start/status/stop` interface as the browser workflow and then loads the
-service's embedded UI over its verified dynamic loopback URL. The shell does
-not open SQLite or call Herdr. Closing the window leaves both the shell and
-service running. **Quit Yard** exits only the shell; **Stop Yard Service**
-requests the existing authenticated graceful stop and does not close Herdr
-panes or complete assignments. Services started by the desktop use an
+service's embedded UI over its verified dynamic loopback URL. `Yard.app`
+bundles target-architecture `yard` and Herdr sidecars under
+`Contents/MacOS/yard` and `Contents/MacOS/herdr`. The shell passes the sibling
+Herdr path as `YARD_HERDR_BIN` only when starting a fresh managed service;
+status and stop remain `yard` lifecycle commands and do not depend on Finder's
+`PATH`, shell initialization, mise shims, or a user-selected executable. The
+shell itself does not open SQLite or call Herdr. Closing the window leaves both
+the shell and service running. **Quit Yard** exits only the shell; **Stop Yard
+Service** requests the existing authenticated graceful stop and does not close
+Herdr panes or complete assignments. Services started by the desktop use an
 ephemeral `127.0.0.1` port; a compatible existing managed service may already
-own any verified credential-free loopback HTTP port. Foreground-owned services
-remain browser/terminal-managed and Yard.app reports that incompatibility
-without enabling its Stop operation.
+own any verified credential-free loopback HTTP port. Yard.app attaches without
+replacing it and shows a window-title notice that **Stop Yard Service**, then
+**Show Yard**, may be required for the service to adopt the bundled Herdr.
+Foreground-owned services remain browser/terminal-managed and Yard.app reports
+that incompatibility without enabling its Stop operation.
 
-Install Xcode command-line tools, supported Rust and Node.js versions, and the
-pinned Tauri CLI once:
+Install Xcode command-line tools, supported Rust and Node.js versions, Herdr
+0.9.3 or newer for the Mac architecture being built, and the pinned Tauri CLI
+once:
 
 ```sh
 cargo install tauri-cli --version 2.9.6 --locked
@@ -399,16 +408,32 @@ bash scripts/build-macos-desktop.sh dev
 bash scripts/build-macos-desktop.sh build
 ```
 
+The script resolves the installed `herdr` explicitly before packaging. For a
+non-`PATH` development install, set `YARD_DESKTOP_BUILD_HERDR_BIN` to an
+absolute executable file. It rejects binaries whose `herdr --version` is older
+than 0.9.3, whose CLI lacks saved-machine JSON listing or `--machine`
+forwarding, or whose Mach-O architecture does not match Rust's host target.
+This build flow intentionally packages the installed CLI; it never changes
+Herdr configuration or contacts a remote host.
+
 The build command reports the resulting `target/release/bundle/macos/Yard.app`.
-It builds the embedded web client and release `yard` sidecar first, removes the
-temporary target-named sidecar after the Tauri command, and does not require a
-manually started server or browser. Service startup and readiness are bounded
-by the existing lifecycle timeouts; the shell's supervising process deadlines
-are longer, command output is capped, and timed-out commands are terminated and
-reaped. Startup errors are shown in the app and **Show Yard** retries discovery
-and startup for an existing disconnected/error window. Managed diagnostics
-remain at the log path reported by `yard status --json`. This POC is
-intentionally unsigned and unnotarized.
+It builds the embedded web client and release `yard` sidecar, stages
+`yard-<target-triple>` and `herdr-<target-triple>` for Tauri, and removes both
+temporary target-named copies on every exit. Tauri places them in the app as:
+
+```text
+Yard.app/Contents/MacOS/yard-desktop
+Yard.app/Contents/MacOS/yard
+Yard.app/Contents/MacOS/herdr
+```
+
+The app does not require a manually started server or browser. Service startup
+and readiness are bounded by the existing lifecycle timeouts; the shell's
+supervising process deadlines are longer, command output is capped, and
+timed-out commands are terminated and reaped. Startup errors are shown in the
+app and **Show Yard** retries discovery and startup for an existing
+disconnected/error window. Managed diagnostics remain at the log path reported
+by `yard status --json`. This POC is intentionally unsigned and unnotarized.
 
 ### Verification
 

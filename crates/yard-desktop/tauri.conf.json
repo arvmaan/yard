@@ -16,6 +16,6 @@
     "active": true,
     "targets": ["app"],
     "icon": ["icons/icon.icns"],
-    "externalBin": ["binaries/yard"]
+    "externalBin": ["binaries/yard", "binaries/herdr"]
   }
 }

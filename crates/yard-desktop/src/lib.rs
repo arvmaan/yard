@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     io::{self, Read},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
@@ -10,6 +10,86 @@ use std::{
 use url::{Host, Url};
 
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
+pub const HERDR_ENVIRONMENT: &str = "YARD_HERDR_BIN";
+
+/// Resolve a required sidecar next to the current executable, with an optional
+/// explicit development override.
+///
+/// # Errors
+///
+/// Returns an error when the override is not absolute or does not name an
+/// executable file, or when the bundled sibling is missing or invalid.
+pub fn resolve_sidecar(
+    current_executable: &Path,
+    bundled_name: &str,
+    override_value: Option<&OsStr>,
+    override_variable: &str,
+) -> Result<PathBuf, String> {
+    if let Some(value) = override_value {
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err(format!(
+                "{override_variable} must name an absolute file: {}",
+                path.display()
+            ));
+        }
+        return require_file(path, override_variable);
+    }
+
+    let directory = current_executable.parent().ok_or_else(|| {
+        format!(
+            "could not locate the directory containing {}",
+            current_executable.display()
+        )
+    })?;
+    require_file(
+        directory.join(bundled_name),
+        &format!("bundled {bundled_name} sidecar"),
+    )
+}
+
+fn require_file(path: PathBuf, description: &str) -> Result<PathBuf, String> {
+    if !path.is_file() {
+        return Err(format!(
+            "{description} does not name a file: {}",
+            path.display()
+        ));
+    }
+    if is_executable(&path)? {
+        Ok(path)
+    } else {
+        Err(format!(
+            "{description} is not executable: {}",
+            path.display()
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> Result<bool, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        .map_err(|error| format!("could not inspect {}: {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> Result<bool, String> {
+    Ok(true)
+}
+
+/// Build the environment used only when starting a fresh managed service.
+#[must_use]
+pub fn fresh_service_environment(herdr_binary: &Path) -> Vec<(OsString, OsString)> {
+    vec![
+        (OsString::from("YARD_BIND"), OsString::from("127.0.0.1:0")),
+        (
+            OsString::from(HERDR_ENVIRONMENT),
+            herdr_binary.as_os_str().to_os_string(),
+        ),
+    ]
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -330,16 +410,121 @@ fn reap_terminated_child(child: &mut std::process::Child) -> Result<(), String> 
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, path::Path, time::Duration};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::{
+        ffi::{OsStr, OsString},
+        fs,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
 
     use super::{
-        ExitDecision, MAX_COMMAND_OUTPUT_BYTES, ServiceAction, ServiceMode, ServiceState,
-        ServiceStatus, can_stop_service, exit_decision, run_bounded_command, service_action,
-        validate_loopback_url,
+        ExitDecision, HERDR_ENVIRONMENT, MAX_COMMAND_OUTPUT_BYTES, ServiceAction, ServiceMode,
+        ServiceState, ServiceStatus, can_stop_service, exit_decision, fresh_service_environment,
+        resolve_sidecar, run_bounded_command, service_action, validate_loopback_url,
     };
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "yard-desktop-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_executable(path: &Path) {
+        fs::write(path, b"sidecar").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     fn status(document: &str) -> ServiceStatus {
         serde_json::from_str(document).unwrap()
+    }
+
+    #[test]
+    fn resolves_bundled_sibling_and_constructs_fresh_start_environment() {
+        let temp = TestDirectory::new("sidecars");
+        let desktop = temp.0.join("yard-desktop");
+        let herdr = temp.0.join("herdr");
+        write_executable(&desktop);
+        write_executable(&herdr);
+
+        assert_eq!(
+            resolve_sidecar(&desktop, "herdr", None, "YARD_DESKTOP_HERDR_BIN").unwrap(),
+            herdr
+        );
+        assert_eq!(
+            fresh_service_environment(&herdr),
+            vec![
+                (OsString::from("YARD_BIND"), OsString::from("127.0.0.1:0")),
+                (
+                    OsString::from(HERDR_ENVIRONMENT),
+                    herdr.as_os_str().to_os_string()
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_sidecar_override_must_be_an_absolute_file() {
+        let temp = TestDirectory::new("override");
+        let override_path = temp.0.join("herdr-development");
+        write_executable(&override_path);
+
+        assert_eq!(
+            resolve_sidecar(
+                Path::new("/Applications/Yard.app/Contents/MacOS/yard-desktop"),
+                "herdr",
+                Some(override_path.as_os_str()),
+                "YARD_DESKTOP_HERDR_BIN"
+            )
+            .unwrap(),
+            override_path
+        );
+        assert!(
+            resolve_sidecar(
+                Path::new("/Applications/Yard.app/Contents/MacOS/yard-desktop"),
+                "herdr",
+                Some(OsStr::new("relative/herdr")),
+                "YARD_DESKTOP_HERDR_BIN"
+            )
+            .unwrap_err()
+            .contains("absolute file")
+        );
+    }
+
+    #[test]
+    fn missing_or_invalid_bundled_sidecar_is_rejected() {
+        let temp = TestDirectory::new("missing-sidecar");
+        let desktop = temp.0.join("yard-desktop");
+        write_executable(&desktop);
+
+        let missing = resolve_sidecar(&desktop, "herdr", None, "unused").unwrap_err();
+        assert!(missing.contains("bundled herdr sidecar"));
+        fs::create_dir(temp.0.join("herdr")).unwrap();
+        let invalid = resolve_sidecar(&desktop, "herdr", None, "unused").unwrap_err();
+        assert!(invalid.contains("does not name a file"));
+        fs::remove_dir(temp.0.join("herdr")).unwrap();
+        fs::write(temp.0.join("herdr"), b"not executable").unwrap();
+        let not_executable = resolve_sidecar(&desktop, "herdr", None, "unused").unwrap_err();
+        assert!(not_executable.contains("not executable"));
     }
 
     #[test]

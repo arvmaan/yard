@@ -1,7 +1,5 @@
 use std::{
-    env,
-    ffi::OsString,
-    fmt,
+    env, fmt,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -14,17 +12,21 @@ use std::{
 use tauri::{
     AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
     menu::{MenuBuilder, MenuItem, SubmenuBuilder},
+    webview::PageLoadEvent,
 };
 use url::Host;
 use yard_desktop::{
     ExitDecision, ReadyService, ServiceAction, ServiceMode, ServiceStatus, can_stop_service,
-    exit_decision, run_bounded_command, service_action,
+    exit_decision, fresh_service_environment, resolve_sidecar, run_bounded_command, service_action,
 };
 
 const MAIN_WINDOW: &str = "main";
 const MENU_SHOW: &str = "show";
 const MENU_STOP: &str = "stop-service";
 const SERVICE_OVERRIDE: &str = "YARD_DESKTOP_SERVICE_BIN";
+const HERDR_OVERRIDE: &str = "YARD_DESKTOP_HERDR_BIN";
+const EXISTING_SERVICE_NOTICE: &str =
+    "Yard — Existing service; Stop Yard Service, then Show Yard to adopt bundled Herdr";
 const STATUS_TIMEOUT: Duration = Duration::from_secs(50);
 const START_TIMEOUT: Duration = Duration::from_secs(80);
 const STOP_TIMEOUT: Duration = Duration::from_secs(65);
@@ -41,7 +43,12 @@ pub(crate) fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let lifecycle = Arc::new(ServiceLifecycle::new(resolve_service_binary()?));
+    let current =
+        env::current_exe().map_err(|error| format!("could not locate Yard.app: {error}"))?;
+    let lifecycle = Arc::new(ServiceLifecycle::new(
+        resolve_service_binary(&current)?,
+        resolve_herdr_binary(&current)?,
+    ));
     let setup_lifecycle = Arc::clone(&lifecycle);
     let menu_lifecycle = Arc::clone(&lifecycle);
 
@@ -52,7 +59,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .setup(move |app| {
             let stop_service = install_menu(app)?;
             app.manage(DesktopMenu { stop_service });
-            let window = loading_window(app.handle())?;
+            let window = loading_window(app.handle(), Arc::clone(&lifecycle))?;
             let lifecycle = Arc::clone(&setup_lifecycle);
             #[cfg(target_os = "macos")]
             app.handle()
@@ -61,7 +68,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let result = lifecycle.ensure_ready();
                 apply_stop_capability(&window, &lifecycle);
                 match result {
-                    Ok(service) => navigate_to_service(&window, &service.url),
+                    Ok(service) => navigate_to_service(&window, &service),
                     Err(error) => show_failure(&window, &error),
                 }
             });
@@ -107,8 +114,19 @@ fn install_menu(app: &tauri::App) -> tauri::Result<MenuItem<tauri::Wry>> {
     Ok(stop_service)
 }
 
-fn loading_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
+fn loading_window(
+    app: &AppHandle,
+    lifecycle: Arc<ServiceLifecycle>,
+) -> tauri::Result<WebviewWindow> {
     WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::App("loading.html".into()))
+        .on_page_load(move |window, payload| {
+            if payload.event() == PageLoadEvent::Finished
+                && payload.url().scheme() == "http"
+                && lifecycle.attached_to_existing()
+            {
+                let _ = window.set_title(EXISTING_SERVICE_NOTICE);
+            }
+        })
         .on_navigation(|url| {
             url.scheme() == "tauri"
                 || (url.scheme() == "http"
@@ -124,9 +142,12 @@ fn loading_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .build()
 }
 
-fn navigate_to_service(window: &WebviewWindow, url: &str) {
-    match url.parse() {
+fn navigate_to_service(window: &WebviewWindow, service: &DesktopReadyService) {
+    match service.service.url.parse() {
         Ok(url) => {
+            if service.attached_to_existing {
+                let _ = window.set_title(EXISTING_SERVICE_NOTICE);
+            }
             if let Err(error) = window.navigate(url) {
                 show_failure(window, &format!("could not load Yard: {error}"));
             }
@@ -150,7 +171,7 @@ fn show_or_create_window(app: &AppHandle, lifecycle: Arc<ServiceLifecycle>) {
         let _ = window.set_focus();
         window
     } else {
-        match loading_window(app) {
+        match loading_window(app, Arc::clone(&lifecycle)) {
             Ok(window) => window,
             Err(error) => {
                 eprintln!("yard-desktop: could not create window: {error}");
@@ -163,9 +184,14 @@ fn show_or_create_window(app: &AppHandle, lifecycle: Arc<ServiceLifecycle>) {
         apply_stop_capability(&window, &lifecycle);
         match result {
             Ok(service) => {
-                let already_connected = window.url().is_ok_and(|url| url.as_str() == service.url);
+                let already_connected = window
+                    .url()
+                    .is_ok_and(|url| url.as_str() == service.service.url);
+                if service.attached_to_existing {
+                    let _ = window.set_title(EXISTING_SERVICE_NOTICE);
+                }
                 if !already_connected {
-                    navigate_to_service(&window, &service.url);
+                    navigate_to_service(&window, &service);
                 }
             }
             Err(error) => show_failure(&window, &error),
@@ -209,44 +235,69 @@ fn stop_service(app: &AppHandle, lifecycle: Arc<ServiceLifecycle>) {
 
 struct ServiceLifecycle {
     binary: PathBuf,
+    herdr_binary: PathBuf,
+    attached_to_existing: AtomicBool,
     operation: Mutex<()>,
     stop_available: AtomicBool,
 }
 
+struct DesktopReadyService {
+    service: ReadyService,
+    attached_to_existing: bool,
+}
+
 impl ServiceLifecycle {
-    fn new(binary: PathBuf) -> Self {
+    fn new(binary: PathBuf, herdr_binary: PathBuf) -> Self {
         Self {
             binary,
+            herdr_binary,
+            attached_to_existing: AtomicBool::new(false),
             operation: Mutex::new(()),
             stop_available: AtomicBool::new(false),
         }
     }
 
-    fn ensure_ready(&self) -> Result<ReadyService, String> {
+    fn ensure_ready(&self) -> Result<DesktopReadyService, String> {
         let operation = self
             .operation
             .try_lock()
             .map_err(|_| "a Yard desktop lifecycle operation is already in progress".to_owned())?;
-        let initial = self.command(["status", "--json"], [], STATUS_TIMEOUT)?;
+        let initial = self.command(
+            ["status", "--json"],
+            std::iter::empty::<(&str, &str)>(),
+            STATUS_TIMEOUT,
+        )?;
         self.stop_available.store(false, Ordering::Release);
+        self.attached_to_existing.store(false, Ordering::Release);
         let status = parse_status(&initial)?;
         let result = match service_action(&status)? {
             ServiceAction::Attach => {
                 self.stop_available.store(true, Ordering::Release);
-                status.ready()
+                self.attached_to_existing.store(true, Ordering::Release);
+                status.ready().map(|service| DesktopReadyService {
+                    service,
+                    attached_to_existing: true,
+                })
             }
             ServiceAction::Start => {
                 let started = self.command(
                     ["start", "--no-open"],
-                    [("YARD_BIND", "127.0.0.1:0")],
+                    fresh_service_environment(&self.herdr_binary),
                     START_TIMEOUT,
                 )?;
                 require_success("start Yard", &started)?;
-                let status = self.command(["status", "--json"], [], STATUS_TIMEOUT)?;
+                let status = self.command(
+                    ["status", "--json"],
+                    std::iter::empty::<(&str, &str)>(),
+                    STATUS_TIMEOUT,
+                )?;
                 let status = parse_status(&status)?;
                 self.stop_available
                     .store(can_stop_service(&status), Ordering::Release);
-                status.ready()
+                status.ready().map(|service| DesktopReadyService {
+                    service,
+                    attached_to_existing: false,
+                })
             }
             ServiceAction::Wait => {
                 self.stop_available.store(false, Ordering::Release);
@@ -265,7 +316,11 @@ impl ServiceLifecycle {
             .operation
             .try_lock()
             .map_err(|_| "a Yard desktop lifecycle operation is already in progress".to_owned())?;
-        let status = self.command(["status", "--json"], [], STATUS_TIMEOUT)?;
+        let status = self.command(
+            ["status", "--json"],
+            std::iter::empty::<(&str, &str)>(),
+            STATUS_TIMEOUT,
+        )?;
         self.stop_available.store(false, Ordering::Release);
         let status = parse_status(&status)?;
         self.stop_available
@@ -277,7 +332,7 @@ impl ServiceLifecycle {
                     .to_owned(),
             );
         }
-        let output = self.command(["stop"], [], STOP_TIMEOUT)?;
+        let output = self.command(["stop"], std::iter::empty::<(&str, &str)>(), STOP_TIMEOUT)?;
         require_success("stop Yard", &output)?;
         self.stop_available.store(false, Ordering::Release);
         Ok(())
@@ -287,12 +342,21 @@ impl ServiceLifecycle {
         self.stop_available.load(Ordering::Acquire)
     }
 
-    fn command<const N: usize, const E: usize>(
+    fn attached_to_existing(&self) -> bool {
+        self.attached_to_existing.load(Ordering::Acquire)
+    }
+
+    fn command<const N: usize, E, K, V>(
         &self,
         args: [&str; N],
-        environment: [(&str, &str); E],
+        environment: E,
         deadline: Duration,
-    ) -> Result<yard_desktop::CommandOutput, String> {
+    ) -> Result<yard_desktop::CommandOutput, String>
+    where
+        E: IntoIterator<Item = (K, V)>,
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
         run_bounded_command(&self.binary, args, environment, deadline)
     }
 }
@@ -333,44 +397,22 @@ fn command_failure(operation: &str, output: &yard_desktop::CommandOutput) -> Str
     }
 }
 
-fn resolve_service_binary() -> Result<PathBuf, String> {
-    if let Some(path) = env::var_os(SERVICE_OVERRIDE) {
-        return require_executable(PathBuf::from(path), SERVICE_OVERRIDE);
-    }
-
-    let current =
-        env::current_exe().map_err(|error| format!("could not locate Yard.app: {error}"))?;
-    if let Some(macos) = current.parent() {
-        let bundled = macos.join("yard");
-        if bundled.is_file() {
-            return Ok(bundled);
-        }
-    }
-
-    find_on_path(OsString::from("yard")).ok_or_else(|| {
-        format!(
-            "could not locate the bundled Yard service; set {SERVICE_OVERRIDE} to a built yard executable"
-        )
-    })
+fn resolve_service_binary(current: &std::path::Path) -> Result<PathBuf, String> {
+    resolve_sidecar(
+        current,
+        "yard",
+        env::var_os(SERVICE_OVERRIDE).as_deref(),
+        SERVICE_OVERRIDE,
+    )
 }
 
-fn require_executable(path: PathBuf, variable: &str) -> Result<PathBuf, String> {
-    if path.is_file() {
-        Ok(path)
-    } else {
-        Err(format!(
-            "{variable} does not name a file: {}",
-            path.display()
-        ))
-    }
-}
-
-fn find_on_path(name: OsString) -> Option<PathBuf> {
-    env::var_os("PATH").and_then(|path| {
-        env::split_paths(&path)
-            .map(|directory| directory.join(&name))
-            .find(|candidate| candidate.is_file())
-    })
+fn resolve_herdr_binary(current: &std::path::Path) -> Result<PathBuf, String> {
+    resolve_sidecar(
+        current,
+        "herdr",
+        env::var_os(HERDR_OVERRIDE).as_deref(),
+        HERDR_OVERRIDE,
+    )
 }
 
 impl fmt::Debug for ServiceLifecycle {
@@ -378,6 +420,7 @@ impl fmt::Debug for ServiceLifecycle {
         formatter
             .debug_struct("ServiceLifecycle")
             .field("binary", &self.binary)
+            .field("herdr_binary", &self.herdr_binary)
             .finish_non_exhaustive()
     }
 }
