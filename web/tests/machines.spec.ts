@@ -370,6 +370,34 @@ test('desktop handoff invokes typed add and reconnect payloads without opening a
   ])
 })
 
+test('desktop handoff sanitizes native errors before showing guidance', async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', {
+      value: {
+        invoke() {
+          return Promise.reject(new Error('secret host and script contents'))
+        },
+      },
+    })
+  })
+  await setup(page)
+  await page.goto('/')
+  await waitForLocalSession(page)
+
+  const dialog = await openMachines(page)
+  await dialog.getByRole('button', { name: 'Add machine' }).click()
+  const add = page.getByRole('dialog', { name: 'Add saved machine' })
+  await add.getByLabel('SSH target').fill('private-user@private-host')
+  await add.getByRole('button', { name: 'Open setup in Terminal' }).click()
+
+  const alert = add.getByRole('alert')
+  await expect(alert).toContainText('Terminal could not be opened')
+  await expect(alert).not.toContainText('secret host')
+  await expect(alert).not.toContainText('private-user')
+})
+
 test('add handoff traps focus, resets target, escapes arguments, and fits 390px', async ({
   page,
 }) => {
