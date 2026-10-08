@@ -12,6 +12,20 @@ use url::{Host, Url};
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 pub const HERDR_ENVIRONMENT: &str = "YARD_HERDR_BIN";
 
+/// Select whether a development sidecar override is eligible. Production
+/// callers always pass `false`, making environment values inert.
+#[must_use]
+pub const fn development_override(
+    development_build: bool,
+    override_value: Option<&OsStr>,
+) -> Option<&OsStr> {
+    if development_build {
+        override_value
+    } else {
+        None
+    }
+}
+
 /// Resolve a required sidecar next to the current executable, with an optional
 /// explicit development override.
 ///
@@ -591,7 +605,7 @@ mod tests {
         AddMachineRequest, ExitDecision, HERDR_ENVIRONMENT, MAX_COMMAND_OUTPUT_BYTES,
         ReconnectMachineRequest, ServiceAction, ServiceMode, ServiceState, ServiceStatus,
         ValidatedAddMachine, add_machine_arguments, can_stop_service, desktop_navigation_allowed,
-        exit_decision, fresh_service_environment, quote_posix_argument,
+        development_override, exit_decision, fresh_service_environment, quote_posix_argument,
         reconnect_machine_arguments, resolve_sidecar, run_bounded_command, service_action,
         service_origin_and_pattern, terminal_handoff_script, validate_loopback_url,
     };
@@ -651,6 +665,17 @@ mod tests {
                 )
             ]
         );
+    }
+
+    #[test]
+    fn release_sidecar_selection_ignores_environment_override() {
+        let override_path = OsStr::new("/tmp/attacker-herdr");
+        assert_eq!(development_override(false, Some(override_path)), None);
+        assert_eq!(
+            development_override(true, Some(override_path)),
+            Some(override_path)
+        );
+        assert_eq!(development_override(true, None), None);
     }
 
     #[test]

@@ -193,6 +193,28 @@ async function setup(
   }
 }
 
+async function setupClipboardUnavailable(page: Page, mode: 'absent' | 'throwing') {
+  await page.addInitScript((clipboardMode) => {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value:
+        clipboardMode === 'absent'
+          ? undefined
+          : {
+              writeText() {
+                return Promise.reject(new Error('clipboard denied'))
+              },
+            },
+    })
+    window.addEventListener('unhandledrejection', (event) => {
+      Object.defineProperty(window, '__yardUnhandledRejection', {
+        configurable: true,
+        value: String(event.reason),
+      })
+    })
+  }, mode)
+}
+
 async function waitForLocalSession(page: Page) {
   await expect(
     page.getByRole('button', { name: /^Runtime health:/ }),
@@ -317,6 +339,61 @@ test('shows an explicit empty state when Herdr returns no endpoints', async ({
     dialog.getByText('No saved endpoints were returned by Herdr.'),
   ).toBeVisible()
   await expect(dialog.getByText('Select a machine.')).toBeVisible()
+})
+
+test('browser clipboard failures preserve selectable commands and show manual guidance', async ({
+  page,
+}) => {
+  await setupClipboardUnavailable(page, 'absent')
+  await setup(page)
+  await page.goto('/')
+  await waitForLocalSession(page)
+
+  const dialog = await openMachines(page)
+  await dialog.getByRole('button', { name: 'Add machine' }).click()
+  const add = page.getByRole('dialog', { name: 'Add saved machine' })
+  await add.getByLabel('SSH target').fill('user@host')
+  await add.getByRole('button', { name: 'Prepare command' }).click()
+  const addCommand = add.getByText("herdr machine add -- 'user@host'")
+  await expect(addCommand).toBeVisible()
+  await add.getByRole('button', { name: 'Copy command' }).click()
+  await expect(add.getByRole('alert')).toContainText('Select it manually')
+  await expect(addCommand).toBeVisible()
+  await expect(
+    page.evaluate(() =>
+      (window as unknown as { __yardUnhandledRejection?: string })
+        .__yardUnhandledRejection,
+    ),
+  ).resolves.toBeUndefined()
+
+  await page.keyboard.press('Escape')
+  await dialog.getByRole('button', { name: /Offline box/ }).click()
+  const reconnectCommand = dialog.getByText(`herdr machine reconnect '${b}'`)
+  await dialog.getByRole('button', { name: 'Copy reconnect command' }).click()
+  await expect(dialog.getByRole('alert')).toContainText(
+    'Select it manually',
+  )
+  await expect(reconnectCommand).toBeVisible()
+})
+
+test('throwing Clipboard API is handled without an uncaught error', async ({
+  page,
+}) => {
+  await setupClipboardUnavailable(page, 'throwing')
+  await setup(page)
+  await page.goto('/')
+  await waitForLocalSession(page)
+
+  const dialog = await openMachines(page)
+  await dialog.getByRole('button', { name: /Offline box/ }).click()
+  await dialog.getByRole('button', { name: 'Copy reconnect command' }).click()
+  await expect(dialog.getByRole('alert')).toContainText('Select it manually')
+  await expect(
+    page.evaluate(() =>
+      (window as unknown as { __yardUnhandledRejection?: string })
+        .__yardUnhandledRejection,
+    ),
+  ).resolves.toBeUndefined()
 })
 
 test('desktop handoff invokes typed add and reconnect payloads without opening a terminal', async ({

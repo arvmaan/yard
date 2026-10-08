@@ -1,5 +1,7 @@
 use std::{
-    env, fmt,
+    env,
+    ffi::OsString,
+    fmt,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -15,6 +17,8 @@ use tauri::{
     menu::{MenuBuilder, MenuItem, SubmenuBuilder},
     webview::PageLoadEvent,
 };
+#[cfg(debug_assertions)]
+use yard_desktop::development_override;
 use yard_desktop::{
     AddMachineRequest, ExitDecision, ReadyService, ReconnectMachineRequest, ServiceAction,
     ServiceMode, ServiceStatus, add_machine_arguments, can_stop_service,
@@ -481,22 +485,27 @@ fn command_failure(operation: &str, output: &yard_desktop::CommandOutput) -> Str
     }
 }
 
+fn sidecar_override(variable: &str) -> Option<std::ffi::OsString> {
+    #[cfg(debug_assertions)]
+    {
+        development_override(true, env::var_os(variable).as_deref())
+            .map(std::ffi::OsStr::to_os_string)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = variable;
+        None
+    }
+}
+
 fn resolve_service_binary(current: &std::path::Path) -> Result<PathBuf, String> {
-    resolve_sidecar(
-        current,
-        "yard",
-        env::var_os(SERVICE_OVERRIDE).as_deref(),
-        SERVICE_OVERRIDE,
-    )
+    let override_value = sidecar_override(SERVICE_OVERRIDE);
+    resolve_sidecar(current, "yard", override_value.as_deref(), SERVICE_OVERRIDE)
 }
 
 fn resolve_herdr_binary(current: &std::path::Path) -> Result<PathBuf, String> {
-    resolve_sidecar(
-        current,
-        "herdr",
-        env::var_os(HERDR_OVERRIDE).as_deref(),
-        HERDR_OVERRIDE,
-    )
+    let override_value = sidecar_override(HERDR_OVERRIDE);
+    resolve_sidecar(current, "herdr", override_value.as_deref(), HERDR_OVERRIDE)
 }
 
 impl fmt::Debug for ServiceLifecycle {

@@ -1,119 +1,190 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    ffi::{CStr, CString, OsStr},
+    fs::File,
     io::{self, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::{fd::OwnedFd, unix::ffi::OsStrExt},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
+use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 #[cfg(target_os = "macos")]
 use yard_desktop::terminal_handoff_script;
 
-const DIRECTORY_MODE: u32 = 0o700;
-const WRITING_MODE: u32 = 0o600;
-const EXECUTABLE_MODE: u32 = 0o700;
+const DIRECTORY_MODE: Mode = Mode::RUSR.union(Mode::WUSR).union(Mode::XUSR);
+const WRITING_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
+const EXECUTABLE_MODE: Mode = DIRECTORY_MODE;
 const HANDOFF_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_HANDOFFS: usize = 16;
 const MAX_CREATE_ATTEMPTS: usize = 32;
+const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+const FILE_FLAGS: OFlags = OFlags::WRONLY
+    .union(OFlags::CREATE)
+    .union(OFlags::EXCL)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
 #[cfg(target_os = "macos")]
 const ERROR: &str = "could not open the secure Terminal handoff";
 
+struct HandoffDirectory {
+    fd: OwnedFd,
+    path: PathBuf,
+}
+
+struct CreatedHandoff {
+    name: CString,
+    path: PathBuf,
+    identity: FileIdentity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    uid: u32,
+    links: u64,
+}
+
 #[cfg(target_os = "macos")]
 pub(super) fn launch(herdr: &Path, arguments: &[String]) -> Result<(), String> {
-    let directory = handoff_directory()?;
-    prepare_directory(&directory).map_err(|_| ERROR.to_owned())?;
+    let directory = open_handoff_directory_from_home().map_err(|_| ERROR.to_owned())?;
     cleanup(&directory, SystemTime::now()).map_err(|_| ERROR.to_owned())?;
     let script = terminal_handoff_script(herdr, arguments);
-    let path = create_handoff(&directory, script.as_bytes()).map_err(|_| ERROR.to_owned())?;
+    let handoff = create_handoff(&directory, script.as_bytes()).map_err(|_| ERROR.to_owned())?;
+    if verify_created_handoff(&directory, &handoff).is_err() {
+        let _ = remove_if_identity_matches(&directory, &handoff.name, handoff.identity);
+        return Err(ERROR.to_owned());
+    }
     match Command::new("/usr/bin/open")
         .args(["-a", "Terminal"])
-        .arg(&path)
+        .arg(&handoff.path)
         .status()
     {
         Ok(status) if status.success() => Ok(()),
         _ => {
-            let _ = remove_owned_regular_file(&path);
+            let _ = remove_if_identity_matches(&directory, &handoff.name, handoff.identity);
             Err(ERROR.to_owned())
         }
     }
 }
 
 #[cfg(target_os = "macos")]
-fn handoff_directory() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").ok_or_else(|| ERROR.to_owned())?;
-    Ok(PathBuf::from(home).join("Library/Caches/dev.yard.desktop/terminal-handoffs"))
+fn open_handoff_directory_from_home() -> io::Result<HandoffDirectory> {
+    let home = std::env::var_os("HOME").ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+    open_handoff_directory(Path::new(&home))
 }
 
-fn prepare_directory(path: &Path) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-    fs::create_dir_all(parent)?;
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => validate_directory(path, &metadata),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(path)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(DIRECTORY_MODE))?;
-            validate_directory(path, &fs::symlink_metadata(path)?)
+fn open_handoff_directory(home: &Path) -> io::Result<HandoffDirectory> {
+    if !home.is_absolute() {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    let mut fd = fs::openat(fs::CWD, home, DIRECTORY_FLAGS, Mode::empty())?;
+    validate_directory_fd(&fd)?;
+    let mut path = home.to_owned();
+    for component in ["Library", "Caches", "dev.yard.desktop", "terminal-handoffs"] {
+        let name = CStr::from_bytes_with_nul(match component {
+            "Library" => b"Library\0",
+            "Caches" => b"Caches\0",
+            "dev.yard.desktop" => b"dev.yard.desktop\0",
+            _ => b"terminal-handoffs\0",
+        })
+        .expect("static directory component is valid");
+        fd = open_or_create_directory(&fd, name)?;
+        validate_directory_fd(&fd)?;
+        path.push(component);
+    }
+    Ok(HandoffDirectory { fd, path })
+}
+
+fn open_or_create_directory(parent: &OwnedFd, name: &CStr) -> io::Result<OwnedFd> {
+    match fs::openat(parent, name, DIRECTORY_FLAGS, Mode::empty()) {
+        Ok(fd) => Ok(fd),
+        Err(rustix::io::Errno::NOENT) => {
+            match fs::mkdirat(parent, name, DIRECTORY_MODE) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => return Err(error.into()),
+            }
+            fs::openat(parent, name, DIRECTORY_FLAGS, Mode::empty()).map_err(Into::into)
         }
-        Err(error) => Err(error),
+        Err(error) => Err(error.into()),
     }
 }
 
-fn validate_directory(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-    if !metadata.file_type().is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != rustix::process::getuid().as_raw()
-        || metadata.permissions().mode() & 0o777 != DIRECTORY_MODE
-    {
+fn validate_directory_fd(fd: &OwnedFd) -> io::Result<()> {
+    let stat = fs::fstat(fd)?;
+    if !directory_stat_is_safe(&stat, rustix::process::getuid().as_raw()) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "unsafe handoff directory",
-        ));
-    }
-    let canonical = path.canonicalize()?;
-    if canonical != path {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "unexpected handoff directory path",
+            "unsafe handoff directory ancestry",
         ));
     }
     Ok(())
 }
 
-fn create_handoff(directory: &Path, contents: &[u8]) -> io::Result<PathBuf> {
+fn directory_stat_is_safe(stat: &fs::Stat, uid: u32) -> bool {
+    FileType::from_raw_mode(stat.st_mode).is_dir()
+        && stat.st_uid == uid
+        && !Mode::from_raw_mode(stat.st_mode).intersects(Mode::WGRP | Mode::WOTH)
+}
+
+fn create_handoff(directory: &HandoffDirectory, contents: &[u8]) -> io::Result<CreatedHandoff> {
     if eligible_handoffs(directory)?.len() >= MAX_HANDOFFS {
         return Err(io::Error::other("handoff limit reached"));
     }
     for attempt in 0..MAX_CREATE_ATTEMPTS {
-        let name = format!(
+        let name = CString::new(format!(
             "handoff-{}-{}-{attempt}.command",
             std::process::id(),
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos()
-        );
-        let path = directory.join(name);
-        match open_new(&path) {
-            Ok(mut file) => {
+        ))
+        .expect("generated handoff name has no NUL");
+        match fs::openat(&directory.fd, name.as_c_str(), FILE_FLAGS, WRITING_MODE) {
+            Ok(fd) => {
+                let mut file = File::from(fd);
+                let opened_stat = fs::fstat(&file)?;
+                validate_file_stat(&opened_stat, WRITING_MODE)?;
+                let opened_identity = FileIdentity::from_stat(&opened_stat);
                 let result = (|| {
                     file.write_all(contents)?;
-                    file.sync_all()?;
-                    file.set_permissions(fs::Permissions::from_mode(EXECUTABLE_MODE))?;
-                    file.sync_all()
+                    fs::fsync(&file)?;
+                    fs::fchmod(&file, EXECUTABLE_MODE)?;
+                    fs::fsync(&file)?;
+                    let stat = fs::fstat(&file)?;
+                    validate_file_stat(&stat, EXECUTABLE_MODE)?;
+                    let identity = FileIdentity::from_stat(&stat);
+                    if identity != opened_identity {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "handoff descriptor identity changed",
+                        ));
+                    }
+                    Ok(identity)
                 })();
                 drop(file);
-                if let Err(error) = result {
-                    let _ = remove_owned_regular_file(&path);
-                    return Err(error);
+                match result {
+                    Ok(identity) => {
+                        return Ok(CreatedHandoff {
+                            path: directory.path.join(OsStr::from_bytes(name.as_bytes())),
+                            name,
+                            identity,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = remove_if_identity_matches(directory, &name, opened_identity);
+                        return Err(error);
+                    }
                 }
-                return Ok(path);
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => return Err(error.into()),
         }
     }
     Err(io::Error::new(
@@ -122,88 +193,151 @@ fn create_handoff(directory: &Path, contents: &[u8]) -> io::Result<PathBuf> {
     ))
 }
 
-fn open_new(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(WRITING_MODE)
-        .custom_flags(no_follow_flag())
-        .open(path)?;
-    if file.metadata()?.permissions().mode() & 0o777 != WRITING_MODE {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "unsafe handoff file mode",
-        ));
-    }
-    Ok(file)
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-const fn no_follow_flag() -> i32 {
-    0x0000_0100 // O_NOFOLLOW
-}
-
-#[cfg(target_os = "linux")]
-const fn no_follow_flag() -> i32 {
-    0x0002_0000 // O_NOFOLLOW
-}
-
-fn cleanup(directory: &Path, now: SystemTime) -> io::Result<()> {
-    let mut files = eligible_handoffs(directory)?;
-    for (path, modified) in &files {
-        if now.duration_since(*modified).unwrap_or_default() >= HANDOFF_TTL {
-            remove_owned_regular_file(path)?;
+impl FileIdentity {
+    fn from_stat(stat: &fs::Stat) -> Self {
+        Self {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+            uid: stat.st_uid,
+            links: stat.st_nlink,
         }
     }
-    files = eligible_handoffs(directory)?;
-    files.sort_by_key(|(_, modified)| *modified);
-    let remove_count = files.len().saturating_sub(MAX_HANDOFFS - 1);
-    for (path, _) in files.into_iter().take(remove_count) {
-        remove_owned_regular_file(&path)?;
+
+    fn matches(self, stat: &fs::Stat) -> bool {
+        self == Self::from_stat(stat)
+    }
+}
+
+fn validate_file_stat(stat: &fs::Stat, expected_mode: Mode) -> io::Result<()> {
+    if !FileType::from_raw_mode(stat.st_mode).is_file()
+        || stat.st_uid != rustix::process::getuid().as_raw()
+        || stat.st_nlink != 1
+        || Mode::from_raw_mode(stat.st_mode) != expected_mode
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe handoff file identity",
+        ));
     }
     Ok(())
 }
 
-fn eligible_handoffs(directory: &Path) -> io::Result<Vec<(PathBuf, SystemTime)>> {
+fn verify_created_handoff(
+    directory: &HandoffDirectory,
+    handoff: &CreatedHandoff,
+) -> io::Result<()> {
+    validate_directory_fd(&directory.fd)?;
+    let stat = fs::statat(
+        &directory.fd,
+        handoff.name.as_c_str(),
+        AtFlags::SYMLINK_NOFOLLOW,
+    )?;
+    validate_file_stat(&stat, EXECUTABLE_MODE)?;
+    if !handoff.identity.matches(&stat) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "handoff pathname identity changed",
+        ));
+    }
+    let path_stat = fs::lstat(&handoff.path)?;
+    validate_file_stat(&path_stat, EXECUTABLE_MODE)?;
+    if !handoff.identity.matches(&path_stat) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "handoff launch path identity changed",
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup(directory: &HandoffDirectory, now: SystemTime) -> io::Result<()> {
+    let mut files = eligible_handoffs(directory)?;
+    for file in &files {
+        if file.expired(now) {
+            remove_if_identity_matches(directory, &file.name, file.identity)?;
+        }
+    }
+    files = eligible_handoffs(directory)?;
+    files.sort_by_key(|file| file.modified_seconds);
+    let remove_count = files.len().saturating_sub(MAX_HANDOFFS - 1);
+    for file in files.into_iter().take(remove_count) {
+        remove_if_identity_matches(directory, &file.name, file.identity)?;
+    }
+    Ok(())
+}
+
+struct ExistingHandoff {
+    name: CString,
+    identity: FileIdentity,
+    modified_seconds: i64,
+}
+
+impl ExistingHandoff {
+    fn expired(&self, now: SystemTime) -> bool {
+        let modified = if self.modified_seconds >= 0 {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(self.modified_seconds.unsigned_abs())
+        } else {
+            SystemTime::UNIX_EPOCH
+        };
+        now.duration_since(modified).unwrap_or_default() >= HANDOFF_TTL
+    }
+}
+
+fn eligible_handoffs(directory: &HandoffDirectory) -> io::Result<Vec<ExistingHandoff>> {
+    validate_directory_fd(&directory.fd)?;
     let uid = rustix::process::getuid().as_raw();
     let mut files = Vec::new();
-    for entry in fs::read_dir(directory)? {
+    for entry in fs::Dir::read_from(&directory.fd)? {
         let entry = entry?;
         let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with("handoff-") || !name.ends_with(".command") {
+        let bytes = name.to_bytes();
+        if !bytes.starts_with(b"handoff-") || !bytes.ends_with(b".command") {
             continue;
         }
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_file()
-            && !metadata.file_type().is_symlink()
-            && metadata.uid() == uid
-        {
-            files.push((entry.path(), metadata.modified()?));
+        let stat = fs::statat(&directory.fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if cleanup_stat_is_eligible(&stat, uid) {
+            files.push(ExistingHandoff {
+                name: name.to_owned(),
+                identity: FileIdentity::from_stat(&stat),
+                modified_seconds: stat.st_mtime,
+            });
         }
     }
     Ok(files)
 }
 
-fn remove_owned_regular_file(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_file()
-        && !metadata.file_type().is_symlink()
-        && metadata.uid() == rustix::process::getuid().as_raw()
+fn cleanup_stat_is_eligible(stat: &fs::Stat, uid: u32) -> bool {
+    FileType::from_raw_mode(stat.st_mode).is_file() && stat.st_uid == uid && stat.st_nlink == 1
+}
+
+fn remove_if_identity_matches(
+    directory: &HandoffDirectory,
+    name: &CStr,
+    identity: FileIdentity,
+) -> io::Result<()> {
+    validate_directory_fd(&directory.fd)?;
+    let stat = fs::statat(&directory.fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file()
+        || stat.st_uid != rustix::process::getuid().as_raw()
+        || stat.st_nlink != 1
+        || !identity.matches(&stat)
     {
-        fs::remove_file(path)
-    } else {
-        Err(io::Error::new(
+        return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "refusing unsafe handoff removal",
-        ))
+            "refusing changed handoff removal",
+        ));
     }
+    remove_entry(&directory.fd, name)
+}
+
+fn remove_entry(directory: &OwnedFd, name: &CStr) -> io::Result<()> {
+    fs::unlinkat(directory, name, AtFlags::empty()).map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::{fs as stdfs, os::unix::fs::symlink};
 
     struct TestDirectory(PathBuf);
 
@@ -217,71 +351,201 @@ mod tests {
                     .unwrap()
                     .as_nanos()
             ));
-            fs::create_dir(&path).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(DIRECTORY_MODE)).unwrap();
+            stdfs::create_dir(&path).unwrap();
+            stdfs::set_permissions(
+                &path,
+                <stdfs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .unwrap();
             Self(path)
+        }
+
+        fn handoffs(&self) -> HandoffDirectory {
+            open_handoff_directory(&self.0).unwrap()
         }
     }
 
     impl Drop for TestDirectory {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            let _ = stdfs::remove_dir_all(&self.0);
         }
     }
 
+    fn cstring(value: &str) -> CString {
+        CString::new(value).unwrap()
+    }
+
     #[test]
-    fn handoff_is_owner_only_then_executable_and_create_new_refuses_symlink() {
+    fn ancestry_is_private_owned_directories_and_refuses_symlinks_or_writable_parent() {
+        let temp = TestDirectory::new("ancestry");
+        let handoffs = temp.handoffs();
+        for component in [
+            temp.0.clone(),
+            temp.0.join("Library"),
+            temp.0.join("Library/Caches"),
+            temp.0.join("Library/Caches/dev.yard.desktop"),
+            handoffs.path.clone(),
+        ] {
+            let metadata = stdfs::symlink_metadata(component).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!(
+                std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o022,
+                0
+            );
+        }
+
+        let unsafe_home = temp.0.join("unsafe-home");
+        stdfs::create_dir(&unsafe_home).unwrap();
+        stdfs::set_permissions(
+            &unsafe_home,
+            <stdfs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o777),
+        )
+        .unwrap();
+        assert!(open_handoff_directory(&unsafe_home).is_err());
+
+        let linked_home = temp.0.join("linked-home");
+        symlink(&temp.0, &linked_home).unwrap();
+        assert!(open_handoff_directory(&linked_home).is_err());
+    }
+
+    #[test]
+    fn create_is_owner_only_descriptor_relative_and_refuses_collision_symlink() {
         let temp = TestDirectory::new("create");
-        let path = create_handoff(&temp.0, b"#!/bin/sh\nexit 0\n").unwrap();
-        let metadata = fs::metadata(&path).unwrap();
-        assert_eq!(metadata.permissions().mode() & 0o777, EXECUTABLE_MODE);
-        assert_eq!(metadata.uid(), rustix::process::getuid().as_raw());
+        let directory = temp.handoffs();
+        let handoff = create_handoff(&directory, b"#!/bin/sh\nexit 0\n").unwrap();
+        verify_created_handoff(&directory, &handoff).unwrap();
+        let stat = fs::statat(
+            &directory.fd,
+            handoff.name.as_c_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        assert_eq!(Mode::from_raw_mode(stat.st_mode), EXECUTABLE_MODE);
+        assert_eq!(stat.st_uid, rustix::process::getuid().as_raw());
+        assert_eq!(stat.st_nlink, 1);
 
         let target = temp.0.join("target");
-        fs::write(&target, b"untouched").unwrap();
-        let link = temp.0.join("collision.command");
-        symlink(&target, &link).unwrap();
-        assert!(open_new(&link).is_err());
-        assert_eq!(fs::read(&target).unwrap(), b"untouched");
+        stdfs::write(&target, b"untouched").unwrap();
+        let link_name = cstring("handoff-collision.command");
+        symlink(&target, directory.path.join("handoff-collision.command")).unwrap();
+        assert!(fs::openat(&directory.fd, &link_name, FILE_FLAGS, WRITING_MODE).is_err());
+        assert_eq!(stdfs::read(target).unwrap(), b"untouched");
     }
 
     #[test]
-    fn directory_refuses_symlink_and_permissive_mode() {
-        let temp = TestDirectory::new("directory");
-        let actual = temp.0.join("actual");
-        fs::create_dir(&actual).unwrap();
-        fs::set_permissions(&actual, fs::Permissions::from_mode(DIRECTORY_MODE)).unwrap();
-        let link = temp.0.join("link");
-        symlink(&actual, &link).unwrap();
-        assert!(prepare_directory(&link).is_err());
-        fs::set_permissions(&actual, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(prepare_directory(&actual).is_err());
+    fn pathname_replacement_and_hardlink_identity_are_refused() {
+        let temp = TestDirectory::new("identity");
+        let directory = temp.handoffs();
+        let handoff = create_handoff(&directory, b"one").unwrap();
+        let replacement = directory.path.join("replacement");
+        stdfs::write(&replacement, b"two").unwrap();
+        stdfs::rename(&replacement, &handoff.path).unwrap();
+        assert!(verify_created_handoff(&directory, &handoff).is_err());
+        assert!(remove_if_identity_matches(&directory, &handoff.name, handoff.identity).is_err());
+        assert_eq!(stdfs::read(&handoff.path).unwrap(), b"two");
+
+        let hardlink_name = cstring("handoff-hardlink.command");
+        let hardlink_path = directory.path.join("handoff-hardlink.command");
+        stdfs::hard_link(&handoff.path, &hardlink_path).unwrap();
+        let stat = fs::statat(
+            &directory.fd,
+            hardlink_name.as_c_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        assert_eq!(stat.st_nlink, 2);
+        assert!(
+            remove_if_identity_matches(&directory, &hardlink_name, FileIdentity::from_stat(&stat))
+                .is_err()
+        );
     }
 
     #[test]
-    fn cleanup_removes_expired_owned_regular_handoff() {
-        let temp = TestDirectory::new("ttl");
-        let stale = temp.0.join("handoff-stale.command");
-        fs::write(&stale, b"x").unwrap();
-        cleanup(&temp.0, SystemTime::now() + HANDOFF_TTL).unwrap();
-        assert!(!stale.exists());
+    fn retained_directory_fd_does_not_follow_replaced_ancestor() {
+        let temp = TestDirectory::new("ancestor-replacement");
+        let directory = temp.handoffs();
+        let original = temp.0.join("Library");
+        let moved = temp.0.join("Library-moved");
+        stdfs::rename(&original, &moved).unwrap();
+        stdfs::create_dir(&original).unwrap();
+        let handoff = create_handoff(&directory, b"safe").unwrap();
+        assert!(
+            moved
+                .join("Caches/dev.yard.desktop/terminal-handoffs")
+                .join(OsStr::from_bytes(handoff.name.as_bytes()))
+                .exists()
+        );
+        assert!(!handoff.path.exists());
+        assert!(verify_created_handoff(&directory, &handoff).is_err());
     }
 
     #[test]
-    fn cleanup_removes_only_owned_regular_handoff_files_and_bounds_count() {
+    fn cleanup_removes_ttl_and_bounds_only_eligible_files() {
         let temp = TestDirectory::new("cleanup");
-        for index in 0..MAX_HANDOFFS + 2 {
-            fs::write(temp.0.join(format!("handoff-{index}.command")), b"x").unwrap();
-        }
-        fs::write(temp.0.join("unrelated.txt"), b"keep").unwrap();
-        let target = temp.0.join("target");
-        fs::write(&target, b"keep").unwrap();
-        symlink(&target, temp.0.join("handoff-link.command")).unwrap();
+        let directory = temp.handoffs();
+        let now = SystemTime::now();
+        let stale = create_handoff(&directory, b"stale").unwrap();
+        cleanup(&directory, now + HANDOFF_TTL).unwrap();
+        assert!(!stale.path.exists());
 
-        cleanup(&temp.0, SystemTime::now()).unwrap();
-        assert_eq!(eligible_handoffs(&temp.0).unwrap().len(), MAX_HANDOFFS - 1);
-        assert!(temp.0.join("unrelated.txt").exists());
-        assert!(temp.0.join("handoff-link.command").exists());
-        assert_eq!(fs::read(target).unwrap(), b"keep");
+        for index in 0..MAX_HANDOFFS + 2 {
+            let name = format!("handoff-{index}.command");
+            stdfs::write(directory.path.join(name), b"x").unwrap();
+        }
+        stdfs::write(directory.path.join("unrelated.txt"), b"keep").unwrap();
+        let target = temp.0.join("target");
+        stdfs::write(&target, b"keep").unwrap();
+        symlink(&target, directory.path.join("handoff-link.command")).unwrap();
+        let hardlink = directory.path.join("handoff-hard.command");
+        stdfs::hard_link(&target, &hardlink).unwrap();
+
+        cleanup(&directory, SystemTime::now()).unwrap();
+        assert_eq!(
+            eligible_handoffs(&directory).unwrap().len(),
+            MAX_HANDOFFS - 1
+        );
+        assert!(directory.path.join("unrelated.txt").exists());
+        assert!(directory.path.join("handoff-link.command").exists());
+        assert!(hardlink.exists());
+        assert_eq!(stdfs::read(target).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn stat_predicates_reject_foreign_owner_wrong_type_links_and_writable_directories() {
+        let temp = TestDirectory::new("predicates");
+        let directory = temp.handoffs();
+        let handoff = create_handoff(&directory, b"safe").unwrap();
+        let file_stat = fs::statat(
+            &directory.fd,
+            handoff.name.as_c_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        assert!(cleanup_stat_is_eligible(&file_stat, uid));
+        assert!(!cleanup_stat_is_eligible(&file_stat, uid.wrapping_add(1)));
+
+        let directory_stat = fs::fstat(&directory.fd).unwrap();
+        assert!(directory_stat_is_safe(&directory_stat, uid));
+        assert!(!directory_stat_is_safe(
+            &directory_stat,
+            uid.wrapping_add(1)
+        ));
+        assert!(!directory_stat_is_safe(&file_stat, uid));
+    }
+
+    #[test]
+    fn identity_fields_include_owner_type_link_count_device_and_inode() {
+        let temp = TestDirectory::new("metadata");
+        let directory = temp.handoffs();
+        let handoff = create_handoff(&directory, b"safe").unwrap();
+        let stat = fs::statat(
+            &directory.fd,
+            handoff.name.as_c_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        assert!(FileType::from_raw_mode(stat.st_mode).is_file());
+        assert_eq!(handoff.identity, FileIdentity::from_stat(&stat));
     }
 }

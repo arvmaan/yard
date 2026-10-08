@@ -20,6 +20,7 @@ import {
   type FormEvent,
 } from 'react'
 import { createPortal } from 'react-dom'
+import { copyMachineCommand } from './machineClipboard'
 import {
   hasDesktopMachineHandoff,
   launchMachineAdd,
@@ -59,8 +60,6 @@ const capabilities = (endpoint: RuntimeEndpoint) =>
     .filter((candidate) => candidate[1])
     .map((candidate) => candidate[0])
     .join(', ') || 'none available'
-
-const copy = (value: string) => navigator.clipboard.writeText(value)
 
 function Topology({ inventory }: { inventory: RuntimeInventory }) {
   const tabs = useMemo(() => {
@@ -285,7 +284,7 @@ function AddMachineDialog({
               <button
                 className="secondary-button"
                 onClick={() =>
-                  void copy(command)
+                  void copyMachineCommand(command)
                     .then(() => setCopied(true))
                     .catch(() =>
                       setError(
@@ -640,9 +639,16 @@ export function MachinesDialog({
                             onClick={() => {
                               if (reconnectPendingRef.current) return
                               if (!desktop) {
-                                void copy(buildReconnectCommand(id))
-                                  .then(() => setCopied(true))
-                                  .catch(() => undefined)
+                                void copyMachineCommand(buildReconnectCommand(id))
+                                  .then(() => {
+                                    setReconnectError(null)
+                                    setCopied(true)
+                                  })
+                                  .catch(() =>
+                                    setReconnectError(
+                                      'Could not copy the reconnect command. Select it manually.',
+                                    ),
+                                  )
                                 return
                               }
                               reconnectPendingRef.current = true
