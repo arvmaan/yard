@@ -55,6 +55,7 @@ cp "$BINARY" "$ROOT/yard"
   YARD_ARTIFACT_PATH="$ROOT/data/artifacts" \
   YARD_COORDINATION_PATH="$ROOT/data/coordination" \
   YARD_KNOWLEDGE_PATH="$ROOT/data/knowledge" \
+  YARD_IMAGE_PASTE_PATH="$ROOT/data/pastes" \
   YARD_ORCHESTRATOR_CWD="$ROOT/run" \
   YARD_HERDR_BIN="$ROOT/missing-herdr" \
   RUST_LOG=yard_server=info \

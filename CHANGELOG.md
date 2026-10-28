@@ -7,6 +7,21 @@ a release is tagged.
 
 ### Added
 
+- Added image paste into web terminals: a pasted or dropped PNG, JPEG, GIF or
+  WebP image is uploaded to `POST <terminal route>/images`, checked against
+  its magic bytes and `YARD_IMAGE_PASTE_MAX_BYTES` (10 MiB), stored privately
+  under `YARD_IMAGE_PASTE_PATH` (`pastes/` beside the database, pruned after 7
+  days and capped at 200 per worker), and its absolute path is typed into the
+  attached pane as a bracketed paste and a space for Claude Code or Codex.
+  Each path and any accompanying text go out as separate pastes; pruning only
+  removes Yard-named files in a marked root, and a paste path inside a git
+  checkout or overlapping Yard's other directories is refused at startup.
+  Typing waits behind an upload so the path lands first, but control input
+  (Ctrl-C, Esc and other single control keys) is sent at once after cancelling
+  the pending upload and discarding the typing queued behind it, so an
+  interrupt never lands ahead of earlier input; an upload can
+  be cancelled from the terminal, the browser abandons it after 60 s, and the
+  server bounds the wait for an upload slot (15 s) and the body read (60 s).
 - Added Slack DM notifications for one owner (`YARD_SLACK_NOTIFICATIONS=on`):
   blocked agents, work ready for review, and failed or ambiguous commands,
   titles and states only, with the bot token read from Secrets Manager.

@@ -219,6 +219,7 @@ where
             StorageScanSettings::from_config(&config, Some(runtime_claim.paths().root())),
             shutdown_receiver.clone(),
             slack.clone(),
+            yard_server::image_paste_service::ImagePasteSettings::from_config(&config.image_paste),
         );
 
     let instance_id = match mode {
@@ -712,6 +713,9 @@ mod tests {
             knowledge_path: temp.path().join("knowledge"),
             storage: yard_server::config::StorageConfig::default(),
             slack: yard_server::config::SlackConfig::Off,
+            image_paste: yard_server::config::ImagePasteConfig::with_defaults(
+                temp.path().join("pastes"),
+            ),
         };
         let runtime_claim = lifecycle::claim_runtime(&database_path, InstanceMode::Managed)
             .await

@@ -518,7 +518,7 @@ fn server_shutting_down() -> ApiError {
 }
 
 #[allow(clippy::too_many_lines)]
-fn terminal_error(error: &TerminalServiceError) -> ApiError {
+pub(super) fn terminal_error(error: &TerminalServiceError) -> ApiError {
     match error {
         TerminalServiceError::InvalidDimensions => ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,

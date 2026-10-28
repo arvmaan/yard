@@ -59,6 +59,7 @@ use crate::assignment_disposition_service::{
 };
 use crate::automation_service::{AutomationService, AutomationServiceError};
 use crate::coordination_node_service::{CoordinationNodeService, CoordinationNodeServiceError};
+use crate::image_paste_service::ImagePasteSettings;
 use crate::intervention_service::{
     InterventionService, InterventionServiceError, RuntimeIntervention, RuntimeInterventionError,
 };
@@ -88,6 +89,7 @@ use crate::worker_cleanup_service::WorkerCleanupService;
 use crate::worker_session_service::{WorkerSessionService, WorkerSessionServiceError};
 use crate::yard_orchestrator_service::{YardOrchestratorService, YardOrchestratorServiceError};
 
+mod image_paste;
 mod lens;
 mod terminal;
 mod web;
@@ -123,6 +125,9 @@ struct AppState {
     connections: ConnectionTracker,
     slack: SlackNotifier,
     presence: ViewerPresence,
+    image_paste: ImagePasteSettings,
+    /// Bounds how many image uploads are buffered in memory at once.
+    image_uploads: Arc<tokio::sync::Semaphore>,
 }
 
 #[cfg(test)]
@@ -164,6 +169,38 @@ fn test_router_with_shutdown(
     connections: ConnectionTracker,
     slack: SlackNotifier,
 ) -> Router {
+    test_router_with_image_paste(
+        source,
+        runtime,
+        intervention,
+        terminal,
+        store,
+        artifacts,
+        ghostty_launcher,
+        storage,
+        shutdown,
+        connections,
+        slack,
+        ImagePasteSettings::not_configured(),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn test_router_with_image_paste(
+    source: Arc<dyn InventorySource>,
+    runtime: Arc<dyn RuntimeControl>,
+    intervention: Arc<dyn RuntimeIntervention>,
+    terminal: Arc<dyn RuntimeTerminal>,
+    store: Arc<dyn YardStore>,
+    artifacts: ArtifactService,
+    ghostty_launcher: GhosttyLauncher,
+    storage: StorageScanSettings,
+    shutdown: Option<watch::Receiver<bool>>,
+    connections: ConnectionTracker,
+    slack: SlackNotifier,
+    image_paste: ImagePasteSettings,
+) -> Router {
     let reconciliation = ReconciliationService::new(Arc::clone(&source), Arc::clone(&store));
     let managed_root = env::temp_dir().join(format!("yard-http-{}", uuid::Uuid::now_v7()));
     let coordination_nodes = CoordinationNodeService::new(
@@ -198,6 +235,7 @@ fn test_router_with_shutdown(
         shutdown,
         connections,
         slack,
+        image_paste,
     )
 }
 
@@ -218,6 +256,7 @@ pub(crate) fn router_with_reconciliation_and_shutdown(
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
     slack: SlackNotifier,
+    image_paste: ImagePasteSettings,
 ) -> Router {
     router_with_reconciliation_and_shutdown_and_ghostty(
         source,
@@ -236,6 +275,7 @@ pub(crate) fn router_with_reconciliation_and_shutdown(
         shutdown,
         connections,
         slack,
+        image_paste,
     )
 }
 
@@ -257,6 +297,7 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
     slack: SlackNotifier,
+    image_paste: ImagePasteSettings,
 ) -> Router {
     let presence = slack.presence();
     let storage = StorageScanService::with_shutdown(
@@ -426,6 +467,10 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             get(terminal::coordination_node_terminal),
         )
         .route(
+            "/api/v1/coordination-nodes/{node_id}/terminal/images",
+            axum::routing::post(image_paste::coordination_node_terminal_image),
+        )
+        .route(
             "/api/v1/coordination-nodes/{node_id}/routes",
             get(list_coordination_node_routes).post(route_coordination_node),
         )
@@ -462,6 +507,10 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         .route(
             "/api/v1/yard/orchestrator/terminal",
             get(terminal::yard_orchestrator_terminal),
+        )
+        .route(
+            "/api/v1/yard/orchestrator/terminal/images",
+            axum::routing::post(image_paste::yard_orchestrator_terminal_image),
         )
         .route("/api/v1/runtimes/herdr/sessions", get(sessions))
         .route(
@@ -622,6 +671,10 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             get(terminal::orchestrator_terminal),
         )
         .route(
+            "/api/v1/projects/{project_id}/orchestrator/terminal/images",
+            axum::routing::post(image_paste::orchestrator_terminal_image),
+        )
+        .route(
             "/api/v1/projects/{project_id}/assignments/{assignment_id}/completion-receipts",
             axum::routing::post(record_completion_receipt),
         )
@@ -648,6 +701,10 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         .route(
             "/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal",
             get(terminal::assignment_terminal),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal/images",
+            axum::routing::post(image_paste::assignment_terminal_image),
         )
         .route(
             "/api/v1/projects/{project_id}/assignments/{assignment_id}/artifacts/{artifact_id}",
@@ -724,6 +781,10 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             connections,
             slack,
             presence,
+            image_paste,
+            image_uploads: Arc::new(tokio::sync::Semaphore::new(
+                image_paste::CONCURRENT_IMAGE_UPLOADS,
+            )),
         })
 }
 
@@ -19665,5 +19726,340 @@ done
         assert_ne!(replacement["id"], id.as_str());
         let old = storage_request(&app, Method::GET, &location, &[]).await;
         assert_eq!(old.status(), StatusCode::NOT_FOUND);
+    }
+
+    mod image_paste_routes {
+        use super::super::test_router_with_image_paste;
+        use super::*;
+        use crate::image_paste_service::ImagePasteSettings;
+
+        const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+
+        async fn paste_router(max_bytes: Option<u64>) -> (Router, TempDir) {
+            let temp = TempDir::new().unwrap();
+            let store = Arc::new(
+                SqliteProjectStore::open(temp.path().join("yard.sqlite3"))
+                    .await
+                    .unwrap(),
+            );
+            let runtime = Arc::new(FakeRuntime);
+            let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+            let image_paste = max_bytes.map_or_else(ImagePasteSettings::not_configured, |max| {
+                let mut settings = ImagePasteSettings::under(temp.path().join("pastes"));
+                settings.max_bytes = max;
+                settings
+            });
+            let app = test_router_with_image_paste(
+                Arc::new(FakeInventory),
+                runtime.clone(),
+                runtime.clone(),
+                runtime,
+                store,
+                artifacts,
+                noop_ghostty_launcher,
+                crate::storage_inventory_service::StorageScanSettings::not_configured(),
+                None,
+                crate::ConnectionTracker::default(),
+                crate::slack::SlackNotifier::off(),
+                image_paste,
+            );
+            (app, temp)
+        }
+
+        async fn post_image(
+            app: &Router,
+            uri: &str,
+            headers: &[(&str, &str)],
+            body: &[u8],
+        ) -> axum::response::Response {
+            let mut request = Request::builder().method(Method::POST).uri(uri);
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            app.clone()
+                .oneshot(request.body(Body::from(body.to_vec())).unwrap())
+                .await
+                .unwrap()
+        }
+
+        const BROWSER: [(&str, &str); 3] = [
+            ("host", "127.0.0.1:4317"),
+            ("origin", "http://127.0.0.1:4317"),
+            ("content-type", "image/png"),
+        ];
+
+        fn pasted_files(temp: &TempDir) -> usize {
+            let Ok(workers) = std::fs::read_dir(temp.path().join("pastes")) else {
+                return 0;
+            };
+            workers
+                .flatten()
+                .filter(|worker| worker.path().is_dir())
+                .map(|worker| std::fs::read_dir(worker.path()).unwrap().count())
+                .sum()
+        }
+
+        #[tokio::test]
+        async fn stores_an_assignment_image_and_returns_its_absolute_path() {
+            let (app, temp) = paste_router(Some(1024)).await;
+            let (project_id, assignment_id) = create_active_assignment(&app).await;
+            let uri = format!(
+                "/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal/images"
+            );
+            let response = post_image(&app, &uri, &BROWSER, PNG).await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store"
+            );
+            let body = response_json(response).await;
+            let path = std::path::PathBuf::from(body["path"].as_str().unwrap());
+            assert!(path.is_absolute());
+            assert!(path.starts_with(temp.path().join("pastes")), "{body}");
+            assert_eq!(std::fs::read(&path).unwrap(), PNG);
+            assert_eq!(body["content_type"], "image/png");
+            assert_eq!(body["bytes"], PNG.len());
+            assert_eq!(body["name"], path.file_name().unwrap().to_str().unwrap());
+            // A CLI caller without Origin passes the same guard.
+            let cli = post_image(&app, &uri, &[("content-type", "image/png")], PNG).await;
+            assert_eq!(cli.status(), StatusCode::CREATED);
+            assert_eq!(pasted_files(&temp), 2);
+        }
+
+        /// Request headers, body, expected status and expected error code.
+        type RefusalCase<'a> = (Vec<(&'a str, &'a str)>, Vec<u8>, StatusCode, &'a str);
+
+        async fn error_code(response: axum::response::Response) -> serde_json::Value {
+            response_json(response).await["error"]["code"].clone()
+        }
+
+        #[tokio::test]
+        async fn refuses_wrong_types_oversized_images_and_foreign_pages() {
+            let (app, temp) = paste_router(Some(16)).await;
+            let (project_id, assignment_id) = create_active_assignment(&app).await;
+            let uri = format!(
+                "/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal/images"
+            );
+            let cases: Vec<RefusalCase<'_>> = vec![
+                (
+                    vec![("content-type", "image/jpeg")],
+                    PNG.to_vec(),
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "image_type_mismatch",
+                ),
+                (
+                    // An SVG body under the limit, declared as PNG.
+                    vec![("content-type", "image/png")],
+                    b"<svg></svg>".to_vec(),
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "image_type_mismatch",
+                ),
+                (
+                    // No Content-Length: the streaming cap refuses it.
+                    vec![("content-type", "image/png")],
+                    [PNG, b"x"].concat(),
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "image_too_large",
+                ),
+                (
+                    vec![("content-type", "image/png")],
+                    b"not a png".to_vec(),
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "image_type_mismatch",
+                ),
+                (
+                    vec![("content-type", "image/svg+xml")],
+                    PNG.to_vec(),
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "unsupported_image_type",
+                ),
+                (
+                    vec![],
+                    PNG.to_vec(),
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "unsupported_image_type",
+                ),
+                (
+                    vec![("content-type", "image/png")],
+                    Vec::new(),
+                    StatusCode::BAD_REQUEST,
+                    "image_empty",
+                ),
+                (
+                    vec![
+                        ("content-type", "image/png"),
+                        ("origin", "https://example.com"),
+                    ],
+                    PNG.to_vec(),
+                    StatusCode::FORBIDDEN,
+                    "request_origin_forbidden",
+                ),
+                (
+                    vec![("content-type", "image/png"), ("host", "yard.example.com")],
+                    PNG.to_vec(),
+                    StatusCode::FORBIDDEN,
+                    "request_host_forbidden",
+                ),
+            ];
+            for (headers, body, status, code) in cases {
+                let response = post_image(&app, &uri, &headers, &body).await;
+                assert_eq!(response.status(), status, "{headers:?}");
+                assert_eq!(error_code(response).await, code, "{headers:?}");
+            }
+            // A declared Content-Length over the limit is refused from the
+            // header alone: the message reports the declared size, not the
+            // 16 bytes actually sent (which are within the limit).
+            let declared = post_image(
+                &app,
+                &uri,
+                &[("content-type", "image/png"), ("content-length", "1000000")],
+                PNG,
+            )
+            .await;
+            assert_eq!(declared.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let error = response_json(declared).await["error"].clone();
+            assert_eq!(error["code"], "image_too_large");
+            assert_eq!(
+                error["message"], "the image is 977 KiB; the limit is 16 B",
+                "{error}"
+            );
+            assert_eq!(
+                super::super::image_paste::declared_too_large(Some(17), 16),
+                Some(17)
+            );
+            assert_eq!(
+                super::super::image_paste::declared_too_large(Some(16), 16),
+                None
+            );
+            assert_eq!(
+                super::super::image_paste::declared_too_large(None, 16),
+                None
+            );
+            assert_eq!(pasted_files(&temp), 0);
+        }
+
+        #[tokio::test]
+        async fn a_real_connection_receives_the_too_large_answer() {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            // Through a real hyper connection the browser must get the 413,
+            // not a reset while it is still sending the body.
+            let (app, temp) = paste_router(Some(16)).await;
+            let (project_id, assignment_id) = create_active_assignment(&app).await;
+            let uri = format!(
+                "/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal/images"
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await });
+            let body = vec![0_u8; 4 * 1024 * 1024];
+            for declared in [true, false] {
+                let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+                let framing = if declared {
+                    format!("content-length: {}\r\n", body.len())
+                } else {
+                    "transfer-encoding: chunked\r\n".to_owned()
+                };
+                let head = format!(
+                    "POST {uri} HTTP/1.1\r\nhost: 127.0.0.1:4317\r\norigin: http://127.0.0.1:4317\r\ncontent-type: image/png\r\n{framing}connection: close\r\n\r\n"
+                );
+                stream.write_all(head.as_bytes()).await.unwrap();
+                if declared {
+                    stream.write_all(&body).await.unwrap();
+                } else {
+                    for chunk in body.chunks(64 * 1024) {
+                        stream
+                            .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                            .await
+                            .unwrap();
+                        stream.write_all(chunk).await.unwrap();
+                        stream.write_all(b"\r\n").await.unwrap();
+                    }
+                    stream.write_all(b"0\r\n\r\n").await.unwrap();
+                }
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).await.unwrap();
+                let response = String::from_utf8_lossy(&response);
+                assert!(
+                    response.starts_with("HTTP/1.1 413"),
+                    "declared={declared}: {response}"
+                );
+                assert!(response.contains("image_too_large"), "{response}");
+            }
+            server.abort();
+            assert_eq!(pasted_files(&temp), 0);
+        }
+
+        #[tokio::test]
+        async fn accepts_images_past_the_default_extractor_body_limit() {
+            // axum caps extracted bodies at 2 MiB by default; the paste
+            // route streams the body against its own limit instead.
+            let (app, temp) = paste_router(Some(10 * 1024 * 1024)).await;
+            let (project_id, assignment_id) = create_active_assignment(&app).await;
+            let uri = format!(
+                "/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal/images"
+            );
+            let mut image = PNG.to_vec();
+            image.resize(3 * 1024 * 1024, 0);
+            let response = post_image(&app, &uri, &BROWSER, &image).await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let body = response_json(response).await;
+            assert_eq!(body["bytes"], image.len());
+            assert_eq!(pasted_files(&temp), 1);
+        }
+
+        #[tokio::test]
+        async fn refuses_targets_that_cannot_be_attached() {
+            let (app, temp) = paste_router(Some(1024)).await;
+            let (project_id, _) = create_active_assignment(&app).await;
+            let missing = post_image(
+                &app,
+                &format!("/api/v1/projects/{project_id}/assignments/missing/terminal/images"),
+                &BROWSER,
+                PNG,
+            )
+            .await;
+            assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+            assert_eq!(error_code(missing).await, "assignment_not_found");
+            let yard = post_image(
+                &app,
+                "/api/v1/yard/orchestrator/terminal/images",
+                &BROWSER,
+                PNG,
+            )
+            .await;
+            assert_eq!(yard.status(), StatusCode::CONFLICT);
+            assert_eq!(error_code(yard).await, "yard_orchestrator_not_configured");
+            let node = post_image(
+                &app,
+                &format!(
+                    "/api/v1/coordination-nodes/{}/terminal/images",
+                    uuid::Uuid::now_v7()
+                ),
+                &BROWSER,
+                PNG,
+            )
+            .await;
+            assert_eq!(node.status(), StatusCode::NOT_FOUND);
+            assert_eq!(error_code(node).await, "coordination_node_not_found");
+            assert_eq!(pasted_files(&temp), 0);
+        }
+
+        #[tokio::test]
+        async fn stores_project_orchestrator_images_and_reports_an_unconfigured_root() {
+            let (app, temp) = paste_router(Some(1024)).await;
+            let (project_id, _) = create_active_assignment(&app).await;
+            let uri = format!("/api/v1/projects/{project_id}/orchestrator/terminal/images");
+            let response = post_image(&app, &uri, &BROWSER, PNG).await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+            assert_eq!(pasted_files(&temp), 1);
+
+            let (app, _temp) = paste_router(None).await;
+            let (project_id, _) = create_active_assignment(&app).await;
+            let uri = format!("/api/v1/projects/{project_id}/orchestrator/terminal/images");
+            let response = post_image(&app, &uri, &BROWSER, PNG).await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(error_code(response).await, "image_paste_not_configured");
+        }
     }
 }

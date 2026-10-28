@@ -172,6 +172,8 @@ export class YardApiError extends Error {
 }
 
 const READ_REQUEST_TIMEOUT_MS = 15_000
+/** An image upload that takes longer than this is abandoned. */
+export const IMAGE_UPLOAD_TIMEOUT_MS = 60_000
 // Herdr answers a history read for an idle full-screen agent only after
 // paging its alternate-screen transcript for up to 15 s plus a restore of up
 // to 5 s, and Yard's server allows 25 s for it; the browser must outwait both.
@@ -189,6 +191,8 @@ async function requestJson<T>(
   path: string,
   init: RequestInit = {},
   readTimeoutMs = READ_REQUEST_TIMEOUT_MS,
+  // A deadline for a non-GET request; reads always have `readTimeoutMs`.
+  writeTimeoutMs: number | null = null,
 ): Promise<T> {
   const callerSignal = init.signal
   const requestController = new AbortController()
@@ -199,12 +203,14 @@ async function requestJson<T>(
     callerSignal?.addEventListener('abort', abortRequest, { once: true })
   }
   let timedOut = false
+  const timeoutMs =
+    (init.method ?? 'GET').toUpperCase() === 'GET' ? readTimeoutMs : writeTimeoutMs
   const timeoutId =
-    (init.method ?? 'GET').toUpperCase() === 'GET'
+    timeoutMs !== null
       ? globalThis.setTimeout(() => {
           timedOut = true
           requestController.abort()
-        }, readTimeoutMs)
+        }, timeoutMs)
       : null
 
   try {
@@ -250,7 +256,7 @@ async function requestJson<T>(
     if (timedOut) {
       throw new YardApiError(
         'request_timeout',
-        `Yard request timed out after ${Math.round(readTimeoutMs / 1_000)} seconds`,
+        `Yard request timed out after ${Math.round((timeoutMs ?? 0) / 1_000)} seconds`,
       )
     }
     throw caught
@@ -1511,5 +1517,59 @@ export function coordinationNodeTerminalWebSocketUrl(
     cols,
     rows,
     pageLocation,
+  )
+}
+
+/** The terminal an image paste is for, named the way its WebSocket route is. */
+export type TerminalImageTarget =
+  | { kind: 'assignment'; projectId: string; assignmentId: string }
+  | { kind: 'orchestrator'; projectId: string }
+  | { kind: 'yard-orchestrator' }
+  | { kind: 'coordination-node'; nodeId: string }
+
+/** An image Yard stored for a terminal paste. */
+export interface PastedTerminalImage {
+  /** Absolute path on the Yard host, readable by the agent. */
+  path: string
+  name: string
+  bytes: number
+  content_type: string
+}
+
+/** `<terminal WebSocket path>/images`. */
+export function terminalImageUploadPath(target: TerminalImageTarget): string {
+  switch (target.kind) {
+    case 'assignment':
+      return `/api/v1/projects/${encodeURIComponent(target.projectId)}/assignments/${encodeURIComponent(target.assignmentId)}/terminal/images`
+    case 'orchestrator':
+      return `/api/v1/projects/${encodeURIComponent(target.projectId)}/orchestrator/terminal/images`
+    case 'yard-orchestrator':
+      return '/api/v1/yard/orchestrator/terminal/images'
+    case 'coordination-node':
+      return `/api/v1/coordination-nodes/${encodeURIComponent(target.nodeId)}/terminal/images`
+  }
+}
+
+/**
+ * Upload one pasted image; Yard checks the type against the bytes. It is
+ * abandoned after `timeoutMs` (or when `signal` aborts), so a stalled upload
+ * cannot hold the terminal's queued input indefinitely.
+ */
+export function uploadTerminalImage(
+  target: TerminalImageTarget,
+  image: Blob,
+  signal?: AbortSignal,
+  timeoutMs = IMAGE_UPLOAD_TIMEOUT_MS,
+): Promise<PastedTerminalImage> {
+  return requestJson(
+    terminalImageUploadPath(target),
+    {
+      method: 'POST',
+      headers: { 'Content-Type': image.type },
+      body: image,
+      signal,
+    },
+    READ_REQUEST_TIMEOUT_MS,
+    timeoutMs,
   )
 }

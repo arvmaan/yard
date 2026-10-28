@@ -10,7 +10,9 @@ import {
   fetchOrchestratorTerminalOutput,
   fetchYardOrchestratorTerminalOutput,
   orchestratorTerminalWebSocketUrl,
+  type TerminalImageTarget,
   type TerminalOutputFormat,
+  uploadTerminalImage,
   yardOrchestratorTerminalWebSocketUrl,
 } from './api'
 import {
@@ -37,6 +39,14 @@ import {
   stripTerminalEscapes,
 } from './terminalHistory'
 import { TerminalHistoryView } from './terminalHistoryView'
+import {
+  clipboardPastePlan,
+  dropNotice,
+  imagePasteNotice,
+  isTerminalControlInput,
+  pasteTerminalImages,
+  transferImages,
+} from './terminalImagePaste'
 import { chunkTerminalInput } from './terminalInput'
 import {
   addPageScroll,
@@ -248,6 +258,9 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
   // the screen height, so it shows that nothing piled up locally.
   const [bufferLines, setBufferLines] = useState<number | null>(null)
   const [inputNotice, setInputNotice] = useState<string | null>(null)
+  // Image pastes still uploading, and how to cancel them.
+  const [uploadingImages, setUploadingImages] = useState(false)
+  const cancelImageUploadsRef = useRef<(() => void) | null>(null)
   // Herdr keeps one scroll offset per pane, so the view stays scrolled back
   // until input or a scroll reset. Show that, with a way back to the latest.
   const [scrolledBack, setScrolledBack] = useState(false)
@@ -1168,11 +1181,51 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       scheduleScrollTimers(now)
     }
 
+    // While an image paste is uploading, later typing and text pastes wait
+    // behind it, so the image path still reaches the pane before them.
+    // Control input (Ctrl-C, Esc, ...) never waits: an interrupt must reach
+    // the agent even while an upload is slow. It must also never overtake
+    // input typed before it, so it cancels the pending uploads and discards
+    // the queued input first (interruptImagePastes); nothing queued before
+    // the interrupt reaches the pane after it.
+    let imagePastesPending = 0
+    let imagePastes: Promise<void> = Promise.resolve()
+    // Bumped by an interrupt; queued input from an older generation is dropped.
+    let queuedInputGeneration = 0
+    let queuedInputCount = 0
+    const afterImagePastes = (run: () => void, immediate = false) => {
+      if (imagePastesPending === 0 || immediate) {
+        run()
+        return
+      }
+      const generation = queuedInputGeneration
+      queuedInputCount += 1
+      imagePastes = imagePastes.then(() => {
+        if (generation !== queuedInputGeneration) return
+        queuedInputCount -= 1
+        if (!disposed) run()
+      })
+    }
+    const interruptImagePastes = () => {
+      if (imagePastesPending === 0) return
+      const discarded = queuedInputCount > 0
+      queuedInputGeneration += 1
+      queuedInputCount = 0
+      cancelImageUploadsRef.current?.()
+      window.clearTimeout(imageNoticeTimer)
+      setInputNotice(
+        discarded ? 'Upload cancelled; typed input discarded' : 'Upload cancelled',
+      )
+    }
+
     const inputSubscription = terminal.onData((text) => {
       // Typing leaves history mode and reaches the pane as always.
       exitHistory()
       resetHistoryProbe()
-      if (socket) {
+      const control = isTerminalControlInput(text)
+      if (control) interruptImagePastes()
+      afterImagePastes(() => {
+        if (!socket) return
         for (const chunk of chunkTerminalInput(text)) {
           if (!sendMessage(socket, { type: 'terminal.input', text: chunk })) {
             break
@@ -1180,7 +1233,7 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
           clearScrolledBack()
           resetScrollGate()
         }
-      }
+      }, control)
     })
 
     // PageUp/PageDown (plain or with Shift) scroll through Herdr. Every other
@@ -1247,35 +1300,153 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       passive: false,
     })
 
-    // A paste is one bracketed `terminal.input`, so the agent sees a single
-    // paste rather than one submitted line per newline. It runs in the
-    // capture phase so xterm never also sends it unbracketed and chunked.
-    const handlePaste = (event: ClipboardEvent) => {
-      const clipboardText = event.clipboardData?.getData('text/plain') ?? ''
-      const paste = bracketedTerminalPaste(clipboardText)
+    // Pasted and dropped images are uploaded to Yard, then their host paths
+    // are typed into the same socket the paste started on. Pastes run one at
+    // a time, and typing or text pastes made meanwhile wait behind them
+    // (afterImagePastes), so everything reaches the pane in order.
+    const imageTarget: TerminalImageTarget =
+      targetKind === 'yard-orchestrator'
+        ? { kind: 'yard-orchestrator' }
+        : targetKind === 'coordination-node'
+          ? { kind: 'coordination-node', nodeId: nodeId ?? '' }
+          : targetKind === 'assignment'
+            ? {
+                kind: 'assignment',
+                projectId: projectId ?? '',
+                assignmentId: assignmentId ?? '',
+              }
+            : { kind: 'orchestrator', projectId: projectId ?? '' }
+    // One controller for the pastes queued so far; Cancel aborts them all
+    // (queued ones captured it too) and later pastes get a fresh one.
+    let imageUploads = new AbortController()
+    cancelImageUploadsRef.current = () => {
+      imageUploads.abort()
+      imageUploads = new AbortController()
+    }
+    let imageNoticeTimer = 0
+    const showBriefNotice = (notice: string) => {
+      window.clearTimeout(imageNoticeTimer)
+      setInputNotice(notice)
+      imageNoticeTimer = window.setTimeout(() => {
+        if (!disposed) {
+          setInputNotice((current) => (current === notice ? null : current))
+        }
+      }, 4_000)
+    }
+    const pasteImages = (images: File[], text: string, skippedNotice: string | null) => {
+      const attachedSocket = socket
+      const uploads = imageUploads.signal
+      const generation = queuedInputGeneration
+      // A cancelled paste types nothing more, even mid-way through its paths.
+      const attached = () =>
+        !disposed &&
+        !uploads.aborted &&
+        attachedSocket !== null &&
+        socket === attachedSocket &&
+        attachedSocket.readyState === WebSocket.OPEN
+      window.clearTimeout(imageNoticeTimer)
+      setInputNotice(
+        images.length === 1 ? 'Uploading image…' : `Uploading ${images.length} images…`,
+      )
+      imagePastesPending += 1
+      setUploadingImages(true)
+      imagePastes = imagePastes.then(async () => {
+        try {
+          const result = await pasteTerminalImages({
+            images,
+            text,
+            upload: (image) => uploadTerminalImage(imageTarget, image, uploads),
+            attached,
+            send: (input) =>
+              attachedSocket !== null &&
+              sendMessage(attachedSocket, { type: 'terminal.input', text: input }),
+          })
+          if (disposed) return
+          if (result.kind === 'error') {
+            // An interrupt already said what happened to this paste.
+            if (generation === queuedInputGeneration) setInputNotice(result.message)
+            return
+          }
+          exitHistory()
+          resetHistoryProbe()
+          clearScrolledBack()
+          resetScrollGate()
+          const notice = imagePasteNotice(result.images)
+          showBriefNotice(skippedNotice ? `${notice}. ${skippedNotice}` : notice)
+        } finally {
+          imagePastesPending -= 1
+          if (imagePastesPending === 0 && !disposed) setUploadingImages(false)
+        }
+      })
+    }
+
+    // A text paste is one bracketed `terminal.input`, so the agent sees a
+    // single paste rather than one submitted line per newline.
+    const pasteText = (text: string, notice: string | null) => {
+      const paste = bracketedTerminalPaste(text)
       if (!paste) return
-      event.preventDefault()
-      event.stopPropagation()
       if (paste.kind === 'too_large') {
         setInputNotice(
           `Paste not sent: ${formatTerminalBytes(paste.bytes)} exceeds the ${formatTerminalBytes(paste.limit)} terminal paste limit`,
         )
         return
-    }
-      if (
-        !socket ||
-        !sendMessage(socket, { type: 'terminal.input', text: paste.text })
-      ) {
-        setInputNotice('Paste not sent: the terminal is not connected')
-        return
       }
-      exitHistory()
-      resetHistoryProbe()
-      clearScrolledBack()
-      resetScrollGate()
-      setInputNotice(null)
+      afterImagePastes(() => {
+        if (
+          !socket ||
+          !sendMessage(socket, { type: 'terminal.input', text: paste.text })
+        ) {
+          setInputNotice('Paste not sent: the terminal is not connected')
+          return
+        }
+        exitHistory()
+        resetHistoryProbe()
+        clearScrolledBack()
+        resetScrollGate()
+        if (notice) showBriefNotice(notice)
+        else setInputNotice(null)
+      })
+    }
+
+    // Pastes run in the capture phase so xterm never also sends them
+    // unbracketed and chunked.
+    const handlePaste = (event: ClipboardEvent) => {
+      const clipboardText = event.clipboardData?.getData('text/plain') ?? ''
+      const plan = clipboardPastePlan(event.clipboardData, clipboardText)
+      if (plan.kind === 'nothing') return
+      event.preventDefault()
+      event.stopPropagation()
+      if (plan.kind === 'unsupported') setInputNotice(plan.notice)
+      else if (plan.kind === 'images') pasteImages(plan.images, plan.text, null)
+      else pasteText(plan.text, plan.ignoredNotice)
     }
     host.addEventListener('paste', handlePaste, { capture: true })
+
+    // Dropped image files take the same path as pasted ones. Every drop that
+    // carries files is handled here, so the browser never opens a dropped
+    // file in place of Yard.
+    const carriesFiles = (event: DragEvent) =>
+      event.dataTransfer?.types.includes('Files') ?? false
+    const handleDragOver = (event: DragEvent) => {
+      if (!carriesFiles(event) || !event.dataTransfer) return
+      event.preventDefault()
+      event.dataTransfer.dropEffect = 'copy'
+    }
+    const handleDrop = (event: DragEvent) => {
+      if (!carriesFiles(event)) return
+      event.preventDefault()
+      event.stopPropagation()
+      const { images, skipped } = transferImages(event.dataTransfer)
+      const notice = dropNotice(images, skipped)
+      if (images.length === 0) {
+        if (notice) setInputNotice(notice)
+        return
+      }
+      terminal.focus()
+      pasteImages(images, '', notice)
+    }
+    host.addEventListener('dragover', handleDragOver)
+    host.addEventListener('drop', handleDrop, { capture: true })
 
     // Copy in history mode copies the history selection. Focus stays on the
     // live terminal (so typing goes to the pane), whose own copy handler
@@ -1504,6 +1675,11 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       window.removeEventListener(THEME_CHANGE_EVENT, handleThemeChange)
       host.removeEventListener('wheel', handleWheel, true)
       host.removeEventListener('paste', handlePaste, true)
+      host.removeEventListener('dragover', handleDragOver)
+      host.removeEventListener('drop', handleDrop, true)
+      imageUploads.abort()
+      cancelImageUploadsRef.current = null
+      window.clearTimeout(imageNoticeTimer)
       host.removeEventListener('copy', handleCopy, true)
       host.removeEventListener('focusin', handleFocusIn)
       jumpToLatestRef.current = null
@@ -1640,6 +1816,15 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
           >
             {inputNotice}
         </div>
+        ) : null}
+        {uploadingImages ? (
+          <button
+            className="terminal-session__notice-action"
+            onClick={() => cancelImageUploadsRef.current?.()}
+            type="button"
+          >
+            Cancel upload
+          </button>
         ) : null}
         {connection.kind === 'closed' || connection.kind === 'error' ? (
           <button
