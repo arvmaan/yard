@@ -144,6 +144,21 @@ import {
 import { AgentWorkspaceShell } from './AgentWorkspaceShell'
 import { ProjectRepositoriesSection } from './RepositoryFilesWorkspace'
 import { ProjectPulseWorkspace } from './ProjectPulseWorkspace'
+import { WorkBoardRailPanel, WorkBoardWorkspace } from './WorkBoardWorkspace'
+import { useWorkBoard } from './useWorkBoard'
+import {
+  EMPTY_FILTER,
+  filterFromHash,
+  filterToHash,
+  isOutOfDate,
+  newBaseline,
+  reconcileBoard,
+  type BoardAction,
+  type BoardFilter,
+  type BoardItem,
+  type ReconcileBaseline,
+} from './workBoard'
+import { agentQuestionKey, latestAgentQuestion } from './agentQuestions'
 import { HerdrInventoryWorkspace } from './HerdrInventoryWorkspace'
 import {
   resolveRuntimeCapabilities,
@@ -321,6 +336,7 @@ import type {
   YardOrchestratorRoute,
   Worker,
 } from './types'
+import { dedupeTargetsByRuntime, sameRuntimeTarget } from './runtimeLensTargets'
 import {
   workerDisplayName,
   withRenamedDisplayName,
@@ -3208,6 +3224,17 @@ function App() {
   const [filter, setFilter] = useState<Filter>('current')
   const [railView, setRailView] = useState<ResourceView>('profiles')
   const [resourceShelfOpen, setResourceShelfOpen] = useState(false)
+  const [workBoardOpen, setWorkBoardOpen] = useState(() =>
+    window.location.hash.startsWith('#board'),
+  )
+  const workBoardTrigger = useRef<HTMLElement | null>(null)
+  const [workBoardFilter, setWorkBoardFilter] = useState<BoardFilter>(
+    () => filterFromHash(window.location.hash) ?? EMPTY_FILTER,
+  )
+  const [workBoardNow, setWorkBoardNow] = useState(() => Date.now())
+  const workBoard = useWorkBoard(
+    workBoardOpen || (resourceShelfOpen && railView === 'board'),
+  )
   const [selection, setSelection] = useState<CanvasSelection>(null)
   const [agentWorkspaceMode, setAgentWorkspaceMode] =
     useState<AgentWorkspaceView>('map')
@@ -4980,7 +5007,10 @@ function App() {
         workspaceId: runtime.workspace_id,
       })
     })
-    return targets
+    // One card per Herdr terminal: an assignment run by a project's
+    // orchestrator worker is the orchestrator card, not a second card on
+    // the same pane (switching between the two re-attached the pane).
+    return dedupeTargetsByRuntime(targets)
   }, [
     assignments,
     coordinationNodes,
@@ -4991,9 +5021,13 @@ function App() {
     yardOrchestrator,
   ])
   const currentAgentWorkspaceTarget = agentWorkspaceTarget
-    ? agentWorkspaceTargets.find(
+    ? (agentWorkspaceTargets.find(
         (target) => target.key === agentWorkspaceTarget.key,
-      )
+      ) ??
+      // A target folded into another card on the same pane opens that card.
+      agentWorkspaceTargets.find((target) =>
+        sameRuntimeTarget(target, agentWorkspaceTarget),
+      ))
     : null
   const activeAgentWorkspaceTarget = currentAgentWorkspaceTarget
     ? {
@@ -5024,6 +5058,67 @@ function App() {
     }),
     [openAgentChat, openAgentTerminal],
   )
+  const boardTargetFor = useCallback(
+    (item: BoardItem) =>
+      agentWorkspaceTargets.find((target) =>
+        item.assignment_id
+          ? target.target.kind === 'assignment' &&
+            target.target.assignment.id === item.assignment_id
+          : item.kind === 'orchestrator' &&
+            target.target.kind === 'orchestrator' &&
+            target.target.project.id === item.project_id,
+      ) ?? null,
+    [agentWorkspaceTargets],
+  )
+  // What the app knew when the current board revision arrived; reconcile
+  // only what changed since.
+  const workBoardBaseline = useRef<ReconcileBaseline | null>(null)
+  const { setBoard: setWorkBoard, setLocallyChanged: setWorkBoardChanged } =
+    workBoard
+  const currentWorkBoard = workBoard.board
+  useEffect(() => {
+    if (!currentWorkBoard) return
+    if (workBoardBaseline.current?.revision !== currentWorkBoard.revision) {
+      workBoardBaseline.current = newBaseline(currentWorkBoard.revision)
+    }
+    const next = reconcileBoard(
+      currentWorkBoard,
+      assignments,
+      workerCandidates,
+      (item) => {
+        const target = boardTargetFor(item)
+        return target ? latestAgentQuestion(agentQuestionKey(target.target)) !== null : false
+      },
+      workBoardBaseline.current,
+    )
+    if (next === currentWorkBoard) return
+    setWorkBoard(next)
+    setWorkBoardChanged(true)
+  }, [
+    assignments,
+    boardTargetFor,
+    currentWorkBoard,
+    setWorkBoard,
+    setWorkBoardChanged,
+    workerCandidates,
+  ])
+  useEffect(() => {
+    if (!workBoardOpen) return
+    const timer = window.setInterval(() => setWorkBoardNow(Date.now()), 30_000)
+    return () => window.clearInterval(timer)
+  }, [workBoardOpen])
+  useEffect(() => {
+    if (!workBoardOpen) {
+      if (window.location.hash.startsWith('#board')) {
+        window.history.replaceState(null, '', window.location.pathname + window.location.search)
+      }
+      return
+    }
+    const hash = filterToHash(workBoardFilter)
+    if (window.location.hash !== hash) {
+      window.history.replaceState(null, '', hash)
+    }
+  }, [workBoardFilter, workBoardOpen])
   const refresh = useCallback(async () => {
     setActionError(null)
     try {
@@ -7967,6 +8062,85 @@ function App() {
         ? 'degraded'
         : 'observed'
 
+  // The existing cleanup dialog, or (when nothing qualifies for it: only
+  // unobserved external workers do) the Workers shelf on the Stale filter
+  // with its own guarded per-worker controls.
+  const openWorkBoardCleanUp = (trigger: HTMLElement) => {
+    if (hideableStaleCandidates.length > 0) {
+      proposeHideStaleWorkers(trigger)
+    } else {
+      setWorkBoardOpen(false)
+      resourceShelfTrigger.current = null
+      setRailView('workers')
+      setFilter('stale')
+      setResourceShelfOpen(true)
+    }
+  }
+  const handleWorkBoardAction = (
+    item: BoardItem,
+    action: BoardAction,
+    trigger: HTMLElement,
+  ) => {
+    const project = projects.find((candidate) => candidate.id === item.project_id)
+    const candidate = workerCandidates.find(
+      ({ worker }) => worker.id === item.worker_id,
+    )
+    const assignment = assignments.find(({ id }) => id === item.assignment_id)
+    switch (action) {
+      case 'open_terminal': {
+        const target = boardTargetFor(item)
+        if (target?.interactive) {
+          setWorkBoardOpen(false)
+          openAgentTerminal({ ...target, returnFocus: null })
+        } else if (item.kind === 'worker' && item.worker_id) {
+          // A live worker without an assignment: open that worker, never
+          // the project orchestrator.
+          setWorkBoardOpen(false)
+          setSelection({ kind: 'worker', id: item.worker_id })
+        } else if (item.kind === 'loose_agent' || !project) {
+          setWorkBoardOpen(false)
+          setHerdrInventoryOpen(true)
+        } else {
+          setWorkBoardOpen(false)
+          setSelection({ kind: 'orchestrator', projectId: project.id })
+        }
+        return
+      }
+      case 'open_project':
+        if (!project) return
+        setWorkBoardOpen(false)
+        setSelection({ kind: 'orchestrator', projectId: project.id })
+        return
+      case 'mark_done':
+        if (!assignment) return
+        setCompletionError(null)
+        setCompletionProposal({ assignment, commandId: crypto.randomUUID() })
+        return
+      case 'end_session':
+        if (candidate) proposeEndSession(candidate)
+        return
+      case 'archive_project':
+        if (project && trigger instanceof HTMLButtonElement) {
+          proposeProjectArchive(project, trigger)
+        }
+        return
+      case 'clean_up':
+      case 'hide':
+        openWorkBoardCleanUp(trigger)
+        return
+      case 'resume':
+        if (!item.worker_id) return
+        setWorkBoardOpen(false)
+        setSelection({ kind: 'worker', id: item.worker_id })
+        return
+    }
+  }
+  const openWorkBoard = (trigger: HTMLElement | null) => {
+    workBoardTrigger.current = trigger
+    setWorkBoardNow(Date.now())
+    setWorkBoardOpen(true)
+  }
+
   return (
     <AgentWorkspaceContext.Provider value={agentWorkspaceContext}>
       <div
@@ -8066,6 +8240,9 @@ function App() {
               workers: workerCandidates.length,
               workspaces: availableWorkspaces.length,
               archived: archivedProjects?.length ?? null,
+              board: workBoard.board?.counts
+                ? workBoard.board.counts.needs_you
+                : null,
             }}
             onChange={setRailView}
             value={railView}
@@ -8293,6 +8470,16 @@ function App() {
               ) : null}
             </div>
           </div>
+        ) : railView === 'board' ? (
+          <WorkBoardRailPanel
+            board={workBoard.board}
+            onOpen={(trigger, generate) => {
+              openWorkBoard(trigger)
+              if (generate && workBoard.board?.state !== 'running') {
+                void workBoard.generate(false)
+              }
+            }}
+          />
         ) : railView === 'archived' ? (
           <ArchivedProjectsPanel
             archived={archivedProjects}
@@ -8915,6 +9102,30 @@ function App() {
         returnFocus={agentWorkspaceReturnFocus.current}
         yardRoutes={yardOrchestratorRoutes}
       />
+      {workBoardOpen ? (
+        <WorkBoardWorkspace
+          board={workBoard.board}
+          error={workBoard.error}
+          filter={workBoardFilter}
+          generateError={workBoard.generateError}
+          nowMs={workBoardNow}
+          onAction={handleWorkBoardAction}
+          onCleanUp={openWorkBoardCleanUp}
+          onClose={() => setWorkBoardOpen(false)}
+          onFilterChange={setWorkBoardFilter}
+          onGenerate={(useModel) => {
+            setWorkBoardNow(Date.now())
+            void workBoard.generate(useModel)
+          }}
+          onTriage={(itemId, choice) => void workBoard.triage(itemId, choice)}
+          outOfDate={isOutOfDate(
+            workBoard.board,
+            workerCandidates,
+            workBoard.locallyChanged,
+          )}
+          returnFocus={workBoardTrigger.current}
+        />
+      ) : null}
       {projectPulseOpen ? (
         <ProjectPulseWorkspace
           assignments={assignments}

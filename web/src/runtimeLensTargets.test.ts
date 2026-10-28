@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest"
 import {
+  dedupeTargetsByRuntime,
   groupRuntimeLensEntries,
   runtimeLensEntryKey,
   runtimeLensEntryLabel,
+  sameRuntimeTarget,
 } from "./runtimeLensTargets"
 import type { AgentWorkspaceTarget } from "./AgentWorkspaceContext"
 import type { RuntimeInventory, RuntimeLensEntry } from "./types"
@@ -135,5 +137,46 @@ describe("runtimeLensEntryLabel", () => {
     expect(runtimeLensEntryLabel({ ...linked, display_name: "  " })).toBe(
       "Generalist",
     )
+  })
+})
+
+describe("dedupeTargetsByRuntime", () => {
+  const target = (key: string, terminalId: string, paneId: string, session = "main") => ({
+    key,
+    session,
+    terminalId,
+    paneId,
+  })
+
+  it("keeps the first card per terminal (the orchestrator)", () => {
+    const orchestrator = target("orchestrator:p", "term-1", "w1:pT")
+    const sameTerminal = target("assignment:a", "term-1", "w1:pT")
+    // A reused pane id with a different terminal is a different agent.
+    const reusedPane = target("assignment:b", "term-2", "w1:pT")
+    const other = target("assignment:c", "term-3", "w1:pX")
+    const otherSession = target("assignment:d", "term-1", "w1:pT", "elsewhere")
+    expect(
+      dedupeTargetsByRuntime([orchestrator, sameTerminal, reusedPane, other, otherSession]).map(
+        ({ key }) => key,
+      ),
+    ).toEqual(["orchestrator:p", "assignment:b", "assignment:c", "assignment:d"])
+    expect(sameRuntimeTarget(orchestrator, sameTerminal)).toBe(true)
+    expect(sameRuntimeTarget(orchestrator, reusedPane)).toBe(false)
+    expect(sameRuntimeTarget(orchestrator, otherSession)).toBe(false)
+  })
+
+  it("falls back to the pane id when a terminal id is missing", () => {
+    const orchestrator = target("orchestrator:p", "term-1", "w1:pT")
+    const paneOnly = target("assignment:a", "", "w1:pT")
+    const otherPane = target("assignment:b", "", "w1:pX")
+    expect(
+      dedupeTargetsByRuntime([orchestrator, paneOnly, otherPane]).map(({ key }) => key),
+    ).toEqual(["orchestrator:p", "assignment:b"])
+  })
+
+  it("ignores empty ids", () => {
+    expect(
+      dedupeTargetsByRuntime([target("a", "", ""), target("b", "", "")]).map(({ key }) => key),
+    ).toEqual(["a", "b"])
   })
 })

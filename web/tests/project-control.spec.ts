@@ -5647,7 +5647,7 @@ async function openRuntimeHealth(page: Page) {
 
 async function openResources(
   page: Page,
-  view: 'Profiles' | 'Workers' | 'Workspaces' = 'Profiles',
+  view: 'Profiles' | 'Workers' | 'Workspaces' | 'Board' = 'Profiles',
 ) {
   const shelf = page.locator('.resource-shelf')
   if (!(await shelf.isVisible().catch(() => false))) {
@@ -21973,4 +21973,919 @@ test('shows workstream archive and delete actions at the top of the inspector', 
     )
   })
   expect(precedesSettings).toBe(true)
+})
+
+
+// ---- Work board (mocked API; neutral web-app/billing-api/docs-site fixtures) ----
+
+const HOUR_MS = 3_600_000
+const DAY_MS = 24 * HOUR_MS
+
+function boardItem(overrides: Record<string, unknown>) {
+  return {
+    id: 'a:x',
+    kind: 'assignment',
+    column: 'doing',
+    section: null,
+    rule: 'R2',
+    chips: [],
+    project_id: 'project-1',
+    project_name: 'web-app',
+    worker_id: null,
+    assignment_id: null,
+    title: 'worker',
+    objective: '',
+    status_line: '',
+    summary: '',
+    next_step: '',
+    labels: [],
+    details: [],
+    next_actions: [],
+    age_ms: 2 * 60_000,
+    age_source: 'worker updated',
+    heat: 'hot',
+    ai: null,
+    actions: ['open_terminal', 'open_project'],
+    rollup: false,
+    pending: false,
+    dead_count: null,
+    about: '',
+    status: '',
+    your_move: '',
+    title_source: 'your name for it',
+    activity_known: true,
+    relevance: 'recent',
+    helper: null,
+    pinned: false,
+    reviewed: false,
+    suggest_archive: false,
+    ...overrides,
+  }
+}
+
+function workBoardFixture(
+  phase: 'empty' | 'partial' | 'idle',
+  options: { modelError?: string; manyStale?: boolean } = {},
+) {
+  const counts = {
+    doing: 1,
+    needs_you: 3,
+    stale_needs_work: 2,
+    stale_likely_done: 1,
+    close: 2,
+    closed: 1,
+  }
+  const base = {
+    revision: phase === 'empty' ? 0 : phase === 'partial' ? 2 : 3,
+    generation_id: phase === 'empty' ? null : 'generation-1',
+    state: phase === 'empty' ? 'empty' : phase === 'partial' ? 'running' : 'idle',
+    stage: phase === 'partial' ? 'model' : null,
+    generated_at_unix_ms: phase === 'empty' ? null : Date.now() - 2 * 60_000,
+    fingerprint: phase === 'empty' ? null : '0-0',
+    mode: phase === 'empty' ? 'deterministic' : 'model',
+    model_available: true,
+    model_estimate_usd: 0.04,
+    model:
+      phase === 'empty'
+        ? null
+        : {
+            enabled: true,
+            calls: phase === 'partial' ? 1 : 2,
+            input_tokens: 6_200,
+            output_tokens: 540,
+            usd: 0.0218,
+            error: options.modelError ?? null,
+            skipped: false,
+            batches_done: phase === 'partial' ? 1 : 2,
+            batches_total: 2,
+          },
+    thresholds: {
+      fresh_ms: 15 * 60_000,
+      review_window_ms: DAY_MS,
+      cold_ms: 7 * DAY_MS,
+      recent_ms: 3 * DAY_MS,
+      waiting_ms: 7 * DAY_MS,
+      suggest_archive_ms: 14 * DAY_MS,
+    },
+    warnings: [],
+    error: null,
+  }
+  if (phase === 'empty') return base
+  const full = workBoardFull(phase, base, counts)
+  if (!options.manyStale) return full
+  // Nothing doing now, and more "Needs work" cards than a section shows.
+  const extra = Array.from({ length: 12 }, (_, index) =>
+    boardItem({
+      id: `a:extra-${index}`,
+      column: 'stale',
+      section: 'needs_work',
+      rule: 'R5',
+      chips: ['stale'],
+      labels: [],
+      title: `Cleanup helper ${index + 1}`,
+      objective: 'Remove unused feature flags',
+      summary: `Quiet for ${5 + index} days`,
+      next_step: 'Check whether it is still needed. Close it if not.',
+      status_line: '',
+      age_ms: (5 + index) * DAY_MS,
+      heat: 'cool',
+    }),
+  )
+  return {
+    ...full,
+    items: [...full.items.filter((item) => item.column !== 'doing'), ...extra],
+  }
+}
+
+function workBoardFull<Base extends object, Counts extends object>(
+  phase: 'partial' | 'idle',
+  base: Base,
+  counts: Counts,
+) {
+  const pending = phase === 'partial'
+  return {
+    ...base,
+    counts,
+    projects: [
+      { id: 'project-1', name: 'web-app', status_line: 'Settings page rework under way', summary: 'Planning the settings page rework', orchestrator_column: 'doing', counts },
+      { id: 'project-2', name: 'billing-api', status_line: 'Waiting on a schema decision', summary: 'Has a question for you', orchestrator_column: 'needs_you', counts },
+      { id: 'project-3', name: 'docs-site', status_line: 'Docs refresh merged', summary: 'Says it is done, with nothing next', orchestrator_column: 'close', counts },
+    ],
+    items: [
+      boardItem({
+        id: 'a:ui',
+        title: 'Settings form coder',
+        objective: 'Rebuild the account settings form',
+        status_line: 'Editing the form validation',
+        summary: 'Editing the form validation',
+        about: 'Rebuild the account settings form',
+        status: 'Working: editing the form validation',
+        your_move: 'Nothing \u2014 it\u2019s working',
+        chips: ['working'],
+        labels: [],
+        details: ['Task state: Active'],
+      }),
+      boardItem({
+        id: 'o:beta',
+        kind: 'orchestrator',
+        column: 'needs_you',
+        rule: 'R1',
+        chips: ['needs attention'],
+        labels: [],
+        project_id: 'project-2',
+        project_name: 'billing-api',
+        title: 'Coordinator: move invoices to the v2 schema',
+        status_line: 'Waiting on a schema decision before the invoice migration',
+        summary: 'Has a question for you',
+        next_step: 'Answer its question: use the v2 invoice schema?',
+        about: 'Coordinates the billing-api project',
+        status: 'Asks: use the v2 invoice schema?',
+        your_move: 'Answer its question: use the v2 invoice schema?',
+        title_source: 'what it is on now',
+        need: 'answer',
+        next_actions: ['Use the v2 invoice schema?', 'Rerun the invoice migration'],
+        age_ms: 5 * HOUR_MS,
+        heat: 'warm',
+        actions: ['open_terminal', 'open_project'],
+      }),
+      // Blocked on something only the user can clear: it waits on the user.
+      boardItem({
+        id: 'a:deploy',
+        column: 'needs_you',
+        rule: 'R5',
+        chips: ['blocked on you', 'stale'],
+        labels: [],
+        need: 'answer',
+        title: 'Staging deploy',
+        objective: 'Deploy the settings page to staging',
+        status_line: 'Deploy the settings page to staging',
+        summary: 'Blocked, waiting on you',
+        next_step: 'Refresh your AWS credentials, then tell it to continue.',
+        about: 'Deploy the settings page to staging',
+        status: 'Blocked: AWS authentication failed',
+        your_move: 'Refresh your AWS credentials, then tell it to continue.',
+        relevance: 'waiting',
+        age_ms: 2 * DAY_MS,
+        heat: 'cool',
+        actions: ['open_terminal', 'mark_done', 'open_project'],
+      }),
+      boardItem({
+        id: 'a:assignment-1',
+        column: 'needs_you',
+        rule: 'R3',
+        chips: ['ready for review'],
+        labels: [],
+        assignment_id: 'assignment-1',
+        title: 'Payment retry fixer',
+        objective: 'Retry failed card payments with backoff',
+        status_line: 'Retry with backoff in place; tests pass',
+        summary: 'Finished, waiting for your review',
+        next_step: 'Review what it did, then mark it done.',
+        about: 'Retry failed card payments with backoff',
+        status: 'Finished: retry with backoff in place, tests pass',
+        your_move: 'Review what it did, then mark it done.',
+        need: 'review',
+        details: ['Task state: Active'],
+        age_ms: 2 * HOUR_MS,
+        heat: 'warm',
+        actions: ['open_terminal', 'mark_done', 'open_project'],
+      }),
+      boardItem({
+        id: 'a:io',
+        column: 'stale',
+        section: 'needs_work',
+        rule: 'R5',
+        chips: ['stale'],
+        labels: [],
+        title: 'Upload refactor',
+        objective: 'Move file uploads to the new storage client',
+        status_line: 'Move file uploads to the new storage client',
+        summary: 'Quiet for 3 days, still has open steps',
+        about: 'Move file uploads to the new storage client',
+        status: 'Gone quiet, with open steps',
+        your_move: 'Tell it to continue with \u201cAdd a retry test for large uploads\u201d, or close it if you no longer need it.',
+        relevance: 'pinned',
+        pinned: true,
+        next_step: 'Tell it to continue with \u201cAdd a retry test for large uploads\u201d, or close it if you no longer need it.',
+        next_actions: ['Add a retry test for large uploads', 'Split the upload retry into its own module'],
+        age_ms: 3 * DAY_MS,
+        heat: 'cool',
+      }),
+      boardItem({
+        id: 'a:notes',
+        column: 'stale',
+        section: 'needs_work',
+        rule: 'P1',
+        chips: ['stale', ...(pending ? [] : ['?'])],
+        labels: [],
+        title: 'Release notes writer',
+        objective: 'Draft the 2.4 release notes',
+        status_line: pending ? 'Draft the 2.4 release notes' : 'Half of the release notes are drafted; the rest may no longer be needed',
+        summary: pending ? 'Quiet for 4 days' : "Quiet for 4 days (the AI can't tell if it is finished)",
+        next_step: 'Check whether it is still needed. Close it if not.',
+        about: 'Draft the 2.4 release notes',
+        status: pending ? 'Gone quiet' : 'Gone quiet (unclear if finished)',
+        your_move: 'Check whether it is still needed. Close it if not.',
+        relevance: 'recent',
+        age_ms: 4 * DAY_MS,
+        heat: 'cool',
+        pending,
+        ai: pending
+          ? null
+          : { verdict: 'unclear', confidence: 0.41, evidence: 'tail', quote: 'TODO: finish section 3', next_actions: [] },
+      }),
+      boardItem({
+        id: 'a:assignment-done',
+        column: 'stale',
+        section: pending ? 'needs_work' : 'likely_done',
+        rule: 'P1',
+        chips: ['stale'],
+        labels: [],
+        assignment_id: 'assignment-1',
+        title: 'Search tuning',
+        objective: 'Tune search ranking for product names',
+        status_line: pending ? 'Tune search ranking for product names' : 'Ranking change is merged and nothing is left to do',
+        summary: pending ? 'Quiet for 9 days' : 'Quiet for 9 days, looks finished',
+        next_step: pending
+          ? 'Check whether it is still needed. Close it if not.'
+          : 'Mark it done or close it.',
+        about: 'Tune search ranking for product names',
+        status: pending ? 'Gone quiet' : 'Finished: ranking change is merged',
+        your_move: pending
+          ? 'Check whether it is still needed. Close it if not.'
+          : 'Mark it done or close it.',
+        relevance: 'pinned',
+        pinned: true,
+        age_ms: 9 * DAY_MS,
+        heat: 'cold',
+        pending,
+        ai: pending
+          ? null
+          : { verdict: 'finished', confidence: 0.82, evidence: 'tail', quote: 'PR merged', next_actions: [] },
+        actions: pending ? ['open_terminal'] : ['mark_done', 'open_terminal'],
+      }),
+      boardItem({
+        id: 'a:docs',
+        column: 'close',
+        rule: 'R4',
+        chips: ['receipt'],
+        labels: [],
+        project_id: 'project-3',
+        project_name: 'docs-site',
+        title: 'Docs refresher',
+        objective: 'Refresh the getting-started guide',
+        status_line: 'Guide refreshed and screenshots updated',
+        summary: 'Done: guide refreshed and screenshots updated',
+        next_step: 'Close it to free the terminal (its report is kept).',
+        about: 'Refresh the getting-started guide',
+        status: 'Done: guide refreshed and screenshots updated',
+        your_move: 'Close it to free the terminal (its report is kept).',
+        relevance: 'pinned',
+        pinned: true,
+        details: ['Task state: Completed'],
+        age_ms: 9 * DAY_MS,
+        heat: 'cold',
+        actions: ['end_session', 'open_project'],
+      }),
+      // A live agent whose failed assignment has a recorded disposition.
+      boardItem({ id: 'w:old', column: 'closed', rule: 'R0', title: 'Old importer', summary: 'Closed, nothing left to do', next_step: '', age_ms: 30 * DAY_MS, heat: 'cold', actions: [] }),
+      // Older work: quiet past the window and not waiting on the user.
+      boardItem({
+        id: 'a:spike',
+        kind: 'worker',
+        column: 'stale',
+        section: 'needs_work',
+        rule: 'R5',
+        chips: ['unassigned'],
+        project_id: 'project-3',
+        project_name: 'docs-site',
+        title: 'Search page prototype',
+        title_source: 'conversation title',
+        about: 'Try a faster search page layout',
+        status: '',
+        your_move: "Close it if you're done with it.",
+        relevance: 'older',
+        age_ms: 6 * DAY_MS,
+        heat: 'cool',
+        actions: ['open_terminal', 'end_session', 'open_project'],
+      }),
+      boardItem({
+        id: 'l:main:w2:p3',
+        kind: 'loose_agent',
+        column: 'stale',
+        section: 'needs_work',
+        rule: 'R5',
+        chips: ['loose agent'],
+        project_id: null,
+        project_name: null,
+        title: 'Flaky upload test triage',
+        title_source: 'conversation title',
+        about: '',
+        status: '',
+        your_move: "Archive it if you're done with it.",
+        relevance: 'older',
+        suggest_archive: true,
+        age_ms: 20 * DAY_MS,
+        heat: 'cold',
+        actions: ['open_terminal', 'hide'],
+      }),
+      // A helper: hidden unless "Show helpers".
+      boardItem({
+        id: 'l:main:w2:p9',
+        kind: 'loose_agent',
+        column: 'needs_you',
+        rule: 'R1',
+        chips: ['loose agent'],
+        project_id: null,
+        project_name: null,
+        title: 'Summary of the web-app run',
+        about: 'Summarise the web-app run',
+        status: 'Has a question for you',
+        your_move: 'Open it and answer the question.',
+        helper: 'A Yard summary worker',
+        actions: ['open_terminal', 'hide'],
+      }),
+    ],
+    older: 2,
+    to_review: 2,
+    helpers: 2,
+    helper_rows: [
+      { id: 'provider-child:claude:s1:a1', title: 'Check the form validation tests', parent_id: 'a:ui', parent_title: 'Settings form coder', status: 'Working', age_ms: 60_000 },
+    ],
+    todos: [
+      { id: 't1', text: 'Answer \u201cCoordinator: move invoices to the v2 schema\u201d: use the v2 invoice schema?', kind: 'unblock', urgency: 'now', project_id: 'project-2', sources: [{ kind: 'item', id: 'o:beta' }], age_ms: 5 * HOUR_MS },
+      { id: 't0', text: 'Unblock \u201cStaging deploy\u201d: refresh your AWS credentials, then tell it to continue.', kind: 'unblock', urgency: 'now', project_id: 'project-1', sources: [{ kind: 'item', id: 'a:deploy' }], age_ms: 2 * DAY_MS },
+      { id: 't2', text: 'Review the result from \u201cPayment retry fixer\u201d: retry with backoff in place, tests pass', kind: 'review', urgency: 'soon', project_id: 'project-1', sources: [{ kind: 'item', id: 'a:assignment-1' }], age_ms: 2 * HOUR_MS },
+      { id: 't3', text: 'Ask \u201cUpload refactor\u201d to continue (2 steps left) or close it', kind: 'next', urgency: 'soon', project_id: 'project-1', sources: [{ kind: 'item', id: 'a:io' }], age_ms: 3 * DAY_MS },
+      { id: 't4', text: 'Close \u201cDocs refresher\u201d (done: guide refreshed and screenshots updated)', kind: 'close', urgency: 'later', project_id: 'project-3', sources: [{ kind: 'item', id: 'a:docs' }], age_ms: 9 * DAY_MS },
+      // Uncapped list: the web keeps 2 per project file and 3 per project, so t6 and t7 are cut.
+      { id: 't5', text: 'Write the 2.4 release checklist', kind: 'snapshot', urgency: 'soon', project_id: 'project-1', sources: [{ kind: 'project', id: 'project-1' }, { kind: 'node', id: 'node-1' }], age_ms: 3 * DAY_MS },
+      { id: 't6', text: 'Update the browser support table', kind: 'snapshot', urgency: 'soon', project_id: 'project-1', sources: [{ kind: 'project', id: 'project-1' }, { kind: 'node', id: 'node-1' }], age_ms: 3 * DAY_MS },
+      { id: 't7', text: 'Remove the old upload endpoint', kind: 'snapshot', urgency: 'soon', project_id: 'project-1', sources: [{ kind: 'project', id: 'project-1' }, { kind: 'node', id: 'node-1' }], age_ms: 3 * DAY_MS },
+    ],
+    hidden: { not_live: 19, dead_runtimes: 17 },
+  }
+}
+
+async function mockWorkBoard(
+  page: Page,
+  options: { modelError?: string; startEmpty?: boolean; manyStale?: boolean } = {},
+) {
+  let phase: 'empty' | 'partial' | 'idle' = options.startEmpty === false ? 'idle' : 'empty'
+  let polls = 0
+  const generates: unknown[] = []
+  const triages: unknown[] = []
+  await page.route('**/api/v1/work-board/triage', async (route) => {
+    triages.push(route.request().postDataJSON())
+    await route.fulfill({ json: { revision: 9 } })
+  })
+  await page.route('**/api/v1/work-board/generate', async (route) => {
+    generates.push(route.request().postDataJSON())
+    phase = 'partial'
+    polls = 0
+    await route.fulfill({ status: 202, json: { generation_id: 'generation-1', revision: 1 } })
+  })
+  let unchanged = 0
+  await page.route(/\/api\/v1\/work-board(\?.*)?$/, async (route) => {
+    if (phase === 'partial') {
+      polls += 1
+      if (polls > 2) phase = 'idle'
+    }
+    const board = workBoardFixture(phase, options)
+    // The incremental poll: an unchanged revision answers {unchanged:true}.
+    const since = new URL(route.request().url()).searchParams.get('since')
+    if (since !== null && Number(since) === board.revision) {
+      unchanged += 1
+      await route.fulfill({ json: { unchanged: true, revision: board.revision } })
+      return
+    }
+    await route.fulfill({ json: board })
+  })
+  return { generates, triages, unchanged: () => unchanged }
+}
+
+function contrastRatio(foreground: string, background: string) {
+  const channels = (color: string) => {
+    // `rgb(0-255 ...)` or `color(srgb 0-1 ...)` (what color-mix() yields).
+    const unit = color.startsWith('color(') ? 1 : 255
+    const match = color.replace(/^color\(srgb/, '').match(/[\d.]+/g)?.map(Number) ?? [0, 0, 0]
+    return match.slice(0, 3).map((value) => {
+      const channel = value / unit
+      return channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4
+    })
+  }
+  const luminance = (color: string) => {
+    const [r = 0, g = 0, b = 0] = channels(color)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+  }
+  const [light, dark] = [luminance(foreground), luminance(background)].sort((a, b) => b - a)
+  return (light + 0.05) / (dark + 0.05)
+}
+
+async function assertBoardContrast(page: Page) {
+  const samples = await page.evaluate(() => {
+    type Rgba = [number, number, number, number]
+    const probe = document.createElement('canvas').getContext('2d')
+    // Any CSS colour (rgb, rgba, color(srgb ...), color-mix results) to RGBA
+    // 0-255 through the canvas parser.
+    const parse = (color: string): Rgba => {
+      const srgb = color.match(/^color\(srgb ([\d.]+) ([\d.]+) ([\d.]+)(?: \/ ([\d.]+))?\)$/)
+      if (srgb) {
+        return [Number(srgb[1]) * 255, Number(srgb[2]) * 255, Number(srgb[3]) * 255, srgb[4] === undefined ? 1 : Number(srgb[4])]
+      }
+      const rgb = color.match(/rgba?\(([\d.]+),?\s*([\d.]+),?\s*([\d.]+)(?:,?\s*\/?\s*([\d.]+))?\)/)
+      if (rgb) return [Number(rgb[1]), Number(rgb[2]), Number(rgb[3]), rgb[4] === undefined ? 1 : Number(rgb[4])]
+      if (probe) {
+        probe.fillStyle = color
+        const hex = String(probe.fillStyle)
+        if (hex.startsWith('#')) {
+          return [Number.parseInt(hex.slice(1, 3), 16), Number.parseInt(hex.slice(3, 5), 16), Number.parseInt(hex.slice(5, 7), 16), 1]
+        }
+      }
+      return [0, 0, 0, 0]
+    }
+    const over = (top: Rgba, bottom: Rgba): Rgba => {
+      const alpha = top[3]
+      return [
+        top[0] * alpha + bottom[0] * (1 - alpha),
+        top[1] * alpha + bottom[1] * (1 - alpha),
+        top[2] * alpha + bottom[2] * (1 - alpha),
+        1,
+      ]
+    }
+    // Composite every ancestor background from the root down onto white.
+    const background = (element: Element): Rgba => {
+      const chain: Element[] = []
+      for (let current: Element | null = element; current; current = current.parentElement) {
+        chain.push(current)
+      }
+      let color: Rgba = [255, 255, 255, 1]
+      for (const node of chain.reverse()) {
+        const layer = parse(getComputedStyle(node).backgroundColor)
+        if (layer[3] > 0) color = over(layer, color)
+      }
+      return color
+    }
+    const root = document.querySelector('.board-workspace')
+    if (!root) return []
+    return Array.from(root.querySelectorAll('*'))
+      .filter(
+        (element) =>
+          element.getClientRects().length > 0 &&
+          getComputedStyle(element).visibility !== 'hidden' &&
+          !element.closest('.board-visually-hidden') &&
+          Array.from(element.childNodes).some(
+            (node) => node.nodeType === Node.TEXT_NODE && (node.textContent ?? '').trim() !== '',
+          ),
+      )
+      .map((element) => {
+        const behind = background(element)
+        const style = getComputedStyle(element)
+        const opacity = Number(style.opacity)
+        const fg = parse(style.color)
+        const front = over([fg[0], fg[1], fg[2], fg[3] * opacity], behind)
+        return {
+          selector: `${element.tagName.toLowerCase()}.${String(element.className)}`,
+          text: (element.textContent ?? '').trim().slice(0, 30),
+          color: `rgb(${front.slice(0, 3).map(Math.round).join(', ')})`,
+          background: `rgb(${behind.slice(0, 3).map(Math.round).join(', ')})`,
+        }
+      })
+  })
+  expect(samples.length).toBeGreaterThan(40)
+  for (const sample of samples) {
+    // WCAG AA: 4.5:1 for small text.
+    const ratio = contrastRatio(sample.color, sample.background)
+    expect(ratio, `${sample.selector} "${sample.text}" ${sample.color} on ${sample.background}`).toBeGreaterThanOrEqual(4.5)
+  }
+}
+
+for (const theme of ['light', 'purple'] as const) {
+  test(`work board generates, streams, and renders cleanly (${theme})`, async ({ page }) => {
+    const state = await mockApi(page)
+    seedActiveAssignment(state, 'assignment-1')
+    // One unobserved external worker, so "Clean up..." has something the
+    // hide dialog may touch.
+    const staleWorker = state.workerCandidates.find(({ worker }) => worker.id === 'worker-unavailable')
+    if (!staleWorker) throw new Error('stale worker fixture missing')
+    const board = await mockWorkBoard(page)
+    await page.addInitScript((value) => {
+      window.localStorage.setItem('yard:theme', value)
+    }, theme)
+    await page.setViewportSize({ width: 1440, height: 960 })
+    await page.goto('/')
+
+    const shelf = await openResources(page, 'Board')
+    await expect(shelf.getByRole('heading', { name: 'Work board' })).toBeVisible()
+    await shelf.getByRole('button', { name: 'Refresh board' }).click()
+    const dialog = page.getByRole('dialog', { name: 'Work board' })
+    await expect(dialog).toBeVisible()
+    expect(board.generates).toEqual([{ use_model: false }])
+
+    // Partial results first, with progress and shimmering pending rows (in Quiet).
+    await expect(dialog.getByRole('status')).toContainText('Writing AI summaries (1 of 2 done)')
+    const quiet = dialog.locator('.board-group[data-group="quiet"]')
+    await quiet.getByRole('button', { name: 'show' }).click()
+    await expect(dialog.locator('.board-row[data-pending]')).toHaveCount(2)
+
+    // Then the finished board.
+    await expect(dialog.locator('.board-progress[data-active]')).toHaveCount(0, { timeout: 10_000 })
+    await expect(dialog.locator('.board-row[data-pending]')).toHaveCount(0)
+    // The incremental poll path ran (an unchanged revision kept the board).
+    expect(board.unchanged()).toBeGreaterThan(0)
+    // Plain words on the face; calls, tokens and cost only under Details.
+    const header = dialog.locator('.board-header__line')
+    await expect(header).toContainText('min ago) · With AI summaries')
+    await expect(header).not.toContainText('built-in')
+    await expect(header.locator('.board-header__details > span').first()).toBeHidden()
+    await header.getByText('Details', { exact: true }).click()
+    await expect(header.locator('.board-header__details')).toContainText('2 calls')
+    await expect(header.locator('.board-header__details')).toContainText('$0.022')
+    // The colour key and thresholds live under Details, not on the face.
+    await expect(header.locator('.board-header__details')).toContainText('quiet over a week')
+    await expect(header.locator('.board-header__details')).toContainText('24 hr for review')
+    await header.getByText('Details', { exact: true }).click()
+    await expect(dialog.locator('.board-howto')).toContainText('How to read this board')
+    await expect(dialog.locator('.board-footer')).not.toContainText('Colour')
+    await expect(dialog.getByLabel('Filter cards')).toHaveAttribute('placeholder', 'Search (press /)')
+
+    // One list: no columns, no project strip, no to-do section, no chips.
+    for (const gone of ['.board-column', '.board-projects', '.board-todos', '.board-todo', '.board-chip', '.board-card', '.board-filters']) {
+      await expect(dialog.locator(gone)).toHaveCount(0)
+    }
+    await expect(dialog).not.toContainText('hides the row')
+    await expect(dialog.locator('.board-group h3')).toHaveText([
+      'Needs you (4)',
+      'Working (1)',
+      'Quiet (3) hide',
+      'Older (2) review',
+    ])
+    // Needs you: questions and blockers, then finished work to review, then
+    // finished work to close; one line each, with an Open button.
+    const needs = dialog.locator('.board-group[data-group="needs"] .board-row')
+    await expect(needs.locator('.board-row__title')).toHaveText([
+      'Coordinator: move invoices to the v2 schema',
+      'Staging deploy',
+      'Payment retry fixer',
+      'Docs refresher',
+    ])
+    await expect(needs.locator('.board-row__project')).toHaveText(['billing-api', 'web-app', 'web-app', 'docs-site'])
+    await expect(needs.locator('.board-row__text')).toHaveText([
+      '— Answer its question: use the v2 invoice schema?',
+      '— Refresh your AWS credentials, then tell it to continue.',
+      '— Review what it did, then mark it done.',
+      '— Close it to free the terminal (its report is kept).',
+    ])
+    await expect(needs.locator('.board-row__age')).toHaveText(['5 hr ago', '2 days ago', '2 hr ago', /ago$/])
+    await expect(needs.getByRole('button', { name: 'Open', exact: true })).toHaveCount(4)
+    // Working: what it is doing now; no Open button on the face.
+    const working = dialog.locator('[data-item-id="a:ui"]')
+    await expect(working.locator('.board-row__text')).toHaveText('— Editing the form validation')
+    await expect(working.getByRole('button', { name: 'Open', exact: true })).toHaveCount(0)
+    // Quiet: the move, or the status when there is nothing to do.
+    await expect(quiet.locator('.board-row__title')).toHaveText(['Upload refactor', 'Release notes writer', 'Search tuning'])
+    // Older work and helpers stay off the list.
+    await expect(dialog.locator('[data-item-id="a:spike"]')).toHaveCount(0)
+    await expect(dialog.locator('[data-item-id="l:main:w2:p9"]')).toHaveCount(0)
+    await expect(dialog.getByLabel('Show helpers (2)')).not.toBeChecked()
+
+    // Everything else is one click away, on the row itself.
+    const review = dialog.locator('[data-item-id="a:assignment-1"]')
+    await expect(review.locator('.board-row__more')).toHaveCount(0)
+    await review.locator('.board-row__face').click()
+    await expect(review.locator('.board-row__face')).toHaveAttribute('aria-expanded', 'true')
+    await expect(review.locator('.board-row__lines dt')).toHaveText(['About:', 'Status:', 'Your move:'])
+    await expect(review.locator('.board-row__lines dd')).toHaveText([
+      'Retry failed card payments with backoff',
+      'Finished: retry with backoff in place, tests pass · 2 hr ago',
+      'Review what it did, then mark it done.',
+    ])
+    await expect(review.locator('.board-row__actions button')).toHaveText(['Open terminal', 'Mark done…'])
+    await review.locator('.board-row__face').click()
+    await expect(review.locator('.board-row__more')).toHaveCount(0)
+    const finished = dialog.locator('[data-item-id="a:docs"]')
+    await finished.locator('.board-row__face').click()
+    await expect(finished.locator('.board-row__labels')).toContainText('kept')
+    await expect(finished.getByRole('button', { name: 'Close agent…' })).toBeVisible()
+    await finished.locator('.board-row__face').click()
+    const likelyDone = dialog.locator('[data-item-id="a:assignment-done"]')
+    // Model numbers live in the row's Details, not on its face.
+    await expect(likelyDone).not.toContainText('0.82')
+    await likelyDone.locator('.board-row__face').click()
+    await expect(likelyDone.locator('.board-row__labels')).toContainText('AI summary')
+    await likelyDone.getByText('Details', { exact: true }).click()
+    await expect(likelyDone.locator('.board-row__details')).toContainText('confidence 82%')
+    await expect(likelyDone.locator('.board-row__details')).toContainText('"PR merged"')
+    await likelyDone.getByText('Details', { exact: true }).click()
+    await likelyDone.locator('.board-row__face').click()
+    await expect(likelyDone.locator('.board-row__more')).toHaveCount(0)
+    await expect(
+      dialog.getByRole('button', { name: /^New activity since .+ · Refresh board$/ }),
+    ).toBeVisible()
+    // No internal codes on any row face.
+    for (const face of await dialog.locator('.board-row__line').allTextContents()) {
+      expect(face).not.toMatch(/\b(R[0-7]|P1)\b|receipt|runtime|unassigned_live|resumable|Turn ended|next:|Herdr|recorded| \. |session|worker|\.\.\.|What to do:|Still to do:/)
+      expect(face).not.toMatch(/not tracked|No conversation topic|Nothing more found|the AI thinks|no task assigned|title from/i)
+    }
+    await expect(dialog.locator('[data-item-id="w:old"]')).toHaveCount(0)
+    // Records without a live agent are one footer link, not rows.
+    await expect(dialog.locator('[data-item-id="dead"]')).toHaveCount(0)
+    await expect(
+      dialog.getByRole('button', { name: '19 ended agents not on the board (17 can’t be resumed) · Clean up…' }),
+    ).toBeVisible()
+    const cleanUp = dialog.locator('.board-hidden-link')
+    await expect(cleanUp).not.toHaveAttribute('title', /Herdr|runtime|worker record/)
+    // Not clipped: the whole link fits in its box.
+    expect(await cleanUp.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true)
+
+    await assertBoardContrast(page)
+    const shots = process.env.WORK_BOARD_SHOTS
+    if (shots) {
+      // The "Out of date" pill is on by design here: the fixture's
+      // fingerprint ('0-0') never matches the mocked /workers, which is what
+      // exercises the pill.
+      await page.mouse.move(0, 0)
+      await dialog.evaluate((root) => {
+        for (const element of [root, ...root.querySelectorAll<HTMLElement>('*')]) element.scrollTop = 0
+      })
+      await page.screenshot({ path: `${shots}/work-board-${theme}.png` })
+      await review.locator('.board-row__face').click()
+      await page.mouse.move(0, 0)
+      await page.screenshot({ path: `${shots}/work-board-${theme}-row-open.png` })
+      await review.locator('.board-row__face').click()
+      await dialog.getByRole('button', { name: /ended agents/ }).scrollIntoViewIfNeeded()
+      await page.screenshot({ path: `${shots}/work-board-${theme}-footer.png` })
+      await dialog.locator('.board-header__line').scrollIntoViewIfNeeded()
+    }
+
+    if (theme !== 'light') return
+
+    // The model option is explicit and shows its estimate.
+    await dialog.getByRole('button', { name: 'More refresh options' }).click()
+    await expect(dialog.getByRole('menuitem', { name: /With AI summaries/ })).toContainText(
+      'costs at most $0.040',
+    )
+    await dialog.getByRole('menuitem', { name: 'Quick (no AI summaries)' }).click()
+    await expect.poll(() => board.generates.length).toBe(2)
+    expect(board.generates[1]).toEqual({ use_model: false })
+    await expect(dialog.locator('.board-progress[data-active]')).toHaveCount(0, { timeout: 10_000 })
+
+    // "Probably finished?" -> Mark done opens the existing completion dialog.
+    await likelyDone.locator('.board-row__face').click()
+    await likelyDone.getByRole('button', { name: 'Mark done…' }).click()
+    const completion = page.getByRole('dialog', { name: 'Complete with details' })
+    await expect(completion).toBeVisible()
+    await completion.getByRole('button', { name: 'Close completion' }).click()
+    await expect(completion).toHaveCount(0)
+
+    // The footer link opens the existing hide-stale dialog.
+    await dialog.getByRole('button', { name: /ended agents/ }).click()
+    const hide = page.getByRole('dialog', { name: /Hide \d+ stale/ })
+    await expect(hide).toBeVisible()
+    await hide.getByRole('button', { name: 'Close hide stale workers' }).click()
+
+    // Keyboard: j/k walk the list top to bottom, Space shows details, Esc closes.
+    await dialog.focus()
+    await page.keyboard.press('j')
+    await expect(dialog.locator('[data-item-id="o:beta"]')).toBeFocused()
+    await page.keyboard.press('j')
+    await expect(dialog.locator('[data-item-id="a:deploy"]')).toBeFocused()
+    await page.keyboard.press('j')
+    await page.keyboard.press('j')
+    await page.keyboard.press('j')
+    await expect(dialog.locator('[data-item-id="a:ui"]')).toBeFocused()
+    await page.keyboard.press('k')
+    await expect(dialog.locator('[data-item-id="a:docs"]')).toBeFocused()
+    await page.keyboard.press(' ')
+    await expect(dialog.locator('[data-item-id="a:docs"] .board-row__more')).toBeVisible()
+    await page.keyboard.press(' ')
+    await expect(dialog.locator('[data-item-id="a:docs"] .board-row__more')).toHaveCount(0)
+    await expect(dialog.locator('.board-row[tabindex="0"]')).toHaveCount(1)
+    await page.keyboard.press('/')
+    await expect(dialog.getByLabel('Filter cards')).toBeFocused()
+    await page.keyboard.type('retry')
+    await expect(dialog.locator('.board-row')).toHaveCount(2)
+    expect(await page.evaluate(() => window.location.hash)).toBe('#board?q=retry')
+    await page.keyboard.press('Escape')
+    await page.keyboard.press('Escape')
+    await expect(dialog).toHaveCount(0)
+    expect(await page.evaluate(() => window.location.hash)).toBe('')
+  })
+}
+
+for (const theme of ['light', 'purple'] as const) {
+  test(`work board: Older work, review one card at a time, helpers (${theme})`, async ({ page }) => {
+    await mockApi(page)
+    const board = await mockWorkBoard(page, { startEmpty: false })
+    await page.addInitScript((value) => window.localStorage.setItem('yard:theme', value), theme)
+    await page.setViewportSize({ width: 1440, height: 960 })
+    await page.goto('/')
+    const shelf = await openResources(page, 'Board')
+    await shelf.getByRole('button', { name: 'Open board' }).click()
+    const dialog = page.getByRole('dialog', { name: 'Work board' })
+    await expect(dialog).toBeVisible()
+    // The window is shown under the header's Details.
+    const header = dialog.locator('.board-header__line')
+    await header.getByText('Details', { exact: true }).click()
+    await expect(dialog.getByTestId('board-window')).toContainText('activity in the last 3 days')
+    await expect(dialog.getByTestId('board-window')).toContainText('suggests archiving after 14 days')
+    await header.getByText('Details', { exact: true }).click()
+
+    // One entry point: Older says what is in it, in one line, and "review"
+    // opens the one-card-at-a-time triage.
+    const olderWork = dialog.getByTestId('board-older')
+    await expect(dialog.getByTestId('board-cleanup')).toHaveCount(0)
+    await expect(olderWork.locator('h3')).toHaveText('Older (2) review')
+    await expect(olderWork.getByTestId('board-older-line')).toHaveText(
+      '1 untouched 2+ weeks, 1 quiet. Nothing here is lost.',
+    )
+    await expect(olderWork.locator('.board-row')).toHaveCount(0)
+    const reviewButton = olderWork.getByRole('button', { name: 'review', exact: true })
+
+    // Helpers appear only on request, with the subagents.
+    await dialog.getByLabel('Show helpers (2)').check()
+    const helpers = dialog.getByTestId('board-helpers')
+    await expect(helpers.locator('[data-item-id="l:main:w2:p9"]')).toBeVisible()
+    await expect(helpers.locator('.board-helper-rows li')).toContainText(
+      'Check the form validation tests Subagent of Settings form coder',
+    )
+    await assertBoardContrast(page)
+    const shots = process.env.WORK_BOARD_SHOTS
+    if (shots) {
+      await olderWork.scrollIntoViewIfNeeded()
+      await page.screenshot({ path: `${shots}/work-board-${theme}-older.png` })
+    }
+    await dialog.getByLabel('Show helpers (2)').uncheck()
+
+    // Esc closes a review without a decision.
+    await reviewButton.click()
+    await expect(page.getByTestId('board-review')).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(page.getByTestId('board-review')).toHaveCount(0)
+    await expect(dialog).toBeVisible()
+    expect(board.triages).toHaveLength(0)
+
+    // Review: one card at a time with progress; K keeps, S skips.
+    await reviewButton.click()
+    const review = page.getByTestId('board-review')
+    await expect(review).toBeFocused()
+    await expect(review.locator('.board-review__progress')).toHaveText('1 of 2')
+    await expect(review.locator('.board-review__title')).toHaveText('Flaky upload test triage')
+    await expect(review.locator('.board-review__suggest')).toHaveText('Untouched 20 days \u2014 suggest archive.')
+    // The suggested action leads; "Done" means nothing for a chat outside Yard.
+    await expect(review.locator('.board-button--primary')).toHaveText(/^Archive/)
+    await expect(review.getByRole('button', { name: /^Done/ })).toHaveCount(0)
+    await expect(review).toContainText('Outside Yard')
+    await expect(review).not.toContainText(/not tracked|No conversation topic|the AI thinks/i)
+    await assertBoardContrast(page)
+    if (shots) await page.screenshot({ path: `${shots}/work-board-${theme}-review.png` })
+    await page.keyboard.press('s')
+    await expect(review.locator('.board-review__progress')).toHaveText('2 of 2')
+    await expect(review.locator('.board-review__title')).toHaveText('Search page prototype')
+    await expect(review.getByRole('button', { name: /^Done/ })).toBeEnabled()
+    await expect(review.getByRole('button', { name: /^Archive/ })).toBeDisabled()
+    // Tab stays inside the review.
+    await expect(review).toBeFocused()
+    await page.keyboard.press('Tab')
+    await expect(review.getByRole('button', { name: 'Close review' })).toBeFocused()
+    await page.keyboard.press('Shift+Tab')
+    await expect(review.getByRole('button', { name: /^Skip/ })).toBeFocused()
+    await page.keyboard.press('Tab')
+    await expect(review.getByRole('button', { name: 'Close review' })).toBeFocused()
+    await page.keyboard.press('k')
+    await expect(review).toHaveCount(0)
+    await expect.poll(() => board.triages).toEqual([
+      { item_id: 'l:main:w2:p3', choice: 'skip' },
+      { item_id: 'a:spike', choice: 'keep' },
+    ])
+    // The kept card is back on the list; the skipped one stays in Older
+    // and is not offered again.
+    await expect(dialog.locator('.board-group[data-group="quiet"] h3')).toHaveText('Quiet (4) show')
+    await dialog.locator('.board-group[data-group="quiet"]').getByRole('button', { name: 'show' }).click()
+    await expect(dialog.locator('[data-item-id="a:spike"] .board-row__title')).toHaveText('Search page prototype')
+    await expect(olderWork.locator('h3')).toHaveText('Older (1)')
+  })
+}
+
+test('work board shows the model error and keeps deterministic cards', async ({ page }) => {
+  await mockApi(page)
+  await mockWorkBoard(page, { modelError: 'timeout', startEmpty: false })
+  await page.goto('/#board')
+  const dialog = page.getByRole('dialog', { name: 'Work board' })
+  await expect(dialog).toBeVisible()
+  const alert = dialog.getByRole('alert')
+  await expect(alert).toContainText('AI summaries aren\u2019t available right now')
+  // The raw error is not on the face; it sits in a tooltip and under Details.
+  await expect(alert).not.toContainText('timeout')
+  await expect(alert.locator('[title="timeout"]')).toHaveCount(1)
+  await expect(alert).not.toContainText('built-in')
+  await expect(dialog.locator('.board-row').first()).toBeVisible()
+  // Enter on a row opens its terminal or project and closes the board.
+  await dialog.focus()
+  await page.keyboard.press('j')
+  await expect(dialog.locator('[data-item-id="o:beta"]')).toBeFocused()
+  await page.keyboard.press('Enter')
+  await expect(dialog).toHaveCount(0)
+})
+
+test('work board keyboard: Enter on a row button runs that button, Open goes to the agent', async ({ page }) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state, 'assignment-1')
+  await mockWorkBoard(page, { startEmpty: false })
+  await page.goto('/#board')
+  const dialog = page.getByRole('dialog', { name: 'Work board' })
+  await expect(dialog.locator('.board-row').first()).toBeVisible()
+  // Tab-reachable "Mark done..." inside an open row: Enter opens the
+  // completion dialog, not the row's terminal.
+  const row = dialog.locator('[data-item-id="a:assignment-1"]')
+  await row.locator('.board-row__face').click()
+  const markDone = row.getByRole('button', { name: 'Mark done\u2026' })
+  await markDone.focus()
+  await page.keyboard.press('Enter')
+  const completion = page.getByRole('dialog', { name: 'Complete with details' })
+  await expect(completion).toBeVisible()
+  await completion.getByRole('button', { name: 'Close completion' }).click()
+  await expect(completion).toHaveCount(0)
+  // Open on a Needs-you line goes to the agent (the board closes).
+  await dialog.locator('[data-item-id="a:deploy"]').getByRole('button', { name: 'Open', exact: true }).click()
+  await expect(dialog).toHaveCount(0)
+})
+
+test('work board keyboard reaches every row, with nothing working and a long Quiet group', async ({ page }) => {
+  await mockApi(page)
+  await mockWorkBoard(page, { startEmpty: false, manyStale: true })
+  await page.goto('/#board')
+  const dialog = page.getByRole('dialog', { name: 'Work board' })
+  const quiet = dialog.locator('.board-group[data-group="quiet"]')
+  await expect(quiet).toBeVisible()
+  await quiet.getByRole('button', { name: 'show' }).click()
+  // Every quiet row renders (no per-column cut), and exactly one row is in the tab order.
+  const total = await quiet.locator('.board-row').count()
+  expect(total).toBeGreaterThan(8)
+  await expect(dialog.locator('.board-row[tabindex="0"]')).toHaveCount(1)
+  const rows = await dialog.locator('.board-row').count()
+  await dialog.locator('.board-row[tabindex="0"]').focus()
+  for (let step = 0; step < rows; step += 1) await page.keyboard.press('j')
+  await expect(dialog.locator('.board-row').last()).toBeFocused()
+  await expect(dialog.locator('[data-item-id="a:assignment-done"]')).toHaveCount(1)
+})
+
+test('work board keeps keyboard focus after Generate from the empty state', async ({ page }) => {
+  await mockApi(page)
+  await mockWorkBoard(page)
+  await page.goto('/#board')
+  const dialog = page.getByRole('dialog', { name: 'Work board' })
+  await expect(dialog).toBeVisible()
+  // No dialog.focus(): the header Generate has focus and stays focusable
+  // while running.
+  const generate = dialog.getByRole('button', { name: /^(Refresh board|Refreshing)/ }).first()
+  await expect(generate).toBeFocused()
+  await page.keyboard.press('Enter')
+  await expect(generate).toHaveAttribute('aria-disabled', 'true')
+  await expect(dialog.locator('.board-progress[data-active]')).toHaveCount(0, { timeout: 10_000 })
+  await expect(dialog.locator('.board-row').first()).toBeVisible()
+  await page.keyboard.press('j')
+  await expect(dialog.locator('.board-row:focus')).toHaveCount(1)
+  await page.keyboard.press('Escape')
+  await expect(dialog).toHaveCount(0)
 })

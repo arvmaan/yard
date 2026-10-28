@@ -12,6 +12,7 @@ import {
   Boxes,
   ChevronDown,
   CircleAlert,
+  ClipboardList,
   FileCode2,
   Files,
   FolderArchive,
@@ -42,7 +43,12 @@ import {
 import { SlackSettingsRow } from './SlackSettingsRow'
 import { useModalDialog } from './useModalDialog'
 
-export type ResourceView = 'archived' | 'profiles' | 'workspaces' | 'workers'
+export type ResourceView =
+  | 'archived'
+  | 'board'
+  | 'profiles'
+  | 'workspaces'
+  | 'workers'
 
 type RuntimeHealth = 'degraded' | 'loading' | 'observed' | 'unavailable'
 
@@ -274,6 +280,7 @@ interface GlobalCommandBarProps extends RuntimeHealthPopoverProps {
 
 const RESOURCE_ICONS = {
   archived: FolderArchive,
+  board: ClipboardList,
   profiles: FileCode2,
   workers: Bot,
   workspaces: Boxes,
@@ -281,6 +288,7 @@ const RESOURCE_ICONS = {
 
 const RESOURCE_LABELS: Record<ResourceView, string> = {
   archived: 'Archived',
+  board: 'Board',
   profiles: 'Profiles',
   workers: 'Workers',
   workspaces: 'Workspaces',
@@ -486,8 +494,9 @@ export function ResourceShelfTabs({
   value,
 }: {
   // The Archived count is unknown until the shelf has read the list once.
-  counts: Record<Exclude<ResourceView, 'archived'>, number> & {
+  counts: Record<Exclude<ResourceView, 'archived' | 'board'>, number> & {
     archived: number | null
+    board: number | null
   }
   onChange: (view: ResourceView) => void
   value: ResourceView
@@ -520,7 +529,7 @@ export function ResourceShelfTabs({
       }}
       role="tablist"
     >
-      {(['profiles', 'workers', 'workspaces', 'archived'] as const).map((view) => {
+      {(['profiles', 'workers', 'workspaces', 'archived', 'board'] as const).map((view) => {
         const Icon = RESOURCE_ICONS[view]
         const label = RESOURCE_LABELS[view]
         const count = counts[view]

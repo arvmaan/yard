@@ -375,6 +375,61 @@ fn select_commands(
         .map_err(Into::into)
 }
 
+/// Assignments whose most recent assignment command (prompt, handoff
+/// or disposition) ended `failed` or `ambiguous` after the cutoff. A later
+/// command that did not fail supersedes an earlier failure, so a retried
+/// prompt clears the signal. One row per assignment, no batch limit.
+pub(super) async fn assignments_with_failed_last_command(
+    store: &SqliteProjectStore,
+    updated_after_unix_ms: u64,
+) -> Result<HashSet<String>, ProjectStoreError> {
+    let after = to_i64(updated_after_unix_ms)?;
+    store
+        .run(move |connection| {
+            let sql = format!(
+                "WITH commands AS (
+                     SELECT prompt.assignment_id AS assignment_id, ack.id AS id,
+                            ack.status AS status, ack.created_at_unix_ms AS created,
+                            ack.updated_at_unix_ms AS updated
+                       FROM assignment_prompt_commands prompt
+                       JOIN command_acknowledgements ack ON ack.id = prompt.command_id
+                     UNION ALL
+                     SELECT handoff.source_assignment_id, ack.id, ack.status,
+                            ack.created_at_unix_ms, ack.updated_at_unix_ms
+                       FROM worker_handoff_commands handoff
+                       JOIN command_acknowledgements ack ON ack.id = handoff.command_id
+                      WHERE handoff.source_assignment_id IS NOT NULL
+                     UNION ALL
+                     SELECT disposition.assignment_id, ack.id, ack.status,
+                            ack.created_at_unix_ms, ack.updated_at_unix_ms
+                       FROM assignment_disposition_commands disposition
+                       JOIN command_acknowledgements ack ON ack.id = disposition.command_id
+                 ),
+                 ranked AS (
+                     SELECT assignment_id, status, updated,
+                            ROW_NUMBER() OVER (PARTITION BY assignment_id
+                                               ORDER BY created DESC, updated DESC, id DESC)
+                                AS position
+                       FROM commands
+                 )
+                 SELECT ranked.assignment_id FROM ranked
+                   JOIN assignments assignment ON assignment.id = ranked.assignment_id
+                   JOIN projects project ON project.id = assignment.project_id
+                  WHERE ranked.position = 1
+                    AND ranked.status IN ('failed', 'ambiguous')
+                    AND ranked.updated > ?1
+                    AND {VISIBLE_PROJECT}
+                    AND NOT EXISTS ({SUMMARY_ASSIGNMENT}ranked.assignment_id)"
+            );
+            let mut statement = connection.prepare(&sql)?;
+            statement
+                .query_map([after], |row| row.get::<_, String>(0))?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use rusqlite::Connection;
@@ -1021,5 +1076,58 @@ mod tests {
             all.iter()
                 .all(|command| command.command_id != "attention-allocation")
         );
+    }
+    #[tokio::test]
+    async fn a_later_successful_prompt_clears_an_earlier_failure() {
+        let temp = TempDir::new().unwrap();
+        let (store, project_id, assignment) = fixture(&temp).await;
+        let prompt = |command_id: &str| SendAssignmentPrompt {
+            command_id: command_id.to_owned(),
+            actor: "local-user".to_owned(),
+            attempt_id: assignment.attempt.id.clone(),
+            expected_assignment_version: assignment.version,
+            expected_attempt_version: assignment.attempt.version,
+            text: "retry".to_owned(),
+        };
+        store
+            .begin_assignment_prompt(
+                &project_id,
+                &assignment.id,
+                prompt("prompt-first"),
+                TokenSpendCommandSource::Manual,
+            )
+            .await
+            .unwrap();
+        store
+            .fail_assignment_prompt("prompt-first", "herdr refused", false)
+            .await
+            .unwrap();
+        let failed = store.assignments_with_failed_last_command(0).await.unwrap();
+        assert!(failed.contains(&assignment.id), "{failed:?}");
+
+        store
+            .begin_assignment_prompt(
+                &project_id,
+                &assignment.id,
+                prompt("prompt-retry"),
+                TokenSpendCommandSource::Manual,
+            )
+            .await
+            .unwrap();
+        store
+            .succeed_assignment_prompt("prompt-retry", "working")
+            .await
+            .unwrap();
+        connection(&temp)
+            .execute(
+                "UPDATE command_acknowledgements SET created_at_unix_ms = created_at_unix_ms + 10
+                  WHERE id = 'prompt-retry'",
+                [],
+            )
+            .unwrap();
+        let failed = store.assignments_with_failed_last_command(0).await.unwrap();
+        assert!(failed.is_empty(), "{failed:?}");
+        // The notifier's read still reports the old failure; the board must not.
+        assert_eq!(store.attention_records(0).await.unwrap().commands.len(), 1);
     }
 }
