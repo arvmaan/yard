@@ -138,6 +138,15 @@ a release is tagged.
 
 ### Hardened
 
+- Every state-changing API request (`POST`, `PUT`, `PATCH` or `DELETE` under
+  `/api/`) now passes the loopback Host/Origin guard in one router layer,
+  before its route runs or its body is parsed: a cross-site page (foreign
+  `Origin`) gets 403 `request_origin_forbidden`, and a DNS-rebinding page
+  (foreign `Host`) gets 403 `request_host_forbidden`. This newly covers
+  end-session, completion receipts, node archive and delete, worker delete,
+  prompts, provisioning and the other commands that had no check of their
+  own. The loopback web UI and clients that send no `Origin` on a loopback
+  host (the CLI, agents) are unaffected; reads are unchanged.
 - Same-UID, secret-authenticated Unix-socket lifecycle control, lifetime and
   launch locks, stale-state recovery, and bounded SIGINT/SIGTERM shutdown.
 - Removed raw pane-input fallback during agent startup so failed agent prompts
