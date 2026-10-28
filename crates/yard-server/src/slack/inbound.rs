@@ -170,7 +170,9 @@ impl InboundFilter {
         context.app_id.clone_from(&self.app_id);
         let context = &context;
         let (inbound, key) = match envelope.kind {
-            EnvelopeKind::EventsApi => message_event(context, &envelope.payload, now_unix_ms)?,
+            EnvelopeKind::EventsApi => {
+                message_event(context, &envelope.payload, Some(now_unix_ms))?
+            }
             EnvelopeKind::Interactive => block_action(context, &envelope.payload, now_unix_ms)?,
             _ => return Err("unsupported_envelope"),
         };
@@ -194,6 +196,23 @@ impl InboundFilter {
 }
 
 impl InboundFilter {
+    /// The owner DM in `envelope` as [`Self::accept`] reads it, without
+    /// the age checks: only for a message [`Self::late_owner_message`]
+    /// answered, so the owner can send it now with one click (a fresh,
+    /// owner-checked action). Nothing is acted on here.
+    #[must_use]
+    pub fn late_message(&self, envelope: &Envelope) -> Option<OwnerMessage> {
+        let mut context = self.context.clone()?;
+        context.app_id.clone_from(&self.app_id);
+        if envelope.kind != EnvelopeKind::EventsApi {
+            return None;
+        }
+        match message_event(&context, &envelope.payload, None) {
+            Ok((Inbound::Message(message), _)) => Some(message),
+            _ => None,
+        }
+    }
+
     /// For an owner DM dropped only for its age (`stale` /
     /// `from_the_future`, checked after the team, app, channel and owner
     /// checks passed): the message ts to reply under, at most once per
@@ -277,7 +296,7 @@ fn fresh(at_ms: Option<u64>, now_unix_ms: u64) -> Result<(), &'static str> {
 fn message_event(
     context: &InboundContext,
     payload: &Value,
-    now_unix_ms: u64,
+    now_unix_ms: Option<u64>,
 ) -> Result<(Inbound, String), &'static str> {
     if text(payload, "/type") != Some("event_callback") {
         return Err("not_an_event_callback");
@@ -318,11 +337,14 @@ fn message_event(
         return Err("not_the_owner");
     }
     let ts = text(event, "/ts").ok_or("missing_ts")?;
-    fresh(
-        payload.get("event_time").and_then(slack_time_ms),
-        now_unix_ms,
-    )?;
-    fresh(slack_time_ms(&Value::String(ts.to_owned())), now_unix_ms)?;
+    // `None`: a late message re-read for its "Send it now" button.
+    if let Some(now_unix_ms) = now_unix_ms {
+        fresh(
+            payload.get("event_time").and_then(slack_time_ms),
+            now_unix_ms,
+        )?;
+        fresh(slack_time_ms(&Value::String(ts.to_owned())), now_unix_ms)?;
+    }
     let body = text(event, "/text").unwrap_or_default().trim();
     if body.is_empty() {
         return Err("empty");

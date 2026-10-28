@@ -44,6 +44,9 @@ use crate::{
     reconciliation_service::{ReconciliationService, ReconciliationServiceError},
     runtime_cleanup_service::RuntimeCleanupService,
     runtime_identity::active_provider_session_matches,
+    slack::superintendent::{
+        SLACK_SUPERINTENDENT_ACTOR, SLACK_SUPERINTENDENT_BRIEF, SLACK_SUPERINTENDENT_ROLE,
+    },
     status_protocol::{
         validate_executable_orchestrator_workflow, with_orchestrator_status_contract,
         with_orchestrator_workflow,
@@ -125,11 +128,35 @@ impl CoordinationNodeService {
     ///
     /// The request has no path field. A failed or replayed command removes
     /// only the empty UUID directory allocated by this attempt.
+    /// The actor [`SLACK_SUPERINTENDENT_ACTOR`] is reserved: only the
+    /// in-process Slack Superintendent creates nodes with it
+    /// ([`Self::create_slack_superintendent`]), so no HTTP client can make
+    /// a node Yard would adopt as that worker.
     pub(crate) async fn create(
         &self,
         command: CreateCoordinationNode,
     ) -> Result<CoordinationNodeCommandResult, CoordinationNodeServiceError> {
         let command = command.normalize()?;
+        if command.actor == SLACK_SUPERINTENDENT_ACTOR {
+            return Err(CoordinationNodeServiceError::ReservedActor);
+        }
+        self.create_normalized(command).await
+    }
+
+    /// Create the Slack Superintendent's node (the reserved actor).
+    pub(crate) async fn create_slack_superintendent(
+        &self,
+        command: CreateCoordinationNode,
+    ) -> Result<CoordinationNodeCommandResult, CoordinationNodeServiceError> {
+        let mut command = command.normalize()?;
+        SLACK_SUPERINTENDENT_ACTOR.clone_into(&mut command.actor);
+        self.create_normalized(command).await
+    }
+
+    async fn create_normalized(
+        &self,
+        command: CreateCoordinationNode,
+    ) -> Result<CoordinationNodeCommandResult, CoordinationNodeServiceError> {
         let node_id = Uuid::now_v7().to_string();
         let (cwd, folder_path, allocated) = match command.kind {
             CoordinationNodeKind::Workstream => {
@@ -323,16 +350,7 @@ impl CoordinationNodeService {
                 kind: profile.spec.provider.clone(),
                 args,
                 prompt: with_orchestrator_status_contract(
-                    &assignment_prompt(
-                        &format!(
-                            "Coordinate the '{}' workstream across only its attached Yard \
-                             projects. Track objectives, dependencies, interfaces, decisions, \
-                             risks, and next actions without claiming project completion.",
-                            node.name
-                        ),
-                        "coordination workstream",
-                        &profile,
-                    ),
+                    &bootstrap_assignment(&node, &profile),
                     &command.command_id,
                 ),
             };
@@ -884,6 +902,14 @@ impl CoordinationNodeService {
         self.refresh_snapshot(snapshot).await
     }
 
+    /// A workstream's backend-owned folder, validated as the prompt and
+    /// provision routes do (inside the coordination root, its own id).
+    pub(crate) fn managed_cwd(&self, node: &CoordinationNode) -> Option<PathBuf> {
+        let cwd = node.cwd.as_deref()?;
+        validate_recorded_managed_path(&self.coordination_root, &node.id, cwd).ok()?;
+        fs::canonicalize(cwd).ok()
+    }
+
     pub(crate) async fn validate_node_binding(
         &self,
         expected: &CoordinationNode,
@@ -1107,6 +1133,28 @@ impl CoordinationNodeService {
             .await
             .map_err(Into::into)
     }
+}
+
+/// The node's bootstrap assignment: the Slack Superintendent's brief for
+/// the node Slack started, otherwise the workstream objective.
+fn bootstrap_assignment(node: &CoordinationNode, profile: &yard_domain::WorkerProfile) -> String {
+    if node.created_by == SLACK_SUPERINTENDENT_ACTOR {
+        return assignment_prompt(
+            SLACK_SUPERINTENDENT_BRIEF,
+            SLACK_SUPERINTENDENT_ROLE,
+            profile,
+        );
+    }
+    assignment_prompt(
+        &format!(
+            "Coordinate the '{}' workstream across only its attached Yard projects. Track \
+             objectives, dependencies, interfaces, decisions, risks, and next actions without \
+             claiming project completion.",
+            node.name
+        ),
+        "coordination workstream",
+        profile,
+    )
 }
 
 fn dedicated_worker(
@@ -1417,6 +1465,8 @@ pub enum CoordinationNodeServiceError {
     WrongNodeKind,
     #[error("the workstream node has not been provisioned")]
     NodeNotProvisioned,
+    #[error("this actor is reserved for Yard")]
+    ReservedActor,
     #[error("the coordination node changed while the operation was in progress")]
     NodeChanged,
     #[error("the target project orchestrator changed while the operation was in progress")]
@@ -1513,6 +1563,11 @@ mod tests {
         project_mutation: Mutex<Option<(PathBuf, String, String)>>,
         project_read_failure: Mutex<Option<PathBuf>>,
         prompt_gate: Mutex<Option<PromptGate>>,
+        /// Appended to the coordination terminal, pane and provider
+        /// session ids: a later bootstrap is a new pane.
+        generation: Mutex<String>,
+        /// Coordination-session inventory reads that fail (Herdr slow).
+        inventory_failures: std::sync::atomic::AtomicU32,
     }
 
     #[derive(Clone)]
@@ -1575,8 +1630,20 @@ mod tests {
                 ));
             }
             assert_eq!(session_name, COORDINATION_SESSION);
+            if self
+                .inventory_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(InventoryServiceError::Herdr(
+                    yard_herdr::HerdrError::DiscoveryTimeout,
+                ));
+            }
             let request = self.bootstrap.lock().unwrap().clone();
             let live = self.live.load(Ordering::SeqCst);
+            let generation = self.generation.lock().unwrap().clone();
             Ok(inventory(
                 COORDINATION_SESSION,
                 observed_at_unix_ms,
@@ -1595,12 +1662,12 @@ mod tests {
                     .filter(|_| live)
                     .map(|request| {
                         let mut worker = observed_worker(
-                            "coordination-terminal",
+                            &format!("coordination-terminal{generation}"),
                             "coordination-workspace",
                             "coordination-tab",
-                            "coordination-pane",
+                            &format!("coordination-pane{generation}"),
                             &request.agent_name,
-                            "coordination-provider-session",
+                            &format!("coordination-provider-session{generation}"),
                         );
                         if let Some(value) = self.observed_provider_session.lock().unwrap().as_ref()
                         {
@@ -1636,6 +1703,14 @@ mod tests {
             }
             self.live.store(true, Ordering::SeqCst);
             let mut runtime = Self::coordination_binding();
+            let generation = self.generation.lock().unwrap().clone();
+            if !generation.is_empty() {
+                runtime.terminal_id = format!("coordination-terminal{generation}");
+                runtime.pane_id = format!("coordination-pane{generation}");
+                runtime.provider_session = Some(provider_session(&format!(
+                    "coordination-provider-session{generation}"
+                )));
+            }
             if self.omit_provider_session.load(Ordering::SeqCst) {
                 runtime.provider_session = None;
             }
@@ -1797,8 +1872,131 @@ mod tests {
         assert!(request.prompt.contains("There is no completed state"));
         assert!(request.prompt.contains("command \"provision-workstream\""));
         assert!(
+            request
+                .prompt
+                .contains("Coordinate the 'Release coordination' workstream")
+        );
+        assert!(!request.prompt.contains("Slack chat assistant"));
+        assert!(
             yard_domain::OrchestratorStatusReport::scan_terminal_output(&request.prompt).is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn the_slack_superintendent_is_started_once_reused_and_recovered() {
+        use crate::slack::superintendent::{
+            ProfileRef, SLACK_SUPERINTENDENT_ACTOR, SLACK_SUPERINTENDENT_BRIEF,
+            SLACK_SUPERINTENDENT_NAME, SlackSuperintendent,
+        };
+
+        let (service, store, runtime, _temp) = setup().await;
+        let profile = store.create_worker_profile(profile()).await.unwrap();
+        let wanted = ProfileRef {
+            id: profile.id.clone(),
+            version: profile.version,
+        };
+        let slack = Arc::new(
+            SlackSuperintendent::new(service.clone(), store.clone())
+                .with_ready_timeout(std::time::Duration::from_secs(2)),
+        );
+        // No Superintendent to copy a profile from: a reason, nothing made.
+        let error = slack.ensure().await.unwrap_err();
+        assert!(error.contains("no worker profile"), "{error}");
+        // An owner's node with the same name is never adopted.
+        let mut owners = create_command(CoordinationNodeKind::Workstream, Vec::new(), "owner");
+        owners.name = SLACK_SUPERINTENDENT_NAME.to_owned();
+        let owners = service.create(owners).await.unwrap().node;
+
+        // Herdr reports no provider session yet (it appears later).
+        runtime.omit_provider_session.store(true, Ordering::SeqCst);
+        // Two first questions at once start one node.
+        let (first, second) = tokio::join!(slack.ensure_with(&wanted), slack.ensure_with(&wanted));
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert_eq!(first, second);
+        assert_ne!(first, owners.id);
+        let mine = |nodes: &[CoordinationNode]| {
+            nodes
+                .iter()
+                .filter(|node| node.created_by == SLACK_SUPERINTENDENT_ACTOR)
+                .map(|node| node.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let nodes = service.list().await.unwrap().nodes;
+        assert_eq!(mine(&nodes), std::slice::from_ref(&first));
+        let node = service.get(&first).await.unwrap();
+        assert_eq!(node.name, SLACK_SUPERINTENDENT_NAME);
+        assert!(node.attached_project_ids.is_empty());
+        assert_eq!(
+            node.worker.as_ref().unwrap().profile_id.as_deref(),
+            Some(profile.id.as_str()),
+            "started with the main Superintendent's profile"
+        );
+        let bootstrap = runtime.bootstrap.lock().unwrap().clone().unwrap();
+        assert!(bootstrap.prompt.contains("Role: Slack chat assistant"));
+        assert!(bootstrap.prompt.contains(SLACK_SUPERINTENDENT_BRIEF));
+        assert!(!bootstrap.prompt.contains("Coordinate the"));
+        assert!(bootstrap.prompt.contains("There is no completed state"));
+
+        // Healthy: re-used, nothing new provisioned.
+        assert_eq!(slack.ensure_with(&wanted).await.unwrap(), first);
+        assert_eq!(runtime.session_requests.lock().unwrap().len(), 1);
+
+        // Herdr can't be read: this turn fails, the node is left alone.
+        runtime.inventory_failures.store(1, Ordering::SeqCst);
+        let error = slack.ensure_with(&wanted).await.unwrap_err();
+        assert!(error.contains("could not check its worker"), "{error}");
+        assert_eq!(slack.ensure_with(&wanted).await.unwrap(), first, "kept");
+        // Herdr now reports a provider session the binding never recorded:
+        // reconciled and re-checked, never archived.
+        assert_eq!(node_provider_session(&node), None);
+        runtime.omit_provider_session.store(false, Ordering::SeqCst);
+        assert_eq!(slack.ensure_with(&wanted).await.unwrap(), first, "adopted");
+        assert!(node_provider_session(&service.get(&first).await.unwrap()).is_some());
+        assert_eq!(runtime.session_requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            mine(&service.list().await.unwrap().nodes),
+            std::slice::from_ref(&first)
+        );
+
+        // The real profile lookup: the Superintendent's worker profile id,
+        // at that profile's current version.
+        let mut orchestrator = store.get_yard_orchestrator().await.unwrap();
+        orchestrator.worker = node.worker.clone();
+        let updated = store
+            .update_worker_profile(
+                &profile.id,
+                yard_domain::UpdateWorkerProfile {
+                    spec: {
+                        let mut spec = super::tests::profile().spec;
+                        spec.name = "Coordination worker v2".to_owned();
+                        spec
+                    },
+                    expected_version: profile.version,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(updated.version > profile.version);
+        assert_eq!(
+            slack.profile_of(orchestrator).await.unwrap(),
+            ProfileRef {
+                id: profile.id.clone(),
+                version: updated.version,
+            }
+        );
+        let wanted = ProfileRef {
+            id: updated.id.clone(),
+            version: updated.version,
+        };
+
+        // Its worker is gone: archived, and a new one started.
+        runtime.live.store(false, Ordering::SeqCst);
+        "-2".clone_into(&mut runtime.generation.lock().unwrap());
+        let recovered = slack.ensure_with(&wanted).await.unwrap();
+        assert_ne!(recovered, first);
+        let nodes = service.list().await.unwrap().nodes;
+        assert_eq!(mine(&nodes), [recovered]);
+        assert!(nodes.iter().any(|node| node.id == owners.id), "untouched");
     }
 
     #[test]

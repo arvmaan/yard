@@ -15,7 +15,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -30,8 +30,9 @@ use super::{
         self, ActionRegistry, AgentConsole, AgentTarget, CardSpec, ConsoleError, NavAction,
         NavError, Outcome, PendingAction, Refusal, TerminalIdentity,
     },
+    ask,
     audit::{AuditLog, AuditRecord},
-    blocks,
+    blocks::{self, Style},
     cards::{
         BUTTON_ACTION_PREFIX, CardContext, answered_card, not_sent_card, plain, prompt_card,
         refusal_text,
@@ -39,6 +40,7 @@ use super::{
     client::SlackError,
     commands::{self, Command, ProjectName},
     controls::{self, Applied, Control},
+    conversations::{self, ConversationAgent, Conversations, Queued, TurnKind},
     detector::{AttentionEvent, AttentionKind, EventSource},
     inbound::{Envelope, Inbound, InboundContext, InboundFilter, OwnerAction, OwnerMessage},
     lock,
@@ -50,21 +52,44 @@ use super::{
     relay::{self, RelayTiming},
     secret::{AppToken, SecretError, SecretSource},
     socket::{self, SessionEnd, SessionStats, SocketEvent, UrlPolicy},
-    unix_ms, views,
+    superintendent, unix_ms, views,
 };
 use crate::config::{SlackInbound, SlackSettings};
 
 mod asking;
+mod routing;
+
+use routing::Route;
 
 /// Envelopes waiting for the worker; more are dropped (already acked).
 const QUEUE_CAPACITY: usize = 64;
 const WAIT_FOR_BOT_SESSION: Duration = Duration::from_secs(5);
 const WAITING_FOR_BOT: &str = "Waiting for the bot connection";
-/// Reply to an owner DM that arrived too late (or too early) to act on.
+/// Reply to an owner DM that arrived too late (or too early) to act on,
+/// when no "Send it now" button can be offered.
 const LATE_MESSAGE: &str =
     "Yard was offline or reconnecting when you sent this, so nothing was done. Send it again.";
-/// A plain reply in a thread that is not a question card's thread.
-const THREAD_REPLY_NOT_SENT: &str = "Nothing was sent: only a question card's thread takes a reply. Use the card's buttons, start with `<Project>:` to ask that project's orchestrator, or ask the Superintendent at the top level of this DM.";
+/// Owner events that arrive before the console is attached (just after a
+/// start) are held this long for it, at most [`NOT_READY_MAX`] of them.
+const NOT_READY_HOLD: Duration = Duration::from_secs(30);
+const NOT_READY_MAX: usize = 16;
+/// Said when a held event could not be handled (Yard never got ready).
+const NOT_READY_MESSAGE: &str =
+    "Yard is still starting, so nothing was done with this. Send it again in a moment.";
+/// Told once while a thread's messages wait for the turn in flight.
+const QUEUED_NOTICE: &str = "Queued — I'll send it after the current answer.";
+/// A message beyond [`conversations::MAX_QUEUED`] waiting ones.
+fn queue_full_text() -> String {
+    format!(
+        "Not queued: {} messages already wait in this thread. Send this again after the next answer.",
+        conversations::MAX_QUEUED
+    )
+}
+/// After a restart, messages queued longer ago than this are not sent
+/// (they may no longer be wanted); the owner is told instead.
+const RESUME_QUEUED_WITHIN: Duration = Duration::from_secs(30 * 60);
+/// How long a thread's context lookup may wait for the Slack session.
+const CONTEXT_LOOKUP_WAIT: Duration = Duration::from_secs(3);
 const WORKER_PANIC_BACKOFF: Duration = Duration::from_secs(5);
 /// How long after sending keys the pane is re-read for the next prompt.
 const SETTLE_AFTER_SEND: Duration = Duration::from_millis(1_500);
@@ -146,6 +171,22 @@ pub(crate) struct InboundState {
     /// Questions still watched (window or late window) by command id, so
     /// shutdown can say Yard restarted instead of leaving "Waiting…".
     asking: Mutex<std::collections::HashMap<String, asking::Asked>>,
+    /// Slack conversations by thread root ([`conversations`]), kept in
+    /// `slack-conversations.json` while Slack is configured.
+    conversations: Mutex<Conversations>,
+    /// Messages queued before a restart were resumed (once per process).
+    resumed: AtomicBool,
+    /// Owner events that arrived before the console was attached.
+    not_ready: Mutex<std::collections::VecDeque<(Inbound, String)>>,
+    /// A task is handling [`Self::not_ready`].
+    not_ready_draining: AtomicBool,
+    /// Held by the Slack Superintendent turn being answered (one shared
+    /// pane: one Slack question at a time), at most
+    /// [`RelayTiming::busy_for`] per turn.
+    slack_superintendent_turn: Arc<tokio::sync::Mutex<()>>,
+    /// Held while a Superintendent is started from Slack (one start at a
+    /// time; a message behind it finds it up).
+    superintendent_start: tokio::sync::Mutex<()>,
     /// Set on shutdown: the socket is closed cleanly and not reopened.
     closing: tokio::sync::watch::Sender<bool>,
     /// A Socket Mode connection is open now.
@@ -214,9 +255,61 @@ impl InboundState {
             late_watchers: Arc::default(),
             relayed: Mutex::default(),
             asking: Mutex::default(),
+            conversations: Mutex::new(Conversations::load(
+                parts
+                    .thread_file
+                    .as_deref()
+                    .filter(|_| settings.is_some())
+                    .map(|path| super::held::sibling(path, conversations::CONVERSATIONS_FILE)),
+                parts.inbound.relay.busy_for(),
+                unix_ms(),
+            )),
+            resumed: AtomicBool::new(false),
+            not_ready: Mutex::default(),
+            not_ready_draining: AtomicBool::new(false),
+            slack_superintendent_turn: Arc::default(),
+            superintendent_start: tokio::sync::Mutex::new(()),
             closing: tokio::sync::watch::Sender::new(false),
             socket_open: tokio::sync::watch::Sender::new(false),
         }
+    }
+}
+
+/// Where a message that is not a command goes: `<Project>:` to that
+/// orchestrator, `Superintendent:` back to the Slack Superintendent, an
+/// ambiguous `<Project>:` to it with a note (it works out, or asks, which
+/// project is meant), anything else to it as typed.
+fn conversation_route(command: Command, text: &str, closed_card: bool) -> Route {
+    let superintendent = |question: String, note, switch_back| Route {
+        target: AgentTarget::YardOrchestrator,
+        to: "the Superintendent".to_owned(),
+        question,
+        note,
+        closed_card,
+        switch_back,
+    };
+    match command {
+        Command::Ask {
+            target,
+            to,
+            question,
+        } => Route {
+            target,
+            to,
+            question,
+            note: None,
+            closed_card,
+            switch_back: false,
+        },
+        Command::Superintendent(question) => superintendent(question, None, true),
+        Command::AmbiguousProject(name) => superintendent(
+            text.trim().to_owned(),
+            Some(format!(
+                "Several Yard projects are named \"{name}\"; the owner's message starts with that name, so work out (or ask) which one is meant."
+            )),
+            false,
+        ),
+        _ => superintendent(text.trim().to_owned(), None, false),
     }
 }
 
@@ -333,6 +426,13 @@ impl SlackNotifier {
     /// HTTP services are built).
     pub fn attach_console(&self, console: Arc<dyn AgentConsole>) {
         let _ = self.inner.inbound.console.set(console);
+        // Connected before the console was attached: messages queued
+        // before a restart are sent now, not at the next event.
+        if self.inbound_status().status == InboundStatusKind::Connected
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
+            self.resume_queued();
+        }
     }
 
     pub(crate) fn console(&self) -> Option<Arc<dyn AgentConsole>> {
@@ -597,6 +697,8 @@ impl SlackNotifier {
                 title,
                 Instant::now(),
             );
+        } else if !ids.is_empty() {
+            lock(&self.inner.inbound.registry).place_card(&ids, thread_ts.unwrap_or(&posted));
         }
         Some(())
     }
@@ -666,6 +768,7 @@ impl SlackNotifier {
                     super::message::clean_prompt_line(&answer)
                 );
                 self.post(&plain(&reply), Some(&thread)).await;
+                self.wake_waiting();
                 let hub = self.clone();
                 tokio::spawn(async move { hub.check_after_send(pending, thread).await });
             }
@@ -749,20 +852,12 @@ impl SlackNotifier {
             lock(&self.inner.inbound.registry).take_question(thread, Instant::now())
         });
         let Some(question) = question else {
+            // A reply to a card already answered or expired is a message
+            // for the conversation in that thread like any other.
             let closed = message.thread_ts.as_deref().is_some_and(|thread| {
                 lock(&self.inner.inbound.registry).question_closed(thread, Instant::now())
             });
-            if closed {
-                self.audit("reply", "free_text", None, "refused:closed", user);
-                let thread = message.thread_ts.as_deref().unwrap_or(&message.ts);
-                self.post(
-                    &plain("That question was already answered or has expired, so nothing was sent. Say `blocked` for the current prompts, or ask at the top level of this DM."),
-                    Some(thread),
-                )
-                .await;
-                return;
-            }
-            self.handle_command(console, message, user).await;
+            self.handle_command(console, message, user, closed).await;
             return;
         };
         let console = console.as_ref();
@@ -780,6 +875,7 @@ impl SlackNotifier {
                     Some(&thread),
                 )
                 .await;
+                self.wake_waiting();
             }
             Outcome::Refused { refusal, current } => {
                 let outcome = format!("refused:{}", refusal_name(&refusal));
@@ -805,14 +901,16 @@ impl SlackNotifier {
         }
     }
 
-    /// Messages that are not a reply to a question: status commands
-    /// (deterministic, from durable state) and questions for the
-    /// Superintendent or a project orchestrator.
+    /// Messages that are not a reply to a question: exact status commands
+    /// (deterministic, from durable state), and everything else, which is
+    /// the next turn of the conversation in its thread ([`Self::route`]).
+    /// `closed_card`: the thread's prompt card was answered or expired.
     async fn handle_command(
         &self,
         console: &Arc<dyn AgentConsole>,
         message: OwnerMessage,
         user: &str,
+        closed_card: bool,
     ) {
         let thread = message
             .thread_ts
@@ -847,12 +945,14 @@ impl SlackNotifier {
                 },
             ),
             Command::Review => ("review", views::review_card(&records, &mut nav, &ui_url)),
-            Command::AmbiguousProject(name) => (
-                "ask",
-                plain(&format!(
-                    "Several projects are named \"{name}\"; nothing was sent. Ask in Yard, or rename one."
-                )),
-            ),
+            command @ (Command::AmbiguousProject(_)
+            | Command::Ask { .. }
+            | Command::Superintendent(_)) => {
+                drop(nav);
+                let route = conversation_route(command, &message.text, closed_card);
+                self.route(console, &message, route, &projects, user).await;
+                return;
+            }
             Command::Blocked => {
                 drop(nav);
                 self.post_blocked(&records, &thread, user).await;
@@ -867,25 +967,6 @@ impl SlackNotifier {
                 drop(nav);
                 self.audit("message", "mute", None, "refused:invalid", user);
                 self.post(&plain(&text), Some(&thread)).await;
-                return;
-            }
-            Command::Ask {
-                target,
-                to,
-                question,
-            } => {
-                drop(nav);
-                // A reply in a thread (a card, a notification, an answer)
-                // without an explicit `<Project>:` is meant for whatever
-                // that thread is about, never a new Superintendent question.
-                if message.thread_ts.is_some() && target == AgentTarget::YardOrchestrator {
-                    self.audit("reply", "free_text", None, "refused:not_a_question", user);
-                    self.post(&plain(THREAD_REPLY_NOT_SENT), Some(&thread))
-                        .await;
-                    return;
-                }
-                self.ask(console, target, &to, &question, &thread, user)
-                    .await;
                 return;
             }
         };
@@ -1017,7 +1098,9 @@ impl SlackNotifier {
                 self.run_control(control, &thread, None).await;
                 return;
             }
-            nav @ (NavAction::Retry { .. } | NavAction::CheckAgain { .. }) => {
+            nav @ (NavAction::Retry { .. }
+            | NavAction::CheckAgain { .. }
+            | NavAction::SendLate { .. }) => {
                 self.handle_ask_nav(nav, thread, user).await;
                 return;
             }
@@ -1186,6 +1269,10 @@ impl SlackNotifier {
                 // Cleared by the next hello that reports one connection.
                 let shared = (num_connections > 1).then(|| shared_warning(num_connections));
                 self.set_inbound_status(InboundStatusKind::Connected, shared);
+                if let Some(context) = self.inbound_context().await {
+                    self.bind_conversations(&context);
+                }
+                self.resume_queued();
                 if num_connections > 1 {
                     warn!(
                         num_connections,
@@ -1201,6 +1288,7 @@ impl SlackNotifier {
             return;
         };
         let owner = context.owner_user_id.clone();
+        self.bind_conversations(&context);
         let verdict = {
             let mut filter = lock(&self.inner.inbound.filter);
             filter.set_context(context);
@@ -1219,25 +1307,149 @@ impl SlackNotifier {
                 if reason != "duplicate" {
                     self.audit("dropped", reason, None, "dropped", user);
                 }
-                let late = lock(&self.inner.inbound.filter).late_owner_message(
-                    &envelope,
-                    reason,
-                    unix_ms(),
-                );
-                if let Some(ts) = late {
-                    self.post(&plain(LATE_MESSAGE), Some(&ts)).await;
+                let late = {
+                    let mut filter = lock(&self.inner.inbound.filter);
+                    filter
+                        .late_owner_message(&envelope, reason, unix_ms())
+                        .map(|ts| (ts, filter.late_message(&envelope)))
+                };
+                if let Some((ts, message)) = late {
+                    self.answer_late(&ts, message).await;
                 }
                 return;
             }
         };
         let Some(console) = self.inner.inbound.console.get().cloned() else {
-            self.audit("dropped", "not_ready", None, "dropped", &owner);
+            self.hold_until_ready(inbound, &owner);
             return;
         };
+        self.resume_queued();
         match inbound {
             Inbound::Action(action) => self.handle_action(console.as_ref(), action, &owner).await,
             Inbound::Message(message) => {
                 self.handle_message(&console, message, &owner).await;
+            }
+        }
+    }
+
+    /// The conversations belong to the owner, workspace and DM channel
+    /// Slack reports now (a file saved for others is dropped).
+    fn bind_conversations(&self, context: &InboundContext) {
+        let owner = conversations::Owner {
+            team_id: context.team_id.clone(),
+            channel_id: context.dm_channel.clone(),
+            user_id: context.owner_user_id.clone(),
+        };
+        lock(&self.inner.inbound.conversations).bind(owner);
+    }
+
+    /// A prompt was answered: threads whose message waits for its agent
+    /// try again once the pane settled.
+    fn wake_waiting(&self) {
+        let roots = lock(&self.inner.inbound.conversations).wake();
+        for root in roots {
+            self.spawn_pump(&root, Some(self.inner.inbound.settle));
+        }
+    }
+
+    /// "Send it now": the late message, handled as if just typed.
+    async fn send_late(&self, message: OwnerMessage, user: &str) {
+        if let Some(console) = self.inner.inbound.console.get().cloned() {
+            self.handle_message(&console, message, user).await;
+        }
+    }
+
+    /// An owner message too old to act on by itself: one click sends it
+    /// now (a fresh, owner-checked action), else it is to be sent again.
+    async fn answer_late(&self, ts: &str, message: Option<OwnerMessage>) {
+        let button = message.and_then(|message| {
+            self.ask_button_for(
+                NavAction::SendLate {
+                    text: message.text,
+                    ts: message.ts,
+                    thread_ts: message.thread_ts,
+                },
+                "Send it now",
+            )
+        });
+        let reply = match button {
+            Some(button) => ask::late_card(Some(button), &self.inner.inbound.ui_url),
+            None => plain(LATE_MESSAGE),
+        };
+        self.post(&reply, Some(ts)).await;
+    }
+
+    fn ask_button_for(&self, action: NavAction, text: &str) -> Option<serde_json::Value> {
+        let mut issue = self.nav_issuer();
+        views::nav_button(&mut issue, action, text, Style::Primary)
+    }
+
+    /// The console is not attached yet (just after a start): hold the
+    /// event for it, at most [`NOT_READY_HOLD`]; then it is handled, or
+    /// the owner is told to send it again.
+    fn hold_until_ready(&self, inbound: Inbound, owner: &str) {
+        {
+            let mut held = lock(&self.inner.inbound.not_ready);
+            if held.len() >= NOT_READY_MAX {
+                drop(held);
+                self.audit("dropped", "not_ready", None, "dropped", owner);
+                return;
+            }
+            held.push_back((inbound, owner.to_owned()));
+        }
+        self.audit("held", "not_ready", None, "held", owner);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self
+            .inner
+            .inbound
+            .not_ready_draining
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let notifier = self.clone();
+        runtime.spawn(async move { notifier.drain_not_ready().await });
+    }
+
+    async fn drain_not_ready(&self) {
+        let deadline = Instant::now() + NOT_READY_HOLD;
+        loop {
+            while self.inner.inbound.console.get().is_none() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let held = std::mem::take(&mut *lock(&self.inner.inbound.not_ready));
+            let console = self.inner.inbound.console.get().cloned();
+            for (inbound, owner) in held {
+                match (&console, inbound) {
+                    (Some(console), Inbound::Action(action)) => {
+                        self.handle_action(console.as_ref(), action, &owner).await;
+                    }
+                    (Some(console), Inbound::Message(message)) => {
+                        self.handle_message(console, message, &owner).await;
+                    }
+                    (None, inbound) => {
+                        self.audit("dropped", "not_ready", None, "dropped", &owner);
+                        if let Inbound::Message(message) = inbound {
+                            let thread = message.thread_ts.unwrap_or(message.ts);
+                            self.post(&plain(NOT_READY_MESSAGE), Some(&thread)).await;
+                        }
+                    }
+                }
+            }
+            self.inner
+                .inbound
+                .not_ready_draining
+                .store(false, Ordering::SeqCst);
+            if lock(&self.inner.inbound.not_ready).is_empty()
+                || self
+                    .inner
+                    .inbound
+                    .not_ready_draining
+                    .swap(true, Ordering::SeqCst)
+            {
+                return;
             }
         }
     }

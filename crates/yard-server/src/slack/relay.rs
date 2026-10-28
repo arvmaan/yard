@@ -56,6 +56,10 @@ pub struct RelayTiming {
     pub late_poll: Duration,
     /// After the window: a late answer is still relayed this long.
     pub late: Duration,
+    /// A conversation turn without an answer holds its thread (and the
+    /// Slack Superintendent's pane) at most this long (or `follow`, if
+    /// shorter); then the owner's next reply is sent anyway.
+    pub chat: Duration,
 }
 
 /// Minutes to watch for an answer (default [`DEFAULT_ASK_TIMEOUT_MINS`]).
@@ -74,11 +78,19 @@ impl Default for RelayTiming {
             progress: Duration::from_secs(90),
             late_poll: Duration::from_secs(120),
             late: Duration::from_secs(6 * 60 * 60),
+            chat: Duration::from_secs(10 * 60),
         }
     }
 }
 
 impl RelayTiming {
+    /// How long one conversation turn may stay unanswered before the next
+    /// one is sent anyway: [`Self::chat`], at most the window.
+    #[must_use]
+    pub fn busy_for(&self) -> Duration {
+        self.chat.min(self.follow)
+    }
+
     /// The defaults with the window from [`ASK_TIMEOUT_VAR`], plus a
     /// warning when the value is not a whole number of minutes in
     /// [`ASK_TIMEOUT_RANGE`] (the default is used then).
@@ -104,9 +116,10 @@ impl RelayTiming {
     }
 }
 
-/// Appended to the owner's question so the answer lands in the report,
-/// quickly: a Slack question is not a task.
-pub const ANSWER_INSTRUCTION: &str = "(The Yard owner asked this from Slack and is waiting for the reply. Answer directly and quickly: answer from what you already know or can read quickly; do not start long investigations or delegations, and do not wait on other agents. If you need to delegate or it needs more work, say so in the answer instead. Put the answer itself in the status report's `last` field, in plain text, at most 2,000 characters; Yard relays only that report back to Slack. Do not include secrets or file contents.)";
+/// Appended to the owner's message so the reply lands in the report,
+/// quickly: questions are answered, instructions done through Yard's
+/// normal routes (destructive ones only once the owner confirms).
+pub const ANSWER_INSTRUCTION: &str = "(The Yard owner sent this from Slack and is waiting for the reply. Reply conversationally. If it is a question, answer directly and quickly: answer from what you already know or can read quickly; do not start long investigations, and do not wait on other agents. If it asks you to do something, do it through Yard's normal routes as you would for the owner in Yard, ask the owner to confirm in this thread before anything destructive, and reply with what you did or started; do not wait for long work to finish. If you need to delegate or it needs more work, say so in the reply. Put the reply itself in the status report's `last` field, in plain text, at most 2,000 characters; Yard relays only that report back to Slack. Do not include secrets or file contents.)";
 
 /// The prompt text: provenance marker, the question, the instruction.
 #[must_use]
@@ -115,6 +128,74 @@ pub fn question_text(question: &str) -> String {
         "{SLACK_PROVENANCE} {}\n\n{ANSWER_INSTRUCTION}",
         question.trim()
     )
+}
+
+/// A Slack conversation prompt is capped at this many bytes (Yard's
+/// prompt routes take 16,000); the oldest turns are dropped first.
+pub const MAX_CHAT_PROMPT_BYTES: usize = 12_000;
+
+/// The instruction for the Slack Superintendent: the full answer goes to
+/// `answer_file`, the status report only says it is there.
+#[must_use]
+pub fn chat_instruction(answer_file: &str) -> String {
+    format!(
+        "(The Yard owner sent this from Slack and is waiting for your reply. This supersedes any earlier brief that told you to stay read-only or only to say which Yard command or UI action does something. Reply conversationally. A question: answer directly and quickly from what you can read; do not start long investigations. An instruction (\"do X\"): carry it out through Yard's normal guarded routes (assign work, prompt a project's orchestrator, report status), ask the owner to confirm in this thread before anything destructive (archiving, deleting, stopping or discarding work), and reply with what you did or started without waiting for long work to finish. Write the reply in plain text (Markdown allowed, no secrets or file contents) to `{answer_file}` relative to your working folder (create the folder if needed), then report `last` as a one-line summary of at most 200 characters. Yard relays that file back to Slack.)"
+    )
+}
+
+fn history_block(history: &[super::conversations::Turn]) -> String {
+    let mut block = "Earlier in this Slack conversation (oldest first):".to_owned();
+    for turn in history {
+        block.push_str("\nQ: ");
+        block.push_str(
+            &turn
+                .question
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        block.push_str("\nA: ");
+        match &turn.answer {
+            Some(answer) => {
+                block.push_str(&answer.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+            None => block.push_str("(no answer relayed)"),
+        }
+    }
+    block
+}
+
+/// A conversation turn: provenance marker and the question, what Yard
+/// knows about an adopted thread (when any), the earlier turns (when
+/// any), and the instruction ([`chat_instruction`] with an
+/// answer file, else [`ANSWER_INSTRUCTION`]). With no history and no file
+/// this is exactly [`question_text`]. Capped at
+/// [`MAX_CHAT_PROMPT_BYTES`], dropping the oldest turns first.
+#[must_use]
+pub fn chat_text(
+    history: &[super::conversations::Turn],
+    question: &str,
+    answer_file: Option<&str>,
+    context: Option<&str>,
+) -> String {
+    let instruction = answer_file.map_or_else(|| ANSWER_INSTRUCTION.to_owned(), chat_instruction);
+    let mut head = format!("{SLACK_PROVENANCE} {}", question.trim());
+    if let Some(context) = context.map(str::trim).filter(|context| !context.is_empty()) {
+        head.push_str("\n\nAbout this Slack thread: ");
+        head.push_str(&context.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+    let mut history = history;
+    loop {
+        let text = if history.is_empty() {
+            format!("{head}\n\n{instruction}")
+        } else {
+            format!("{head}\n\n{}\n\n{instruction}", history_block(history))
+        };
+        if text.len() <= MAX_CHAT_PROMPT_BYTES || history.is_empty() {
+            return text;
+        }
+        history = &history[1..];
+    }
 }
 
 /// Glyphs agent UIs put before (or around) an output line.
@@ -328,12 +409,18 @@ fn lines(text: &str) -> String {
 /// The relayed answer: redacted, escaped, capped with "(truncated)".
 #[must_use]
 pub fn report_text(to: &str, report: &OrchestratorStatusReport) -> String {
+    report_text_with(to, report, &report.last)
+}
+
+/// [`report_text`] with `body` as the answer instead of `last`.
+#[must_use]
+pub fn report_text_with(to: &str, report: &OrchestratorStatusReport, body: &str) -> String {
     let state = match report.state {
         OrchestratorStatusState::Working => "working",
         OrchestratorStatusState::NeedsAttention => "needs attention",
         OrchestratorStatusState::Idle => "idle",
     };
-    let mut text = format!("*Answer from {to}* ({state})\n{}", lines(&report.last));
+    let mut text = format!("*Answer from {to}* ({state})\n{}", lines(body));
     let next = lines(&report.next);
     if !next.is_empty() {
         text.push_str("\n*Next:* ");
@@ -612,11 +699,60 @@ pub(crate) mod tests {
     fn slack_questions_ask_for_a_quick_direct_answer() {
         for phrase in [
             "answer from what you already know or can read quickly",
-            "do not start long investigations or delegations",
-            "If you need to delegate or it needs more work, say so in the answer",
+            "do not start long investigations",
+            "If it asks you to do something, do it through Yard's normal routes",
+            "confirm in this thread before anything destructive",
+            "If you need to delegate or it needs more work, say so in the reply",
             "status report's `last` field",
         ] {
             assert!(ANSWER_INSTRUCTION.contains(phrase), "{phrase}");
         }
+    }
+
+    #[test]
+    fn conversation_prompts_replay_earlier_turns_oldest_first_within_the_cap() {
+        use super::{MAX_CHAT_PROMPT_BYTES, chat_text};
+        use crate::slack::conversations::Turn;
+
+        assert_eq!(chat_text(&[], " q ", None, None), question_text("q"));
+        let history = [
+            Turn::new("Q1 what is left?", Some("A1 two tasks")),
+            Turn::new("Q2 and tests?", None),
+        ];
+        let text = chat_text(&history, "Q3 which ones?", Some("slack-answers/k.md"), None);
+        assert!(
+            text.starts_with(&format!("{SLACK_PROVENANCE} Q3 which ones?\n\n")),
+            "{text}"
+        );
+        let earlier = text
+            .find("Earlier in this Slack conversation (oldest first):")
+            .unwrap();
+        let first = text.find("Q: Q1 what is left?\nA: A1 two tasks").unwrap();
+        let second = text
+            .find("Q: Q2 and tests?\nA: (no answer relayed)")
+            .unwrap();
+        assert!(earlier < first && first < second, "{text}");
+        assert!(text.contains("`slack-answers/k.md`"), "{text}");
+        assert!(
+            !text.contains(ANSWER_INSTRUCTION),
+            "the file instruction instead"
+        );
+        let plain = chat_text(&history, "Q3", None, None);
+        assert!(plain.ends_with(ANSWER_INSTRUCTION));
+        assert!(!plain.contains("slack-answers"));
+
+        let long = (0..20)
+            .map(|index| {
+                Turn::new(
+                    &format!("old-{index} {}", "q".repeat(700)),
+                    Some(&"a".repeat(700)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let capped = chat_text(&long, "newest", None, None);
+        assert!(capped.len() <= MAX_CHAT_PROMPT_BYTES, "{}", capped.len());
+        assert!(!capped.contains("old-0 "), "the oldest turns go first");
+        assert!(capped.contains("old-19 "), "the newest are kept");
+        assert!(capped.contains("newest"));
     }
 }

@@ -39,8 +39,9 @@ pub const QUESTION_TTL: Duration = Duration::from_secs(30 * 60);
 const TOMBSTONE_TTL: Duration = Duration::from_secs(60 * 60);
 const MAX_CARDS: usize = 256;
 
-/// A Yard agent Slack can answer.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// A Yard agent Slack can answer (serialized in `slack-conversations.json`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentTarget {
     Assignment {
         project_id: String,
@@ -232,6 +233,34 @@ pub trait AgentConsole: Send + Sync {
         target: &AgentTarget,
         command_id: &str,
     ) -> Result<Option<OrchestratorStatusReport>, ConsoleError>;
+    /// The dedicated Slack Superintendent, found, re-used, recovered or
+    /// started now (this may take a while: call it off the event loop).
+    /// `Ok(None)`: this console has none, so Slack asks the main
+    /// Superintendent as before; an error is why it could not start.
+    async fn slack_superintendent(&self) -> Result<Option<AgentTarget>, ConsoleError> {
+        Ok(None)
+    }
+    /// The full answer the agent wrote for `answer_key` (only the Slack
+    /// Superintendent writes one); `None` falls back to the report's `last`.
+    async fn answer_text(&self, _target: &AgentTarget, _answer_key: &str) -> Option<String> {
+        None
+    }
+    /// The answer for `answer_key` was relayed: remove its file.
+    async fn forget_answer(&self, _target: &AgentTarget, _answer_key: &str) {}
+    /// Start or recover a Superintendent that is gone or not running:
+    /// the main one ([`AgentTarget::YardOrchestrator`], through Yard's
+    /// normal recovery) or the Slack Superintendent (its node). Returns the
+    /// target to ask now (the Slack Superintendent may be a new node); the
+    /// caller waits for it to be reachable. `actor` is the Slack owner.
+    async fn recover_superintendent(
+        &self,
+        _target: &AgentTarget,
+        _actor: &str,
+    ) -> Result<AgentTarget, ConsoleError> {
+        Err(ConsoleError::Unavailable(
+            "Yard cannot start it from Slack".to_owned(),
+        ))
+    }
     /// One look while waiting for `command_id`'s answer: its report and
     /// whether the agent UI lost its session, from one guarded read.
     async fn watch(
@@ -312,10 +341,22 @@ pub enum NavAction {
         /// The question's progress message (updated once answered).
         progress_ts: Option<String>,
         asked_at: Instant,
+        /// The Slack Superintendent's answer file key, when it has one.
+        answer_key: Option<String>,
+        /// Shown with the answer (why the main Superintendent answered).
+        note: Option<String>,
     },
     /// A quiet-hours control from the settings card (mute, unmute,
     /// digest now).
     Quiet(super::controls::Control),
+    /// Send an owner message that arrived while Yard was offline (too old
+    /// to act on by itself) now, as if just typed. The text never leaves
+    /// Yard: Slack only returns this id.
+    SendLate {
+        text: String,
+        ts: String,
+        thread_ts: Option<String>,
+    },
 }
 
 impl NavAction {
@@ -331,6 +372,7 @@ impl NavAction {
             Self::AskHint => "nav_ask_hint",
             Self::Retry { .. } => "nav_retry",
             Self::CheckAgain { .. } => "nav_check_again",
+            Self::SendLate { .. } => "nav_send_late",
             Self::Quiet(control) => match control {
                 super::controls::Control::Settings => "nav_settings",
                 super::controls::Control::Mute(_) => "nav_mute",
@@ -344,7 +386,7 @@ impl NavAction {
     #[must_use]
     pub const fn ttl(&self) -> Duration {
         match self {
-            Self::Retry { .. } | Self::CheckAgain { .. } => ASK_ACTION_TTL,
+            Self::Retry { .. } | Self::CheckAgain { .. } | Self::SendLate { .. } => ASK_ACTION_TTL,
             _ => ACTION_TTL,
         }
     }
@@ -403,6 +445,9 @@ pub struct ActionRegistry {
     /// Used (`false`) or expired (`true`) navigation ids.
     nav_tombstones: HashMap<String, (bool, Instant)>,
     next_card: u64,
+    /// Thread root ts → (card, agent title) of a prompt card posted there,
+    /// so a message typed in that thread can be told its buttons are open.
+    card_roots: HashMap<String, (u64, String)>,
 }
 
 /// 32 lowercase hex characters from the OS RNG.
@@ -616,6 +661,41 @@ impl ActionRegistry {
             );
         }
         Ok(action)
+    }
+
+    /// The card whose buttons are `ids` sits in the thread rooted at
+    /// `root` (its own ts for a top-level card).
+    pub fn place_card(&mut self, ids: &[String], root: &str) {
+        let Some(card) = ids
+            .first()
+            .and_then(|id| self.actions.get(id))
+            .map(|action| (action.card, action.title.clone()))
+        else {
+            return;
+        };
+        if self.card_roots.len() >= MAX_CARDS {
+            let live = self
+                .actions
+                .values()
+                .map(|action| action.card)
+                .collect::<std::collections::HashSet<_>>();
+            self.card_roots.retain(|_, (card, _)| live.contains(card));
+        }
+        if self.card_roots.len() >= MAX_CARDS {
+            return;
+        }
+        self.card_roots.insert(root.to_owned(), card);
+    }
+
+    /// The agent title of a prompt card in the thread rooted at `root`
+    /// whose buttons still work.
+    pub fn open_card(&mut self, root: &str, now: Instant) -> Option<String> {
+        self.prune(now);
+        let (card, title) = self.card_roots.get(root)?;
+        self.actions
+            .values()
+            .any(|action| action.card == *card)
+            .then(|| title.clone())
     }
 
     /// Expect a free-text reply in the thread rooted at `thread_ts`
@@ -863,6 +943,20 @@ pub(crate) mod tests {
         pub watch_error: Mutex<Option<ConsoleError>>,
         /// Returned by `sendable` while set.
         pub send_refusal: Mutex<Option<ConsoleError>>,
+        /// `slack_superintendent()`: `None` → `Ok(None)` (no such worker).
+        pub superintendent: Mutex<Option<Result<AgentTarget, ConsoleError>>>,
+        pub superintendent_calls: Mutex<usize>,
+        /// `answer_text()` for any key while set.
+        pub answer_file: Mutex<Option<String>>,
+        /// Answer keys read, then forgotten.
+        pub answer_reads: Mutex<Vec<String>>,
+        pub forgotten: Mutex<Vec<String>>,
+        /// `recover_superintendent()`: `None` → the trait default; on
+        /// `Ok`, the snapshot becomes a running, unblocked agent.
+        pub recovered: Mutex<Option<Result<AgentTarget, ConsoleError>>>,
+        pub recover_calls: Mutex<Vec<AgentTarget>>,
+        /// `screen()` of these targets (others: `screen`).
+        pub screens: Mutex<Vec<(AgentTarget, String)>>,
     }
 
     pub(crate) fn identity() -> TerminalIdentity {
@@ -899,6 +993,14 @@ pub(crate) mod tests {
                 prompt_targets: Mutex::default(),
                 watch_error: Mutex::default(),
                 send_refusal: Mutex::default(),
+                superintendent: Mutex::default(),
+                superintendent_calls: Mutex::default(),
+                answer_file: Mutex::default(),
+                answer_reads: Mutex::default(),
+                forgotten: Mutex::default(),
+                recovered: Mutex::default(),
+                recover_calls: Mutex::default(),
+                screens: Mutex::default(),
             }
         }
 
@@ -921,7 +1023,16 @@ pub(crate) mod tests {
                 .map_or(Ok(()), Err)
         }
 
-        async fn screen(&self, _: &AgentTarget) -> Result<String, ConsoleError> {
+        async fn screen(&self, target: &AgentTarget) -> Result<String, ConsoleError> {
+            if let Some((_, screen)) = self
+                .screens
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(of, _)| of == target)
+            {
+                return Ok(screen.clone());
+            }
             Ok(self.screen.lock().unwrap().clone())
         }
 
@@ -968,6 +1079,58 @@ pub(crate) mod tests {
                 &self.screen.lock().unwrap(),
                 command_id,
             ))
+        }
+
+        async fn slack_superintendent(&self) -> Result<Option<AgentTarget>, ConsoleError> {
+            *self.superintendent_calls.lock().unwrap() += 1;
+            self.superintendent.lock().unwrap().clone().transpose()
+        }
+
+        /// `answer_file` is what the agent wrote, but only for a key it
+        /// was told about: a prompt to this very target naming the file.
+        async fn answer_text(&self, target: &AgentTarget, answer_key: &str) -> Option<String> {
+            self.answer_reads
+                .lock()
+                .unwrap()
+                .push(answer_key.to_owned());
+            let file = crate::slack::superintendent::answer_file(answer_key);
+            let told = {
+                let prompts = self.prompts.lock().unwrap();
+                let targets = self.prompt_targets.lock().unwrap();
+                prompts
+                    .iter()
+                    .zip(targets.iter())
+                    .any(|((text, _), to)| to == target && text.contains(&file))
+            };
+            told.then(|| self.answer_file.lock().unwrap().clone())
+                .flatten()
+        }
+
+        async fn forget_answer(&self, _: &AgentTarget, answer_key: &str) {
+            self.forgotten.lock().unwrap().push(answer_key.to_owned());
+        }
+
+        async fn recover_superintendent(
+            &self,
+            target: &AgentTarget,
+            _: &str,
+        ) -> Result<AgentTarget, ConsoleError> {
+            self.recover_calls.lock().unwrap().push(target.clone());
+            let recovered = self.recovered.lock().unwrap().clone();
+            match recovered {
+                None => Err(ConsoleError::Unavailable(
+                    "Yard cannot start it from Slack".to_owned(),
+                )),
+                Some(Ok(target)) => {
+                    *self.snapshot.lock().unwrap() = Ok(AgentSnapshot {
+                        identity: identity(),
+                        blocked: false,
+                        health: super::AgentHealth::Idle,
+                    });
+                    Ok(target)
+                }
+                Some(Err(error)) => Err(error),
+            }
         }
 
         async fn watch(
@@ -1083,6 +1246,8 @@ pub(crate) mod tests {
             command_id: "command-1".to_owned(),
             progress_ts: None,
             asked_at: now,
+            answer_key: None,
+            note: None,
         };
         let retry = super::NavAction::Retry {
             target: target(),

@@ -57,6 +57,36 @@ pub enum Command {
     Control(Control),
     /// `mute …` that could not be read: what to say instead.
     ControlUsage(String),
+    /// `Superintendent: …` (or `yard: …`): talk to the Slack
+    /// Superintendent again in a thread switched to a project.
+    Superintendent(String),
+}
+
+/// Prefixes (before `:`) that switch a thread back to the Superintendent,
+/// unless a project has that name.
+pub const SUPERINTENDENT_PREFIXES: &[&str] = &["superintendent", "the superintendent", "yard"];
+
+/// `mute <args>` that failed to parse but was meant as the command: at
+/// most two words, or a duration or `until`/`till`/`for` first in at most
+/// four.
+fn looks_like_mute(args: &str) -> bool {
+    let words = args.split_whitespace().collect::<Vec<_>>();
+    let first = words.first().copied().unwrap_or_default();
+    words.len() <= 2
+        || (words.len() <= 4
+            && (first.starts_with(|c: char| c.is_ascii_digit())
+                || matches!(first, "until" | "till" | "for")))
+}
+
+/// Whether `query` (normalized) names a visible project, exactly or as
+/// part of its name.
+fn names_a_project(query: &str, projects: &[ProjectName]) -> bool {
+    let wanted = normalized(query);
+    !wanted.is_empty()
+        && projects.iter().any(|project| {
+            let name = normalized(&project.name);
+            name == wanted || name.contains(&wanted)
+        })
 }
 
 fn normalized(value: &str) -> String {
@@ -89,11 +119,16 @@ pub fn parse(text: &str, projects: &[ProjectName]) -> Command {
         "mute" => return Command::ControlUsage(controls::MUTE_USAGE.to_owned()),
         _ => {}
     }
+    // `mute …` and `status <project>` only when they read as that command;
+    // a sentence that merely starts with the word ("Status of the deploy
+    // after the restart?", "Mute the noisy CI alerts tonight") is a message
+    // for the Superintendent.
     if let Some(args) = command.strip_prefix("mute ") {
-        return match controls::parse_mute(args) {
-            Ok(spec) => Command::Control(Control::Mute(spec)),
-            Err(text) => Command::ControlUsage(text),
-        };
+        match controls::parse_mute(args) {
+            Ok(spec) => return Command::Control(Control::Mute(spec)),
+            Err(text) if looks_like_mute(args) => return Command::ControlUsage(text),
+            Err(_) => {}
+        }
     }
     if let Some(query) = command.strip_prefix("status ") {
         // Take the query from the original text so display keeps its case.
@@ -103,7 +138,9 @@ pub fn parse(text: &str, projects: &[ProjectName]) -> Command {
             .trim_end_matches(['?', '.', '!'])
             .trim();
         let query = if original.is_empty() { query } else { original };
-        return Command::ProjectStatus(query.to_owned());
+        if names_a_project(query, projects) || query.split_whitespace().count() == 1 {
+            return Command::ProjectStatus(query.to_owned());
+        }
     }
     if let Some((prefix, rest)) = text.split_once(':') {
         let wanted = normalized(prefix);
@@ -125,6 +162,13 @@ pub fn parse(text: &str, projects: &[ProjectName]) -> Command {
                     question: question.to_owned(),
                 };
             }
+            [] if SUPERINTENDENT_PREFIXES.contains(&wanted.as_str()) => {
+                let question = rest.trim();
+                if question.is_empty() {
+                    return Command::Help;
+                }
+                return Command::Superintendent(question.to_owned());
+            }
             [] => {}
             _ => return Command::AmbiguousProject(clean(prefix.trim(), NAME_CHARS)),
         }
@@ -145,12 +189,13 @@ pub fn help_text() -> String {
         "• `status <project>` — one project's agents",
         "• `blocked` — each blocked agent with its answer buttons",
         "• `review` — work that finished its turn and waits for your review",
-        "• `<Project>: question` — ask that project's orchestrator",
+        "• `<Project>: …` — talk to that project's orchestrator (a question or something to do); in a thread, the thread then talks to it",
+        "• `Superintendent: …` (or `yard: …`) — switch a thread back to the Superintendent",
         "• `settings` (or `quiet`) — quiet hours, mute and the next digest",
         "• `mute 2h` / `mute until 9am` / `mute until monday`, `unmute` — hold notifications",
         "• `digest` — send what is held now",
-        "• anything else at the top level — ask the Superintendent; the answer is posted in the thread",
-        "Buttons answer once and expire in 5 minutes; \"always allow\" is never offered. Reply in a question card's thread to answer it; other thread replies are not sent.",
+        "• anything else — talk to the Superintendent: ask a question or tell it what to do, at the top level or in any thread; the reply is posted in that thread, and you can reply there to follow up",
+        "Every thread is a conversation, also after a restart; a message sent while the previous reply is pending, or while the agent waits on a prompt, is queued and sent next. Buttons answer once and expire in 5 minutes; \"always allow\" is never offered. Reply in a pending question card's thread to answer that prompt.",
     ]
     .join("\n")
 }
@@ -662,18 +707,17 @@ pub(crate) mod tests {
         );
         assert_eq!(to, "the Telemetry orchestrator");
         assert_eq!(question, "what's left?");
-        // An unknown prefix, a statement, and "blocked?" in a sentence go to
-        // the Superintendent unchanged.
+        // An unknown prefix, a statement, "blocked?" in a sentence, and
+        // sentences that merely start with `status` or `mute` go to the
+        // Superintendent unchanged.
         for text in [
             "Note: ship it today",
             "what is blocked right now?",
             "status of the release?",
+            "Status of the deploy after the restart?",
+            "Mute the noisy CI alerts tonight",
         ] {
             let command = parse(text, &projects);
-            if text.starts_with("status ") {
-                assert!(matches!(command, Command::ProjectStatus(_)), "{text}");
-                continue;
-            }
             assert_eq!(
                 command,
                 Command::Ask {
@@ -696,7 +740,29 @@ pub(crate) mod tests {
             parse("Telemetry: hi", &twins),
             Command::AmbiguousProject("Telemetry".to_owned())
         );
+        // `Superintendent:` / `yard:` switch a thread back, unless a project
+        // has that name.
+        for text in ["Superintendent: and now?", "yard : and now?"] {
+            assert_eq!(
+                parse(text, &projects),
+                Command::Superintendent("and now?".to_owned()),
+                "{text}"
+            );
+        }
+        let mut named_yard = projects.clone();
+        named_yard.push(ProjectName {
+            id: "p-yard".to_owned(),
+            name: "Yard".to_owned(),
+        });
+        assert!(matches!(
+            parse("Yard: and now?", &named_yard),
+            Command::Ask {
+                target: AgentTarget::ProjectOrchestrator { .. },
+                ..
+            }
+        ));
         assert!(help_text().contains("`blocked`"));
+        assert!(help_text().contains("`Superintendent: …`"));
     }
 
     #[test]
@@ -816,6 +882,26 @@ pub(crate) mod tests {
         let body = card.blocks[1]["text"]["text"].as_str().unwrap();
         assert!(body.starts_with("*Blocked*"), "{body}");
         assert_eq!(body.matches('*').count(), 2, "{body}");
+    }
+
+    /// Documented (README, Slack Superintendent): the dedicated Slack
+    /// worker is an ordinary workstream to `status`.
+    #[test]
+    fn the_slack_superintendent_counts_as_a_workstream_in_status() {
+        let (mut records, projects) = (records(), projects());
+        let mut slack = runtime(
+            AttentionRuntimeRole::CoordinationNode,
+            "n2",
+            None,
+            ObservedStatus::Working,
+        );
+        slack.node_name = Some("Slack Superintendent".to_owned());
+        records.runtimes.push(slack);
+        let status = status_text(&records, &projects);
+        assert!(
+            status.contains("Workstreams: 2 workstreams: 1 blocked, 1 working"),
+            "{status}"
+        );
     }
 
     #[test]

@@ -318,12 +318,6 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
     );
     let terminals =
         TerminalService::new(interventions.clone(), coordination_nodes.clone(), terminal);
-    slack.attach_console(Arc::new(crate::slack::console::YardConsole::new(
-        interventions.clone(),
-        terminals.clone(),
-        coordination_nodes.clone(),
-        Arc::clone(&store),
-    )));
     let yard_orchestrator = YardOrchestratorService::new(
         runtime,
         yard_orchestrator_intervention,
@@ -331,6 +325,15 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         reconciliation.clone(),
         orchestrator_cwd,
     );
+    slack.attach_console(Arc::new(
+        crate::slack::console::YardConsole::new(
+            interventions.clone(),
+            terminals.clone(),
+            coordination_nodes.clone(),
+            Arc::clone(&store),
+        )
+        .with_yard_orchestrator(yard_orchestrator.clone()),
+    ));
     let pane_management = PaneManagementService::new(Arc::clone(&source), Arc::clone(&store));
     Router::new()
         .route("/health", get(health))
@@ -3744,6 +3747,11 @@ impl From<CoordinationNodeServiceError> for ApiError {
     fn from(error: CoordinationNodeServiceError) -> Self {
         match error {
             CoordinationNodeServiceError::InvalidCommand(error) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid_coordination_node_command",
+                message: error.to_string(),
+            },
+            CoordinationNodeServiceError::ReservedActor => Self {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "invalid_coordination_node_command",
                 message: error.to_string(),
@@ -9294,6 +9302,139 @@ mod tests {
             .send_prompt(&target, &identity, "hello", "slack:owner:U1")
             .await
             .unwrap();
+    }
+
+    /// The Slack Superintendent can't be forged over HTTP, and Yard reads
+    /// answer files only from its own node's validated folder.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn slack_answer_files_are_read_only_from_the_slack_superintendents_folder() {
+        use crate::{
+            CoordinationNodeService, InterventionService,
+            slack::{
+                actions::{AgentConsole, AgentTarget},
+                console::YardConsole,
+                superintendent::{SLACK_SUPERINTENDENT_ACTOR, answer_file, new_answer_key},
+            },
+            terminal_service::TerminalService,
+        };
+
+        let source: Arc<dyn InventorySource> = Arc::new(FakeInventory);
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("yard.sqlite3");
+        let store = Arc::new(SqliteProjectStore::open(&db).await.unwrap());
+        let runtime = Arc::new(FakeRuntime);
+        let artifacts = ArtifactService::new(temp.path().join("artifacts"), store.clone());
+        let app = router(
+            source.clone(),
+            runtime.clone(),
+            runtime.clone(),
+            runtime.clone(),
+            store.clone(),
+            artifacts,
+        );
+        // Any HTTP client naming the reserved actor is refused.
+        let forged = serde_json::json!({
+            "command_id": "forge-slack-superintendent",
+            "actor": SLACK_SUPERINTENDENT_ACTOR,
+            "name": "Slack Superintendent",
+            "kind": "workstream",
+            "placement": {"x": 0.0, "y": 0.0, "width": 300.0, "height": 180.0}
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/coordination-nodes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(forged.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let listed = get_json(&app, "/api/v1/coordination-nodes").await;
+        assert!(listed["nodes"].as_array().unwrap().is_empty());
+
+        let reconciliation = ReconciliationService::new(Arc::clone(&source), store.clone());
+        let nodes = CoordinationNodeService::new(
+            Arc::clone(&source),
+            runtime.clone(),
+            runtime.clone(),
+            store.clone(),
+            reconciliation,
+            temp.path().join("coordination"),
+            temp.path().join("knowledge"),
+        );
+        let interventions =
+            InterventionService::new(Arc::clone(&source), runtime.clone(), store.clone());
+        let terminals = TerminalService::new(interventions.clone(), nodes.clone(), runtime);
+        let console = YardConsole::new(interventions, terminals, nodes.clone(), store.clone());
+        let command = |actor: &str, id: &str| yard_domain::CreateCoordinationNode {
+            command_id: id.to_owned(),
+            actor: actor.to_owned(),
+            name: "Slack Superintendent".to_owned(),
+            kind: yard_domain::CoordinationNodeKind::Workstream,
+            placement: yard_domain::CanvasPlacement {
+                x: 0.0,
+                y: 0.0,
+                width: 300.0,
+                height: 180.0,
+            },
+            attached_project_ids: Vec::new(),
+        };
+        let owners = nodes
+            .create(command("local-user", "owner"))
+            .await
+            .unwrap()
+            .node;
+        let slack = nodes
+            .create_slack_superintendent(command("ignored", "slack"))
+            .await
+            .unwrap()
+            .node;
+        assert_eq!(slack.created_by, SLACK_SUPERINTENDENT_ACTOR);
+        let key = new_answer_key();
+        for node in [&owners, &slack] {
+            let file = std::path::Path::new(node.cwd.as_deref().unwrap()).join(answer_file(&key));
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, format!("answer in {}", node.id)).unwrap();
+        }
+        let target = |node: &yard_domain::CoordinationNode| AgentTarget::CoordinationNode {
+            node_id: node.id.clone(),
+        };
+        assert_eq!(
+            console.answer_text(&target(&slack), &key).await,
+            Some(format!("answer in {}", slack.id))
+        );
+        assert_eq!(
+            console.answer_text(&target(&owners), &key).await,
+            None,
+            "an owner's workstream with the same file is never read"
+        );
+        console.forget_answer(&target(&owners), &key).await;
+        assert!(
+            std::path::Path::new(owners.cwd.as_deref().unwrap())
+                .join(answer_file(&key))
+                .exists(),
+            "nor cleaned"
+        );
+
+        // A recorded folder outside the coordination root is not trusted.
+        let outside = TempDir::new().unwrap();
+        std::fs::create_dir_all(outside.path().join("slack-answers")).unwrap();
+        std::fs::write(outside.path().join(answer_file(&key)), "outside").unwrap();
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(
+                "UPDATE coordination_nodes SET workstream_cwd = ?1 WHERE id = ?2",
+                rusqlite::params![outside.path().to_str().unwrap(), slack.id],
+            )
+            .unwrap();
+        let moved = nodes.get(&slack.id).await.unwrap();
+        assert!(nodes.managed_cwd(&moved).is_none());
+        assert_eq!(console.answer_text(&target(&slack), &key).await, None);
     }
 
     #[tokio::test]

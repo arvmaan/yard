@@ -109,11 +109,22 @@ impl<T: Serialize + DeserializeOwned + Default> JsonFile<T> {
 }
 
 fn read<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
+    read_capped(path, MAX_FILE_BYTES)
+}
+
+/// Read a versioned Slack state file of at most `max_bytes` (a regular
+/// file, not a symlink).
+///
+/// # Errors
+///
+/// Why the file was not read (missing, not a regular file, too large, not
+/// valid JSON, another version).
+pub(crate) fn read_capped<T: DeserializeOwned>(path: &Path, max_bytes: u64) -> Result<T, String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.kind().to_string())?;
     if !metadata.file_type().is_file() {
         return Err("not a regular file".to_owned());
     }
-    if metadata.len() > MAX_FILE_BYTES {
+    if metadata.len() > max_bytes {
         return Err("too large".to_owned());
     }
     let bytes = fs::read(path).map_err(|error| error.kind().to_string())?;
@@ -125,15 +136,43 @@ fn read<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
     Ok(file.body)
 }
 
-fn write<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
-    if fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.file_type().is_file()) {
-        return Err(std::io::Error::other("not a regular file"));
-    }
+/// Write a versioned Slack state file atomically, mode 0600 (refused when
+/// `path` is not a regular file).
+///
+/// # Errors
+///
+/// The I/O error; a temporary file is removed again.
+pub(crate) fn write<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     let bytes = serde_json::to_vec_pretty(&Versioned {
         version: FILE_VERSION,
         body: value,
     })
     .map_err(std::io::Error::other)?;
+    write_bytes(path, &bytes)
+}
+
+/// `value` as a versioned Slack state file, compact (for [`write_bytes`]).
+///
+/// # Errors
+///
+/// When `value` can't be serialized.
+pub(crate) fn encode<T: Serialize>(value: &T) -> std::io::Result<Vec<u8>> {
+    serde_json::to_vec(&Versioned {
+        version: FILE_VERSION,
+        body: value,
+    })
+    .map_err(std::io::Error::other)
+}
+
+/// [`write`] of bytes already encoded ([`encode`]).
+///
+/// # Errors
+///
+/// The I/O error; a temporary file is removed again.
+pub(crate) fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.file_type().is_file()) {
+        return Err(std::io::Error::other("not a regular file"));
+    }
     let name = path
         .file_name()
         .map_or_else(|| "slack-state.json".into(), |name| name.to_string_lossy());
@@ -144,7 +183,7 @@ fn write<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
             .create_new(true)
             .mode(0o600)
             .open(&temporary)?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, path)
     })();
