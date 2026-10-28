@@ -131,3 +131,31 @@ export function groupRuntimeLensEntries(
         left.workspaceId.localeCompare(right.workspaceId),
     )
 }
+
+type RuntimeTargetIds = Pick<AgentWorkspaceTarget, 'session' | 'terminalId' | 'paneId'>
+
+/**
+ * Whether two targets drive the same Herdr terminal or pane. The terminal id
+ * is the identity when both have one (a short pane id such as `w1:pT` can be
+ * reused by a different terminal after a stale record's runtime ended); the
+ * pane id decides only when a terminal id is missing.
+ */
+export function sameRuntimeTarget(left: RuntimeTargetIds, right: RuntimeTargetIds) {
+  if (left.session !== right.session) return false
+  if (left.terminalId && right.terminalId) return left.terminalId === right.terminalId
+  return Boolean(left.paneId) && left.paneId === right.paneId
+}
+
+/**
+ * One card per Herdr terminal/pane (see `sameRuntimeTarget`): the first
+ * target wins (the list puts the Yard orchestrator, workstreams and project
+ * orchestrators before assignments), so an assignment whose worker is also a
+ * project orchestrator shows once, as the orchestrator.
+ */
+export function dedupeTargetsByRuntime<T extends RuntimeTargetIds>(targets: T[]): T[] {
+  const kept: T[] = []
+  for (const target of targets) {
+    if (!kept.some((other) => sameRuntimeTarget(other, target))) kept.push(target)
+  }
+  return kept
+}

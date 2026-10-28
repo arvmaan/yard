@@ -93,6 +93,7 @@ mod image_paste;
 mod lens;
 mod terminal;
 mod web;
+mod work_board;
 
 type GhosttyLauncher = fn(&OsString, &[String]) -> io::Result<()>;
 
@@ -128,6 +129,7 @@ struct AppState {
     image_paste: ImagePasteSettings,
     /// Bounds how many image uploads are buffered in memory at once.
     image_uploads: Arc<tokio::sync::Semaphore>,
+    work_board: crate::work_board::WorkBoardService,
 }
 
 #[cfg(test)]
@@ -236,6 +238,7 @@ fn test_router_with_image_paste(
         connections,
         slack,
         image_paste,
+        crate::work_board::WorkBoardSettings::disabled(),
     )
 }
 
@@ -276,6 +279,7 @@ pub(crate) fn router_with_reconciliation_and_shutdown(
         connections,
         slack,
         image_paste,
+        crate::work_board::WorkBoardSettings::from_env(),
     )
 }
 
@@ -298,6 +302,7 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
     connections: ConnectionTracker,
     slack: SlackNotifier,
     image_paste: ImagePasteSettings,
+    work_board: crate::work_board::WorkBoardSettings,
 ) -> Router {
     let presence = slack.presence();
     let protected_paths = storage.excluded_paths.clone();
@@ -346,7 +351,7 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         Arc::clone(&store),
         reconciliation.clone(),
         coordination_path,
-        knowledge_path,
+        knowledge_path.clone(),
     );
     let yard_orchestrator_intervention = Arc::clone(&intervention);
     let interventions =
@@ -378,8 +383,24 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         .with_yard_orchestrator(yard_orchestrator.clone()),
     ));
     let pane_management = PaneManagementService::new(Arc::clone(&source), Arc::clone(&store));
+    let work_board = crate::work_board::WorkBoardService::new(
+        Arc::clone(&store),
+        Arc::clone(&source),
+        interventions.clone(),
+        knowledge_path,
+        work_board,
+    );
     Router::new()
         .route("/health", get(health))
+        .route("/api/v1/work-board", get(work_board::get_work_board))
+        .route(
+            "/api/v1/work-board/generate",
+            axum::routing::post(work_board::generate_work_board),
+        )
+        .route(
+            "/api/v1/work-board/triage",
+            axum::routing::post(work_board::triage_work_board),
+        )
         .route(
             "/api/v1/orchestrator-workflow-profile",
             get(get_orchestrator_workflow_profile).put(update_orchestrator_workflow_profile),
@@ -790,6 +811,7 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             image_uploads: Arc::new(tokio::sync::Semaphore::new(
                 image_paste::CONCURRENT_IMAGE_UPLOADS,
             )),
+            work_board,
         })
 }
 
@@ -5085,6 +5107,7 @@ struct ErrorBody {
 #[cfg(test)]
 mod tests {
     mod lifecycle_origin_tests;
+    mod work_board_tests;
 
     use std::{
         collections::{BTreeMap, HashMap},

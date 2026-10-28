@@ -1573,3 +1573,33 @@ export function uploadTerminalImage(
     timeoutMs,
   )
 }
+
+export function fetchWorkBoard(
+  since?: number,
+  signal?: AbortSignal,
+): Promise<import('./workBoard').WorkBoardResponse> {
+  const query = since === undefined ? '' : `?since=${since}`
+  return requestJson(`/api/v1/work-board${query}`, { signal })
+}
+
+/** Keep (pin), Skip (reviewed until new activity) or Clear one board card. */
+export function triageWorkBoard(
+  itemId: string,
+  choice: 'keep' | 'skip' | 'clear',
+): Promise<{ revision: number }> {
+  return requestJson('/api/v1/work-board/triage', {
+    body: JSON.stringify({ item_id: itemId, choice }),
+    headers: { 'Content-Type': 'application/json' },
+    method: 'POST',
+  })
+}
+
+export function generateWorkBoard(
+  useModel: boolean,
+): Promise<{ generation_id: string; revision: number }> {
+  return requestJson('/api/v1/work-board/generate', {
+    body: JSON.stringify({ use_model: useModel }),
+    headers: { 'Content-Type': 'application/json' },
+    method: 'POST',
+  })
+}

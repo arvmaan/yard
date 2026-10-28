@@ -7,6 +7,16 @@ a release is tagged.
 
 ### Added
 
+- Added a Board tab: one prioritized list of live work, one card per pane
+  (Needs you, Working, Quiet, Older), served by loopback-guarded
+  `GET /api/v1/work-board`, `POST /api/v1/work-board/generate` and
+  `POST /api/v1/work-board/triage`. Card titles and status lines come from
+  Yard's store, Herdr, and the local Claude Code and Codex session files
+  (`$CLAUDE_CONFIG_DIR`, else `~/.claude`, and `$CODEX_HOME`, else
+  `~/.codex`), read bounded, for safe session ids only, and redacted. An
+  optional model pass (`YARD_BOARD_MODEL`, `YARD_BOARD_AWS_PROFILE` and
+  `YARD_BOARD_AWS_ACCOUNT_ID`; off unless all are set) rewrites the cards only
+  on an explicit click, capped at $0.10 per generate and $1.00 per day.
 - Added image paste into web terminals: a pasted or dropped PNG, JPEG, GIF or
   WebP image is uploaded to `POST <terminal route>/images`, checked against
   its magic bytes and `YARD_IMAGE_PASTE_MAX_BYTES` (10 MiB), stored privately

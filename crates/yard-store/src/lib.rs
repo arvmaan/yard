@@ -224,6 +224,12 @@ pub trait YardStore: Send + Sync {
         &self,
         commands_updated_after_unix_ms: u64,
     ) -> Result<AttentionRecords, ProjectStoreError>;
+    /// Assignments whose latest prompt/handoff/disposition command ended
+    /// failed or ambiguous after the cutoff (a later success clears it).
+    async fn assignments_with_failed_last_command(
+        &self,
+        updated_after_unix_ms: u64,
+    ) -> Result<HashSet<String>, ProjectStoreError>;
     async fn claim_automatic_summary_request(
         &self,
         kind: AutomaticSummaryRequestKind,
@@ -1866,6 +1872,13 @@ impl YardStore for SqliteProjectStore {
         commands_updated_after_unix_ms: u64,
     ) -> Result<AttentionRecords, ProjectStoreError> {
         notification_store::attention_records(self, commands_updated_after_unix_ms).await
+    }
+
+    async fn assignments_with_failed_last_command(
+        &self,
+        updated_after_unix_ms: u64,
+    ) -> Result<HashSet<String>, ProjectStoreError> {
+        notification_store::assignments_with_failed_last_command(self, updated_after_unix_ms).await
     }
 
     async fn claim_automatic_summary_request(
