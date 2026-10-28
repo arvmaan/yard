@@ -1,6 +1,7 @@
 use std::{
     env,
     ffi::OsString,
+    fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
 };
@@ -18,6 +19,92 @@ pub struct ServerConfig {
     pub knowledge_path: PathBuf,
     pub storage: StorageConfig,
     pub slack: SlackConfig,
+    pub image_paste: ImagePasteConfig,
+}
+
+/// Images pasted into a web terminal (`YARD_IMAGE_PASTE_*`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImagePasteConfig {
+    /// Absolute directory; defaults to `pastes` beside the database.
+    pub path: PathBuf,
+    /// Largest accepted image (`YARD_IMAGE_PASTE_MAX_BYTES`, 1 B to 64 MiB).
+    pub max_bytes: u64,
+    /// Images older than this are pruned (`YARD_IMAGE_PASTE_RETENTION_DAYS`,
+    /// 1 to 365).
+    pub retention_days: u32,
+    /// Images kept per worker (`YARD_IMAGE_PASTE_MAX_FILES`, 1 to 10000).
+    pub max_files_per_worker: usize,
+}
+
+const MAX_IMAGE_PASTE_BYTES: u64 = 64 * 1024 * 1024;
+
+impl ImagePasteConfig {
+    /// `path` with the default limits.
+    #[must_use]
+    pub fn with_defaults(path: PathBuf) -> Self {
+        Self::parse(path, None, None, None).unwrap_or_else(|_| unreachable!("defaults parse"))
+    }
+
+    /// Parse the limits; `path` is resolved by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidImagePasteSetting`] when a value is not
+    /// a whole number in its range.
+    pub fn parse(
+        path: PathBuf,
+        max_bytes: Option<&std::ffi::OsStr>,
+        retention_days: Option<&std::ffi::OsStr>,
+        max_files: Option<&std::ffi::OsStr>,
+    ) -> Result<Self, ConfigError> {
+        use crate::image_paste_service::{
+            DEFAULT_IMAGE_PASTE_MAX_BYTES, DEFAULT_IMAGE_PASTE_MAX_FILES,
+            DEFAULT_IMAGE_PASTE_RETENTION_DAYS,
+        };
+        Ok(Self {
+            path,
+            max_bytes: parse_bounded(
+                "YARD_IMAGE_PASTE_MAX_BYTES",
+                max_bytes,
+                DEFAULT_IMAGE_PASTE_MAX_BYTES,
+                1..=MAX_IMAGE_PASTE_BYTES,
+            )?,
+            retention_days: parse_bounded(
+                "YARD_IMAGE_PASTE_RETENTION_DAYS",
+                retention_days,
+                DEFAULT_IMAGE_PASTE_RETENTION_DAYS,
+                1..=365,
+            )?,
+            max_files_per_worker: parse_bounded(
+                "YARD_IMAGE_PASTE_MAX_FILES",
+                max_files,
+                DEFAULT_IMAGE_PASTE_MAX_FILES,
+                1..=10_000,
+            )?,
+        })
+    }
+}
+
+fn parse_bounded<T>(
+    name: &'static str,
+    value: Option<&std::ffi::OsStr>,
+    default: T,
+    range: std::ops::RangeInclusive<T>,
+) -> Result<T, ConfigError>
+where
+    T: std::str::FromStr + PartialOrd,
+{
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    value
+        .to_str()
+        .and_then(|text| text.trim().parse::<T>().ok())
+        .filter(|parsed| range.contains(parsed))
+        .ok_or_else(|| ConfigError::InvalidImagePasteSetting {
+            name,
+            value: value.to_string_lossy().into_owned(),
+        })
 }
 
 /// Default for `YARD_STORAGE_LOG_RETENTION_DAYS`.
@@ -464,6 +551,12 @@ pub enum ConfigError {
     InvalidStorageLogRetention(String),
     #[error("YARD_STORAGE_WORKSPACE_MARKERS entry '{0}' must be a plain file name")]
     InvalidStorageWorkspaceMarker(String),
+    #[error("{name} must be a whole number in its allowed range, got '{value}'")]
+    InvalidImagePasteSetting { name: &'static str, value: String },
+    #[error(
+        "YARD_IMAGE_PASTE_PATH '{path}' must be a directory used only for pasted images: {reason}"
+    )]
+    InvalidImagePastePath { path: PathBuf, reason: String },
 }
 
 impl ServerConfig {
@@ -516,6 +609,29 @@ impl ServerConfig {
             })?;
         let storage = StorageConfig::from_env()?;
         let slack = SlackConfig::from_env();
+        let image_paste = ImagePasteConfig::parse(
+            managed_path_from_env(
+                "YARD_IMAGE_PASTE_PATH",
+                default_image_paste_path(&database_path),
+            )?,
+            env::var_os("YARD_IMAGE_PASTE_MAX_BYTES").as_deref(),
+            env::var_os("YARD_IMAGE_PASTE_RETENTION_DAYS").as_deref(),
+            env::var_os("YARD_IMAGE_PASTE_MAX_FILES").as_deref(),
+        )?;
+        let runtime_dir = env::var_os("YARD_RUNTIME_DIR").map(PathBuf::from);
+        let mut reserved = vec![
+            (
+                "Yard's data directory",
+                database_path.parent().unwrap_or(&database_path),
+            ),
+            ("the artifact directory", artifact_path.as_path()),
+            ("the coordination directory", coordination_path.as_path()),
+            ("the knowledge directory", knowledge_path.as_path()),
+        ];
+        if let Some(runtime_dir) = runtime_dir.as_deref() {
+            reserved.push(("YARD_RUNTIME_DIR", runtime_dir));
+        }
+        check_image_paste_path(&image_paste.path, &reserved, &orchestrator_cwd)?;
 
         Ok(Self {
             bind,
@@ -527,6 +643,7 @@ impl ServerConfig {
             knowledge_path,
             storage,
             slack,
+            image_paste,
         })
     }
 }
@@ -545,6 +662,105 @@ fn managed_path_from_env(name: &str, default: PathBuf) -> Result<PathBuf, Config
     }
 }
 
+/// Refuse an image paste root that is not dedicated to pastes or that sits in
+/// a git checkout, because retention prunes inside it and an agent's
+/// worktree must never collect pasted files.
+///
+/// - It must not be, contain, or lie inside a directory in `reserved` (Yard's
+///   data directory may contain it, which is the default layout, but the root
+///   must not be the data directory itself or an ancestor of it).
+/// - It must not contain `orchestrator_cwd`.
+/// - Outside Yard's data directory, neither it nor any ancestor may hold a
+///   `.git` entry (inside the data directory the root is Yard's even when, say,
+///   the home directory above it is a git checkout).
+fn check_image_paste_path(
+    path: &Path,
+    reserved: &[(&str, &Path)],
+    orchestrator_cwd: &Path,
+) -> Result<(), ConfigError> {
+    let refuse = |reason: String| ConfigError::InvalidImagePastePath {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let paste = normalize_path(path);
+    for (index, (label, other)) in reserved.iter().enumerate() {
+        let other = normalize_path(other);
+        // Index 0 is the data directory, which may hold the paste root.
+        let contained_is_fine = index == 0;
+        if paste == other || other.starts_with(&paste) {
+            return Err(refuse(format!(
+                "it is or contains {label} ({})",
+                other.display()
+            )));
+        }
+        if !contained_is_fine && paste.starts_with(&other) {
+            return Err(refuse(format!(
+                "it is inside {label} ({})",
+                other.display()
+            )));
+        }
+    }
+    let cwd = normalize_path(orchestrator_cwd);
+    if cwd.starts_with(&paste) {
+        return Err(refuse(format!(
+            "it contains the orchestrator working directory ({})",
+            cwd.display()
+        )));
+    }
+    // Inside Yard's own data directory (the default layout) the root is Yard's,
+    // even when an ancestor such as a home directory is itself a git checkout.
+    let inside_data_dir = reserved
+        .first()
+        .is_some_and(|(_, data)| paste.starts_with(normalize_path(data)));
+    if let Some(repository) = (!inside_data_dir)
+        .then(|| {
+            paste
+                .ancestors()
+                .find(|ancestor| fs::symlink_metadata(ancestor.join(".git")).is_ok())
+        })
+        .flatten()
+    {
+        return Err(refuse(format!(
+            "it is inside the git checkout {}; choose a directory outside every worktree",
+            repository.display()
+        )));
+    }
+    Ok(())
+}
+
+/// `path` with `.` and `..` resolved lexically and its longest existing
+/// ancestor canonicalized, so paths that do not exist yet compare correctly
+/// with canonical ones.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut lexical = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                lexical.pop();
+            }
+            other => lexical.push(other),
+        }
+    }
+    let mut rest = Vec::new();
+    let mut existing = lexical.as_path();
+    loop {
+        if let Ok(canonical) = fs::canonicalize(existing) {
+            return rest
+                .iter()
+                .rev()
+                .fold(canonical, |joined, name| joined.join(name));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return lexical,
+        }
+    }
+}
+
 fn default_artifact_path(database_path: &Path) -> PathBuf {
     database_path.parent().map_or_else(
         || PathBuf::from(".yard/artifacts"),
@@ -556,6 +772,13 @@ fn default_coordination_path(database_path: &Path) -> PathBuf {
     database_path.parent().map_or_else(
         || PathBuf::from(".yard/coordination"),
         |parent| parent.join("coordination"),
+    )
+}
+
+fn default_image_paste_path(database_path: &Path) -> PathBuf {
+    database_path.parent().map_or_else(
+        || PathBuf::from(".yard/pastes"),
+        |parent| parent.join("pastes"),
     )
 }
 
@@ -915,6 +1138,108 @@ mod tests {
             assert!(
                 matches!(error, ConfigError::InvalidStorageLogRetention(_)),
                 "{retention}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_paste_root_must_be_dedicated_and_outside_git_checkouts() {
+        use super::check_image_paste_path;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let artifacts = data.join("artifacts");
+        let coordination = data.join("coordination");
+        let knowledge = data.join("knowledge");
+        let runtime = temp.path().join("run");
+        let cwd = temp.path().join("home/projects");
+        let checkout = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::create_dir_all(&artifacts).unwrap();
+        let reserved = [
+            ("Yard's data directory", data.as_path()),
+            ("the artifact directory", artifacts.as_path()),
+            ("the coordination directory", coordination.as_path()),
+            ("the knowledge directory", knowledge.as_path()),
+            ("YARD_RUNTIME_DIR", runtime.as_path()),
+        ];
+        let check = |path: &std::path::Path| check_image_paste_path(path, &reserved, &cwd);
+        check(&data.join("pastes")).unwrap();
+        check(&temp.path().join("elsewhere/pastes")).unwrap();
+        // A home directory that is itself a git checkout must not block the
+        // default root inside Yard's data directory.
+        let home_repo = temp.path().join("homerepo");
+        let home_data = home_repo.join(".local/share/yard");
+        std::fs::create_dir_all(home_repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&home_data).unwrap();
+        let home_reserved = [("Yard's data directory", home_data.as_path())];
+        check_image_paste_path(&home_data.join("pastes"), &home_reserved, &cwd).unwrap();
+        check_image_paste_path(&home_repo.join("elsewhere/pastes"), &home_reserved, &cwd)
+            .unwrap_err();
+        for refused in [
+            data.clone(),
+            temp.path().to_path_buf(),
+            artifacts.clone(),
+            artifacts.join("pastes"),
+            knowledge.join("x/../pastes"),
+            runtime.join("pastes"),
+            temp.path().join("home"),
+            checkout.clone(),
+            checkout.join("nested/.yard/pastes"),
+        ] {
+            let error = check(&refused).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::InvalidImagePastePath { .. }),
+                "{}: {error}",
+                refused.display()
+            );
+        }
+    }
+
+    #[test]
+    fn image_paste_limits_default_and_reject_out_of_range_values() {
+        use std::path::PathBuf;
+
+        use super::ImagePasteConfig;
+
+        let path = PathBuf::from("/data/pastes");
+        let defaults = ImagePasteConfig::with_defaults(path.clone());
+        assert_eq!(defaults.max_bytes, 10 * 1024 * 1024);
+        assert_eq!(defaults.retention_days, 7);
+        assert_eq!(defaults.max_files_per_worker, 200);
+        let custom = ImagePasteConfig::parse(
+            path.clone(),
+            Some(OsStr::new(" 2048 ")),
+            Some(OsStr::new("30")),
+            Some(OsStr::new("5")),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                custom.max_bytes,
+                custom.retention_days,
+                custom.max_files_per_worker
+            ),
+            (2048, 30, 5)
+        );
+        for (bytes, days, files, name) in [
+            (Some("0"), None, None, "YARD_IMAGE_PASTE_MAX_BYTES"),
+            (Some("67108865"), None, None, "YARD_IMAGE_PASTE_MAX_BYTES"),
+            (None, Some("0"), None, "YARD_IMAGE_PASTE_RETENTION_DAYS"),
+            (None, Some("seven"), None, "YARD_IMAGE_PASTE_RETENTION_DAYS"),
+            (None, None, Some("10001"), "YARD_IMAGE_PASTE_MAX_FILES"),
+        ] {
+            let error = ImagePasteConfig::parse(
+                path.clone(),
+                bytes.map(OsStr::new),
+                days.map(OsStr::new),
+                files.map(OsStr::new),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidImagePasteSetting { name: actual, .. } if *actual == name),
+                "{error}"
             );
         }
     }

@@ -8,6 +8,7 @@ pub mod config;
 pub mod coordination_node_service;
 mod git_probe;
 mod http;
+pub mod image_paste_service;
 pub mod intervention_service;
 pub mod inventory_service;
 pub mod orchestrator_replacement_service;
@@ -44,6 +45,7 @@ use artifact_service::ArtifactService;
 use automation_service::AutomationService;
 use axum::Router;
 use coordination_node_service::CoordinationNodeService;
+use image_paste_service::ImagePasteSettings;
 use intervention_service::{InterventionService, RuntimeIntervention};
 use inventory_service::InventorySource;
 use reconciliation_service::ReconciliationService;
@@ -243,6 +245,7 @@ pub fn app_with_reconciliation_and_paths_and_automation(
         None,
         ConnectionTracker::default(),
         SlackNotifier::off(),
+        ImagePasteSettings::not_configured(),
     )
 }
 
@@ -262,6 +265,7 @@ pub fn app_with_reconciliation_and_paths_and_automation_and_shutdown(
     storage: StorageScanSettings,
     shutdown: watch::Receiver<bool>,
     slack: SlackNotifier,
+    image_paste: ImagePasteSettings,
 ) -> (Router, AutomationService, ConnectionTracker) {
     let connections = ConnectionTracker::default();
     let (router, automations) = build_app_with_reconciliation_and_paths_and_automation(
@@ -279,6 +283,7 @@ pub fn app_with_reconciliation_and_paths_and_automation_and_shutdown(
         Some(shutdown),
         connections.clone(),
         slack,
+        image_paste,
     );
     (router, automations, connections)
 }
@@ -299,6 +304,7 @@ fn build_app_with_reconciliation_and_paths_and_automation(
     shutdown: Option<watch::Receiver<bool>>,
     connections: ConnectionTracker,
     slack: SlackNotifier,
+    image_paste: ImagePasteSettings,
 ) -> (Router, AutomationService) {
     let artifacts = ArtifactService::new(artifact_path, Arc::clone(&store));
     let coordination_nodes = CoordinationNodeService::new(
@@ -335,6 +341,7 @@ fn build_app_with_reconciliation_and_paths_and_automation(
         shutdown,
         connections,
         slack,
+        image_paste,
     );
     (router, automations)
 }

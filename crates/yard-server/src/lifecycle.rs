@@ -1645,6 +1645,9 @@ mod tests {
             knowledge_path: "/data/yard/knowledge".into(),
             storage: StorageConfig::default(),
             slack: SlackConfig::Off,
+            image_paste: yard_server::config::ImagePasteConfig::with_defaults(
+                "/data/yard/pastes".into(),
+            ),
         };
         let mut configured = base.clone();
         configured.storage.roots = Some(vec!["/work/a".into()]);
@@ -1689,6 +1692,9 @@ mod tests {
             knowledge_path: "/data/yard/knowledge".into(),
             storage: StorageConfig::default(),
             slack: SlackConfig::Off,
+            image_paste: yard_server::config::ImagePasteConfig::with_defaults(
+                "/data/yard/pastes".into(),
+            ),
         };
         let settings = SlackSettings {
             secret_id: "yard/slack-bot".to_owned(),

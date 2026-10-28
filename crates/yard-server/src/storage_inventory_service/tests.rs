@@ -1757,6 +1757,7 @@ fn server_config_excludes_every_yard_data_path_and_the_runtime_dir() {
         knowledge_path: PathBuf::from("/data/knowledge"),
         storage: crate::config::StorageConfig::default(),
         slack: crate::config::SlackConfig::Off,
+        image_paste: crate::config::ImagePasteConfig::with_defaults(PathBuf::from("/data/pastes")),
     };
     let settings = StorageScanSettings::from_config(&config, Some(Path::new("/run/yard")));
     assert_eq!(
@@ -1768,6 +1769,7 @@ fn server_config_excludes_every_yard_data_path_and_the_runtime_dir() {
             "/data/artifacts",
             "/data/coordination",
             "/data/knowledge",
+            "/data/pastes",
             "/run/yard",
         ]
         .map(PathBuf::from)

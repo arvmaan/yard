@@ -13410,6 +13410,277 @@ test('sends a multi-line paste to Herdr as one bracketed paste', async ({
   expect(terminalMessagesOfType(state, 'terminal.input')).toHaveLength(1)
 })
 
+test('uploads a pasted or dropped image and types its host path into the pane', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  const uploads: { url: string; type: string | null; bytes: number[] }[] = []
+  let mode: 'store' | 'refuse' | 'abort' | 'hold' = 'store'
+  const held: { release: (() => void) | null } = { release: null }
+  await page.route('**/terminal/images', async (route) => {
+    const request = route.request()
+    uploads.push({
+      url: new URL(request.url()).pathname,
+      type: request.headers()['content-type'] ?? null,
+      bytes: [...(request.postDataBuffer() ?? [])],
+    })
+    if (mode === 'refuse') {
+      await route.fulfill({
+        status: 413,
+        json: {
+          error: {
+            code: 'image_too_large',
+            message: 'the image is 11.0 MiB; the limit is 10.0 MiB',
+          },
+        },
+      })
+      return
+    }
+    if (mode === 'abort') {
+      await route.abort('connectionreset')
+      return
+    }
+    if (mode === 'hold') {
+      await new Promise<void>((resolve) => {
+        held.release = resolve
+      })
+    }
+    const name = `20261017-${uploads.length}.png`
+    await route.fulfill({
+      status: 201,
+      json: {
+        path: `/data/yard/pastes/worker-1/${name}`,
+        name,
+        bytes: 3,
+        content_type: 'image/png',
+      },
+    })
+  })
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open terminal', exact: true }).click()
+  const terminal = page.locator('.terminal-session')
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  const textarea = terminal.locator('.xterm-helper-textarea')
+  const inputs = () => terminalMessagesOfType(state, 'terminal.input').map((message) => message.text)
+  /** Dispatch a paste, dragover or drop; resolves to whether it was default-prevented. */
+  const transfer = (
+    kind: 'paste' | 'drop' | 'dragover',
+    files: { name: string; type: string }[],
+    text = '',
+    html = '',
+  ) =>
+    textarea.evaluate(
+      (element, args) => {
+        const data = new DataTransfer()
+        for (const entry of args.files) {
+          data.items.add(
+            new File([new Uint8Array([0x89, 0x50, 0x4e])], entry.name, { type: entry.type }),
+          )
+        }
+        if (args.text) data.setData('text/plain', args.text)
+        if (args.html) data.setData('text/html', args.html)
+        const event =
+          args.kind === 'paste'
+            ? new ClipboardEvent('paste', {
+                bubbles: true,
+                cancelable: true,
+                clipboardData: data,
+              })
+            : new DragEvent(args.kind, {
+                bubbles: true,
+                cancelable: true,
+                dataTransfer: data,
+              })
+        element.dispatchEvent(event)
+        return event.defaultPrevented
+      },
+      { kind, files, text, html },
+    )
+  const png = [{ name: 'shot.png', type: 'image/png' }]
+
+  // An image with text: the path as its own bracketed paste and a space, then
+  // the text as a separate paste; never Enter.
+  await transfer('paste', png, 'what is this')
+  await expect.poll(() => inputs().length).toBe(2)
+  expect(uploads).toEqual([
+    {
+      url: '/api/v1/projects/project-1/assignments/assignment-1/terminal/images',
+      type: 'image/png',
+      bytes: [0x89, 0x50, 0x4e],
+    },
+  ])
+  expect(inputs()).toEqual([
+    '\u001b[200~/data/yard/pastes/worker-1/20261017-1.png\u001b[201~ ',
+    '\u001b[200~what is this\u001b[201~',
+  ])
+  await expect(terminal.getByRole('alert')).toHaveText('Image pasted → 20261017-1.png')
+
+  // A Finder-style copy (the file plus its name as text) types only the path.
+  await transfer('paste', png, 'shot.png')
+  await expect.poll(() => inputs().length).toBe(3)
+  expect(inputs()[2]).toBe('\u001b[200~/data/yard/pastes/worker-1/20261017-2.png\u001b[201~ ')
+
+  // A rich copy (spreadsheet cells with a PNG rendering) pastes only its text.
+  await transfer('paste', [{ name: 'image.png', type: 'image/png' }], 'West\t42', '<table/>')
+  await expect.poll(() => inputs().length).toBe(4)
+  expect(inputs()[3]).toBe('\u001b[200~West\t42\u001b[201~')
+  expect(uploads).toHaveLength(2)
+  await expect(terminal.getByRole('alert')).toHaveText(
+    'Pasted the copied text; its image rendering was not uploaded',
+  )
+
+  // A dropped image takes the same path as a pasted one.
+  expect(await transfer('dragover', png)).toBe(true)
+  expect(await transfer('drop', png)).toBe(true)
+  await expect.poll(() => inputs().length).toBe(5)
+  expect(inputs()[4]).toBe('\u001b[200~/data/yard/pastes/worker-1/20261017-3.png\u001b[201~ ')
+
+  // A drop with no image is still claimed, so the browser never navigates
+  // away to the file, and it is explained.
+  expect(await transfer('drop', [{ name: 'notes.pdf', type: 'application/pdf' }])).toBe(true)
+  await expect(terminal.getByRole('alert')).toHaveText(
+    'Only PNG, JPEG, GIF or WebP images can be dropped into a terminal',
+  )
+  await expect(page).toHaveURL(/^http:\/\/[^/]+\/$/)
+
+  // Text pasted while an upload is still running waits behind its path.
+  mode = 'hold'
+  await transfer('paste', png)
+  await expect.poll(() => uploads.length).toBe(4)
+  await expect(terminal.getByRole('alert')).toHaveText('Uploading image…')
+  await transfer('paste', [], 'after the image')
+  expect(inputs()).toHaveLength(5)
+  mode = 'store'
+  held.release?.()
+  await expect.poll(() => inputs().length).toBe(7)
+  expect(inputs().slice(5)).toEqual([
+    '\u001b[200~/data/yard/pastes/worker-1/20261017-4.png\u001b[201~ ',
+    '\u001b[200~after the image\u001b[201~',
+  ])
+
+  // Unsupported types, refused uploads and an unreachable Yard are explained;
+  // nothing is typed.
+  await transfer('paste', [{ name: 'icon.tiff', type: 'image/tiff' }])
+  await expect(terminal.getByRole('alert')).toContainText(
+    'Image not pasted: image/tiff is not supported',
+  )
+  mode = 'refuse'
+  await transfer('paste', png)
+  await expect(terminal.getByRole('alert')).toHaveText(
+    'Image not pasted: the image is 11.0 MiB; the limit is 10.0 MiB',
+  )
+  expect(uploads).toHaveLength(5)
+  mode = 'abort'
+  await transfer('paste', png)
+  await expect(terminal.getByRole('alert')).toHaveText(
+    'Image not pasted: Yard is offline or unreachable',
+  )
+  expect(uploads).toHaveLength(6)
+  expect(inputs()).toHaveLength(7)
+
+  // The socket closes while an upload is held: once it finishes, nothing is
+  // typed into the old socket or the one that replaces it.
+  mode = 'hold'
+  await transfer('paste', png)
+  await expect.poll(() => uploads.length).toBe(7)
+  await state.terminalSockets[0].close()
+  await expect(terminal).not.toHaveAttribute('data-state', 'connected')
+  held.release?.()
+  await expect(terminal.getByRole('alert')).toHaveText(
+    'Image not pasted: the terminal disconnected during the upload',
+  )
+  expect(inputs()).toHaveLength(7)
+})
+
+test('control keys reach the pane during a stalled image upload, never ahead of earlier typing', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  const held: Array<() => void> = []
+  let uploads = 0
+  await page.route('**/terminal/images', async (route) => {
+    uploads += 1
+    // Never answered while the test runs: a stalled upload.
+    await new Promise<void>((resolve) => {
+      held.push(resolve)
+    })
+    await route.abort('connectionreset').catch(() => {})
+  })
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open terminal', exact: true }).click()
+  const terminal = page.locator('.terminal-session')
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  const textarea = terminal.locator('.xterm-helper-textarea')
+  const inputs = () =>
+    terminalMessagesOfType(state, 'terminal.input').map((message) => message.text)
+  const pasteImage = () =>
+    textarea.evaluate((element) => {
+      const data = new DataTransfer()
+      data.items.add(
+        new File([new Uint8Array([0x89, 0x50, 0x4e])], 'shot.png', { type: 'image/png' }),
+      )
+      element.dispatchEvent(
+        new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: data }),
+      )
+    })
+  const cancelUpload = terminal.getByRole('button', { name: 'Cancel upload' })
+
+  // Typing waits behind the image path. Ctrl-C goes at once, but first
+  // cancels the upload and discards the queued typing, so neither the typing
+  // nor the path ever lands after the interrupt.
+  await pasteImage()
+  await expect.poll(() => uploads).toBe(1)
+  await expect(terminal.getByRole('alert')).toHaveText('Uploading image…')
+  await textarea.focus()
+  await page.keyboard.type('a')
+  await page.keyboard.press('Control+c')
+  await expect.poll(inputs).toEqual(['\u0003'])
+  await expect(terminal.getByRole('alert')).toHaveText(
+    'Upload cancelled; typed input discarded',
+  )
+  await expect(cancelUpload).toHaveCount(0)
+  // Input after the interrupt flows normally, in order.
+  await page.keyboard.type('b')
+  await page.keyboard.press('Escape')
+  await expect.poll(inputs).toEqual(['\u0003', 'b', '\u001b'])
+
+  // A queued Enter is discarded too: the typed command is never submitted.
+  await pasteImage()
+  await expect.poll(() => uploads).toBe(2)
+  await expect(terminal.getByRole('alert')).toHaveText('Uploading image…')
+  await page.keyboard.type('x')
+  await page.keyboard.press('Enter')
+  await page.keyboard.press('Escape')
+  await expect(terminal.getByRole('alert')).toHaveText(
+    'Upload cancelled; typed input discarded',
+  )
+  await expect(cancelUpload).toHaveCount(0)
+  await page.waitForTimeout(300)
+  expect(inputs()).toEqual(['\u0003', 'b', '\u001b', '\u001b'])
+
+  // Cancel upload instead releases the waiting input; no path is typed.
+  await pasteImage()
+  await expect.poll(() => uploads).toBe(3)
+  await page.keyboard.type('c')
+  await cancelUpload.click()
+  await expect(terminal.getByRole('alert')).toHaveText(
+    'Image not pasted: the upload was cancelled',
+  )
+  await expect.poll(inputs).toEqual(['\u0003', 'b', '\u001b', '\u001b', 'c'])
+  await expect(cancelUpload).toHaveCount(0)
+  for (const release of held) release()
+})
+
 test('keeps terminal sizes inside the server range and sends only settled sizes', async ({
   page,
 }) => {

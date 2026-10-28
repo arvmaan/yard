@@ -203,3 +203,14 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.terminal-session__notice-action {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}

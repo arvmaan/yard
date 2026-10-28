@@ -226,6 +226,23 @@ pub trait RuntimeTerminal: Send + Sync {
     ) -> Result<Box<dyn RuntimeTerminalSession>, RuntimeTerminalError>;
 }
 
+/// One of the four kinds of interactive terminal, named the way its
+/// WebSocket route names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalTarget<'a> {
+    Assignment {
+        project_id: &'a str,
+        assignment_id: &'a str,
+    },
+    Orchestrator {
+        project_id: &'a str,
+    },
+    YardOrchestrator,
+    CoordinationNode {
+        node_id: &'a str,
+    },
+}
+
 pub struct OpenedTerminal {
     pub lease: TerminalLease,
     pub session: Box<dyn RuntimeTerminalSession>,
@@ -507,6 +524,87 @@ impl TerminalService {
             return Err(error);
         }
         Ok(OpenedTerminal { lease, session })
+    }
+
+    /// The worker behind a terminal the browser may type into, checked the
+    /// way [`Self::open`] and its siblings check a terminal before attaching
+    /// (active target, unchanged binding and lease) but without taking
+    /// Herdr control. Image pastes use it to file an upload under the
+    /// worker before the browser types the path into its attached socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerminalServiceError`] when the target is not active, has no
+    /// runtime binding, or its binding changed.
+    pub async fn attachable_worker(
+        &self,
+        target: TerminalTarget<'_>,
+    ) -> Result<String, TerminalServiceError> {
+        let lease = match target {
+            TerminalTarget::Assignment {
+                project_id,
+                assignment_id,
+            } => {
+                let assignment = self
+                    .interventions
+                    .assignment(project_id, assignment_id)
+                    .await?;
+                if assignment.lifecycle != AssignmentLifecycle::Active
+                    || assignment.attempt.lifecycle != AttemptLifecycle::Active
+                {
+                    return Err(TerminalServiceError::AssignmentNotActive);
+                }
+                self.interventions.validate_runtime(&assignment).await?;
+                let binding = assignment
+                    .worker
+                    .runtime
+                    .as_ref()
+                    .ok_or(TerminalServiceError::RuntimeBindingMissing)?;
+                assignment_terminal_lease(project_id, assignment_id, &assignment, binding)
+            }
+            TerminalTarget::Orchestrator { project_id } => {
+                let project = self.interventions.project(project_id).await?;
+                self.interventions
+                    .validate_orchestrator_binding(&project)
+                    .await?;
+                let binding = project
+                    .orchestrator
+                    .runtime
+                    .as_ref()
+                    .ok_or(TerminalServiceError::RuntimeBindingMissing)?;
+                orchestrator_terminal_lease(project_id, &project.orchestrator.id, binding)
+            }
+            TerminalTarget::YardOrchestrator => {
+                let orchestrator = self.interventions.yard_orchestrator().await?;
+                self.interventions
+                    .validate_yard_orchestrator_binding(&orchestrator)
+                    .await?;
+                let worker = orchestrator
+                    .worker
+                    .as_ref()
+                    .ok_or(TerminalServiceError::YardOrchestratorNotConfigured)?;
+                let binding = worker
+                    .runtime
+                    .as_ref()
+                    .ok_or(TerminalServiceError::RuntimeBindingMissing)?;
+                yard_orchestrator_terminal_lease(&worker.id, binding)
+            }
+            TerminalTarget::CoordinationNode { node_id } => {
+                let node = self.coordination_nodes.get(node_id).await?;
+                self.coordination_nodes.validate_node_binding(&node).await?;
+                let worker = node
+                    .worker
+                    .as_ref()
+                    .ok_or(TerminalServiceError::CoordinationNodeNotProvisioned)?;
+                let binding = worker
+                    .runtime
+                    .as_ref()
+                    .ok_or(TerminalServiceError::RuntimeBindingMissing)?;
+                coordination_node_terminal_lease(&node.id, node.version, &worker.id, binding)
+            }
+        };
+        self.validate_lease(&lease).await?;
+        Ok(lease.granted_identity().0.to_owned())
     }
 
     /// Confirm that an open terminal still belongs to the same active

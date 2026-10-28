@@ -145,6 +145,7 @@ impl StorageScanSettings {
             config.artifact_path.clone(),
             config.coordination_path.clone(),
             config.knowledge_path.clone(),
+            config.image_paste.path.clone(),
         ];
         excluded_paths.extend(runtime_dir.map(Path::to_path_buf));
         Self {

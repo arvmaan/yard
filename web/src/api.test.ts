@@ -7,7 +7,9 @@ import {
   renameWorker,
   restoreProject,
   fetchSessions,
+  IMAGE_UPLOAD_TIMEOUT_MS,
   TERMINAL_OUTPUT_REQUEST_TIMEOUT_MS,
+  uploadTerminalImage,
 } from './api'
 import type { DisposeAssignmentInput } from './types'
 
@@ -223,6 +225,28 @@ describe('Yard API requests', () => {
     await vi.advanceTimersByTimeAsync(
       TERMINAL_OUTPUT_REQUEST_TIMEOUT_MS - 25_000,
     )
+    await rejection
+  })
+
+  it('abandons a stalled image upload after its deadline', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', vi.fn(stalledFetch))
+    let settled = false
+
+    const result = uploadTerminalImage(
+      { kind: 'yard-orchestrator' },
+      new Blob([new Uint8Array([1])], { type: 'image/png' }),
+    ).finally(() => {
+      settled = true
+    })
+    const rejection = expect(result).rejects.toMatchObject({
+      code: 'request_timeout',
+      message: 'Yard request timed out after 60 seconds',
+    })
+
+    await vi.advanceTimersByTimeAsync(IMAGE_UPLOAD_TIMEOUT_MS - 1)
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
     await rejection
   })
 })

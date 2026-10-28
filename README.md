@@ -301,6 +301,53 @@ loopback `Origin`; this is provenance, not authentication.
 Live Codex and Claude subagents are shown as children connected to their parent
 terminal. Exited subagents are removed from the active tree.
 
+### Pasting images into a terminal
+
+The agents run on the Yard host, so they cannot read the browser's clipboard.
+Pasting (or dropping) a PNG, JPEG, GIF, or WebP image into an attached web
+terminal uploads it to Yard, which stores it as
+`<YARD_IMAGE_PASTE_PATH>/<worker>/<yyyymmdd>-<uuid>.<ext>` (directories `0700`,
+files `0600`) and returns its absolute path. The browser then types each path
+into the pane as its own bracketed paste followed by a space, never Enter, so
+you can keep typing the prompt. Each path is a separate `terminal.input` sent
+about 150 ms apart, because Codex attaches a pasted path only when it is the
+whole paste and Claude Code gathers pastes that arrive close together; text
+pasted together with an image follows as a paste of its own. Typing or text
+pasted while an upload is still running waits until its path has been typed.
+
+Clipboard text that only names the pasted file (a Finder copy, or the image
+URL from Firefox's Copy Image) is dropped. A rich copy from apps such as
+Excel, Numbers, Keynote or Word, whose clipboard holds the text, HTML/RTF and a
+PNG rendering, pastes only the text, as before. Drops of other files are
+refused with a notice rather than opened by the browser.
+
+The image attachment behaviour was checked against the code of Claude Code
+2.1.302 and Codex 0.162.1 (both attach a pasted absolute path ending in an
+image extension); other versions may differ, and a path typed by hand together
+with other text in one paste is not attached by Codex. A live check in an
+isolated rehearsal is still pending.
+
+`YARD_IMAGE_PASTE_PATH` (default `pastes/` beside the database) must be a
+directory used only for pasted images and outside every git worktree: Yard
+refuses to start if it is, contains, or lies inside the data, artifact,
+coordination, knowledge or `YARD_RUNTIME_DIR` directories, contains the
+orchestrator working directory, or sits inside a git checkout. Yard also
+writes a `.yard-image-pastes` marker into the root and will not adopt an
+existing directory that already holds other files.
+
+The upload route is `POST <terminal route>/images` (for example
+`/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal/images`)
+with the raw bytes and their `Content-Type`. It accepts only a loopback `Host`
+and, from a browser, a loopback `Origin`; checks the bytes against the
+declared type; refuses anything over `YARD_IMAGE_PASTE_MAX_BYTES` (draining
+the rest of an oversized body first so the browser sees the 413); buffers at
+most four uploads at a time; and only stores an image for a terminal that
+could be attached right now. Nothing is typed if the terminal disconnected
+during the upload. Each upload prunes images older than
+`YARD_IMAGE_PASTE_RETENTION_DAYS` and keeps at most `YARD_IMAGE_PASTE_MAX_FILES`
+per worker, removing only files whose names Yard generated. Other image types
+(for example TIFF) are refused with a notice.
+
 ## Orchestration
 
 Every project has exactly one project orchestrator. Yard can also provision:
@@ -783,6 +830,10 @@ exclusively owns a database.
 | `YARD_ARTIFACT_PATH` | managed artifact bytes | `artifacts/` beside the database |
 | `YARD_COORDINATION_PATH` | managed workstream directories | `coordination/` beside the database |
 | `YARD_KNOWLEDGE_PATH` | managed knowledge snapshots | `knowledge/` beside the database |
+| `YARD_IMAGE_PASTE_PATH` | images pasted into web terminals ([Pasting images](#pasting-images-into-a-terminal)) | `pastes/` beside the database |
+| `YARD_IMAGE_PASTE_MAX_BYTES` | largest accepted pasted image, 1 B to 64 MiB | `10485760` (10 MiB) |
+| `YARD_IMAGE_PASTE_RETENTION_DAYS` | pasted images older than this many days are pruned on the next paste, 1 to 365 | `7` |
+| `YARD_IMAGE_PASTE_MAX_FILES` | pasted images kept per worker, 1 to 10000 | `200` |
 | `YARD_ORCHESTRATOR_CWD` | working directory for the superintendent | process working directory |
 | `YARD_RUNTIME_DIR` | private base directory for database-scoped lifecycle state and logs | `$XDG_RUNTIME_DIR/yard` or UID-qualified temporary directory |
 | `YARD_STORAGE_ROOTS` | colon-separated absolute directories the read-only storage preview may scan; each must be an existing directory and not itself a symlink, including spellings such as `link/` or `link/.` (symlinked ancestors are fine), for example `/local/home/sample/workspaces:/home/sample/yard`; an invalid or missing entry stops `yard start` with a configuration error (fail closed) | unset: nothing is scanned |
