@@ -754,6 +754,9 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
             "/api/v1/agent-profiles/{profile_id}/dry-run",
             axum::routing::post(dry_run_agent_profile),
         )
+        // Every state-changing API request passes the loopback Host/Origin
+        // guard before its route runs (and so before any body is parsed).
+        .route_layer(axum::middleware::from_fn(guard_state_changing_requests))
         .fallback(web::serve)
         .with_state(AppState {
             store,
@@ -2471,6 +2474,30 @@ async fn get_assignment_transcript(
         .await
         .map(NoStoreJson)
         .map_err(allocation_store_error)
+}
+
+/// Refuse a state-changing (`POST`, `PUT`, `PATCH`, `DELETE`) API request
+/// that fails [`lifecycle_request_origin`], before the route's extractors run.
+/// One guard for every mutating route means a new route cannot forget it, so a
+/// DNS-rebinding page (foreign `Host`) or a cross-site page (foreign `Origin`)
+/// cannot reach any command, including `/delete` with archive preconditions.
+/// Safe methods are left to their routes (the terminal WebSocket upgrade has
+/// its own check).
+async fn guard_state_changing_requests(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !request.method().is_safe() && request.uri().path().starts_with("/api/") {
+        if let Err(error) = lifecycle_request_origin(request.headers()) {
+            let mut response = error.into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            return response;
+        }
+    }
+    next.run(request).await
 }
 
 /// Request guard for lifecycle commands.
@@ -5057,6 +5084,8 @@ struct ErrorBody {
 
 #[cfg(test)]
 mod tests {
+    mod lifecycle_origin_tests;
+
     use std::{
         collections::{BTreeMap, HashMap},
         env,
@@ -18229,6 +18258,37 @@ done
         );
         assert_eq!(preview["automations"], serde_json::json!([]));
         assert_eq!(preview["blockers"], serde_json::json!([]));
+
+        // A DNS-rebinding page can read the preview's versions, but its
+        // archive-and-delete of the active node is refused and changes nothing.
+        let rebinding = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("{node_uri}/delete"))
+                    .header(header::HOST, "yard.attacker.test")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command_id": "rebinding-delete",
+                            "actor": "local-user",
+                            "archive": { "expected_node_version": preview["node_version"] }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_error_code(rebinding, StatusCode::FORBIDDEN, "request_host_forbidden").await;
+        let unchanged = send_node_request(&app, Method::GET, &node_uri, None).await;
+        assert_eq!(unchanged.status(), StatusCode::OK);
+        let unchanged = response_json(unchanged).await;
+        assert_eq!(unchanged["version"], node.version.to_string());
+        // Still active: an archived node would leave the listing.
+        let listed = get_json(&app, "/api/v1/coordination-nodes").await;
+        assert_eq!(listed["nodes"].as_array().unwrap().len(), 1);
 
         let workstream_automation = |command_id: &str| {
             serde_json::json!({
