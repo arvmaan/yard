@@ -23518,6 +23518,8 @@ mod tests {
             role: "orchestrator".to_owned(),
             old_session_disposition: disposition,
             handoff_artifact_ref: Some("artifact://orchestrator-handoff".to_owned()),
+            cwd: None,
+            cwd_in_use_confirmed: false,
         };
         let mut prepared = handoff_runtime("workspace-replacement", "terminal-replacement");
         prepared.provider_session = None;
@@ -35800,6 +35802,8 @@ mod tests {
             role: "orchestrator".to_owned(),
             old_session_disposition: OldSessionDisposition::RetainForInspection,
             handoff_artifact_ref: None,
+            cwd: None,
+            cwd_in_use_confirmed: false,
         };
         let route_first_error = store
             .begin_project_orchestrator_replacement(&project.id, replacement.clone())

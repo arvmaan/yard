@@ -227,6 +227,7 @@ import {
   type ProjectTransferContextEntry,
   type ProjectTransferSnapshot,
 } from './projectTransferContext'
+import { replacementWorkingDirectoryDefault } from './replacementWorkingDirectory'
 import {
   readMapVisualMode,
   writeMapVisualMode,
@@ -1663,6 +1664,8 @@ function ProjectOrchestratorTransferDialog({
 }
 
 interface ProjectOrchestratorReplacementDetails {
+  cwd: string
+  cwdInUseConfirmed: boolean
   objective: string
   profileId: string
   role: string
@@ -1670,6 +1673,8 @@ interface ProjectOrchestratorReplacementDetails {
 
 function ProjectOrchestratorReplacementDialog({
   busy,
+  cwdInUse,
+  defaultCwd,
   error,
   onClose,
   onConfirm,
@@ -1678,6 +1683,9 @@ function ProjectOrchestratorReplacementDialog({
   returnFocus,
 }: {
   busy: boolean
+  // A directory the server refused because a live pane already uses it.
+  cwdInUse: string | null
+  defaultCwd: string
   error: string | null
   onClose: () => void
   onConfirm: (details: ProjectOrchestratorReplacementDetails) => Promise<void>
@@ -1699,6 +1707,10 @@ function ProjectOrchestratorReplacementDialog({
   const [role, setRole] = useState(
     preferredProfile?.default_role ?? 'orchestrator',
   )
+  const [cwd, setCwd] = useState(defaultCwd)
+  const [cwdInUseConfirmed, setCwdInUseConfirmed] = useState(false)
+  const cwdNeedsConfirmation =
+    cwdInUse !== null && cwd.trim() !== '' && cwd.trim() === cwdInUse
   useModalDialog({
     canClose: !busy,
     dialogRef,
@@ -1708,7 +1720,13 @@ function ProjectOrchestratorReplacementDialog({
 
   const submit = (event: FormEvent) => {
     event.preventDefault()
-    void onConfirm({ objective, profileId, role })
+    void onConfirm({
+      cwd,
+      cwdInUseConfirmed: cwdNeedsConfirmation && cwdInUseConfirmed,
+      objective,
+      profileId,
+      role,
+    })
   }
 
   return (
@@ -1781,6 +1799,44 @@ function ProjectOrchestratorReplacementDialog({
               value={role}
             />
           </label>
+          <label>
+            <span>Working directory</span>
+            <input
+              aria-describedby="project-orchestrator-replacement-cwd-help"
+              disabled={busy}
+              maxLength={4096}
+              onChange={(event) => {
+                setCwd(event.target.value)
+                setCwdInUseConfirmed(false)
+              }}
+              placeholder="/absolute/path"
+              value={cwd}
+            />
+          </label>
+          <p
+            className="field-help"
+            id="project-orchestrator-replacement-cwd-help"
+          >
+            Optional. Used only when the previous orchestrator pane is gone and
+            the project workspace has no worktree checkout. Yard never fills
+            this from another pane&apos;s directory.
+          </p>
+          {cwdNeedsConfirmation ? (
+            <label className="checkbox-field">
+              <input
+                checked={cwdInUseConfirmed}
+                disabled={busy}
+                onChange={(event) =>
+                  setCwdInUseConfirmed(event.target.checked)
+                }
+                type="checkbox"
+              />
+              <span>
+                I chose this directory. Start the replacement here even though
+                another pane already uses it.
+              </span>
+            </label>
+          ) : null}
           <div className="end-session-impact">
             <CircleAlert aria-hidden="true" size={17} />
             <p>
@@ -3218,6 +3274,8 @@ function App() {
   const [projectOrchestratorReplacement, setProjectOrchestratorReplacement] =
     useState<{
       commandId: string
+      // Directory the server refused as already in use by a live pane.
+      cwdInUse?: string | null
       projectId: string
       returnFocus: HTMLElement | null
     } | null>(null)
@@ -5280,6 +5338,8 @@ function App() {
 
   const replaceSelectedProjectOrchestrator = useCallback(
     async ({
+      cwd,
+      cwdInUseConfirmed,
       objective,
       profileId,
       role,
@@ -5317,6 +5377,10 @@ function App() {
           role,
           old_session_disposition: 'retain_for_inspection',
           handoff_artifact_ref: null,
+          cwd: cwd.trim() || null,
+          ...(cwdInUseConfirmed && cwd.trim()
+            ? { cwd_in_use_confirmed: true }
+            : {}),
         })
         setProjects((current) =>
           current.map((candidate) =>
@@ -5338,6 +5402,25 @@ function App() {
           loadWorkers(),
         ])
       } catch (caught) {
+        // A working-directory refusal is definitive and recorded against this
+        // command id, so a retry with a chosen directory needs a fresh one.
+        if (
+          caught instanceof YardApiError &&
+          (caught.code === 'runtime_cwd_unavailable' ||
+            caught.code === 'orchestrator_cwd_in_use')
+        ) {
+          const refused =
+            caught.code === 'orchestrator_cwd_in_use' ? cwd.trim() : null
+          setProjectOrchestratorReplacement((current) =>
+            current
+              ? {
+                  ...current,
+                  commandId: crypto.randomUUID(),
+                  cwdInUse: refused,
+                }
+              : current,
+          )
+        }
         setProjectOrchestratorReplacementError(
           caught instanceof Error
             ? caught.message
@@ -8960,6 +9043,11 @@ function App() {
       projectOrchestratorReplacementProject ? (
         <ProjectOrchestratorReplacementDialog
           busy={projectOrchestratorReplacementBusy}
+          cwdInUse={projectOrchestratorReplacement.cwdInUse ?? null}
+          defaultCwd={replacementWorkingDirectoryDefault(
+            projectOrchestratorReplacementProject,
+            inventory,
+          )}
           error={projectOrchestratorReplacementError}
           onClose={() => {
             if (projectOrchestratorReplacementBusy) return

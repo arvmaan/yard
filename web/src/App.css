@@ -6091,6 +6091,24 @@ html[data-yard-allocation-dragging="true"]
   text-transform: uppercase;
 }
 
+.dialog-form .field-help {
+  margin: -7px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.dialog-form label.checkbox-field {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.dialog-form label.checkbox-field > span {
+  font-family: inherit;
+  font-size: 12px;
+  text-transform: none;
+}
+
 .dialog-form input,
 .dialog-form select,
 .dialog-form textarea {
@@ -6112,6 +6130,13 @@ html[data-yard-allocation-dragging="true"]
 .dialog-form textarea {
   resize: vertical;
   line-height: 1.45;
+}
+
+.dialog-form label.checkbox-field input {
+  flex: none;
+  width: auto;
+  height: auto;
+  margin: 2px 0 0;
 }
 
 .dialog-error {

@@ -6,8 +6,9 @@ use std::{
 use async_trait::async_trait;
 use thiserror::Error;
 use yard_domain::{
-    ObservedWorker, RuntimeInventory, RuntimeObservationState, RuntimeProcessState, RuntimeSession,
-    RuntimeSessions, TerminalOutputFormat, TerminalScrollPosition, WorkerRuntimeBinding,
+    ObservedWorker, PaneForegroundJob, RuntimeInventory, RuntimeObservationState,
+    RuntimeProcessState, RuntimeSession, RuntimeSessions, TerminalOutputFormat,
+    TerminalScrollPosition, WorkerRuntimeBinding,
 };
 use yard_herdr::{
     AcquirePaneLeaseRequest, BootstrapAgentRequest, CloseLeasedPaneRequest, DiscoveredHerdrSession,
@@ -153,6 +154,26 @@ pub trait InventorySource: Send + Sync {
         _recheck_budget: &CommandLineRecheckBudget,
     ) -> Result<RuntimeInventory, InventoryServiceError> {
         self.fleet_inventory_for_descriptor(session).await
+    }
+
+    /// The foreground process group of each of `pane_ids` in `session_name`
+    /// (Herdr `pane.process_info`), in request order. A runtime that cannot
+    /// inspect panes reports every pane as failed, so callers that need
+    /// process evidence fail closed.
+    async fn pane_foreground_jobs(
+        &self,
+        _session_name: &str,
+        pane_ids: Vec<String>,
+    ) -> Vec<(String, Result<PaneForegroundJob, String>)> {
+        pane_ids
+            .into_iter()
+            .map(|pane_id| {
+                (
+                    pane_id,
+                    Err("the runtime cannot inspect pane foreground processes".to_owned()),
+                )
+            })
+            .collect()
     }
 
     async fn pane_management_capability(
@@ -356,6 +377,38 @@ impl InventorySource for HerdrInventorySource {
             )
             .await?;
         Ok(self.observe_provider_agents(inventory).await)
+    }
+
+    async fn pane_foreground_jobs(
+        &self,
+        session_name: &str,
+        pane_ids: Vec<String>,
+    ) -> Vec<(String, Result<PaneForegroundJob, String>)> {
+        if pane_ids.is_empty() {
+            return Vec::new();
+        }
+        let session = match self.adapter.discover_sessions().await {
+            Ok(sessions) => sessions
+                .into_iter()
+                .find(|session| session.name() == session_name)
+                .ok_or_else(|| HerdrError::SessionNotFound(session_name.to_owned()).to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        let session = match session {
+            Ok(session) => session,
+            Err(error) => {
+                return pane_ids
+                    .into_iter()
+                    .map(|pane_id| (pane_id, Err(error.clone())))
+                    .collect();
+            }
+        };
+        self.adapter
+            .foreground_jobs_for_discovered_session(&session, pane_ids)
+            .await
+            .into_iter()
+            .map(|(pane_id, result)| (pane_id, result.map_err(|error| error.to_string())))
+            .collect()
     }
 
     async fn session_descriptors(
