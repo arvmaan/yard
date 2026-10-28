@@ -9,6 +9,11 @@ import {
   createScrollGate,
   expireScrollBatch,
   formatTerminalBytes,
+  MAX_PENDING_SCROLL_STEPS,
+  MAX_SCROLL_ANSWER_BYTES_IN_FLIGHT,
+  MAX_SCROLL_BATCHES_IN_FLIGHT,
+  ROUND_TRIP_SAMPLES,
+  MAX_RETURN_SCROLL_COMMANDS,
   MAX_SCROLL_BATCH_COMMANDS,
   MIN_UNTAGGED_ANSWER_ESTIMATE_MS,
   MAX_TERMINAL_COLS,
@@ -19,9 +24,16 @@ import {
   pageScrollMessage,
   pointerTerminalCell,
   readTerminalScreenReaderPreference,
+  queueScrollReturn,
+  scrolledBackCommands,
   type ScrollGate,
+  scrollBatchDeadline,
   scrollBatchMessages,
+  scrollBatchWindow,
   scrollCommandMessage,
+  scrollSendDelay,
+  SCROLL_BATCH_TIMEOUT_MS,
+  SCROLL_SEND_INTERVAL_MS,
   takeScrollBatch,
   TERMINAL_SCREEN_READER_STORAGE_KEY,
   WHEEL_PIXELS_PER_STEP,
@@ -198,7 +210,7 @@ describe('scroll flow control', () => {
     let batch = sent(gate, 1_000, 7)
     expect(batch.commands).toEqual([up, up])
     gate = batch.gate
-    expect(gate.inFlight).toMatchObject({ sentAt: 1_000, afterSeq: 7 })
+    expect(gate.inFlight.at(-1)).toMatchObject({ sentAt: 1_000, afterSeq: 7 })
 
     // More input while the batch is in flight is summed, not sent.
     gate = addWheelSteps(gate, -1.5)
@@ -207,17 +219,17 @@ describe('scroll flow control', () => {
 
     // A frame the browser already had (or an older one) is not the answer.
     gate = answerScrollBatch(gate, { seq: 7 }, 1_130)
-    expect(gate.inFlight).not.toBeNull()
+    expect(gate.inFlight).not.toEqual([])
 
     // The next newer frame is; the summed input then goes as one batch and
     // the half step stays pending.
     gate = answerScrollBatch(gate, { seq: 8 }, 1_136)
-    expect(gate.inFlight).toBeNull()
+    expect(gate.inFlight).toEqual([])
     expect(gate.fastestAnswerMs).toBe(136)
     batch = sent(gate, 1_137, 8)
     expect(batch.commands).toEqual([up, up])
     expect(batch.gate.wheel).toBeCloseTo(-0.5)
-    expect(batch.gate.inFlight).toMatchObject({ afterSeq: 8 })
+    expect(batch.gate.inFlight.at(-1)).toMatchObject({ afterSeq: 8 })
   })
 
   it('caps a batch at five commands and the pending input at five steps', () => {
@@ -262,24 +274,24 @@ describe('scroll flow control', () => {
     // Two wheel steps are one counted message; a page press and a wheel
     // step are two messages.
     let gate = sent(addWheelSteps(createScrollGate(), -2), 1_000, 7, 4).gate
-    expect(gate.inFlight).toMatchObject({ afterSeq: 7, scrolls: 5 })
+    expect(gate.inFlight.at(-1)).toMatchObject({ afterSeq: 7, scrolls: 5 })
     // Herdr's repaint of an earlier batch is newer, and late enough to pass
     // any timing guard, but Yard read it before this batch arrived.
     gate = answerScrollBatch(gate, { seq: 8, scrolls: 4 }, 1_200)
-    expect(gate.inFlight).not.toBeNull()
+    expect(gate.inFlight).not.toEqual([])
     // The first frame read after the batch answers it, however soon.
     gate = answerScrollBatch(gate, { seq: 9, scrolls: 5 }, 1_001)
-    expect(gate.inFlight).toBeNull()
+    expect(gate.inFlight).toEqual([])
     expect(gate.fastestAnswerMs).toBeNull()
 
     gate = addWheelSteps(addPageScroll(gate, 'up'), -1)
     gate = sent(gate, 2_000, 9, 5).gate
-    expect(gate.inFlight).toMatchObject({ scrolls: 7 })
+    expect(gate.inFlight.at(-1)).toMatchObject({ scrolls: 7 })
     gate = answerScrollBatch(gate, { seq: 10, scrolls: 6 }, 2_130)
-    expect(gate.inFlight).not.toBeNull()
+    expect(gate.inFlight).not.toEqual([])
     expect(
       answerScrollBatch(gate, { seq: 11, scrolls: 7 }, 2_140).inFlight,
-    ).toBeNull()
+    ).toEqual([])
   })
 
   it('never lets stale tagged or untagged frames ratchet the gate open', () => {
@@ -295,7 +307,7 @@ describe('scroll flow control', () => {
       })
       let gate = sent(addWheelSteps(createScrollGate(), -1), 0, seq, 0).gate
       gate = answerScrollBatch(gate, frame(1), 125)
-      expect(gate.inFlight).toBeNull()
+      expect(gate.inFlight).toEqual([])
       let answeredEarly = 0
       stale.forEach((latency, index) => {
         const sentAt = 200 * (index + 1)
@@ -303,12 +315,12 @@ describe('scroll flow control', () => {
         gate = sent(addWheelSteps(gate, -1), sentAt, seq, scrolls).gate
         // Tagged, the stale frame still carries the previous batch's count.
         gate = answerScrollBatch(gate, frame(scrolls), sentAt + latency)
-        if (!gate.inFlight) {
+        if (gate.inFlight.length === 0) {
           answeredEarly += 1
           return
         }
         gate = answerScrollBatch(gate, frame(scrolls + 1), sentAt + 125)
-        expect(gate.inFlight).toBeNull()
+        expect(gate.inFlight).toEqual([])
       })
       // Untagged, the 75 ms frame passes the 62.5 ms guard once; accepted
       // answers never lower the guard, so 45, 27, 16, and 17 ms never do.
@@ -324,9 +336,9 @@ describe('scroll flow control', () => {
     gate = sent(addWheelSteps(gate, -1), 200, 1).gate
     // Herdr's second render of the previous batch, 17 ms later.
     gate = answerScrollBatch(gate, { seq: 2 }, 217)
-    expect(gate.inFlight).toMatchObject({ earlyFrameMs: 17 })
+    expect(gate.inFlight.at(-1)).toMatchObject({ earlyFrameMs: 17 })
     gate = answerScrollBatch(gate, { seq: 3 }, 332)
-    expect(gate.inFlight).toBeNull()
+    expect(gate.inFlight).toEqual([])
     expect(gate.fastestAnswerMs).toBe(130)
   })
 
@@ -334,7 +346,7 @@ describe('scroll flow control', () => {
     let gate = sent(addWheelSteps(createScrollGate(), -1), 0, 0).gate
     gate = addWheelSteps(gate, -2)
     gate = expireScrollBatch(gate)
-    expect(gate.inFlight).toBeNull()
+    expect(gate.inFlight).toEqual([])
     expect(gate.fastestAnswerMs).toBeNull()
     expect(sent(gate, 300, 0).commands).toEqual([up, up])
     expect(expireScrollBatch(createScrollGate())).toEqual(createScrollGate())
@@ -345,12 +357,12 @@ describe('scroll flow control', () => {
     gate = answerScrollBatch(gate, { seq: 1 }, 300)
     gate = sent(addWheelSteps(gate, -1), 400, 1).gate
     gate = answerScrollBatch(gate, { seq: 2 }, 460)
-    expect(gate.inFlight).not.toBeNull()
+    expect(gate.inFlight).not.toEqual([])
     gate = expireScrollBatch(gate)
     expect(gate.fastestAnswerMs).toBe(60)
     gate = sent(addWheelSteps(gate, -1), 800, 2).gate
     gate = answerScrollBatch(gate, { seq: 3 }, 860)
-    expect(gate.inFlight).toBeNull()
+    expect(gate.inFlight).toEqual([])
   })
 
   it("never lowers the untagged guard below Herdr's second render after a timeout", () => {
@@ -361,7 +373,7 @@ describe('scroll flow control', () => {
     gate = answerScrollBatch(gate, { seq: (seq += 1) }, 126)
     gate = sent(addWheelSteps(gate, -1), 126, seq).gate
     gate = answerScrollBatch(gate, { seq: (seq += 1) }, 143)
-    expect(gate.inFlight).toMatchObject({ earlyFrameMs: 17 })
+    expect(gate.inFlight.at(-1)).toMatchObject({ earlyFrameMs: 17 })
     gate = expireScrollBatch(gate)
     expect(gate.fastestAnswerMs).toBe(MIN_UNTAGGED_ANSWER_ESTIMATE_MS)
     // Later second renders 17 ms after each send never release a batch.
@@ -369,10 +381,109 @@ describe('scroll flow control', () => {
       const sentAt = 1_000 + batch * 200
       gate = sent(addWheelSteps(gate, -1), sentAt, seq).gate
       gate = answerScrollBatch(gate, { seq: (seq += 1) }, sentAt + 17)
-      expect(gate.inFlight).not.toBeNull()
+      expect(gate.inFlight).not.toEqual([])
       gate = answerScrollBatch(gate, { seq: (seq += 1) }, sentAt + 126)
-      expect(gate.inFlight).toBeNull()
+      expect(gate.inFlight).toEqual([])
     }
+  })
+
+  it('pipelines batches once a tagged answer has measured the round trip', () => {
+    // Until then, one batch at a time.
+    let gate = sent(addWheelSteps(createScrollGate(), -1), 0, 1, 0).gate
+    expect(scrollBatchWindow(gate)).toBe(1)
+    expect(scrollSendDelay(gate, 50)).toBeNull()
+    gate = answerScrollBatch(gate, { seq: 2, scrolls: 1, bytes: 700 }, 90)
+    expect(gate).toMatchObject({ roundTripMs: 90, answerBytes: 700 })
+    // One batch per 16 ms of round trip, plus one: 7.
+    expect(scrollBatchWindow(gate)).toBe(Math.ceil(90 / 16) + 1)
+    // Nothing in flight: the next batch leaves at once.
+    expect(scrollSendDelay(gate, 91)).toBe(0)
+    let scrolls = 1
+    let now = 100
+    for (let batch = 0; batch < 7; batch += 1) {
+      gate = addWheelSteps(gate, -1)
+      // Within the send interval the step waits.
+      if (batch > 0) {
+        expect(sent(gate, now - 1, 2, scrolls).commands).toEqual([])
+        expect(scrollSendDelay(gate, now - 1)).toBe(1)
+      }
+      const next = sent(gate, now, 2, scrolls)
+      expect(next.commands).toEqual([up])
+      gate = next.gate
+      scrolls += 1
+      now += SCROLL_SEND_INTERVAL_MS
+    }
+    // The window is full: input waits for an answer or the timeout.
+    gate = addWheelSteps(gate, -2)
+    expect(scrollSendDelay(gate, now)).toBeNull()
+    expect(sent(gate, now, 2, scrolls).commands).toEqual([])
+    // Tags are cumulative: one frame answers every batch it covers, so a
+    // batch the app never repainted for does not hold the rest.
+    gate = answerScrollBatch(gate, { seq: 3, scrolls: 4 }, now + 1)
+    expect(gate.inFlight.map((flight) => flight.scrolls)).toEqual([5, 6, 7, 8])
+    expect(gate.answerBytes).toBe(700)
+    expect(sent(gate, now + 1, 3, scrolls).commands).toEqual([up, up])
+  })
+
+  it('sizes the window from recent answers, so a slower path widens it', () => {
+    let gate = createScrollGate()
+    let scrolls = 0
+    let now = 0
+    const answerAfter = (latency: number) => {
+      gate = sent(addWheelSteps(gate, -1), now, 1, scrolls).gate
+      scrolls += 1
+      gate = answerScrollBatch(gate, { seq: 2, scrolls }, now + latency)
+      now += 1_000
+    }
+    answerAfter(20)
+    expect(gate.roundTripMs).toBe(20)
+    // One slow answer does not widen it: the fastest recent one counts.
+    answerAfter(100)
+    expect(gate.roundTripMs).toBe(20)
+    // Once the fast answer is older than the samples, the slower path does.
+    for (let answer = 1; answer < ROUND_TRIP_SAMPLES; answer += 1) {
+      answerAfter(100)
+    }
+    expect(gate.recentRoundTrips).toHaveLength(ROUND_TRIP_SAMPLES)
+    expect(gate.roundTripMs).toBe(100)
+    expect(scrollBatchWindow(gate)).toBe(Math.ceil(100 / 16) + 1)
+    // Input keeps the samples.
+    expect(clearScrollGate(gate).recentRoundTrips).toEqual(
+      gate.recentRoundTrips,
+    )
+  })
+
+  it('times out only the batches past their deadline', () => {
+    let gate: ScrollGate = { ...createScrollGate(), roundTripMs: 40 }
+    gate = sent(addWheelSteps(gate, -1), 0, 1, 0).gate
+    gate = sent(addWheelSteps(gate, -1), 20, 1, 1).gate
+    expect(scrollBatchDeadline(gate)).toBe(SCROLL_BATCH_TIMEOUT_MS)
+    gate = expireScrollBatch(gate, SCROLL_BATCH_TIMEOUT_MS)
+    expect(gate.inFlight.map((flight) => flight.sentAt)).toEqual([20])
+    expect(scrollBatchDeadline(gate)).toBe(20 + SCROLL_BATCH_TIMEOUT_MS)
+    expect(expireScrollBatch(gate).inFlight).toEqual([])
+    expect(scrollBatchDeadline(createScrollGate())).toBeNull()
+  })
+
+  it('keeps the window within the round trip, the cap, and the answer bytes', () => {
+    const gate = createScrollGate()
+    expect(scrollBatchWindow({ ...gate, roundTripMs: 0 })).toBe(1)
+    expect(scrollBatchWindow({ ...gate, roundTripMs: 10 })).toBe(2)
+    expect(scrollBatchWindow({ ...gate, roundTripMs: 36 })).toBe(4)
+    expect(scrollBatchWindow({ ...gate, roundTripMs: 500 })).toBe(
+      MAX_SCROLL_BATCHES_IN_FLIGHT,
+    )
+    // A shell repainting its scrollback: ~30 KB per answer.
+    expect(
+      scrollBatchWindow({ ...gate, roundTripMs: 130, answerBytes: 30_000 }),
+    ).toBe(Math.floor(MAX_SCROLL_ANSWER_BYTES_IN_FLIGHT / 30_000))
+    expect(
+      scrollBatchWindow({ ...gate, roundTripMs: 130, answerBytes: 200_000 }),
+    ).toBe(1)
+    // Input keeps what the connection has measured.
+    expect(
+      clearScrollGate({ ...gate, roundTripMs: 36, answerBytes: 700 }),
+    ).toMatchObject({ roundTripMs: 36, answerBytes: 700, inFlight: [] })
   })
 
   it('drops pending input and the in-flight batch on input, keeping the guard', () => {
@@ -532,5 +643,118 @@ describe('pageScrollMessage', () => {
     expect(pageScrollMessage(key('PageUp', { ctrlKey: true }), 40)).toBeNull()
     expect(pageScrollMessage(key('PageDown', { altKey: true }), 40)).toBeNull()
     expect(pageScrollMessage(key('PageUp', { metaKey: true }), 40)).toBeNull()
+  })
+})
+
+describe('returning a scrolled-back view to the latest output', () => {
+  const up = { direction: 'up', source: 'wheel' } as const
+
+  it('counts net wheel and page commands, never below zero', () => {
+    let net = { wheel: 0, pages: 0 }
+    net = scrolledBackCommands(net, { ...up, count: 5 })
+    net = scrolledBackCommands(net, up)
+    net = scrolledBackCommands(net, {
+      direction: 'down',
+      source: 'wheel',
+      count: 2,
+    })
+    net = scrolledBackCommands(net, { direction: 'up', source: 'page_key' })
+    expect(net).toEqual({ wheel: 4, pages: 1 })
+    net = scrolledBackCommands(net, {
+      direction: 'down',
+      source: 'wheel',
+      count: 5,
+    })
+    net = scrolledBackCommands(net, { direction: 'down', source: 'page_key' })
+    net = scrolledBackCommands(net, { direction: 'down', source: 'page_key' })
+    expect(net).toEqual({ wheel: 0, pages: 0 })
+  })
+
+  it('queues the same commands down, paced by the gate and uncapped by input limits', () => {
+    const flying = takeScrollBatch(
+      addWheelSteps(createScrollGate(), -3),
+      0,
+      1,
+      0,
+    ).gate
+    let gate = queueScrollReturn(
+      { ...flying, fastestAnswerMs: 90 },
+      { wheel: 12, pages: 1 },
+    )
+    expect(gate).toEqual({
+      ...createScrollGate(),
+      wheel: 12,
+      pages: 1,
+      returning: true,
+      fastestAnswerMs: 90,
+    })
+    const sent: string[] = []
+    for (let seq = 2; ; seq += 1) {
+      const batch = takeScrollBatch(gate, seq * 100, seq, sent.length)
+      if (batch.commands.length === 0) break
+      sent.push(
+        ...batch.commands.map(
+          (command) => command.source + ':' + command.direction,
+        ),
+      )
+      expect(batch.commands.length).toBeLessThanOrEqual(
+        MAX_SCROLL_BATCH_COMMANDS,
+      )
+      gate = answerScrollBatch(
+        batch.gate,
+        { seq: seq + 1, scrolls: sent.length + 99 },
+        seq * 100 + 50,
+      )
+    }
+    expect(sent).toEqual(['page_key:down', ...Array(12).fill('wheel:down')])
+  })
+
+  it('queues nothing when the view did not scroll, caps a long return, and yields to input', () => {
+    expect(
+      queueScrollReturn(createScrollGate(), { wheel: 0, pages: 0 }),
+    ).toEqual(createScrollGate())
+    const long = queueScrollReturn(createScrollGate(), {
+      wheel: 5000,
+      pages: 20,
+    })
+    expect(long.pages + long.wheel).toBe(MAX_RETURN_SCROLL_COMMANDS)
+    expect(long.pages).toBe(20)
+    // Scrolling up again cancels the rest of the return.
+    expect(addWheelSteps(long, -1)).toMatchObject({
+      wheel: -1,
+      pages: 0,
+      returning: false,
+    })
+  })
+
+  it('adds input the same way on top of a return instead of capping it', () => {
+    let gate = queueScrollReturn(createScrollGate(), { wheel: 40, pages: 2 })
+    gate = takeScrollBatch(gate, 0, 1, 0).gate
+    expect(gate).toMatchObject({ wheel: 37, pages: 0, returning: true })
+    gate = addWheelSteps(gate, 1.5)
+    expect(gate).toMatchObject({ wheel: 38.5, returning: true })
+    gate = addPageScroll(gate, 'down')
+    expect(gate).toMatchObject({ wheel: 38.5, pages: 1, returning: true })
+    // Draining the return ends it: later input is capped again.
+    gate = expireScrollBatch(gate)
+    let sent = 0
+    for (let seq = 2; ; seq += 1) {
+      const batch = takeScrollBatch(gate, seq * 100, seq, sent)
+      if (batch.commands.length === 0) break
+      sent += batch.commands.length
+      gate = expireScrollBatch(batch.gate)
+    }
+    expect(sent).toBe(39)
+    expect(gate).toMatchObject({ wheel: 0.5, pages: 0, returning: false })
+    expect(addWheelSteps(gate, 20).wheel).toBe(MAX_PENDING_SCROLL_STEPS)
+    // A return still cancels on input the other way, which is capped.
+    const cancelled = addWheelSteps(
+      queueScrollReturn(createScrollGate(), { wheel: 30, pages: 0 }),
+      -20,
+    )
+    expect(cancelled).toMatchObject({
+      wheel: -MAX_PENDING_SCROLL_STEPS,
+      returning: false,
+    })
   })
 })

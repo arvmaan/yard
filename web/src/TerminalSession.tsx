@@ -47,13 +47,17 @@ import {
   clearScrollGate,
   createScrollGate,
   expireScrollBatch,
+  scrollBatchDeadline,
+  scrollSendDelay,
   formatTerminalBytes,
   pageScrollMessage,
   pointerTerminalCell,
   readTerminalScreenReaderPreference,
   pageScrollLines,
-  SCROLL_BATCH_TIMEOUT_MS,
+  queueScrollReturn,
   scrollBatchMessages,
+  type ScrolledBackCommands,
+  scrolledBackCommands,
   takeScrollBatch,
   type TerminalCell,
   type TerminalSize,
@@ -277,9 +281,10 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
     let connectAnimationFrame = 0
     let frameAnimationFrame = 0
     let resizeSendTimer = 0
-    // Scroll flow control: at most one batch waits for Herdr's repaint.
+    // Scroll flow control: a window of batches waits for Herdr's repaints.
     let scrollGate = createScrollGate()
     let scrollTimeoutTimer = 0
+    let scrollPaceTimer = 0
     // `terminal.scroll` messages sent on this socket; Yard tags each frame
     // with how many of them it had forwarded when it read the frame.
     let scrollMessagesSent = 0
@@ -288,12 +293,16 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
     let lastSequence = -1
     let lastSentSize = ''
     let frameWriteQueue = Promise.resolve()
-    // Net lines this view has asked Herdr to scroll up since the last input
-    // or reset. An approximation for mouse-aware apps (one report per
-    // command), exact for Herdr's own scrollback.
-    let scrolledUpLines = 0
-    // Signed lines (negative = up) of the scroll batch Herdr has not answered.
-    let inFlightScrollLines = 0
+    // Net wheel and page commands this view has sent up since the last
+    // input or reset. Herdr turned each into a scroll of its own scrollback
+    // or into one wheel report or key for a full-screen app, so "Jump to
+    // latest" can undo them (queueScrollReturn). During a return it counts
+    // the return commands not yet sent, so a return cancelled by scrolling
+    // up again keeps the unsent remainder.
+    let scrolledUp: ScrolledBackCommands = { wheel: 0, pages: 0 }
+    // Signed lines (negative = up) of each scroll batch Herdr has not
+    // answered, by the batch's tag (`scrolls`).
+    let inFlightScrollLines: { scrolls: number; lines: number }[] = []
     // Local history mode (terminalHistory.ts). `historyRecords` describe the
     // last `historyRecords.length` rows of the history view's buffer.
     let history: TerminalHistoryView | null = null
@@ -343,24 +352,26 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
     setHistoryNote(null)
     setHistoryTail('current')
 
-    const trackScroll = (direction: 'up' | 'down', lines: number) => {
-      scrolledUpLines = Math.max(
-        0,
-        scrolledUpLines + (direction === 'up' ? lines : -lines),
-      )
-      if (!disposed) setScrolledBack(scrolledUpLines > 0)
+    const trackScroll = (message: TerminalScrollMessage) => {
+      scrolledUp = scrolledBackCommands(scrolledUp, message)
+      // A "Jump to latest" return in progress already shows the view as live.
+      if (!disposed) {
+        setScrolledBack(
+          !scrollGate.returning && scrolledUp.wheel + scrolledUp.pages > 0,
+        )
+      }
     }
 
     // Any input makes Herdr return the pane to its latest output.
     const clearScrolledBack = () => {
-      scrolledUpLines = 0
+      scrolledUp = { wheel: 0, pages: 0 }
       if (!disposed) setScrolledBack(false)
     }
 
     const sendScroll = (message: TerminalScrollMessage) => {
       if (!socket || !sendMessage(socket, message)) return false
       scrollMessagesSent += 1
-      trackScroll(message.direction, message.lines * (message.count ?? 1))
+      trackScroll(message)
       return true
     }
 
@@ -626,10 +637,16 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       )
     }
 
-    // Scroll input Herdr has not painted yet: the batch in flight and what
+    // Scroll input Herdr has not painted yet: the batches in flight and what
     // is still queued. History mode applies it locally at the handoff.
+    const scrollBatchInFlight = (scrolls: number) =>
+      scrollGate.inFlight.some((flight) => flight.scrolls === scrolls)
     const unshownScrollLines = () =>
-      (scrollGate.inFlight ? inFlightScrollLines : 0) +
+      inFlightScrollLines.reduce(
+        (sum, batch) =>
+          scrollBatchInFlight(batch.scrolls) ? sum + batch.lines : sum,
+        0,
+      ) +
       Math.trunc(scrollGate.wheel) * WHEEL_LINES_PER_SCROLL +
       scrollGate.pages * pageScrollLines(targetSize.rows)
 
@@ -1058,14 +1075,43 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
     const clearScrollTimeout = () => {
       if (scrollTimeoutTimer) window.clearTimeout(scrollTimeoutTimer)
       scrollTimeoutTimer = 0
+      if (scrollPaceTimer) window.clearTimeout(scrollPaceTimer)
+      scrollPaceTimer = 0
     }
 
     const resetScrollGate = () => {
       scrollGate = clearScrollGate(scrollGate)
+      inFlightScrollLines = []
       clearScrollTimeout()
     }
 
-    // Send the pending scroll input as one batch if none is in flight. The
+    // The timeout of the oldest batch in flight, and the send interval when
+    // whole commands wait for it.
+    const scheduleScrollTimers = (now: number) => {
+      clearScrollTimeout()
+      const deadline = scrollBatchDeadline(scrollGate)
+      if (deadline !== null) {
+        scrollTimeoutTimer = window.setTimeout(() => {
+          scrollTimeoutTimer = 0
+          if (disposed) return
+          scrollGate = expireScrollBatch(scrollGate, performance.now())
+          startDeferredHistoryProbe()
+          pumpScroll()
+        }, Math.max(0, deadline - now))
+      }
+      const delay = scrollSendDelay(scrollGate, now)
+      const pending =
+        scrollGate.pages !== 0 ||
+        Math.trunc(Math.abs(scrollGate.wheel) + 1e-6) > 0
+      if (pending && delay !== null && delay > 0) {
+        scrollPaceTimer = window.setTimeout(() => {
+          scrollPaceTimer = 0
+          pumpScroll()
+        }, delay)
+      }
+    }
+
+    // Send the pending scroll input as a batch if the window has room. Each
     // batch is answered by the first frame Yard read after the batch reached
     // Herdr (see answerScrollBatch) or by the timeout, and whatever
     // accumulated meanwhile goes next.
@@ -1075,47 +1121,51 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
         resetScrollGate()
         return
       }
+      const now = performance.now()
       const batch = takeScrollBatch(
         scrollGate,
-        performance.now(),
+        now,
         lastSequence,
         scrollMessagesSent,
       )
-      if (batch.commands.length === 0) return
+      if (batch.commands.length === 0) {
+        scheduleScrollTimers(now)
+        return
+      }
       scrollGate = batch.gate
       const cell = batch.commands.some((command) => command.source === 'wheel')
         ? wheelCell()
         : null
-      inFlightScrollLines = 0
+      let lines = 0
       for (const message of scrollBatchMessages(
         batch.commands,
         cell,
         targetSize.rows,
       )) {
         if (!sendScroll(message)) break
-        inFlightScrollLines +=
+        lines +=
           (message.direction === 'up' ? -1 : 1) *
           message.lines *
           (message.count ?? 1)
       }
+      const sentBatch = scrollGate.inFlight[scrollGate.inFlight.length - 1]
+      inFlightScrollLines = [
+        ...inFlightScrollLines.filter((entry) =>
+          scrollBatchInFlight(entry.scrolls),
+        ),
+        { scrolls: sentBatch.scrolls, lines },
+      ]
       // A scroll-up is on its way to Herdr: read history right behind it.
       // For a pane that last showed a full-screen app, the read waits until
       // Herdr has answered the scroll: a response that reached the browser
       // first would push Herdr's frame past the tunnel's first congestion
       // window and delay the native scroll by a round trip. If the app has
       // since exited, history mode opens one round trip later.
-      if (inFlightScrollLines < 0) {
+      if (lines < 0) {
         if (historyProbeMaxOffset === 0) historyProbeAfterFrame = true
         else startHistoryProbe()
       }
-      clearScrollTimeout()
-      scrollTimeoutTimer = window.setTimeout(() => {
-        scrollTimeoutTimer = 0
-        if (disposed) return
-        scrollGate = expireScrollBatch(scrollGate)
-        startDeferredHistoryProbe()
-        pumpScroll()
-      }, SCROLL_BATCH_TIMEOUT_MS)
+      scheduleScrollTimers(now)
     }
 
     const inputSubscription = terminal.onData((text) => {
@@ -1176,8 +1226,9 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
     // TUIs such as full-screen Claude Code get wheel reports) or its own
     // pane scrollback, then sends the repainted viewport. Each step is one
     // notch-sized command, because Herdr turns each command into exactly one
-    // wheel report for a mouse-aware app. The first batch leaves at once;
-    // later input is summed until Herdr answers.
+    // wheel report for a mouse-aware app. A batch leaves at once when the
+    // window has room (see scrollBatchWindow); otherwise input is summed
+    // until the send interval passes or Herdr answers.
     const handleWheel = (event: WheelEvent) => {
       // The history view scrolls itself, locally.
       if (history?.element.contains(event.target as Node)) return
@@ -1248,8 +1299,15 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
     jumpToLatestRef.current = () => {
       exitHistory()
       if (socket && sendMessage(socket, { type: 'terminal.scroll_reset' })) {
-        clearScrolledBack()
-        resetScrollGate()
+        // The reset returns Herdr's own scrollback. A full-screen app
+        // (Claude Code, Codex) scrolled its transcript itself, so this
+        // view's wheel and page commands go back down too. `scrolledUp`
+        // keeps the queued return and drops as its commands are sent.
+        clearScrollTimeout()
+        scrollGate = queueScrollReturn(scrollGate, scrolledUp)
+        scrolledUp = { wheel: scrollGate.wheel, pages: scrollGate.pages }
+        if (!disposed) setScrolledBack(false)
+        pumpScroll()
       }
       terminal.focus()
     }
@@ -1281,11 +1339,17 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
         await writeTerminal(terminal, frameBytes)
         if (disposed) return
         if (screenReaderMode) clearLiveRegion()
-        const waiting = scrollGate.inFlight
-        scrollGate = answerScrollBatch(scrollGate, message, performance.now())
-        if (waiting && !scrollGate.inFlight) {
-          inFlightScrollLines = 0
-          clearScrollTimeout()
+        const waiting = scrollGate.inFlight.length
+        scrollGate = answerScrollBatch(
+          scrollGate,
+          {
+            seq: message.seq,
+            scrolls: message.scrolls,
+            bytes: frameBytes.length,
+          },
+          performance.now(),
+        )
+        if (scrollGate.inFlight.length < waiting) {
           startDeferredHistoryProbe()
           pumpScroll()
         }
