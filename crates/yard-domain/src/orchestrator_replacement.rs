@@ -8,6 +8,7 @@ const MAX_ACTOR_BYTES: usize = 120;
 const MAX_OBJECTIVE_BYTES: usize = 16_000;
 const MAX_ROLE_BYTES: usize = 240;
 const MAX_ARTIFACT_REF_BYTES: usize = 2_048;
+const MAX_CWD_BYTES: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +38,18 @@ pub struct ReplaceProjectOrchestrator {
     pub old_session_disposition: OldSessionDisposition,
     #[serde(default)]
     pub handoff_artifact_ref: Option<String>,
+    /// Operator-chosen working directory for the replacement. It is used only
+    /// when the displaced provider identity is absent from fresh inventory and
+    /// the project workspace has no worktree checkout; otherwise it is
+    /// ignored. The server validates and canonicalises it before use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The operator explicitly confirmed `cwd` even though a live pane or
+    /// worker in the session already uses that directory. Without this, the
+    /// server refuses a chosen directory that another pane occupies, so a
+    /// reused or unrelated pane's directory is never borrowed silently.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cwd_in_use_confirmed: bool,
 }
 
 impl ReplaceProjectOrchestrator {
@@ -64,6 +77,22 @@ impl ReplaceProjectOrchestrator {
             .handoff_artifact_ref
             .map(|value| required("handoff_artifact_ref", &value, MAX_ARTIFACT_REF_BYTES))
             .transpose()?;
+        self.cwd = self
+            .cwd
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        self.cwd_in_use_confirmed &= self.cwd.is_some();
+        if let Some(cwd) = self.cwd.as_deref() {
+            if cwd.len() > MAX_CWD_BYTES {
+                return Err(OrchestratorReplacementValidationError::TooLong {
+                    field: "cwd",
+                    max: MAX_CWD_BYTES,
+                });
+            }
+            if !cwd.starts_with('/') || cwd.contains('\0') {
+                return Err(OrchestratorReplacementValidationError::InvalidCwd);
+            }
+        }
         self.expected_orchestrator_runtime = self
             .expected_orchestrator_runtime
             .normalize()
@@ -124,6 +153,8 @@ pub enum OrchestratorReplacementValidationError {
     InvalidRuntime(String),
     #[error("a runtime that owns its tab must include tab_id")]
     InvalidTabOwnership,
+    #[error("cwd must be an absolute path")]
+    InvalidCwd,
 }
 
 fn required(
@@ -191,7 +222,33 @@ mod tests {
             role: " orchestrator ".to_owned(),
             old_session_disposition: OldSessionDisposition::RetireAfterCutover,
             handoff_artifact_ref: Some(" artifact://handoff ".to_owned()),
+            cwd: None,
+            cwd_in_use_confirmed: false,
         }
+    }
+
+    #[test]
+    fn normalizes_optional_working_directory() {
+        let mut blank = command();
+        blank.cwd = Some("   ".to_owned());
+        blank.cwd_in_use_confirmed = true;
+        let blank = blank.normalize().unwrap();
+        assert_eq!(blank.cwd, None);
+        assert!(!blank.cwd_in_use_confirmed);
+
+        let mut chosen = command();
+        chosen.cwd = Some(" /work/project ".to_owned());
+        assert_eq!(
+            chosen.normalize().unwrap().cwd.as_deref(),
+            Some("/work/project")
+        );
+
+        let mut relative = command();
+        relative.cwd = Some("work/project".to_owned());
+        assert_eq!(
+            relative.normalize(),
+            Err(OrchestratorReplacementValidationError::InvalidCwd)
+        );
     }
 
     #[test]

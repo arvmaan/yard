@@ -1229,6 +1229,34 @@ mod source_tests {
     }
 
     #[tokio::test]
+    async fn pane_foreground_jobs_reports_the_pane_process_group_and_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        let herdr = Arc::new(FakeHerdr::default());
+        let source = fake_source(&temp, &herdr);
+        herdr.set(codex(None), "codex --yolo");
+
+        let jobs = source
+            .pane_foreground_jobs("default", vec!["w1:pB".to_owned()])
+            .await;
+        assert_eq!(jobs.len(), 1);
+        let job = jobs[0].1.as_ref().unwrap();
+        assert_eq!(job.process_group_id, Some(20));
+        assert_eq!(job.processes[0].name, "codex");
+
+        let missing = source
+            .pane_foreground_jobs("no-such-session", vec!["w1:pB".to_owned()])
+            .await;
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].1.is_err());
+        assert!(
+            source
+                .pane_foreground_jobs("default", Vec::new())
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_snapshots_share_one_first_sight_inspection() {
         let temp = TempDir::new().unwrap();
         let herdr = Arc::new(FakeHerdr::default());

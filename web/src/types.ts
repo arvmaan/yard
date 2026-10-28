@@ -705,6 +705,11 @@ export interface ReplaceProjectOrchestratorInput {
   role: string
   old_session_disposition: 'retain_for_inspection'
   handoff_artifact_ref: null
+  // Used by the server only when the displaced orchestrator is gone and the
+  // project workspace has no worktree checkout.
+  cwd?: string | null
+  // The operator confirmed `cwd` although a live pane already uses it.
+  cwd_in_use_confirmed?: boolean
 }
 
 export interface ReplacedProjectOrchestrator {

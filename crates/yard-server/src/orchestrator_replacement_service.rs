@@ -1,5 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
@@ -36,6 +38,9 @@ pub struct OrchestratorReplacementService {
     store: Arc<dyn YardStore>,
     cleanup: RuntimeCleanupService,
     active_operations: Arc<ReplacementOperations>,
+    /// Yard's own data and lifecycle runtime paths; an operator-chosen
+    /// replacement working directory may not be inside one.
+    protected_paths: Arc<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -109,7 +114,33 @@ impl OrchestratorReplacementService {
             runtime,
             store,
             active_operations,
+            protected_paths: Arc::new(Vec::new()),
         }
+    }
+
+    /// Refuse operator-chosen working directories inside these Yard-owned
+    /// paths. A protected path that is an existing regular file (the
+    /// database and its journals) also protects its parent directory, which
+    /// is Yard's data directory.
+    #[must_use]
+    pub fn with_protected_paths(mut self, paths: &[PathBuf]) -> Self {
+        self.protected_paths = Arc::new(Self::protected_path_set(paths));
+        self
+    }
+
+    fn protected_path_set(paths: &[PathBuf]) -> Vec<PathBuf> {
+        let mut protected = Vec::new();
+        for path in paths {
+            protected.push(path.clone());
+            if path.is_file()
+                && let Some(parent) = path.parent()
+            {
+                protected.push(parent.to_path_buf());
+            }
+        }
+        protected.sort();
+        protected.dedup();
+        protected
     }
 
     async fn begin_active_replacement(
@@ -512,7 +543,10 @@ impl OrchestratorReplacementService {
         project_id: &str,
         command: ReplaceProjectOrchestrator,
     ) -> Result<ReplacedProjectOrchestrator, OrchestratorReplacementServiceError> {
-        let command = command.normalize()?;
+        let mut command = command.normalize()?;
+        if let Some(cwd) = command.cwd.take() {
+            command.cwd = Some(validate_operator_cwd(&cwd, &self.protected_paths).await?);
+        }
         let command_id = command.command_id.clone();
         let _active = self.begin_active_replacement(&command_id).await?;
         let context = match self
@@ -550,6 +584,10 @@ impl OrchestratorReplacementService {
             .verify_target_and_displaced_runtime(
                 &context.project,
                 &context.command.expected_orchestrator_runtime,
+                context.command.cwd.as_deref(),
+                OperatorCwdCheck::BeforeStart {
+                    in_use_confirmed: context.command.cwd_in_use_confirmed,
+                },
             )
             .await
         {
@@ -769,6 +807,9 @@ impl OrchestratorReplacementService {
             .verify_target_and_displaced_runtime(
                 &context.project,
                 &context.command.expected_orchestrator_runtime,
+                context.command.cwd.as_deref(),
+                // The started replacement now runs in the chosen directory.
+                OperatorCwdCheck::AfterStart,
             )
             .await
         {
@@ -797,9 +838,36 @@ impl OrchestratorReplacementService {
         &self,
         project: &Project,
         expected: &WorkerRuntimeBinding,
+        operator_cwd: Option<&str>,
+        check: OperatorCwdCheck,
     ) -> Result<String, OrchestratorReplacementServiceError> {
         let inventory = self.source.inventory(&project.runtime.session).await?;
-        displaced_runtime_cwd(&project.runtime, expected, &inventory)
+        let candidates = same_tab_panes_needing_shell_confirmation(expected, &inventory);
+        let idle_shells = if candidates.is_empty() {
+            HashSet::new()
+        } else {
+            confirmed_idle_shell_panes(
+                self.source
+                    .pane_foreground_jobs(&project.runtime.session, candidates)
+                    .await,
+            )
+        };
+        let resolved = resolve_displaced_runtime_cwd(
+            &project.runtime,
+            expected,
+            &inventory,
+            &idle_shells,
+            operator_cwd,
+        )?;
+        if resolved.operator_chosen
+            && check
+                == (OperatorCwdCheck::BeforeStart {
+                    in_use_confirmed: false,
+                })
+        {
+            refuse_operator_cwd_in_use(&resolved.path, &inventory).await?;
+        }
+        Ok(resolved.path)
     }
 
     async fn verify_replacement_runtime(
@@ -883,11 +951,58 @@ impl OrchestratorReplacementService {
     }
 }
 
+/// `idle_shells` holds the runtime ids of panes whose Herdr foreground
+/// process group was inspected and found to be only an interactive shell (see
+/// [`confirmed_idle_shell_panes`]); every other pane is treated as possibly
+/// hosting an agent Herdr has not identified.
+///
+/// `operator_cwd` is the validated, operator-chosen working directory. It is
+/// used only when the displaced runtime is absent from fresh inventory and the
+/// project workspace has no worktree checkout; it never overrides the exact
+/// displaced runtime's directory or the workspace worktree.
+#[cfg(test)]
 fn displaced_runtime_cwd(
     project: &ProjectRuntimeBinding,
     expected: &WorkerRuntimeBinding,
     inventory: &RuntimeInventory,
+    idle_shells: &HashSet<String>,
+    operator_cwd: Option<&str>,
 ) -> Result<String, OrchestratorReplacementServiceError> {
+    resolve_displaced_runtime_cwd(project, expected, inventory, idle_shells, operator_cwd)
+        .map(|resolved| resolved.path)
+}
+
+/// A resolved replacement working directory and whether it is the operator's
+/// chosen directory (as opposed to the worktree or the displaced runtime's own).
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedCwd {
+    path: String,
+    operator_chosen: bool,
+}
+
+impl ResolvedCwd {
+    fn derived(path: String) -> Self {
+        Self {
+            path,
+            operator_chosen: false,
+        }
+    }
+
+    fn operator(path: &str) -> Self {
+        Self {
+            path: path.to_owned(),
+            operator_chosen: true,
+        }
+    }
+}
+
+fn resolve_displaced_runtime_cwd(
+    project: &ProjectRuntimeBinding,
+    expected: &WorkerRuntimeBinding,
+    inventory: &RuntimeInventory,
+    idle_shells: &HashSet<String>,
+    operator_cwd: Option<&str>,
+) -> Result<ResolvedCwd, OrchestratorReplacementServiceError> {
     if project.adapter != expected.adapter
         || project.session != expected.session
         || project.workspace_id != expected.workspace_id
@@ -932,9 +1047,21 @@ fn displaced_runtime_cwd(
         .map(|worktree| worktree.checkout_path.clone());
 
     let Some(provider_session) = expected.provider_session.as_ref() else {
-        return providerless_displaced_runtime_cwd(expected, inventory, workspace_cwd.as_deref());
+        return providerless_displaced_runtime_cwd(
+            expected,
+            inventory,
+            workspace_cwd.as_deref(),
+            operator_cwd,
+        );
     };
-    provider_displaced_runtime_cwd(expected, inventory, workspace_cwd, provider_session)
+    provider_displaced_runtime_cwd(
+        expected,
+        inventory,
+        workspace_cwd,
+        provider_session,
+        idle_shells,
+        operator_cwd,
+    )
 }
 
 fn provider_displaced_runtime_cwd(
@@ -942,7 +1069,9 @@ fn provider_displaced_runtime_cwd(
     inventory: &RuntimeInventory,
     workspace_cwd: Option<String>,
     provider_session: &yard_domain::ProviderSessionRef,
-) -> Result<String, OrchestratorReplacementServiceError> {
+    idle_shells: &HashSet<String>,
+    operator_cwd: Option<&str>,
+) -> Result<ResolvedCwd, OrchestratorReplacementServiceError> {
     let provider_workers = inventory
         .workers
         .iter()
@@ -971,6 +1100,8 @@ fn provider_displaced_runtime_cwd(
                 pane_or_capture_topology_overlaps(pane, expected)
                     && pane.provider_session.as_ref() != Some(provider_session)
                     && !(pane.provider_session.is_none() && pane_matches_capture(pane, expected))
+                    && (pane_occupies_captured_runtime(pane, expected)
+                        || !pane_is_confirmed_idle_shell(pane, inventory, idle_shells))
             })
             || !worker.interactive_ready
         {
@@ -981,6 +1112,7 @@ fn provider_displaced_runtime_cwd(
         }
         return workspace_cwd
             .or_else(|| worker.foreground_cwd.clone().or_else(|| worker.cwd.clone()))
+            .map(ResolvedCwd::derived)
             .ok_or_else(|| {
                 OrchestratorReplacementServiceError::RuntimeCwdUnavailable(
                     "the exact displaced orchestrator and project workspace have no usable working directory"
@@ -1000,19 +1132,27 @@ fn provider_displaced_runtime_cwd(
                 .to_owned(),
         ));
     }
-    if !captured_topology_is_absent_or_explicitly_reused(inventory, expected, provider_session) {
+    if !captured_topology_is_absent_or_explicitly_reused(
+        inventory,
+        expected,
+        provider_session,
+        idle_shells,
+    ) {
         return Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
             "the expected provider identity is absent, but captured topology is occupied without a distinct provider identity"
                 .to_owned(),
         ));
     }
 
-    workspace_cwd.ok_or_else(|| {
-        OrchestratorReplacementServiceError::RuntimeCwdUnavailable(
-            "the expected displaced provider identity is absent from fresh inventory, but the project workspace has no worktree checkout; replacement refused to borrow a reused pane or worker working directory"
-                .to_owned(),
-        )
-    })
+    workspace_cwd
+        .map(ResolvedCwd::derived)
+        .or_else(|| operator_cwd.map(ResolvedCwd::operator))
+        .ok_or_else(|| {
+            OrchestratorReplacementServiceError::RuntimeCwdUnavailable(
+                "the expected displaced provider identity is absent from fresh inventory, but the project workspace has no worktree checkout; replacement refused to borrow a reused pane or worker working directory. Choose a working directory for the replacement orchestrator"
+                    .to_owned(),
+            )
+        })
 }
 
 pub(crate) fn verified_replacement_runtime(
@@ -1073,7 +1213,8 @@ fn providerless_displaced_runtime_cwd(
     expected: &WorkerRuntimeBinding,
     inventory: &RuntimeInventory,
     workspace_cwd: Option<&str>,
-) -> Result<String, OrchestratorReplacementServiceError> {
+    operator_cwd: Option<&str>,
+) -> Result<ResolvedCwd, OrchestratorReplacementServiceError> {
     let terminal_workers = inventory
         .workers
         .iter()
@@ -1097,6 +1238,7 @@ fn providerless_displaced_runtime_cwd(
         return workspace_cwd
             .map(str::to_owned)
             .or_else(|| worker.foreground_cwd.clone().or_else(|| worker.cwd.clone()))
+            .map(ResolvedCwd::derived)
             .ok_or_else(|| {
                 OrchestratorReplacementServiceError::RuntimeCwdUnavailable(
                     "the exact providerless displaced orchestrator and project workspace have no usable working directory"
@@ -1136,12 +1278,99 @@ fn providerless_displaced_runtime_cwd(
                 })
                 .flatten()
         })
+        .map(ResolvedCwd::derived)
+        .or_else(|| operator_cwd.map(ResolvedCwd::operator))
         .ok_or_else(|| {
             OrchestratorReplacementServiceError::RuntimeCwdUnavailable(
-                "the restored providerless pane is not the exact saved terminal identity and the project workspace has no worktree checkout"
+                "the restored providerless pane is not the exact saved terminal identity and the project workspace has no worktree checkout. Choose a working directory for the replacement orchestrator"
                     .to_owned(),
             )
         })
+}
+
+/// When the operator-chosen working directory is re-checked against inventory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperatorCwdCheck {
+    /// Before the replacement starts: a directory a live pane or worker
+    /// already uses is refused unless the operator confirmed it.
+    BeforeStart { in_use_confirmed: bool },
+    /// After the replacement started in the chosen directory, which its own
+    /// pane now occupies.
+    AfterStart,
+}
+
+/// Refuse an operator-chosen directory that a live pane or worker in the
+/// session already uses, so a reused or unrelated pane's directory (for
+/// example one a client pre-filled) is never borrowed without an explicit
+/// confirmation. `canonical` is the validated chosen directory; observed
+/// directories are compared as reported and canonicalised where they resolve.
+async fn refuse_operator_cwd_in_use(
+    canonical: &str,
+    inventory: &RuntimeInventory,
+) -> Result<(), OrchestratorReplacementServiceError> {
+    let mut observed = Vec::new();
+    for pane in &inventory.panes {
+        for cwd in [&pane.cwd, &pane.foreground_cwd].into_iter().flatten() {
+            observed.push((format!("pane {}", pane.runtime_id), cwd.clone()));
+        }
+    }
+    for worker in &inventory.workers {
+        for cwd in [&worker.cwd, &worker.foreground_cwd].into_iter().flatten() {
+            observed.push((format!("worker {}", worker.terminal_id), cwd.clone()));
+        }
+    }
+    let trim = |path: &str| path.trim_end_matches('/').to_owned();
+    let wanted = trim(canonical);
+    for (owner, cwd) in observed {
+        let matches = trim(&cwd) == wanted
+            || tokio::fs::canonicalize(&cwd)
+                .await
+                .is_ok_and(|resolved| resolved.as_os_str() == canonical);
+        if matches {
+            return Err(OrchestratorReplacementServiceError::CwdInUse(format!(
+                "{owner} already uses {canonical}; confirm the directory explicitly to start the replacement there"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate an operator-chosen replacement working directory: it must resolve
+/// to an existing directory owned by the user running Yard that is not inside
+/// one of Yard's own data or runtime paths. Returns the canonical path.
+async fn validate_operator_cwd(
+    cwd: &str,
+    protected_paths: &[PathBuf],
+) -> Result<String, OrchestratorReplacementServiceError> {
+    let invalid = |reason: &str| OrchestratorReplacementServiceError::InvalidCwd(reason.to_owned());
+    let path = Path::new(cwd);
+    if !path.is_absolute() {
+        return Err(invalid("it must be an absolute path"));
+    }
+    let canonical = tokio::fs::canonicalize(path)
+        .await
+        .map_err(|_| invalid("it does not exist or cannot be resolved"))?;
+    let metadata = tokio::fs::metadata(&canonical)
+        .await
+        .map_err(|_| invalid("it cannot be inspected"))?;
+    if !metadata.is_dir() {
+        return Err(invalid("it is not a directory"));
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(invalid("it is not owned by the user running Yard"));
+    }
+    for protected in protected_paths {
+        let protected = tokio::fs::canonicalize(protected)
+            .await
+            .unwrap_or_else(|_| protected.clone());
+        if canonical.starts_with(&protected) {
+            return Err(invalid("it is inside Yard's own data or runtime directory"));
+        }
+    }
+    canonical
+        .into_os_string()
+        .into_string()
+        .map_err(|_| invalid("it is not valid UTF-8"))
 }
 
 fn worker_or_capture_topology_overlaps(
@@ -1156,22 +1385,155 @@ fn worker_or_capture_topology_overlaps(
             .is_some_and(|tab_id| worker.tab_id == tab_id)
 }
 
+fn pane_occupies_captured_runtime(
+    pane: &yard_domain::PaneObservation,
+    capture: &WorkerRuntimeBinding,
+) -> bool {
+    pane.terminal_id == capture.terminal_id || pane.runtime_id == capture.pane_id
+}
+
 fn pane_or_capture_topology_overlaps(
     pane: &yard_domain::PaneObservation,
     capture: &WorkerRuntimeBinding,
 ) -> bool {
-    pane.terminal_id == capture.terminal_id
-        || pane.runtime_id == capture.pane_id
+    pane_occupies_captured_runtime(pane, capture)
         || capture
             .tab_id
             .as_deref()
             .is_some_and(|tab_id| pane.tab_id == tab_id)
 }
 
+fn observed_workers_on_pane<'a>(
+    pane: &'a yard_domain::PaneObservation,
+    inventory: &'a RuntimeInventory,
+) -> impl Iterator<Item = &'a ObservedWorker> + Clone + 'a {
+    inventory.workers.iter().filter(move |worker| {
+        worker.pane_id == pane.runtime_id || worker.terminal_id == pane.terminal_id
+    })
+}
+
+/// Herdr attached no agent signal to the pane: no detected agent, no display
+/// agent, no provider session, and no observed worker. This is *not* evidence
+/// of a plain shell. Herdr detects agents from the foreground process, so an
+/// agent behind a hiding wrapper (without `HERDR_AGENT`), inside tmux, or in a
+/// runtime without a visible foreground process group looks the same until it
+/// reports its session. The worker clause is defensive: any worker in the
+/// captured tab is already refused by the worker overlap checks.
+fn pane_has_no_herdr_agent_signal(
+    pane: &yard_domain::PaneObservation,
+    inventory: &RuntimeInventory,
+) -> bool {
+    pane.provider_session.is_none()
+        && pane.provider.is_none()
+        && pane.display_provider.is_none()
+        && observed_workers_on_pane(pane, inventory).next().is_none()
+}
+
+/// A pane without any Herdr agent signal whose foreground process group was
+/// inspected and found to be only an interactive shell.
+fn pane_is_confirmed_idle_shell(
+    pane: &yard_domain::PaneObservation,
+    inventory: &RuntimeInventory,
+    idle_shells: &HashSet<String>,
+) -> bool {
+    pane_has_no_herdr_agent_signal(pane, inventory) && idle_shells.contains(&pane.runtime_id)
+}
+
+/// Panes in the captured tab, other than the captured terminal or pane, that
+/// carry no Herdr agent signal. Each may be released from the absent-identity
+/// guard only by foreground process evidence. Empty when the displaced
+/// orchestrator had no provider identity (that path never exempts shells).
+fn same_tab_panes_needing_shell_confirmation(
+    expected: &WorkerRuntimeBinding,
+    inventory: &RuntimeInventory,
+) -> Vec<String> {
+    if expected.provider_session.is_none() {
+        return Vec::new();
+    }
+    inventory
+        .panes
+        .iter()
+        .filter(|pane| {
+            pane_or_capture_topology_overlaps(pane, expected)
+                && !pane_occupies_captured_runtime(pane, expected)
+                && pane_has_no_herdr_agent_signal(pane, inventory)
+        })
+        .map(|pane| pane.runtime_id.clone())
+        .collect()
+}
+
+/// Interactive shells whose sole presence in a pane's foreground process group
+/// means nothing else (an agent, a wrapper, tmux) holds the terminal.
+const IDLE_SHELL_NAMES: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu",
+];
+
+fn foreground_job_is_idle_shell(job: &yard_domain::PaneForegroundJob) -> bool {
+    job.process_group_id.is_some()
+        && !job.processes.is_empty()
+        && job.processes.iter().all(|process| {
+            let name = process.name.rsplit('/').next().unwrap_or(&process.name);
+            IDLE_SHELL_NAMES.contains(&name.trim_start_matches('-'))
+        })
+}
+
+/// Runtime ids of the inspected panes whose foreground process group is only
+/// an interactive shell. A failed inspection, or one that found no foreground
+/// process group, confirms nothing.
+fn confirmed_idle_shell_panes(
+    jobs: Vec<(String, Result<yard_domain::PaneForegroundJob, String>)>,
+) -> HashSet<String> {
+    jobs.into_iter()
+        .filter_map(|(pane_id, job)| {
+            job.ok()
+                .filter(|job| job.pane_id == pane_id && foreground_job_is_idle_shell(job))
+                .map(|_| pane_id)
+        })
+        .collect()
+}
+
+/// Whether an observed pane could still be the displaced orchestrator (or an
+/// unidentified agent standing in for it) and therefore blocks replacement
+/// when the displaced provider identity is absent.
+///
+/// The exact captured terminal or pane is occupied unless the occupant carries
+/// a provider identity distinct from the displaced one. A restored or
+/// relaunched orchestrator may get fresh pane and terminal ids, so a pane
+/// elsewhere in the captured tab also conflicts unless it is explained: its
+/// agents all carry other known provider sessions, or it has no Herdr agent
+/// signal *and* its foreground process group is confirmed to be only a shell.
+///
+/// This is a tab-scoped heuristic. A displaced orchestrator relaunched in
+/// another tab or workspace of the session is caught only once Herdr reports
+/// its provider session there (the duplicated/present-identity checks).
+fn pane_may_hold_displaced_runtime(
+    pane: &yard_domain::PaneObservation,
+    inventory: &RuntimeInventory,
+    capture: &WorkerRuntimeBinding,
+    expected_provider: &yard_domain::ProviderSessionRef,
+    idle_shells: &HashSet<String>,
+) -> bool {
+    let distinct = |provider: Option<&yard_domain::ProviderSessionRef>| {
+        provider.is_some_and(|provider| provider != expected_provider)
+    };
+    if !pane_or_capture_topology_overlaps(pane, capture) || distinct(pane.provider_session.as_ref())
+    {
+        return false;
+    }
+    if pane_occupies_captured_runtime(pane, capture) {
+        return true;
+    }
+    let mut workers = observed_workers_on_pane(pane, inventory);
+    let explained_by_known_agents = workers.clone().next().is_some()
+        && workers.all(|worker| distinct(worker.provider_session.as_ref()));
+    !explained_by_known_agents && !pane_is_confirmed_idle_shell(pane, inventory, idle_shells)
+}
+
 fn captured_topology_is_absent_or_explicitly_reused(
     inventory: &RuntimeInventory,
     capture: &WorkerRuntimeBinding,
     expected_provider: &yard_domain::ProviderSessionRef,
+    idle_shells: &HashSet<String>,
 ) -> bool {
     inventory
         .workers
@@ -1183,15 +1545,15 @@ fn captured_topology_is_absent_or_explicitly_reused(
                 .as_ref()
                 .is_some_and(|provider| provider != expected_provider)
         })
-        && inventory
-            .panes
-            .iter()
-            .filter(|pane| pane_or_capture_topology_overlaps(pane, capture))
-            .all(|pane| {
-                pane.provider_session
-                    .as_ref()
-                    .is_some_and(|provider| provider != expected_provider)
-            })
+        && !inventory.panes.iter().any(|pane| {
+            pane_may_hold_displaced_runtime(
+                pane,
+                inventory,
+                capture,
+                expected_provider,
+                idle_shells,
+            )
+        })
 }
 
 async fn replacement_recovery_inventory(
@@ -1656,6 +2018,10 @@ pub enum OrchestratorReplacementServiceError {
     RuntimeWorkspaceMissing(String),
     #[error("{0}")]
     RuntimeCwdUnavailable(String),
+    #[error("the chosen working directory is not usable: {0}")]
+    InvalidCwd(String),
+    #[error("the chosen working directory is in use by another pane: {0}")]
+    CwdInUse(String),
     #[error("the displaced orchestrator runtime identity conflicts with fresh inventory: {0}")]
     RuntimeIdentityChanged(String),
     #[error("Herdr replacement provisioning failed: {0}")]
@@ -1671,7 +2037,7 @@ pub enum OrchestratorReplacementServiceError {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, HashMap, VecDeque},
+        collections::{BTreeMap, HashMap, HashSet, VecDeque},
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -1683,11 +2049,12 @@ mod tests {
     use rusqlite::Connection;
     use tempfile::TempDir;
     use yard_domain::{
-        CanvasPlacement, CreateProject, CreateWorkerProfile, FocusObservation, ObservedStatus,
-        ObservedWorker, OldSessionDisposition, PaneObservation, ProjectRuntimeBinding,
-        ProviderSessionRef, ReplaceProjectOrchestrator, RuntimeInventory, RuntimeObservationState,
-        RuntimeProcessState, RuntimeSession, RuntimeSessions, TabObservation, WorkerProfileSpec,
-        WorkerRuntimeBinding, WorkspaceObservation, WorktreeObservation,
+        CanvasPlacement, CreateProject, CreateWorkerProfile, FocusObservation, ForegroundProcess,
+        ObservedStatus, ObservedWorker, OldSessionDisposition, PaneForegroundJob, PaneObservation,
+        ProjectRuntimeBinding, ProviderSessionRef, ReplaceProjectOrchestrator, RuntimeInventory,
+        RuntimeObservationState, RuntimeProcessState, RuntimeSession, RuntimeSessions,
+        TabObservation, WorkerProfileSpec, WorkerRuntimeBinding, WorkspaceObservation,
+        WorktreeObservation,
     };
     use yard_store::{
         BeginProjectOrchestratorReplacement, OrchestratorReplacementPrepareIntent,
@@ -1697,8 +2064,10 @@ mod tests {
 
     use super::{
         CaptureResolution, OrchestratorReplacementService, OrchestratorReplacementServiceError,
-        PrepareIntentResolution, STRANDED_PENDING_MESSAGE, displaced_runtime_cwd,
-        resolve_prepare_intent, resolve_replacement_capture, verified_replacement_runtime,
+        PrepareIntentResolution, STRANDED_PENDING_MESSAGE, confirmed_idle_shell_panes,
+        displaced_runtime_cwd as displaced_runtime_cwd_with_shells, foreground_job_is_idle_shell,
+        resolve_prepare_intent, resolve_replacement_capture, validate_operator_cwd,
+        verified_replacement_runtime,
     };
     use crate::{
         allocation_service::{
@@ -1707,6 +2076,125 @@ mod tests {
         },
         inventory_service::{InventoryServiceError, InventorySource},
     };
+
+    /// Pane runtime ids the fixtures treat as foreground-confirmed shells.
+    fn idle_shells(pane_ids: &[&str]) -> HashSet<String> {
+        pane_ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    /// [`displaced_runtime_cwd_with_shells`] where Herdr `pane.process_info`
+    /// confirmed only the fixture pane `pane-shell` to be an idle shell.
+    fn displaced_runtime_cwd(
+        project: &ProjectRuntimeBinding,
+        expected: &WorkerRuntimeBinding,
+        inventory: &RuntimeInventory,
+    ) -> Result<String, OrchestratorReplacementServiceError> {
+        displaced_runtime_cwd_with_shells(
+            project,
+            expected,
+            inventory,
+            &idle_shells(&["pane-shell"]),
+            None,
+        )
+    }
+
+    fn displaced_runtime_cwd_choosing(
+        expected: &WorkerRuntimeBinding,
+        inventory: &RuntimeInventory,
+        operator_cwd: &str,
+    ) -> Result<String, OrchestratorReplacementServiceError> {
+        displaced_runtime_cwd_with_shells(
+            &project_runtime(),
+            expected,
+            inventory,
+            &idle_shells(&["pane-shell"]),
+            Some(operator_cwd),
+        )
+    }
+
+    #[test]
+    fn absent_displaced_provider_without_worktree_uses_the_chosen_directory() {
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+        let mut reused = expected.clone();
+        reused.provider_session = Some(provider_session("provider-reused"));
+        let mut reused = observed_worker(&reused);
+        reused.cwd = Some("/tmp/reused-occupant".to_owned());
+
+        assert_eq!(
+            displaced_runtime_cwd_choosing(&expected, &inventory(vec![reused]), "/work/chosen")
+                .unwrap(),
+            "/work/chosen"
+        );
+    }
+
+    #[test]
+    fn chosen_directory_never_overrides_a_present_identity_or_a_worktree() {
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+        let mut present = observed_worker(&expected);
+        present.foreground_cwd = Some("/tmp/displaced-live".to_owned());
+        assert_eq!(
+            displaced_runtime_cwd_choosing(&expected, &inventory(vec![present]), "/work/chosen")
+                .unwrap(),
+            "/tmp/displaced-live"
+        );
+        assert_eq!(
+            displaced_runtime_cwd_choosing(
+                &expected,
+                &with_worktree(inventory(Vec::new())),
+                "/work/chosen"
+            )
+            .unwrap(),
+            "/tmp/project-worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_directory_must_be_an_owned_directory_outside_yard_paths() {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let chosen = temp.path().join("work");
+        std::fs::create_dir_all(data.join("artifacts")).unwrap();
+        std::fs::create_dir_all(&chosen).unwrap();
+        std::fs::write(data.join("yard.sqlite3"), b"").unwrap();
+        let service_paths = OrchestratorReplacementService::protected_path_set(&[
+            data.join("yard.sqlite3"),
+            data.join("artifacts"),
+        ]);
+
+        let accepted = validate_operator_cwd(chosen.to_str().unwrap(), &service_paths)
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted,
+            std::fs::canonicalize(&chosen).unwrap().to_str().unwrap()
+        );
+        for refused in [
+            data.join("artifacts"),
+            data.clone(),
+            data.join("yard.sqlite3"),
+            temp.path().join("missing"),
+        ] {
+            assert!(matches!(
+                validate_operator_cwd(refused.to_str().unwrap(), &service_paths).await,
+                Err(OrchestratorReplacementServiceError::InvalidCwd(_))
+            ));
+        }
+        if rustix::process::geteuid().as_raw() != 0 {
+            assert!(matches!(
+                validate_operator_cwd("/", &service_paths).await,
+                Err(OrchestratorReplacementServiceError::InvalidCwd(message))
+                    if message.contains("not owned")
+            ));
+        }
+    }
 
     fn provider_session(value: &str) -> ProviderSessionRef {
         ProviderSessionRef {
@@ -1954,6 +2442,381 @@ mod tests {
             OrchestratorReplacementServiceError::RuntimeCwdUnavailable(_)
         ));
         assert!(error.to_string().contains("refused to borrow"));
+    }
+
+    fn observed_pane(
+        terminal_id: &str,
+        pane_id: &str,
+        tab_id: &str,
+        provider: Option<&str>,
+        provider_session: Option<ProviderSessionRef>,
+    ) -> PaneObservation {
+        PaneObservation {
+            runtime_id: pane_id.to_owned(),
+            pane_instance_id: None,
+            terminal_id: terminal_id.to_owned(),
+            workspace_id: "workspace-1".to_owned(),
+            tab_id: tab_id.to_owned(),
+            focused: false,
+            cwd: Some("/tmp/occupant".to_owned()),
+            foreground_cwd: Some("/tmp/occupant".to_owned()),
+            label: None,
+            provider: provider.map(str::to_owned),
+            display_provider: None,
+            status: ObservedStatus::Unknown,
+            tokens: BTreeMap::new(),
+            provider_session,
+            revision: 1,
+        }
+    }
+
+    /// The displaced orchestrator's pane vanished after a host reboot. Herdr
+    /// restored the captured tab with a bare shell (no agent, no provider
+    /// identity, no worker) and a different codex session.
+    fn restored_tab_inventory(expected: &WorkerRuntimeBinding) -> RuntimeInventory {
+        let tab_id = expected.tab_id.clone().unwrap();
+        let mut other = expected.clone();
+        other.terminal_id = "terminal-other-codex".to_owned();
+        other.pane_id = "pane-other-codex".to_owned();
+        other.provider_session = Some(provider_session("provider-other"));
+        let mut inventory = with_worktree(inventory(vec![observed_worker(&other)]));
+        inventory.panes = vec![
+            observed_pane("terminal-shell", "pane-shell", &tab_id, None, None),
+            observed_pane(
+                "terminal-other-codex",
+                "pane-other-codex",
+                &tab_id,
+                Some("codex"),
+                Some(provider_session("provider-other")),
+            ),
+        ];
+        inventory
+    }
+
+    #[test]
+    fn vanished_displaced_pane_with_same_tab_shell_and_other_codex_is_replaceable() {
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+
+        assert_eq!(
+            displaced_runtime_cwd(
+                &project_runtime(),
+                &expected,
+                &restored_tab_inventory(&expected)
+            )
+            .unwrap(),
+            "/tmp/project-worktree"
+        );
+    }
+
+    #[test]
+    fn same_tab_agent_without_provider_identity_still_blocks_replacement() {
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+        let tab_id = expected.tab_id.clone().unwrap();
+
+        let mut herdr_agent_pane = restored_tab_inventory(&expected);
+        herdr_agent_pane.panes.push(observed_pane(
+            "terminal-unknown",
+            "pane-unknown",
+            &tab_id,
+            Some("codex"),
+            None,
+        ));
+        // Pane-only: no worker, so only the same-tab pane check can refuse.
+        let mut display_only_pane = restored_tab_inventory(&expected);
+        let mut display_only = observed_pane(
+            "terminal-unknown",
+            "pane-shell-display",
+            &tab_id,
+            None,
+            None,
+        );
+        display_only.display_provider = Some("codex".to_owned());
+        display_only_pane.panes.push(display_only);
+        // Defensive: the worker overlap check refuses this before the pane check.
+        let mut unidentified_worker = restored_tab_inventory(&expected);
+        let mut unknown = expected.clone();
+        unknown.terminal_id = "terminal-unknown".to_owned();
+        unknown.pane_id = "pane-unknown".to_owned();
+        unknown.provider_session = None;
+        unidentified_worker.workers.push(observed_worker(&unknown));
+        unidentified_worker.panes.push(observed_pane(
+            "terminal-unknown",
+            "pane-unknown",
+            &tab_id,
+            None,
+            None,
+        ));
+
+        // Even a foreground-confirmed shell is refused while Herdr reports an
+        // agent signal on it, so each case fails if its clause is dropped.
+        let shells = idle_shells(&["pane-shell", "pane-shell-display", "pane-unknown"]);
+        for inventory in [herdr_agent_pane, display_only_pane, unidentified_worker] {
+            let error = displaced_runtime_cwd_with_shells(
+                &project_runtime(),
+                &expected,
+                &inventory,
+                &shells,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("captured topology is occupied without a distinct provider identity"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_tab_pane_without_agent_signal_blocks_until_foreground_confirms_a_shell() {
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+        let restored = restored_tab_inventory(&expected);
+        // An agent behind a hiding wrapper, tmux, or no foreground process group
+        // looks like this to Herdr; without process evidence it must refuse.
+        for shells in [idle_shells(&[]), idle_shells(&["pane-other-codex"])] {
+            let error = displaced_runtime_cwd_with_shells(
+                &project_runtime(),
+                &expected,
+                &restored,
+                &shells,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("captured topology is occupied without a distinct provider identity"),
+                "{error}"
+            );
+        }
+
+        let tab_id = expected.tab_id.clone().unwrap();
+        let mut live = inventory(vec![observed_worker(&expected)]);
+        live.panes = vec![
+            observed_pane(
+                "terminal-displaced",
+                "pane-displaced",
+                &tab_id,
+                Some("codex"),
+                Some(provider_session("provider-displaced")),
+            ),
+            observed_pane("terminal-shell", "pane-shell", &tab_id, None, None),
+        ];
+        assert!(matches!(
+            displaced_runtime_cwd_with_shells(
+                &project_runtime(),
+                &expected,
+                &live,
+                &idle_shells(&[]),
+                None
+            ),
+            Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+                _
+            ))
+        ));
+    }
+
+    #[test]
+    fn restored_same_tab_pane_carrying_the_displaced_session_blocks_replacement() {
+        // Herdr restored the displaced pane with fresh ids and exposes its stored
+        // native session before `codex resume` runs: no agent, no worker.
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+        let tab_id = expected.tab_id.clone().unwrap();
+        let mut restored = restored_tab_inventory(&expected);
+        restored.panes = vec![observed_pane(
+            "terminal-shell",
+            "pane-shell",
+            &tab_id,
+            None,
+            Some(provider_session("provider-displaced")),
+        )];
+        let error = displaced_runtime_cwd(&project_runtime(), &expected, &restored).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("remains on a pane without an interactive worker"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn same_tab_pane_explained_by_workers_with_distinct_sessions_is_replaceable() {
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+        let mut restored = restored_tab_inventory(&expected);
+        for pane in &mut restored.panes {
+            if pane.runtime_id == "pane-other-codex" {
+                pane.provider = None;
+                pane.provider_session = None;
+            }
+        }
+        // No pane is foreground-confirmed: the pane is released only because
+        // its worker carries a distinct known provider session.
+        assert_eq!(
+            displaced_runtime_cwd_with_shells(
+                &project_runtime(),
+                &expected,
+                &restored,
+                &idle_shells(&["pane-shell"]),
+                None
+            )
+            .unwrap(),
+            "/tmp/project-worktree"
+        );
+    }
+
+    fn foreground(pane_id: &str, group: Option<u32>, names: &[&str]) -> PaneForegroundJob {
+        PaneForegroundJob {
+            pane_id: pane_id.to_owned(),
+            process_group_id: group,
+            processes: names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| ForegroundProcess {
+                    pid: 100 + u32::try_from(index).unwrap(),
+                    name: (*name).to_owned(),
+                    argv: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn only_a_foreground_group_of_shells_confirms_an_idle_shell() {
+        assert!(foreground_job_is_idle_shell(&foreground(
+            "p",
+            Some(1),
+            &["zsh"]
+        )));
+        assert!(foreground_job_is_idle_shell(&foreground(
+            "p",
+            Some(1),
+            &["-bash"]
+        )));
+        for job in [
+            foreground("p", Some(1), &["codex"]),
+            foreground("p", Some(1), &["tmux"]),
+            foreground("p", Some(1), &["make"]),
+            foreground("p", Some(1), &["zsh", "node"]),
+            foreground("p", Some(1), &[]),
+            foreground("p", None, &["zsh"]),
+        ] {
+            assert!(!foreground_job_is_idle_shell(&job), "{job:?}");
+        }
+
+        let confirmed = confirmed_idle_shell_panes(vec![
+            (
+                "pane-a".to_owned(),
+                Ok(foreground("pane-a", Some(1), &["zsh"])),
+            ),
+            ("pane-b".to_owned(), Err("timed out".to_owned())),
+            (
+                "pane-c".to_owned(),
+                Ok(foreground("pane-other", Some(1), &["zsh"])),
+            ),
+            (
+                "pane-d".to_owned(),
+                Ok(foreground("pane-d", Some(1), &["codex"])),
+            ),
+        ]);
+        assert_eq!(confirmed, idle_shells(&["pane-a"]));
+    }
+
+    #[test]
+    fn exact_captured_runtime_reuse_without_provider_identity_still_blocks_replacement() {
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+        let tab_id = expected.tab_id.clone().unwrap();
+
+        let mut same_terminal = restored_tab_inventory(&expected);
+        same_terminal.panes.push(observed_pane(
+            "terminal-displaced",
+            "pane-restored",
+            "tab-elsewhere",
+            None,
+            None,
+        ));
+        let mut same_pane = restored_tab_inventory(&expected);
+        same_pane.panes.push(observed_pane(
+            "terminal-restored",
+            "pane-displaced",
+            &tab_id,
+            None,
+            None,
+        ));
+
+        for inventory in [same_terminal, same_pane] {
+            let error =
+                displaced_runtime_cwd(&project_runtime(), &expected, &inventory).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("captured topology is occupied without a distinct provider identity"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn present_displaced_provider_tolerates_only_bare_shells_in_its_tab() {
+        let expected = runtime(
+            "terminal-displaced",
+            "pane-displaced",
+            Some(provider_session("provider-displaced")),
+        );
+        let tab_id = expected.tab_id.clone().unwrap();
+        let mut live = inventory(vec![observed_worker(&expected)]);
+        live.panes = vec![
+            observed_pane(
+                "terminal-displaced",
+                "pane-displaced",
+                &tab_id,
+                Some("codex"),
+                Some(provider_session("provider-displaced")),
+            ),
+            observed_pane("terminal-shell", "pane-shell", &tab_id, None, None),
+        ];
+        assert_eq!(
+            displaced_runtime_cwd(&project_runtime(), &expected, &live).unwrap(),
+            "/tmp/project"
+        );
+
+        live.panes.push(observed_pane(
+            "terminal-unknown",
+            "pane-unknown",
+            &tab_id,
+            Some("codex"),
+            None,
+        ));
+        assert!(matches!(
+            displaced_runtime_cwd(&project_runtime(), &expected, &live),
+            Err(OrchestratorReplacementServiceError::RuntimeIdentityChanged(
+                _
+            ))
+        ));
     }
 
     #[test]
@@ -2520,6 +3383,8 @@ mod tests {
             role: "orchestrator".to_owned(),
             old_session_disposition: OldSessionDisposition::RetainForInspection,
             handoff_artifact_ref: None,
+            cwd: None,
+            cwd_in_use_confirmed: false,
         };
         store
             .begin_project_orchestrator_replacement(&project.id, command.clone())
@@ -2721,6 +3586,8 @@ mod tests {
             role: "orchestrator".to_owned(),
             old_session_disposition: OldSessionDisposition::RetainForInspection,
             handoff_artifact_ref: None,
+            cwd: None,
+            cwd_in_use_confirmed: false,
         };
         let prepare_tab_label = match store
             .begin_project_orchestrator_replacement(&project.id, command.clone())

@@ -300,6 +300,7 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
     image_paste: ImagePasteSettings,
 ) -> Router {
     let presence = slack.presence();
+    let protected_paths = storage.excluded_paths.clone();
     let storage = StorageScanService::with_shutdown(
         storage,
         Arc::clone(&store),
@@ -334,7 +335,8 @@ fn router_with_reconciliation_and_shutdown_and_ghostty(
         Arc::clone(&source),
         Arc::clone(&runtime),
         Arc::clone(&store),
-    );
+    )
+    .with_protected_paths(&protected_paths);
     let orchestrator_transfers =
         ProjectOrchestratorTransferService::new(Arc::clone(&source), Arc::clone(&store));
     let coordination_nodes = CoordinationNodeService::new(
@@ -3488,6 +3490,16 @@ impl From<OrchestratorReplacementServiceError> for ApiError {
                 code: "runtime_cwd_unavailable",
                 message: error.to_string(),
             },
+            OrchestratorReplacementServiceError::InvalidCwd(_) => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "invalid_orchestrator_cwd",
+                message: error.to_string(),
+            },
+            OrchestratorReplacementServiceError::CwdInUse(_) => Self {
+                status: StatusCode::CONFLICT,
+                code: "orchestrator_cwd_in_use",
+                message: error.to_string(),
+            },
             OrchestratorReplacementServiceError::RuntimeProvision(message) => Self {
                 status: StatusCode::BAD_GATEWAY,
                 code: "orchestrator_replacement_provision_failed",
@@ -5825,6 +5837,11 @@ mod tests {
     #[derive(Default)]
     struct StaleBindingReplacementInventory {
         calls: AtomicUsize,
+        /// The project workspace loses its worktree checkout once the
+        /// displaced orchestrator vanishes.
+        drop_worktree: bool,
+        /// Working directory reported for the unrelated reused occupant.
+        occupant_cwd: Option<String>,
     }
 
     #[async_trait]
@@ -5843,6 +5860,17 @@ mod tests {
                 inventory
                     .workers
                     .retain(|worker| worker.terminal_id != "terminal-target-orchestrator");
+                if self.drop_worktree {
+                    for workspace in &mut inventory.workspaces {
+                        if workspace.runtime_id == "workspace-2" {
+                            workspace.worktree = None;
+                        }
+                    }
+                }
+                let occupant_cwd = self
+                    .occupant_cwd
+                    .clone()
+                    .unwrap_or_else(|| "/tmp/reused-occupant".to_owned());
                 inventory.workers.push(ObservedWorker {
                     runtime_id: "terminal-reused-occupant".to_owned(),
                     pane_instance_id: None,
@@ -5858,8 +5886,8 @@ mod tests {
                     launch_pending: false,
                     interactive_ready: true,
                     state_change_sequence: 7,
-                    cwd: Some("/tmp/reused-occupant".to_owned()),
-                    foreground_cwd: Some("/tmp/reused-occupant".to_owned()),
+                    cwd: Some(occupant_cwd.clone()),
+                    foreground_cwd: Some(occupant_cwd),
                     tokens: BTreeMap::new(),
                     provider_session: Some(provider_session("reused-occupant-session")),
                     revision: 7,
@@ -8246,6 +8274,168 @@ mod tests {
         assert_eq!(replay["cleanup_pending"], true);
         assert_eq!(runtime.start_calls.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.retirement_calls.lock().unwrap().len(), 1);
+    }
+
+    async fn post_replacement(
+        app: &Router,
+        uri: &str,
+        command: &serde_json::Value,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn vanished_orchestrator_without_worktree() -> Arc<dyn InventorySource> {
+        Arc::new(StaleBindingReplacementInventory {
+            drop_worktree: true,
+            ..StaleBindingReplacementInventory::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn vanished_orchestrator_without_worktree_asks_for_a_working_directory() {
+        let (app, _temp, runtime) =
+            handoff_test_router_with_source(0, vanished_orchestrator_without_worktree()).await;
+        let (uri, command, _project_id) = create_orchestrator_replacement_request(&app).await;
+
+        let response = post_replacement(&app, &uri, &command).await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let error = response_json(response).await;
+        assert_eq!(error["error"]["code"], "runtime_cwd_unavailable");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Choose a working directory")
+        );
+        assert_eq!(runtime.start_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn vanished_orchestrator_without_worktree_replaces_in_the_chosen_directory() {
+        let (app, _temp, runtime) =
+            handoff_test_router_with_source(0, vanished_orchestrator_without_worktree()).await;
+        let (uri, mut command, _project_id) = create_orchestrator_replacement_request(&app).await;
+        let chosen = TempDir::new().unwrap();
+        let canonical = std::fs::canonicalize(chosen.path()).unwrap();
+        command["cwd"] = serde_json::Value::String(format!("{}/.", chosen.path().display()));
+
+        let response = post_replacement(&app, &uri, &command).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = runtime.start_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].cwd, canonical.to_str().unwrap());
+        assert_ne!(requests[0].cwd, "/tmp/reused-occupant");
+    }
+
+    #[tokio::test]
+    async fn replacement_refuses_a_live_panes_directory_until_explicitly_confirmed() {
+        let occupied = TempDir::new().unwrap();
+        let canonical = std::fs::canonicalize(occupied.path()).unwrap();
+        let source = || -> Arc<dyn InventorySource> {
+            Arc::new(StaleBindingReplacementInventory {
+                drop_worktree: true,
+                occupant_cwd: Some(occupied.path().display().to_string()),
+                ..StaleBindingReplacementInventory::default()
+            })
+        };
+        let (app, _temp, runtime) = handoff_test_router_with_source(0, source()).await;
+        let (uri, mut command, _project_id) = create_orchestrator_replacement_request(&app).await;
+        command["cwd"] = serde_json::Value::String(occupied.path().display().to_string());
+
+        let response = post_replacement(&app, &uri, &command).await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = response_json(response).await;
+        assert_eq!(error["error"]["code"], "orchestrator_cwd_in_use");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("worker terminal-reused-occupant")
+        );
+        assert_eq!(runtime.start_calls.load(Ordering::SeqCst), 0);
+
+        // The same directory is accepted once the operator confirms it.
+        let (app, _temp, runtime) = handoff_test_router_with_source(0, source()).await;
+        let (uri, mut command, _project_id) = create_orchestrator_replacement_request(&app).await;
+        command["cwd"] = serde_json::Value::String(occupied.path().display().to_string());
+        command["cwd_in_use_confirmed"] = serde_json::Value::Bool(true);
+        let response = post_replacement(&app, &uri, &command).await;
+
+        let status = response.status();
+        let body = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let requests = runtime.start_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].cwd, canonical.to_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_an_unusable_working_directory_before_any_record() {
+        let (app, temp, runtime) =
+            handoff_test_router_with_source(0, vanished_orchestrator_without_worktree()).await;
+        let (uri, command, _project_id) = create_orchestrator_replacement_request(&app).await;
+        let scratch = TempDir::new().unwrap();
+        let file = scratch.path().join("not-a-directory");
+        std::fs::write(&file, b"x").unwrap();
+        let cases = [
+            (
+                scratch.path().join("missing").display().to_string(),
+                "invalid_orchestrator_cwd",
+            ),
+            (file.display().to_string(), "invalid_orchestrator_cwd"),
+            (
+                "relative/path".to_owned(),
+                "invalid_orchestrator_replacement",
+            ),
+        ];
+        for (cwd, code) in cases {
+            let mut command = command.clone();
+            command["cwd"] = serde_json::Value::String(cwd);
+            let response = post_replacement(&app, &uri, &command).await;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(response_json(response).await["error"]["code"], code);
+        }
+        assert_eq!(runtime.start_calls.load(Ordering::SeqCst), 0);
+        let connection = rusqlite::Connection::open(temp.path().join("yard.sqlite3")).unwrap();
+        let recorded: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM project_orchestrator_replacement_commands",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 0);
+    }
+
+    #[tokio::test]
+    async fn chosen_working_directory_is_ignored_when_the_workspace_has_a_worktree() {
+        let (app, _temp, runtime) = handoff_test_router_with_source(
+            0,
+            Arc::new(StaleBindingReplacementInventory::default()),
+        )
+        .await;
+        let (uri, mut command, _project_id) = create_orchestrator_replacement_request(&app).await;
+        let chosen = TempDir::new().unwrap();
+        command["cwd"] = serde_json::Value::String(chosen.path().display().to_string());
+
+        let response = post_replacement(&app, &uri, &command).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = runtime.start_requests.lock().unwrap();
+        assert_eq!(requests[0].cwd, "/tmp/target-api");
     }
 
     #[tokio::test]

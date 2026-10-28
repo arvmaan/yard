@@ -102,6 +102,13 @@ a release is tagged.
 
 ### Changed
 
+- Orchestrator replacement is no longer blocked by a bare interactive shell
+  that Herdr restored in the captured tab (inspection failure still refuses),
+  and the operator can choose the working directory when the displaced pane
+  and worktree are both gone. The field is prefilled only with the workspace's
+  worktree checkout, never another pane's directory, and a chosen directory
+  that a live pane already uses is refused (`orchestrator_cwd_in_use`) unless
+  the operator confirms it explicitly.
 - Jump to latest now returns full-screen (alternate-screen, mouse-reporting)
   agents to their latest output, and terminal scroll batches are pipelined
   across the round trip so long scrolls no longer lag.

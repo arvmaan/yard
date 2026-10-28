@@ -501,6 +501,10 @@ interface MockState {
   projectDetailRequests: number
   projectOrchestratorCommands: ChangeProjectOrchestratorInput[]
   projectOrchestratorReplacementCommands: ReplaceProjectOrchestratorInput[]
+  // Replacement POSTs answered with a working-directory refusal first.
+  // Mirrors a project workspace without a worktree checkout whose displaced
+  // orchestrator is gone: the server then needs an operator-chosen cwd.
+  projectOrchestratorReplacementWithoutWorktree: boolean
   projectArchiveCommands: ArchiveProjectInput[]
   projectArchiveAttempts: ArchiveProjectInput[]
   projectDeleteCommands: DeleteProjectInput[]
@@ -915,6 +919,7 @@ async function mockApi(
     projectDetailRequests: 0,
     projectOrchestratorCommands: [],
     projectOrchestratorReplacementCommands: [],
+    projectOrchestratorReplacementWithoutWorktree: false,
     projectArchiveCommands: [],
     projectArchiveAttempts: [],
     projectDeleteCommands: [],
@@ -3277,6 +3282,42 @@ async function mockApi(
       const input =
         request.postDataJSON() as ReplaceProjectOrchestratorInput
       state.projectOrchestratorReplacementCommands.push(input)
+      // Same decisions as the server: no chosen cwd is refused, and a chosen
+      // cwd a live pane or worker already uses needs explicit confirmation.
+      if (state.projectOrchestratorReplacementWithoutWorktree) {
+        const chosen = input.cwd?.trim() || null
+        const occupied = [
+          ...state.runtimeInventory.panes,
+          ...state.runtimeInventory.workers,
+        ].some((observed) =>
+          [observed.cwd, observed.foreground_cwd].includes(chosen),
+        )
+        if (!chosen) {
+          await route.fulfill({
+            json: {
+              error: {
+                code: 'runtime_cwd_unavailable',
+                message:
+                  'The project workspace has no worktree checkout. Choose a working directory for the replacement orchestrator',
+              },
+            },
+            status: 422,
+          })
+          return
+        }
+        if (occupied && input.cwd_in_use_confirmed !== true) {
+          await route.fulfill({
+            json: {
+              error: {
+                code: 'orchestrator_cwd_in_use',
+                message: `the chosen working directory is in use by another pane: ${chosen}`,
+              },
+            },
+            status: 409,
+          })
+          return
+        }
+      }
       const projectIndex = state.projects.findIndex(
         (candidate) => candidate.id === projectId,
       )
@@ -7965,6 +8006,91 @@ test('explains a replaced project pane and uses the replacement endpoint', async
     old_session_disposition: 'retain_for_inspection',
     profile_id: 'profile-1',
   })
+})
+
+test('replacement dialog never prefills a pane directory and confirms a shared one explicitly', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  state.projectOrchestratorReplacementWithoutWorktree = true
+  const project = state.projects[0]
+  const runtime = project.orchestrator.runtime
+  if (!runtime) throw new Error('Project orchestrator runtime is missing')
+  const observed = state.runtimeInventory.workers.find(
+    (worker) => worker.terminal_id === runtime.terminal_id,
+  )
+  if (!observed) throw new Error('Project orchestrator observation is missing')
+  observed.runtime_id = 'terminal-reused'
+  observed.terminal_id = 'terminal-reused'
+  state.runtimeInventory.panes.push({
+    runtime_id: 'pane-workspace-shell',
+    terminal_id: 'terminal-workspace-shell',
+    workspace_id: project.runtime.workspace_id,
+    tab_id: runtime.tab_id ?? `${project.runtime.workspace_id}:tab-1`,
+    focused: true,
+    cwd: '/work/api-migration',
+    foreground_cwd: '/work/api-migration',
+    label: null,
+    provider: null,
+    display_provider: null,
+    status: 'idle',
+    tokens: {},
+    provider_session: null,
+    revision: '1',
+  })
+
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.goto('/')
+  await page
+    .locator(
+      `.orchestrator-marker[data-worker-id="${project.orchestrator.id}"]`,
+    )
+    .click()
+  await page
+    .locator('.inspector')
+    .getByRole('button', { name: 'Replace orchestrator', exact: true })
+    .click()
+
+  const dialog = page.getByRole('dialog', { name: 'Replace orchestrator' })
+  const cwd = dialog.getByRole('textbox', { name: 'Working directory' })
+  // The focused pane is unrelated to the vanished orchestrator.
+  await expect(cwd).toHaveValue('')
+  const submit = dialog.getByRole('button', {
+    name: 'Replace orchestrator',
+    exact: true,
+  })
+  await submit.click()
+  await expect(dialog.getByRole('alert')).toContainText(
+    'Choose a working directory',
+  )
+
+  const confirm = dialog.getByRole('checkbox', {
+    name: /I chose this directory/,
+  })
+  await cwd.fill('/work/api-migration')
+  await submit.click()
+  await expect(dialog.getByRole('alert')).toContainText(
+    'in use by another pane',
+  )
+  await expect(confirm).not.toBeChecked()
+  await cwd.fill('/work/other')
+  await expect(confirm).toHaveCount(0)
+  await cwd.fill('/work/api-migration')
+  await confirm.check()
+  await submit.click()
+
+  await expect.poll(
+    () => state.projectOrchestratorReplacementCommands.length,
+  ).toBe(3)
+  const [missing, inUse, confirmed] =
+    state.projectOrchestratorReplacementCommands
+  expect(missing.cwd).toBeNull()
+  expect(inUse.cwd).toBe('/work/api-migration')
+  expect(inUse.cwd_in_use_confirmed).toBeUndefined()
+  expect(confirmed.cwd).toBe('/work/api-migration')
+  expect(confirmed.cwd_in_use_confirmed).toBe(true)
+  expect(new Set([missing, inUse, confirmed].map((c) => c.command_id)).size).toBe(3)
+  await expect(dialog).toBeHidden()
 })
 
 test('keeps exited assignment process state separate from runtime status', async ({
