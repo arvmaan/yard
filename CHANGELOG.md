@@ -102,6 +102,9 @@ a release is tagged.
 
 ### Changed
 
+- Ctrl+Enter and Shift+Enter in web terminals now reach the agent as distinct
+  keys through Herdr `pane.send_keys`, with a carriage-return fallback only
+  when Herdr cannot have pressed the key.
 - Orchestrator replacement is no longer blocked by a bare interactive shell
   that Herdr restored in the captured tab (inspection failure still refuses),
   and the operator can choose the working directory when the displaced pane

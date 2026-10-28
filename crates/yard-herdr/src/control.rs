@@ -117,6 +117,34 @@ pub struct ReadPaneRequest {
     pub format: PaneReadFormat,
 }
 
+/// A modified key press that Herdr encodes for the pane's keyboard mode.
+///
+/// Herdr's terminal emulator sees the app's keyboard-protocol requests (the
+/// kitty `CSI > flags u` push, `modifyOtherKeys`) and Yard's terminal stream
+/// does not, so only Herdr can pick the bytes: the CSI-u form (for example
+/// `ESC [ 13 ; 5 u`) when the app asked for it, else the legacy `CR`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneKey {
+    CtrlEnter,
+    ShiftEnter,
+}
+
+impl PaneKey {
+    fn herdr_name(self) -> &'static str {
+        match self {
+            Self::CtrlEnter => "ctrl+enter",
+            Self::ShiftEnter => "shift+enter",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendPaneKeyRequest {
+    pub request_id: String,
+    pub pane_id: String,
+    pub key: PaneKey,
+}
+
 /// Herdr's `pane.get` scroll metrics for a pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct PaneScroll {
@@ -761,6 +789,41 @@ async fn read_pane_at_socket(
     Ok(output)
 }
 
+/// The control socket of a running session, found once so that later key
+/// presses are a single socket round trip without a `session list` spawn.
+pub(crate) async fn session_socket(
+    config: &HerdrConfig,
+    session: &str,
+) -> Result<std::path::PathBuf, HerdrError> {
+    running_session(config, session)
+        .await
+        .map(|session| session.socket_path)
+}
+
+/// Press one key in a pane through Herdr's `pane.send_keys`, which encodes it
+/// for the keyboard mode the pane's app enabled. `request_timeout` bounds
+/// the whole round trip.
+pub(crate) async fn send_pane_key_at_socket(
+    config: &HerdrConfig,
+    socket_path: &std::path::Path,
+    request: SendPaneKeyRequest,
+    request_timeout: Duration,
+) -> Result<(), HerdrError> {
+    let result = request_command(
+        config,
+        socket_path,
+        &format!("yard:{}:key", request.request_id),
+        "pane.send_keys",
+        json!({
+            "pane_id": request.pane_id,
+            "keys": [request.key.herdr_name()]
+        }),
+        request_timeout,
+    )
+    .await?;
+    expect_result_type(&result, "ok")
+}
+
 /// Read the latest rendered rows with their colours, then the pane's scroll
 /// position. The rows are `recent` (not unwrapped), so each `\r\n` line is
 /// one row exactly as Herdr lays it out at the pane width. The scroll
@@ -1303,15 +1366,15 @@ mod tests {
     };
 
     use super::{
-        BootstrapAgentRequest, HerdrControlError, PaneReadFormat, PaneScroll, PrepareAgentRequest,
-        PromptAgentRequest, ProvisionAgentRequest, ReadPaneRequest, StartFailureRuntime,
-        StartPreparedAgentRequest, StartRollback, bootstrap_agent_at_socket, close_tab,
-        close_workspace, deliver_prompt_when_ready, expect_tab_close_result,
-        prepare_agent_at_socket, prompt_agent_at_socket, prompt_definitely_not_submitted,
-        prompt_failure_after_rollback, provision_agent_at_socket, read_pane_at_socket,
-        retained_prepared_topology, runtime_creation_outcome_ambiguous, start_agent_at_socket,
-        start_failure_retention, start_prepared_agent_at_socket,
-        start_prepared_workspace_agent_at_socket,
+        BootstrapAgentRequest, HerdrControlError, PaneKey, PaneReadFormat, PaneScroll,
+        PrepareAgentRequest, PromptAgentRequest, ProvisionAgentRequest, ReadPaneRequest,
+        SendPaneKeyRequest, StartFailureRuntime, StartPreparedAgentRequest, StartRollback,
+        bootstrap_agent_at_socket, close_tab, close_workspace, deliver_prompt_when_ready,
+        expect_tab_close_result, prepare_agent_at_socket, prompt_agent_at_socket,
+        prompt_definitely_not_submitted, prompt_failure_after_rollback, provision_agent_at_socket,
+        read_pane_at_socket, retained_prepared_topology, runtime_creation_outcome_ambiguous,
+        send_pane_key_at_socket, start_agent_at_socket, start_failure_retention,
+        start_prepared_agent_at_socket, start_prepared_workspace_agent_at_socket,
     };
     use crate::{HerdrConfig, HerdrError};
     use yard_domain::{
@@ -3186,6 +3249,150 @@ mod tests {
         server.await.unwrap();
 
         assert_eq!(prompted.status, "working");
+    }
+
+    #[tokio::test]
+    async fn presses_a_key_through_herdr_send_keys() {
+        for (key, name) in [
+            (PaneKey::CtrlEnter, "ctrl+enter"),
+            (PaneKey::ShiftEnter, "shift+enter"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let socket_path = temp.path().join("herdr.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["id"], "yard:key-1:key");
+                assert_eq!(request["method"], "pane.send_keys");
+                assert_eq!(request["params"]["pane_id"], "pane-1");
+                assert_eq!(request["params"]["keys"], serde_json::json!([name]));
+                writer
+                    .write_all(b"{\"id\":\"yard:key-1:key\",\"result\":{\"type\":\"ok\"}}\n")
+                    .await
+                    .unwrap();
+            });
+            let config = HerdrConfig {
+                request_timeout: Duration::from_secs(1),
+                ..HerdrConfig::default()
+            };
+
+            send_pane_key_at_socket(
+                &config,
+                &socket_path,
+                SendPaneKeyRequest {
+                    request_id: "key-1".to_owned(),
+                    pane_id: "pane-1".to_owned(),
+                    key,
+                },
+                config.request_timeout,
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn reports_a_rejected_key_press() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            writer
+                .write_all(b"{\"id\":\"yard:key-2:key\",\"error\":{\"code\":\"pane_not_found\",\"message\":\"pane pane-9 not found\"}}\n")
+                .await
+                .unwrap();
+        });
+        let config = HerdrConfig {
+            request_timeout: Duration::from_secs(1),
+            ..HerdrConfig::default()
+        };
+
+        let result = send_pane_key_at_socket(
+            &config,
+            &socket_path,
+            SendPaneKeyRequest {
+                request_id: "key-2".to_owned(),
+                pane_id: "pane-9".to_owned(),
+                key: PaneKey::CtrlEnter,
+            },
+            config.request_timeout,
+        )
+        .await;
+        server.await.unwrap();
+
+        // A structured refusal: Herdr did not press the key.
+        let error = result.unwrap_err();
+        assert!(matches!(error, HerdrError::Api { .. }), "{error}");
+        assert!(error.request_not_delivered(), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_key_press_that_gets_no_answer_times_out_as_possibly_pressed() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (received_tx, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, _writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            received_tx.send(line).unwrap();
+            // Never answer; hold the connection until Yard gives up.
+            let mut rest = String::new();
+            let _ = reader.read_line(&mut rest).await;
+        });
+        let config = HerdrConfig::default();
+
+        let started = std::time::Instant::now();
+        let result = send_pane_key_at_socket(
+            &config,
+            &socket_path,
+            SendPaneKeyRequest {
+                request_id: "key-3".to_owned(),
+                pane_id: "pane-1".to_owned(),
+                key: PaneKey::ShiftEnter,
+            },
+            Duration::from_millis(200),
+        )
+        .await;
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(received.await.unwrap().contains("pane.send_keys"));
+        // The request reached Herdr, so it may have pressed the key.
+        let error = result.unwrap_err();
+        assert!(matches!(error, HerdrError::SocketTimeout), "{error}");
+        assert!(!error.request_not_delivered(), "{error}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_key_press_to_a_missing_socket_was_not_delivered() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = send_pane_key_at_socket(
+            &HerdrConfig::default(),
+            &temp.path().join("gone.sock"),
+            SendPaneKeyRequest {
+                request_id: "key-4".to_owned(),
+                pane_id: "pane-1".to_owned(),
+                key: PaneKey::CtrlEnter,
+            },
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, HerdrError::SocketConnect { .. }), "{error}");
+        assert!(error.request_not_delivered(), "{error}");
     }
 
     #[tokio::test]

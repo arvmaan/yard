@@ -14,13 +14,13 @@ use yard_herdr::{
     AcquirePaneLeaseRequest, BootstrapAgentRequest, CloseLeasedPaneRequest, DiscoveredHerdrSession,
     HerdrAdapter, HerdrControlError, HerdrError, HerdrTerminal, HerdrTerminalError,
     OpenTerminalRequest as HerdrOpenTerminalRequest, PROCESS_INFO_PHASE_DEADLINE,
-    PROCESS_INFO_REQUEST_TIMEOUT, PaneLease, PaneLeaseOperationResult, PaneLeaseStatus,
+    PROCESS_INFO_REQUEST_TIMEOUT, PaneKey, PaneLease, PaneLeaseOperationResult, PaneLeaseStatus,
     PaneLeaseStatusRequest, PaneManagementCapability, PaneManagementRpcError, PaneReadFormat,
     PrepareAgentRequest, PrepareWorkspaceAgentRequest, PromptAgentRequest, ProvisionAgentRequest,
-    ReadPaneRequest, ReleasePaneLeaseRequest, RenewPaneLeaseRequest, StartPreparedAgentRequest,
-    TerminalCommand as HerdrTerminalCommand, TerminalDimensions, TerminalEncoding, TerminalEvent,
-    TerminalInput, TerminalScroll, TerminalScrollDirection as HerdrScrollDirection,
-    TerminalScrollSource as HerdrScrollSource,
+    ReadPaneRequest, ReleasePaneLeaseRequest, RenewPaneLeaseRequest, SendPaneKeyRequest,
+    StartPreparedAgentRequest, TerminalCommand as HerdrTerminalCommand, TerminalDimensions,
+    TerminalEncoding, TerminalEvent, TerminalInput, TerminalScroll,
+    TerminalScrollDirection as HerdrScrollDirection, TerminalScrollSource as HerdrScrollSource,
 };
 
 use crate::allocation_service::{
@@ -37,7 +37,8 @@ use crate::intervention_service::{
 use crate::provider_agents::ProviderAgentObserver;
 use crate::terminal_service::{
     OpenTerminalRequest, RuntimeTerminal, RuntimeTerminalError, RuntimeTerminalSession,
-    TerminalClientMessage, TerminalScrollDirection, TerminalScrollSource, TerminalServerMessage,
+    TerminalClientMessage, TerminalKey, TerminalScrollDirection, TerminalScrollSource,
+    TerminalServerMessage,
 };
 
 #[derive(Debug, Error)]
@@ -326,6 +327,86 @@ pub struct HerdrInventorySource {
 struct HerdrRuntimeTerminalSession {
     terminal: Option<HerdrTerminal>,
     first_message: Option<TerminalServerMessage>,
+    keys: PaneKeys,
+}
+
+/// Where a modified key press goes: Herdr's `pane.send_keys` for the pane
+/// behind the terminal, so Herdr encodes it for the app's keyboard mode.
+struct PaneKeys {
+    adapter: HerdrAdapter,
+    session: String,
+    pane_id: String,
+    /// The session's control socket, found on the first press and kept, so
+    /// a press is one socket round trip rather than a `session list` spawn.
+    socket: Option<std::path::PathBuf>,
+}
+
+/// How long the first press may spend finding the session's socket.
+const KEY_SESSION_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long a press may wait for Herdr's answer. The press runs inside the
+/// terminal socket's loop, which relays no output while it waits, so this
+/// is short, and well inside the loop's `TERMINAL_OPERATION_TIMEOUT`.
+const KEY_PRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_000);
+
+/// Why a key press failed, and whether Herdr can have pressed it anyway.
+#[derive(Debug)]
+enum KeyPressFailure {
+    /// Herdr did not press the key (nothing was sent, or it refused).
+    NotPressed(HerdrError),
+    /// The request may have reached Herdr (a timeout or a broken reply), so
+    /// the key may or may not have been pressed.
+    Unknown(HerdrError),
+}
+
+impl PaneKeys {
+    /// Press `key`, or report why Herdr did not (or might not have).
+    async fn press(&mut self, key: TerminalKey) -> Result<(), KeyPressFailure> {
+        let socket = if let Some(socket) = &self.socket {
+            socket.clone()
+        } else {
+            let socket = match tokio::time::timeout(
+                KEY_SESSION_LOOKUP_TIMEOUT,
+                self.adapter.session_socket(&self.session),
+            )
+            .await
+            {
+                Ok(Ok(socket)) => socket,
+                Ok(Err(error)) => return Err(KeyPressFailure::NotPressed(error)),
+                Err(_) => return Err(KeyPressFailure::NotPressed(HerdrError::DiscoveryTimeout)),
+            };
+            self.socket = Some(socket.clone());
+            socket
+        };
+        let result = self
+            .adapter
+            .send_pane_key_at(
+                &socket,
+                SendPaneKeyRequest {
+                    request_id: uuid::Uuid::now_v7().to_string(),
+                    pane_id: self.pane_id.clone(),
+                    key: match key {
+                        TerminalKey::CtrlEnter => PaneKey::CtrlEnter,
+                        TerminalKey::ShiftEnter => PaneKey::ShiftEnter,
+                    },
+                },
+                KEY_PRESS_TIMEOUT,
+            )
+            .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if matches!(error, HerdrError::SocketConnect { .. }) {
+                    // The session may have restarted on another socket.
+                    self.socket = None;
+                }
+                if error.request_not_delivered() {
+                    Err(KeyPressFailure::NotPressed(error))
+                } else {
+                    Err(KeyPressFailure::Unknown(error))
+                }
+            }
+        }
+    }
 }
 
 impl HerdrInventorySource {
@@ -1230,6 +1311,12 @@ impl RuntimeTerminal for HerdrInventorySource {
     ) -> Result<Box<dyn RuntimeTerminalSession>, RuntimeTerminalError> {
         let dimensions = TerminalDimensions::new(request.cols, request.rows)
             .map_err(|error| classify_terminal_error(&error))?;
+        let keys = PaneKeys {
+            adapter: self.adapter.clone(),
+            session: request.session.clone(),
+            pane_id: request.pane_id,
+            socket: None,
+        };
         let request =
             HerdrOpenTerminalRequest::new(request.session, request.terminal_id, dimensions)
                 .map_err(|error| classify_terminal_error(&error))?;
@@ -1268,6 +1355,7 @@ impl RuntimeTerminal for HerdrInventorySource {
         Ok(Box::new(HerdrRuntimeTerminalSession {
             terminal: Some(terminal),
             first_message: Some(first_message),
+            keys,
         }))
     }
 }
@@ -1304,11 +1392,53 @@ impl RuntimeTerminalSession for HerdrRuntimeTerminalSession {
             TerminalClientMessage::Input {
                 text: Some(text),
                 bytes: None,
+                key: None,
             } => HerdrTerminalCommand::Input(TerminalInput::Text(text)),
             TerminalClientMessage::Input {
                 text: None,
                 bytes: Some(bytes),
+                key: None,
             } => HerdrTerminalCommand::Input(TerminalInput::BytesBase64(bytes)),
+            TerminalClientMessage::Input {
+                text: None,
+                bytes: None,
+                key: Some(key),
+            } => {
+                // Typed input returns Herdr to the live view; so must a key.
+                terminal
+                    .send(HerdrTerminalCommand::ScrollReset)
+                    .await
+                    .map_err(|error| classify_terminal_error(&error))?;
+                // Ordering assumption: text sent just before this key went
+                // to the `terminal session control` child's stdin, and the
+                // await above only waited for the pipe write; the key goes
+                // over Herdr's control socket. Herdr's control stream has
+                // no key command and does not acknowledge input, so nothing
+                // guarantees Herdr applies that text first. A human types
+                // far slower than the child relays a line, and in rehearsal
+                // the text always landed first, but a script that writes
+                // text and a key back to back could see them reordered.
+                // Input sent after the key is ordered: it waits for this.
+                match self.keys.press(key).await {
+                    Ok(()) => return Ok(()),
+                    // Herdr did not press it: send what xterm.js sends for
+                    // this key, a bare CR, as before keys were routed here.
+                    Err(KeyPressFailure::NotPressed(error)) => {
+                        tracing::warn!(%error, ?key, "Herdr did not press the key; sending CR");
+                        HerdrTerminalCommand::Input(TerminalInput::Text("\r".to_owned()))
+                    }
+                    // Herdr may have pressed it: a CR on top could submit a
+                    // prompt twice, so send nothing.
+                    Err(KeyPressFailure::Unknown(error)) => {
+                        tracing::warn!(
+                            %error,
+                            ?key,
+                            "Herdr key press outcome unknown; not sending CR"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
             TerminalClientMessage::Resize { cols, rows } => HerdrTerminalCommand::Resize(
                 TerminalDimensions::new(cols, rows)
                     .map_err(|error| classify_terminal_error(&error))?,
@@ -1341,7 +1471,7 @@ impl RuntimeTerminalSession for HerdrRuntimeTerminalSession {
             TerminalClientMessage::Release => HerdrTerminalCommand::Release,
             TerminalClientMessage::Input { .. } => {
                 return Err(RuntimeTerminalError::Protocol(
-                    "terminal.input requires exactly one text or bytes field".to_owned(),
+                    "terminal.input requires exactly one text, bytes, or key field".to_owned(),
                 ));
             }
         };

@@ -14,9 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use config::HerdrConfig;
 pub use control::{
-    BootstrapAgentRequest, HerdrControlError, PaneOutput, PaneReadFormat, PaneScroll,
+    BootstrapAgentRequest, HerdrControlError, PaneKey, PaneOutput, PaneReadFormat, PaneScroll,
     PrepareAgentRequest, PrepareWorkspaceAgentRequest, PreparedAgent, PromptAgentRequest,
-    PromptedAgent, ProvisionAgentRequest, ProvisionedAgent, ReadPaneRequest,
+    PromptedAgent, ProvisionAgentRequest, ProvisionedAgent, ReadPaneRequest, SendPaneKeyRequest,
     StartPreparedAgentRequest,
 };
 pub use error::HerdrError;
@@ -326,6 +326,36 @@ impl HerdrAdapter {
     /// response does not match the pinned protocol.
     pub async fn read_pane(&self, request: ReadPaneRequest) -> Result<PaneOutput, HerdrError> {
         control::read_pane(&self.config, request).await
+    }
+
+    /// Find the control socket of a running session, for
+    /// [`Self::send_pane_key_at`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HerdrError`] when discovery fails or the session is missing
+    /// or stopped.
+    pub async fn session_socket(&self, session: &str) -> Result<std::path::PathBuf, HerdrError> {
+        control::session_socket(&self.config, session).await
+    }
+
+    /// Press one key in a pane through the session's control socket, encoded
+    /// by Herdr for the keyboard mode the pane's app enabled. `timeout`
+    /// bounds the round trip. On error,
+    /// [`HerdrError::request_not_delivered`] tells whether Herdr can have
+    /// pressed the key anyway.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HerdrError`] when the socket is gone, Herdr rejects the key
+    /// or pane, or no answer arrives within `timeout`.
+    pub async fn send_pane_key_at(
+        &self,
+        socket: &std::path::Path,
+        request: SendPaneKeyRequest,
+        timeout: std::time::Duration,
+    ) -> Result<(), HerdrError> {
+        control::send_pane_key_at_socket(&self.config, socket, request, timeout).await
     }
 
     /// Negotiate safe pane-management support for a running Herdr session.
