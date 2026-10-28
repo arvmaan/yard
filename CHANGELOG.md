@@ -21,6 +21,15 @@ a release is tagged.
   and its status report is posted back in the thread. Every inbound action is
   audited in `slack-audit.jsonl`. The Slack app manifests are now JSON
   (`docs/slack/manifest.json`, `docs/slack/manifest-outbound-only.json`).
+- Added Slack conversations: a top-level owner question starts a
+  conversation rooted at its thread, and follow-ups in that thread go to the
+  same agent with the earlier turns and are answered in the same thread
+  (messages queue per thread while the agent is busy, at most 5). Plain
+  questions go to a dedicated, lazily started Slack Superintendent; the main
+  Superintendent answers if it cannot. Conversations persist in
+  `slack-conversations.json` (0600, redacted, 7-day TTL). Owner messages in a
+  thread are now routed or queued instead of refused as "not an open
+  conversation".
 - Installed `yard` CLI with managed `start`, `status`, and `stop` commands,
   explicit foreground `run`, and a user-local source installer.
 - Added durable project archiving with guarded runtime cleanup, active-map

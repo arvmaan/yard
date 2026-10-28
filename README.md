@@ -477,10 +477,12 @@ With inbound on, the owner can use the DM with the Yard bot:
   `From Slack (owner):`. Herdr reports an agent that asks at its input box
   as finished rather than blocked, so a "finished" notification is followed
   by such a question card too when the agent's screen ends in a question.
-  Only a question card's thread takes a free-text reply: typed text in any
-  other thread (a menu or permission card, a notification, an answer) is
-  not sent anywhere unless it starts with `<Project>:`; use the buttons, or
-  open Yard for a menu's "Type something" entry. A prompt Yard cannot parse
+  A reply in a pending question card's thread answers that agent's
+  prompt. Typed text in any other thread (a menu or permission card, a
+  notification, an answered or expired card) is never typed into that
+  agent: it is a message for the conversation in that thread (see
+  [Conversations and follow-ups](#conversations-and-follow-ups)); use the
+  buttons, or open Yard for a menu's "Type something" entry. A prompt Yard cannot parse
   confidently gets a
   redacted screen excerpt and "open Yard", never guessed buttons; so do
   multi-select (checkbox) lists and Submit / Review steps. An agent that is
@@ -496,9 +498,16 @@ With inbound on, the owner can use the DM with the Yard bot:
   `help`. They show titles and states only. A message Slack delivers more
   than 5 minutes late (Yard offline or reconnecting) is not acted on; Yard
   replies once in its thread asking to send it again.
-- **Questions.** Any other top-level message goes to the Superintendent, or to a
-  project's orchestrator when it starts with the project's name and a colon
-  (`Telemetry: what's left?`). It is delivered through the same guarded
+- **Questions and instructions.** Any other message (a question, a
+  statement or something to do; at the top level or in any thread) goes to
+  the [Slack Superintendent](#slack-superintendent) (the main
+  Superintendent when it cannot start), or to a project's orchestrator when
+  it starts with the project's name and a colon (`Telemetry: what's
+  left?`); a name several projects share goes to the Slack Superintendent
+  with a note to work out which one is meant. Nothing you type is refused
+  with "nothing was sent". A Superintendent that is not running is started
+  first ("Starting the Superintendent…") and the message is sent once it is
+  up. It is delivered through the same guarded
   orchestrator prompt path as Yard's prompt box, prefixed `From Slack
   (owner):`, and refused while that orchestrator is itself waiting on a prompt
   (its card is shown instead). The orchestrator answers with Yard's status
@@ -529,6 +538,111 @@ user, action, target, outcome; never message or prompt text); dropped events
 (anyone but the owner, stale, malformed) go to `slack-audit-dropped.jsonl`,
 so they can never rotate the owner's records away. Run inbound on
 one Yard only: Slack spreads events over every open connection.
+
+#### Conversations and follow-ups
+
+Every thread is a conversation. A top-level message starts one rooted at
+that message; a reply in a thread Yard has no conversation for (a status or
+help card, a notification, an answered card, a thread from before this
+existed) adopts that thread as one, told what Yard knows about its root (the
+project of a notification thread, an answered card). Reply in its thread to
+follow up or say what to do next: it goes to the same agent with the earlier
+questions and answers of that thread (the last 6 turns, each capped at 1,500
+characters, redacted), and its answer is posted in the same thread. This
+works for as many turns as you like. Keyword commands (`status`, `blocked`,
+`help`…) typed in the thread are still answered as commands (a sentence
+that merely starts with `status` or `mute`, such as "Status of the deploy
+after the restart?", is a message), and `<Project>: question` in the thread
+switches the conversation to that project's orchestrator (Yard says so, and
+the earlier turns are dropped); `Superintendent: …` (or `yard: …`) switches
+it back. An ambiguous `<Project>:` goes to the Slack Superintendent, told
+that several projects share the name.
+One turn per conversation runs at a time: a reply while the previous answer
+is still awaited is queued, in order, and sent as the next turn when the
+answer arrives (Yard says "Queued — I'll send it after the current answer"
+once, not for every message). At most 5 messages wait per thread; a sixth is
+not queued and Yard says so. A turn holds its thread at most 10 minutes (or
+the answer window, if shorter): then the next queued message is sent, the
+unanswered turn is replayed as "(no answer relayed)", and its answer, if it
+still comes, is posted and remembered. A turn Yard could not watch (every
+watch slot busy) still holds its thread for that time. When the agent is on
+a prompt, has its terminal open in Yard, or its pane lease needs recovery,
+nothing is typed and nothing is refused: the message stays first in the
+thread's queue, Yard says once "Waiting: … I'll send your message right
+after" (with the prompt card when it is on one), and it is sent as soon as
+the agent can take it (tried every few seconds, and at once when a prompt
+is answered from Slack); only after the whole answer window of waiting is
+it given up, with Retry. A
+Retry on an older card in the thread is sent only while the thread still
+talks to the agent that card names. A reply under a prompt card whose
+buttons still work goes to the Slack Superintendent, told which agent's
+prompt is open there (only the card's buttons answer it).
+Conversations survive restarts: they are kept in
+`slack-conversations.json` beside the other Slack state (mode 0600, written
+atomically off the conversations lock, every question, answer and queued
+message redacted as above before it is written; at most 64, each for 7 days
+after its last use, the last 6 turns each, and at most 4 MiB: the least
+recently used conversations are left out first). The file records the
+Slack team, DM channel and owner it belongs to: started against another
+workspace, channel or owner, Yard drops it and resumes nothing. A turn in
+flight at a restart is watched again by the new process (its answer is
+relayed and joins the history; its thread waits for it as before);
+messages still queued are sent once Slack reconnects, or, when queued more
+than 30 minutes before, dropped with a note in their thread. A queued
+message that redaction changed is sent as saved, and Yard says so in the
+thread. An owner message that arrives in the seconds after a start, before
+Yard can act on it, is held (up to 30 seconds) and then handled; one that
+Slack delivers more than 5 minutes late is not acted on by itself, but its
+notice has a single-use "Send it now" button.
+Prompt-question cards keep their own single-use reply, and replies to your
+own messages are never held by quiet hours.
+
+#### Slack Superintendent
+
+Plain questions go to a dedicated Yard worker, the Slack Superintendent, so
+Slack chat never queues behind or interrupts the main Superintendent's work.
+It is a workstream named `Slack Superintendent` on the canvas (shared
+`yard-coordination` session, its own pane and provider session, no attached
+projects), started with the main Superintendent's worker profile the first
+time a plain question needs it, and re-used afterwards. Yard recognises it
+by its creator (`slack:superintendent`, an actor no HTTP client may use),
+never by name. When its worker is positively gone (exited, missing from
+Herdr, or bound to another pane), or its terminal shows a lost session when
+a message is about to be sent, Yard archives the node and starts a new one
+("Starting the Superintendent…"; one start at a time, a message behind it
+finds it up); when Yard merely cannot read its state that turn falls back
+and the node is kept. The main Superintendent is recovered the same way when
+it is gone, not running or disconnected. Archiving it yourself is safe, the next question starts it
+again. It answers one Slack question at a time (one pane): a question from
+another conversation waits, shown as "Queued behind another Slack
+question", for at most that same 10-minute hold. Its brief makes it a
+conversational assistant: it answers from Yard state, read with the same
+tools and HTTP API as the Superintendent, and when you ask it to do
+something (assign work, prompt a project's orchestrator, report status) it
+does so through Yard's normal guarded routes, never by typing into
+terminals or editing Yard's files or database. It asks you to confirm in
+the thread before anything destructive (archiving, deleting, stopping or
+discarding work). It writes each
+full answer to `slack-answers/<key>.md` in its backend-owned folder and
+then reports a one-line status; Yard relays that file (a regular file, no
+symlinks, at most 64 KiB of UTF-8, removed after relay, at most 32 kept),
+split into sections and capped at 12,000 characters with "(truncated; ask a
+follow-up for the rest)", or the report's `last` when there is no file. Yard
+never acts on what an answer says. If it cannot start, the main
+Superintendent answers that turn and the answer says why; the next turn
+tries the Slack Superintendent again; the same happens when it can't be
+started again after showing a lost session. If it is waiting on a prompt or
+refuses typing (for example a pane lease that needs recovery), the message
+waits for it as described above, and nothing falls back.
+Its brief is fixed when its node is first started. A node started by an
+older Yard keeps the older, read-only brief; every Slack turn says that it
+supersedes that, but to give it the current brief archive the `Slack
+Superintendent` workstream once after upgrading (the next message starts a
+new one).
+Being a workstream, it counts in `status` and the status card, is listed by
+`blocked`, and its permission prompts arrive as ordinary "Workstream Slack
+Superintendent is blocked" notifications (held by quiet hours like any
+other); it never sends finished or ready-for-review notifications.
 
 ### Setting it up
 

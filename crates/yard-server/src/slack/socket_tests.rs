@@ -212,6 +212,7 @@ fn fast_relay() -> super::relay::RelayTiming {
         progress: Duration::from_millis(150),
         late_poll: Duration::from_millis(100),
         late: Duration::from_millis(1_500),
+        chat: Duration::from_millis(900),
     }
 }
 
@@ -267,13 +268,20 @@ async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
 struct GatedConsole {
     inner: super::actions::tests::FakeConsole,
     gate: Semaphore,
+    /// Every `slack_superintendent` call waits for a permit.
+    superintendent_gate: Semaphore,
 }
 
 impl GatedConsole {
     fn new(screen: &str, permits: usize) -> Arc<Self> {
+        Self::with_superintendent_permits(screen, permits, Semaphore::MAX_PERMITS)
+    }
+
+    fn with_superintendent_permits(screen: &str, permits: usize, starts: usize) -> Arc<Self> {
         Arc::new(Self {
             inner: super::actions::tests::FakeConsole::blocked_on(screen),
             gate: Semaphore::new(permits),
+            superintendent_gate: Semaphore::new(starts),
         })
     }
 
@@ -330,6 +338,27 @@ impl AgentConsole for GatedConsole {
         command_id: &str,
     ) -> Result<super::relay::Watched, ConsoleError> {
         self.inner.watch(target, command_id).await
+    }
+
+    async fn slack_superintendent(&self) -> Result<Option<AgentTarget>, ConsoleError> {
+        self.superintendent_gate.acquire().await.unwrap().forget();
+        self.inner.slack_superintendent().await
+    }
+
+    async fn answer_text(&self, target: &AgentTarget, answer_key: &str) -> Option<String> {
+        self.inner.answer_text(target, answer_key).await
+    }
+
+    async fn forget_answer(&self, target: &AgentTarget, answer_key: &str) {
+        self.inner.forget_answer(target, answer_key).await;
+    }
+
+    async fn recover_superintendent(
+        &self,
+        target: &AgentTarget,
+        actor: &str,
+    ) -> Result<AgentTarget, ConsoleError> {
+        self.inner.recover_superintendent(target, actor).await
     }
 }
 
@@ -622,25 +651,40 @@ async fn stale_foreign_and_bot_events_are_acked_but_ignored() {
         console.typed().is_empty(),
         "free text never becomes keystrokes"
     );
-    // A second message in the answered question's thread goes nowhere.
+    // A second message in the answered question's thread is not refused:
+    // it goes to the Superintendent (never the card's agent again), told
+    // that the card was answered.
+    set_blocked(&console, false);
     socket.send(with(
         message("env-7", "Ev7", "and also this", now_s()),
         "/payload/event/thread_ts",
         json!(CARD_TS),
     ));
-    eventually("closed reply", || {
-        posted_texts(&slack)
-            .iter()
-            .any(|text| text.starts_with("That question was already answered"))
+    eventually("closed card thread adopted", || {
+        console.inner.prompts.lock().unwrap().len() == 2
     })
     .await;
-    assert_eq!(console.inner.prompts.lock().unwrap().len(), 1, "not sent");
-    assert_eq!(console.inner.prompt_targets.lock().unwrap().len(), 1);
+    assert_eq!(
+        console.inner.prompt_targets.lock().unwrap().clone(),
+        [target.clone(), AgentTarget::YardOrchestrator]
+    );
+    let second = console.inner.prompts.lock().unwrap()[1].0.clone();
+    assert!(second.contains("and also this"), "{second}");
+    assert!(
+        second.contains("prompt card that was already answered or has expired"),
+        "{second}"
+    );
+    assert!(
+        !posted_texts(&slack)
+            .iter()
+            .any(|text| text.starts_with("That question was already answered"))
+    );
 
-    // The owner's message that Slack delivered too late: dropped, and one
-    // notice in its thread, even when Slack retries it.
-    socket.send(message("env-8", "Ev1", "blocked", now - 400));
-    socket.send(message("env-9", "Ev1", "blocked", now - 400));
+    // The owner's message that Slack delivered too late: not acted on by
+    // itself, and one notice in its thread (even when Slack retries it)
+    // with a single-use "Send it now".
+    socket.send(message("env-8", "Ev1", "late question", now - 400));
+    socket.send(message("env-9", "Ev1", "late question", now - 400));
     let late_thread = format!("{}.000100", now - 400);
     eventually("late notice", || {
         slack
@@ -658,13 +702,40 @@ async fn stale_foreign_and_bot_events_are_acked_but_ignored() {
         .map(|call| call.body)
         .collect::<Vec<_>>();
     assert_eq!(texts(&late).len(), 1, "{late:?}");
-    assert!(texts(&late)[0].contains("nothing was done"), "{late:?}");
-    assert_eq!(console.inner.prompts.lock().unwrap().len(), 1, "not sent");
+    assert!(
+        texts(&late)[0].contains("so it was not sent then"),
+        "{late:?}"
+    );
+    assert!(
+        !late[0].to_string().contains("late question"),
+        "the text never leaves Yard"
+    );
+    assert_eq!(console.inner.prompts.lock().unwrap().len(), 2, "not sent");
     assert!(
         audit_lines(&temp)
             .iter()
             .any(|line| line["action"] == "stale")
     );
+    // One click sends it as if just typed; a second click does nothing.
+    let send = button_value(&late[0], "Send it now");
+    socket.send(thread_click("env-10", &send, now - 400));
+    eventually("late message sent", || {
+        console.inner.prompts.lock().unwrap().len() == 3
+    })
+    .await;
+    assert!(
+        console.inner.prompts.lock().unwrap()[2]
+            .0
+            .contains("late question")
+    );
+    socket.send(thread_click("env-11", &send, now - 400));
+    eventually("used", || {
+        posted_texts(&slack)
+            .iter()
+            .any(|text| text.starts_with("That button was already used"))
+    })
+    .await;
+    assert_eq!(console.inner.prompts.lock().unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -914,7 +985,12 @@ async fn questions_go_to_the_named_orchestrator_and_the_answer_is_relayed() {
     let temp = TempDir::new().unwrap();
     let slack = MockSlack::start().await;
     let socket = MockSocket::start().await;
-    let notifier = connected(&temp, &slack, &socket).await;
+    // A long window: a message waiting for its agent is kept that long.
+    let relay = super::relay::RelayTiming {
+        follow: Duration::from_secs(30),
+        ..fast_relay()
+    };
+    let notifier = connected_relay(&temp, &slack, &socket, relay).await;
     let console = GatedConsole::new(super::prompt::tests::WORKING, 10_000);
     set_blocked(&console, false);
     notifier.attach_console(console.clone());
@@ -946,7 +1022,8 @@ async fn questions_go_to_the_named_orchestrator_and_the_answer_is_relayed() {
         text,
         super::relay::question_text("what's left? a && b token=abc123")
     );
-    assert!(text.contains("do not start long investigations or delegations"));
+    assert!(text.contains("do not start long investigations"));
+    assert!(text.contains("If it asks you to do something"));
     assert_eq!(actor, "slack:owner:U01OWNER");
     let posts = thread_posts(&slack, at);
     assert_eq!(posts.len(), 1, "{:?}", texts(&posts));
@@ -1010,72 +1087,74 @@ async fn questions_go_to_the_named_orchestrator_and_the_answer_is_relayed() {
         "only our command's report is looked for"
     );
 
-    // A blocked orchestrator gets no question: its prompt card instead.
+    // A blocked agent is not typed into: the message waits (said once,
+    // with its prompt card, no Retry) and is sent once the prompt is gone.
     set_blocked(&console, true);
     *console.inner.screen.lock().unwrap() = CLAUDE_PERMISSION.to_owned();
     let at = at + 1;
     socket.send(message("env-3", "Ev3", "are you done?", at));
-    eventually("blocked refusal", || thread_posts(&slack, at).len() == 2).await;
+    eventually("prompt card", || thread_posts(&slack, at).len() == 2).await;
     let posts = thread_posts(&slack, at);
     assert_eq!(
         posts[1]["blocks"][2]["elements"].as_array().unwrap().len(),
         2
     );
-    let not_sent = |slack: &MockSlack, why: &str| {
+    let update = |slack: &MockSlack, needle: &str| {
         slack.calls("chat.update").into_iter().find(|call| {
             call.body["text"]
                 .as_str()
                 .unwrap_or_default()
-                .contains(&format!("was not sent: {why}"))
+                .contains(needle)
         })
     };
-    // A card like every other ask outcome: Retry and Open in Yard.
-    let card = not_sent(&slack, "it is waiting on a prompt").unwrap().body;
-    button_value(&card, "Retry");
+    let card = update(&slack, "Waiting: The Superintendent is waiting on a prompt")
+        .unwrap()
+        .body;
+    assert!(!card.to_string().contains("Retry"), "{card}");
     assert!(
         card["blocks"]
             .to_string()
             .contains(super::blocks::OPEN_ACTION_ID)
     );
     assert_eq!(console.inner.prompts.lock().unwrap().len(), 1, "not sent");
-
-    // A rejected delivery (terminal open in Yard) becomes an error card
-    // with Retry and Open in Yard; nothing is retried by itself.
     set_blocked(&console, false);
+    *console.inner.screen.lock().unwrap() = super::prompt::tests::WORKING.to_owned();
+    eventually("sent once free", || {
+        console.inner.prompts.lock().unwrap().len() == 2
+    })
+    .await;
+
+    // A rejected delivery (terminal open in Yard) waits the same way.
     *console.inner.prompt_error.lock().unwrap() =
         Some(ConsoleError::Busy("open in Yard".to_owned()));
     let at = at + 1;
     socket.send(message("env-4", "Ev4", "hello?", at));
-    let failed = |slack: &MockSlack| {
-        slack.calls("chat.update").into_iter().find(|call| {
-            call.body["text"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("its terminal is open in Yard; answer it there")
-        })
-    };
-    eventually("busy", || failed(&slack).is_some()).await;
-    let card = failed(&slack).unwrap().body;
-    button_value(&card, "Retry");
-    assert!(
-        card["blocks"]
-            .to_string()
-            .contains(super::blocks::OPEN_ACTION_ID)
-    );
-    assert_eq!(console.inner.prompts.lock().unwrap().len(), 1);
-
-    // Reading the agent fails (not gone): the same card, with Retry.
+    eventually("busy", || {
+        update(
+            &slack,
+            "Waiting: The Superintendent has its terminal open in Yard",
+        )
+        .is_some()
+    })
+    .await;
+    assert_eq!(console.inner.prompts.lock().unwrap().len(), 2);
     *console.inner.prompt_error.lock().unwrap() = None;
+    eventually("sent once closed", || {
+        console.inner.prompts.lock().unwrap().len() == 3
+    })
+    .await;
+
+    // Reading the agent fails (not gone): not sent, with Retry.
     let running = console.inner.snapshot.lock().unwrap().clone();
     *console.inner.snapshot.lock().unwrap() =
         Err(ConsoleError::Failed("herdr timed out".to_owned()));
     let at = at + 1;
     socket.send(message("env-5", "Ev5", "anyone?", at));
     eventually("read failed", || {
-        not_sent(&slack, "Yard could not deliver the question").is_some()
+        update(&slack, "was not sent: Yard could not deliver the question").is_some()
     })
     .await;
-    let card = not_sent(&slack, "Yard could not deliver the question")
+    let card = update(&slack, "was not sent: Yard could not deliver the question")
         .unwrap()
         .body;
     button_value(&card, "Retry");
@@ -1085,18 +1164,31 @@ async fn questions_go_to_the_named_orchestrator_and_the_answer_is_relayed() {
             .contains(super::blocks::OPEN_ACTION_ID)
     );
     *console.inner.snapshot.lock().unwrap() = running;
-    assert_eq!(console.inner.prompts.lock().unwrap().len(), 1);
+    assert_eq!(console.inner.prompts.lock().unwrap().len(), 3);
 
     let outcomes = outcomes(&temp);
+    for expected in [
+        format!("ask:orchestrator:{project_id}:sent"),
+        format!("relay:orchestrator:{project_id}:relayed"),
+        "ask:superintendent:waiting:blocked".to_owned(),
+        "ask:superintendent:waiting:busy".to_owned(),
+        "ask:superintendent:refused:failed".to_owned(),
+    ] {
+        assert!(outcomes.contains(&expected), "{expected}: {outcomes:?}");
+    }
     assert_eq!(
-        outcomes,
-        [
-            format!("ask:orchestrator:{project_id}:sent"),
-            format!("relay:orchestrator:{project_id}:relayed"),
-            "ask:superintendent:refused:blocked".to_owned(),
-            "ask:superintendent:refused:busy".to_owned(),
-            "ask:superintendent:refused:failed".to_owned(),
-        ]
+        outcomes
+            .iter()
+            .filter(|outcome| *outcome == "ask:superintendent:sent")
+            .count(),
+        2,
+        "{outcomes:?}"
+    );
+    assert!(
+        !outcomes
+            .iter()
+            .any(|outcome| outcome.contains("refused:blocked") || outcome.contains("refused:busy")),
+        "{outcomes:?}"
     );
     let audit = std::fs::read_to_string(temp.path().join("slack-audit.jsonl")).unwrap()
         + &std::fs::read_to_string(temp.path().join("slack-audit-dropped.jsonl"))
@@ -1482,11 +1574,16 @@ async fn unreachable_or_disconnected_agents_are_reported_fast_with_retry() {
     })
     .await;
     let card = update_with(&slack, "The Superintendent isn't running").unwrap();
+    // It was started first (this console can't), never just dropped.
     assert!(
-        card["text"]
-            .as_str()
-            .unwrap()
-            .contains("(its agent process exited)")
+        card["text"].as_str().unwrap().contains(
+            "(its agent process exited; Yard could not start it: Yard cannot start it from Slack)"
+        ),
+        "{card}"
+    );
+    assert_eq!(
+        *console.inner.recover_calls.lock().unwrap(),
+        [AgentTarget::YardOrchestrator]
     );
     assert!(
         card["blocks"]
@@ -1584,7 +1681,8 @@ async fn unreachable_or_disconnected_agents_are_reported_fast_with_retry() {
     .await;
 
     // Already disconnected before the question (the process lives on):
-    // refused at once with Retry, nothing typed.
+    // nothing typed into it; it is started again first (this console
+    // can't), then the card says why, with Retry.
     *console.inner.watch_error.lock().unwrap() = None;
     *console.inner.screen.lock().unwrap() = [
         "• Earlier answer",
@@ -1615,7 +1713,8 @@ async fn unreachable_or_disconnected_agents_are_reported_fast_with_retry() {
     assert_eq!(
         outcomes(&temp),
         [
-            "ask:superintendent:refused:not_running",
+            "ask:superintendent:starting",
+            "ask:superintendent:failed:start",
             "nav_retry:superintendent:answered",
             "ask:superintendent:sent",
             "nav:-:refused:already_used",
@@ -1624,8 +1723,14 @@ async fn unreachable_or_disconnected_agents_are_reported_fast_with_retry() {
             "relay:superintendent:lost:not_running",
             "ask:superintendent:sent",
             "relay:superintendent:lost:terminal_changed",
-            "ask:superintendent:refused:disconnected",
+            "ask:superintendent:starting",
+            "ask:superintendent:failed:start",
         ]
+    );
+    assert_eq!(
+        console.inner.recover_calls.lock().unwrap().len(),
+        2,
+        "the disconnected one was started again too"
     );
 }
 
@@ -2035,7 +2140,7 @@ async fn an_unknown_navigation_button_leaves_its_card_alone() {
 }
 
 #[tokio::test]
-async fn a_reply_in_a_menu_or_notification_thread_is_never_a_superintendent_question() {
+async fn a_reply_in_a_menu_or_notification_thread_goes_to_the_superintendent_with_context() {
     let temp = TempDir::new().unwrap();
     let slack = MockSlack::start().await;
     let socket = MockSocket::start().await;
@@ -2056,6 +2161,7 @@ async fn a_reply_in_a_menu_or_notification_thread_is_never_a_superintendent_ques
         .await
         .unwrap();
     // The owner types an answer in that thread instead of clicking.
+    set_blocked(&console, false);
     socket.send(with(
         message(
             "env-1",
@@ -2066,36 +2172,44 @@ async fn a_reply_in_a_menu_or_notification_thread_is_never_a_superintendent_ques
         "/payload/event/thread_ts",
         json!(root),
     ));
-    eventually("refusal", || {
-        posted_texts(&slack)
-            .iter()
-            .any(|text| text.starts_with("Nothing was sent"))
-    })
-    .await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        console.inner.prompt_targets.lock().unwrap().is_empty(),
-        "nothing prompted, least of all the Superintendent"
-    );
-    assert!(console.typed().is_empty());
-    let audit = audit_lines(&temp);
-    assert!(
-        audit
-            .iter()
-            .any(|line| line["outcome"] == "refused:not_a_question"),
-        "{audit:?}"
-    );
-    // A top-level question still reaches the Superintendent (once it is
-    // not itself waiting on a prompt).
-    set_blocked(&console, false);
-    socket.send(message("env-2", "Ev2", "what is left today?", now_s()));
+    // Not refused: the thread is adopted as a conversation with the
+    // Superintendent, which is told what the thread was.
     eventually("superintendent prompt", || {
         !console.inner.prompt_targets.lock().unwrap().is_empty()
     })
     .await;
     assert_eq!(
         *console.inner.prompt_targets.lock().unwrap(),
-        [AgentTarget::YardOrchestrator]
+        [AgentTarget::YardOrchestrator],
+        "never the menu's agent"
+    );
+    assert!(console.typed().is_empty(), "no menu key typed");
+    let prompt = console.inner.prompts.lock().unwrap()[0].0.clone();
+    assert!(
+        prompt.contains("Pick us-west-2 but only after the canary"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("About this Slack thread: The owner replied in an existing Slack thread."),
+        "{prompt}"
+    );
+    let audit = audit_lines(&temp);
+    assert!(
+        audit.iter().any(|line| line["outcome"] == "adopted_thread"),
+        "{audit:?}"
+    );
+    assert!(
+        !audit
+            .iter()
+            .any(|line| line["outcome"] == "refused:not_a_question"),
+        "{audit:?}"
+    );
+    assert!(
+        !posted_texts(&slack)
+            .iter()
+            .any(|text| text.starts_with("Nothing was sent")),
+        "{:?}",
+        posted_texts(&slack)
     );
 }
 
@@ -2319,18 +2433,18 @@ async fn questions_to_agents_yard_refuses_input_for_are_not_sent() {
     notifier.attach_console(console.clone());
     set_health(&console, AgentHealth::Working);
 
-    // A managed pane whose lease needs recovery: refused before sending,
-    // with the reason, Retry and Open in Yard.
+    // A managed pane whose lease needs recovery: nothing is typed; the
+    // message waits, with the reason and Open in Yard.
     *console.inner.send_refusal.lock().unwrap() = Some(ConsoleError::Unavailable(
         super::console::LEASE_RECOVERY_REQUIRED.to_owned(),
     ));
     let at = now_s();
     socket.send(message("env-1", "Ev1", "what is blocked?", at));
-    eventually("refused", || update_with(&slack, "was not sent").is_some()).await;
-    let card = update_with(&slack, "was not sent").unwrap();
+    eventually("waiting", || update_with(&slack, "Waiting:").is_some()).await;
+    let card = update_with(&slack, "Waiting:").unwrap();
     let text = card["text"].as_str().unwrap();
     assert!(
-        text.contains("Yard lost the pane lease; recovery is required."),
+        text.contains("can't be typed into yet (Yard lost the pane lease; recovery is required)"),
         "{text}"
     );
     assert!(!text.contains("required.."), "{text}");
@@ -2339,20 +2453,19 @@ async fn questions_to_agents_yard_refuses_input_for_are_not_sent() {
             .to_string()
             .contains(super::blocks::OPEN_ACTION_ID)
     );
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(console.inner.prompts.lock().unwrap().is_empty(), "not sent");
-    let retry = button_value(&card, "Retry");
 
-    // Once recovered, the owner's Retry sends it.
+    // Once recovered (in Yard), it is sent by itself.
     *console.inner.send_refusal.lock().unwrap() = None;
-    socket.send(thread_click("env-2", &retry, at));
-    eventually("retried", || {
+    eventually("sent once recovered", || {
         console.inner.prompts.lock().unwrap().len() == 1
     })
     .await;
     assert!(
         audit_lines(&temp)
             .iter()
-            .any(|line| line["outcome"] == "refused:unavailable"),
+            .any(|line| line["outcome"] == "waiting:unavailable"),
         "{:?}",
         audit_lines(&temp)
     );
@@ -2545,3 +2658,6 @@ async fn quiet_controls_mute_unmute_and_digest_through_the_guarded_path() {
         );
     }
 }
+
+#[path = "socket_conversation_tests.rs"]
+mod conversations;

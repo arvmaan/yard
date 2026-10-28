@@ -16,7 +16,6 @@ use yard_domain::{OrchestratorStatusReport, OrchestratorStatusState};
 use super::{
     blocks,
     message::{OutgoingMessage, clean_prompt_line, since_token},
-    prompt::cap,
     relay,
 };
 
@@ -73,6 +72,60 @@ pub fn asking_card(to: &str, at_unix_ms: u64, ui_url: &str) -> OutgoingMessage {
     }
 }
 
+/// Posted when the Slack Superintendent takes a while to start; it then
+/// becomes the progress message.
+#[must_use]
+pub fn starting_card(at_unix_ms: u64, ui_url: &str) -> OutgoingMessage {
+    OutgoingMessage {
+        text: "Starting the Slack Superintendent… Its answer will be posted in this thread."
+            .to_owned(),
+        blocks: blocks::finish(vec![
+            blocks::section(":hourglass_flowing_sand: *Starting the Slack Superintendent…*"),
+            blocks::context(&[
+                format!("Sent from Slack · {}", since_token(at_unix_ms)),
+                "A dedicated Yard workstream answers Slack conversations; the first start takes up to a minute.".to_owned(),
+            ]),
+            links(Vec::new(), ui_url),
+        ]),
+    }
+}
+
+/// A Superintendent that was gone or not running is being started (or
+/// recovered); the owner's message is sent once it is up.
+#[must_use]
+pub fn recovering_card(to: &str, at_unix_ms: u64, ui_url: &str) -> OutgoingMessage {
+    OutgoingMessage {
+        text: format!("Starting {to}… Your message is sent once it is up."),
+        blocks: blocks::finish(vec![
+            blocks::section(&format!(":hourglass_flowing_sand: *Starting {to}…*")),
+            blocks::context(&[
+                format!("Sent from Slack · {}", since_token(at_unix_ms)),
+                "It was not running, so Yard is starting it; your message is sent once it is up (up to a minute or two).".to_owned(),
+            ]),
+            links(Vec::new(), ui_url),
+        ]),
+    }
+}
+
+/// The Slack Superintendent is answering another Slack question: this
+/// one waits its turn, then becomes the progress message.
+#[must_use]
+pub fn queued_card(at_unix_ms: u64, ui_url: &str) -> OutgoingMessage {
+    OutgoingMessage {
+        text: "Queued behind another Slack question to the Slack Superintendent… Its answer will be posted in this thread.".to_owned(),
+        blocks: blocks::finish(vec![
+            blocks::section(
+                ":hourglass_flowing_sand: *Queued behind another Slack question to the Slack Superintendent…*",
+            ),
+            blocks::context(&[
+                format!("Sent from Slack · {}", since_token(at_unix_ms)),
+                "It answers one question at a time; this one is sent as soon as it is free.".to_owned(),
+            ]),
+            links(Vec::new(), ui_url),
+        ]),
+    }
+}
+
 /// The throttled "still waiting" update of the progress message.
 #[must_use]
 pub fn progress_card(
@@ -119,6 +172,45 @@ pub fn unreachable_card(
             )),
             blocks::context(&["Start it in Yard, then press Retry.".to_owned()]),
             links(vec![retry], ui_url),
+        ]),
+    }
+}
+
+/// The message waits for its agent (on a prompt, or its terminal open in
+/// Yard) and is sent as soon as it can take it; nothing to retry.
+#[must_use]
+pub fn waiting_card(to: &str, reason: &str, ui_url: &str) -> OutgoingMessage {
+    let reason = clean_prompt_line(reason);
+    OutgoingMessage {
+        text: format!(
+            "Waiting: {} {reason}. I'll send your message right after.",
+            title(to)
+        ),
+        blocks: blocks::finish(vec![
+            blocks::section(&format!(
+                ":hourglass_flowing_sand: *Waiting:* {} {reason}. I'll send your message right after.",
+                title(to)
+            )),
+            blocks::context(&[
+                "It stays first in this thread's queue; nothing to resend.".to_owned()
+            ]),
+            links(Vec::new(), ui_url),
+        ]),
+    }
+}
+
+/// An owner message that arrived while Yard was offline: not acted on by
+/// itself (too old), sent with one click.
+#[must_use]
+pub fn late_card(send: Option<Value>, ui_url: &str) -> OutgoingMessage {
+    OutgoingMessage {
+        text: "Yard was offline or reconnecting when you sent this, so it was not sent then. Press Send it now to send it.".to_owned(),
+        blocks: blocks::finish(vec![
+            blocks::section(
+                ":electric_plug: *Yard was offline or reconnecting when you sent this*, so it was not sent then.",
+            ),
+            blocks::context(&["Press Send it now to send it as if you just typed it.".to_owned()]),
+            links(vec![send], ui_url),
         ]),
     }
 }
@@ -343,22 +435,48 @@ fn split(text: &str, max: usize) -> Vec<String> {
     parts
 }
 
-/// The relayed answer: header with the speaker, the answer in sections of
-/// at most [`SECTION_CHARS`], next step and blockers, a state context.
-/// Redacted and escaped line by line; past [`MAX_RELAY_CHARS`] it ends with
-/// "(truncated)". `text` is the plain [`relay::report_text`].
+/// Ends an answer cut at [`MAX_RELAY_CHARS`].
+pub const TRUNCATED: &str = "(truncated; ask a follow-up for the rest)";
+
+fn cap_answer(text: &str) -> String {
+    if text.chars().count() <= MAX_RELAY_CHARS {
+        return text.to_owned();
+    }
+    let keep = MAX_RELAY_CHARS.saturating_sub(TRUNCATED.chars().count() + 1);
+    let mut capped = text.chars().take(keep).collect::<String>();
+    capped.push('\n');
+    capped.push_str(TRUNCATED);
+    capped
+}
+
+/// The relayed answer from the report alone (`last` is the answer).
 #[must_use]
 pub fn answer_message(to: &str, report: &OrchestratorStatusReport) -> OutgoingMessage {
+    answer_with(to, report, &report.last, None)
+}
+
+/// The relayed answer: header with the speaker, `body` (the answer file,
+/// or the report's `last`) in sections of at most [`SECTION_CHARS`], next
+/// step and blockers, a state context and `note` (why another agent
+/// answered). Redacted and escaped line by line; past [`MAX_RELAY_CHARS`]
+/// it ends with [`TRUNCATED`]. `text` is the plain [`relay::report_text_with`].
+#[must_use]
+pub fn answer_with(
+    to: &str,
+    report: &OrchestratorStatusReport,
+    body: &str,
+    note: Option<&str>,
+) -> OutgoingMessage {
     let state = match report.state {
         OrchestratorStatusState::Working => ":large_green_circle: working",
         OrchestratorStatusState::NeedsAttention => ":large_yellow_circle: needs attention",
         OrchestratorStatusState::Idle => ":white_circle: idle",
     };
-    let mut body = mrkdwn(&report.last);
+    let mut text = mrkdwn(body);
     let next = mrkdwn(&report.next);
     if !next.is_empty() {
-        body.push_str("\n\n*Next:* ");
-        body.push_str(&next);
+        text.push_str("\n\n*Next:* ");
+        text.push_str(&next);
     }
     let blockers = report
         .blockers
@@ -366,22 +484,26 @@ pub fn answer_message(to: &str, report: &OrchestratorStatusReport) -> OutgoingMe
         .map(|blocker| format!("• {}", mrkdwn(blocker)))
         .collect::<Vec<_>>();
     if !blockers.is_empty() {
-        body.push_str("\n\n*Blockers:*\n");
-        body.push_str(&blockers.join("\n"));
+        text.push_str("\n\n*Blockers:*\n");
+        text.push_str(&blockers.join("\n"));
     }
-    if body.trim().is_empty() {
-        "_(empty answer)_".clone_into(&mut body);
+    if text.trim().is_empty() {
+        "_(empty answer)_".clone_into(&mut text);
     }
-    let body = cap(&body, MAX_RELAY_CHARS);
+    let text = cap_answer(&text);
     let mut blocks = vec![blocks::header(&format!(":speech_balloon: {}", speaker(to)))];
     blocks.extend(
-        split(&body, SECTION_CHARS)
+        split(&text, SECTION_CHARS)
             .iter()
             .map(|part| blocks::section(part)),
     );
-    blocks.push(blocks::context(&[format!("Status: {state}")]));
+    let mut context = vec![format!("Status: {state}")];
+    if let Some(note) = note {
+        context.push(clean_prompt_line(note));
+    }
+    blocks.push(blocks::context(&context));
     OutgoingMessage {
-        text: relay::report_text(to, report),
+        text: relay::report_text_with(to, report, body),
         blocks: blocks::finish(blocks),
     }
 }
@@ -549,6 +671,48 @@ mod tests {
             .map(|part| part.chars().count())
             .sum::<usize>();
         assert!(total <= MAX_RELAY_CHARS);
-        assert!(sections.last().unwrap().ends_with("(truncated)"));
+        assert!(sections.last().unwrap().ends_with(super::TRUNCATED));
+    }
+
+    #[test]
+    fn an_answer_file_body_replaces_last_and_carries_the_fallback_note() {
+        let fake_key = format!("{}-{}-{}", "sk", "ant-api03", "SECRET".repeat(4));
+        let body = format!("## Plan\n- tests\nkey {fake_key}");
+        let answer = super::answer_with(
+            "the Slack Superintendent",
+            &report("answered"),
+            &body,
+            Some(
+                "The Slack Superintendent could not start (x), so the main Superintendent answered.",
+            ),
+        );
+        let first = answer.blocks[1]["text"]["text"].as_str().unwrap();
+        assert!(first.starts_with("*Plan*\n• tests"), "{first}");
+        assert!(!answer.blocks.to_string().contains("answered\n"));
+        assert!(
+            !answer.blocks.to_string().contains("SECRETSECRET"),
+            "redacted"
+        );
+        assert!(!answer.text.contains("SECRETSECRET"), "redacted");
+        assert!(
+            answer
+                .text
+                .starts_with("*Answer from the Slack Superintendent* (working)\n## Plan")
+        );
+        let context = answer
+            .blocks
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|block| block["type"] == "context")
+            .unwrap()
+            .to_string();
+        assert!(
+            context.contains("so the main Superintendent answered."),
+            "{context}"
+        );
+        let plain = super::answer_with("x", &report("answered"), "body", None);
+        assert!(!plain.blocks.to_string().contains("main Superintendent"));
     }
 }

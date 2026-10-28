@@ -72,6 +72,17 @@ impl ThreadStore {
             .map(|entry| entry.ts.as_str())
     }
 
+    /// The key of the thread rooted at `ts` (its notification thread).
+    #[must_use]
+    pub fn key_of(&self, team_id: &str, channel_id: &str, ts: &str) -> Option<&str> {
+        self.threads
+            .iter()
+            .find(|entry| {
+                entry.team_id == team_id && entry.channel_id == channel_id && entry.ts == ts
+            })
+            .map(|entry| entry.key.as_str())
+    }
+
     pub fn put(&mut self, team_id: &str, channel_id: &str, key: &str, ts: &str, now_unix_ms: u64) {
         self.threads.retain(|entry| {
             !(entry.team_id == team_id && entry.channel_id == channel_id && entry.key == key)

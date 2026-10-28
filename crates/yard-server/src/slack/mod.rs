@@ -22,6 +22,7 @@ pub mod client;
 pub mod commands;
 pub mod console;
 pub mod controls;
+pub mod conversations;
 pub mod detector;
 pub mod digest;
 pub mod held;
@@ -35,6 +36,7 @@ pub mod quiet;
 pub mod relay;
 pub mod secret;
 pub(crate) mod socket;
+pub mod superintendent;
 pub mod threads;
 pub mod views;
 

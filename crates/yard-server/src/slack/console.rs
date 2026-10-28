@@ -37,6 +37,7 @@ use super::{
     },
     prompt::SCREEN_LINES,
     relay::{REPORT_LINES, Watched, scan_report, watched},
+    superintendent::{SLACK_SUPERINTENDENT_ACTOR, SlackSuperintendent, forget_answer, read_answer},
 };
 use yard_store::{StoredPaneManagementLease, YardStore};
 
@@ -71,6 +72,10 @@ pub struct YardConsole {
     terminals: TerminalService,
     nodes: CoordinationNodeService,
     store: Arc<dyn YardStore>,
+    superintendent: Arc<SlackSuperintendent>,
+    /// Restarts the main Superintendent when it is gone (Slack's
+    /// [`AgentConsole::recover_superintendent`]); `None`: not from Slack.
+    yard_orchestrator: Option<crate::yard_orchestrator_service::YardOrchestratorService>,
 }
 
 pub(crate) fn provider_key(session: &ProviderSessionRef) -> String {
@@ -178,12 +183,39 @@ impl YardConsole {
         nodes: CoordinationNodeService,
         store: Arc<dyn YardStore>,
     ) -> Self {
+        let superintendent = Arc::new(SlackSuperintendent::new(nodes.clone(), Arc::clone(&store)));
         Self {
             interventions,
             terminals,
             nodes,
             store,
+            superintendent,
+            yard_orchestrator: None,
         }
+    }
+
+    /// Let Slack restart a gone main Superintendent through Yard's normal
+    /// recovery (the UI's "Recover").
+    #[must_use]
+    pub fn with_yard_orchestrator(
+        mut self,
+        service: crate::yard_orchestrator_service::YardOrchestratorService,
+    ) -> Self {
+        self.yard_orchestrator = Some(service);
+        self
+    }
+
+    /// The Slack Superintendent node's validated folder, when `target` is
+    /// that node (answer files are read nowhere else).
+    async fn answer_folder(&self, target: &AgentTarget) -> Option<std::path::PathBuf> {
+        let AgentTarget::CoordinationNode { node_id } = target else {
+            return None;
+        };
+        let node = self.nodes.get(node_id).await.ok()?;
+        if node.created_by != SLACK_SUPERINTENDENT_ACTOR {
+            return None;
+        }
+        self.nodes.managed_cwd(&node)
     }
 }
 
@@ -700,6 +732,85 @@ impl AgentConsole for YardConsole {
             }
         };
         Ok(scan_report(&text, command_id))
+    }
+
+    async fn slack_superintendent(&self) -> Result<Option<AgentTarget>, ConsoleError> {
+        let node_id = self
+            .superintendent
+            .ensure()
+            .await
+            .map_err(ConsoleError::Unavailable)?;
+        // Started: a refusal to type (lease needs recovery, ...) is shown
+        // by the normal not-sent card with Retry, never as a fallback.
+        Ok(Some(AgentTarget::CoordinationNode { node_id }))
+    }
+
+    async fn recover_superintendent(
+        &self,
+        target: &AgentTarget,
+        actor: &str,
+    ) -> Result<AgentTarget, ConsoleError> {
+        match target {
+            AgentTarget::YardOrchestrator => {
+                let service = self.yard_orchestrator.as_ref().ok_or_else(|| {
+                    ConsoleError::Unavailable("Yard cannot restart it from Slack".to_owned())
+                })?;
+                let current = self
+                    .store
+                    .get_yard_orchestrator()
+                    .await
+                    .map_err(|error| ConsoleError::Failed(error.to_string()))?;
+                service
+                    .recover(yard_domain::RecoverYardOrchestrator {
+                        command_id: uuid::Uuid::now_v7().to_string(),
+                        actor: actor.to_owned(),
+                        expected_orchestrator_version: current.version,
+                    })
+                    .await
+                    .map_err(|error| ConsoleError::Unavailable(error.to_string()))?;
+                Ok(AgentTarget::YardOrchestrator)
+            }
+            // Only the Slack Superintendent's own node is started again
+            // (archived and replaced when its worker is gone).
+            AgentTarget::CoordinationNode { node_id } => {
+                // A node that no longer exists was the Slack one's (only
+                // its node is ever asked through a conversation).
+                if let Ok(node) = self.nodes.get(node_id).await
+                    && node.created_by != SLACK_SUPERINTENDENT_ACTOR
+                {
+                    return Err(ConsoleError::Unavailable(
+                        "only a Superintendent is started from Slack".to_owned(),
+                    ));
+                }
+                // Replaced even when its process runs: Slack asks for a
+                // start only when it is unusable (a lost session too).
+                let node_id = self
+                    .superintendent
+                    .replace(node_id)
+                    .await
+                    .map_err(ConsoleError::Unavailable)?;
+                Ok(AgentTarget::CoordinationNode { node_id })
+            }
+            _ => Err(ConsoleError::Unavailable(
+                "only a Superintendent is started from Slack".to_owned(),
+            )),
+        }
+    }
+
+    async fn answer_text(&self, target: &AgentTarget, answer_key: &str) -> Option<String> {
+        let folder = self.answer_folder(target).await?;
+        let key = answer_key.to_owned();
+        tokio::task::spawn_blocking(move || read_answer(&folder, &key))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn forget_answer(&self, target: &AgentTarget, answer_key: &str) {
+        if let Some(folder) = self.answer_folder(target).await {
+            let key = answer_key.to_owned();
+            let _ = tokio::task::spawn_blocking(move || forget_answer(&folder, &key)).await;
+        }
     }
 
     async fn watch(&self, target: &AgentTarget, command_id: &str) -> Result<Watched, ConsoleError> {

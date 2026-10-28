@@ -162,7 +162,7 @@ pub fn help_card(nav: &mut Nav<'_>, ui_url: &str) -> OutgoingMessage {
 /// The hint behind "Ask the Superintendent".
 #[must_use]
 pub fn ask_hint() -> OutgoingMessage {
-    let text = "Type your question at the top level of this DM and I'll ask the Superintendent; start with `<Project>:` to ask that project's orchestrator instead. The answer is posted in the thread.";
+    let text = "Type a question or tell it what to do, here or in any thread, and I'll pass it to the Superintendent; start with `<Project>:` to talk to that project's orchestrator instead. The reply is posted in the thread; reply there to keep the conversation going.";
     OutgoingMessage {
         text: text.to_owned(),
         blocks: blocks::finish(vec![
