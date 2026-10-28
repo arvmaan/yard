@@ -11425,6 +11425,24 @@ test('shows when the Herdr view is scrolled back and jumps to the latest output'
   await expect
     .poll(() => terminalMessagesOfType(state, 'terminal.scroll_reset'))
     .toEqual([{ type: 'terminal.scroll_reset' }])
+  // The reset only returns Herdr's own scrollback. A full-screen agent
+  // (Claude Code, Codex) scrolled its transcript itself, one wheel report
+  // per command, so the same number of commands go back down after it.
+  await expect.poll(scrollSteps).toBe(10)
+  const afterReset = state.terminalMessages.slice(
+    state.terminalMessages.findIndex(
+      (message) => message.type === 'terminal.scroll_reset',
+    ) + 1,
+  )
+  expect(afterReset).toEqual([
+    expect.objectContaining({
+      type: 'terminal.scroll',
+      direction: 'down',
+      lines: 3,
+      source: 'wheel',
+      count: 5,
+    }),
+  ])
   await expect(status).toHaveText('Connected')
   await expect(jump).toHaveCount(0)
   expect(terminalMessagesOfType(state, 'terminal.input')).toHaveLength(0)
@@ -11435,7 +11453,7 @@ test('shows when the Herdr view is scrolled back and jumps to the latest output'
   await expect(jump).toBeVisible()
   await page.waitForTimeout(300)
   await page.mouse.wheel(0, 240)
-  await expect.poll(scrollSteps).toBe(15)
+  await expect.poll(scrollSteps).toBe(20)
   await expect(jump).toHaveCount(0)
 
   // Typing makes Herdr return to the latest output, so the notice clears.
@@ -11447,7 +11465,164 @@ test('shows when the Herdr view is scrolled back and jumps to the latest output'
   await expect(status).toHaveText('Connected')
 })
 
-test('keeps one scroll batch in flight until Herdr answers, then sends the input that accumulated', async ({
+test('Jump to latest returns a full-screen agent scrolled by wheel and PageUp', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open terminal', exact: true }).click()
+  const terminal = page.locator('.terminal-session')
+  const jump = terminal.getByRole('button', { name: 'Jump to latest' })
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+
+  const steps = (source: string, direction: string) =>
+    terminalMessagesOfType(state, 'terminal.scroll')
+      .filter(
+        (message) =>
+          message.source === source && message.direction === direction,
+      )
+      .reduce((total, message) => total + (message.count ?? 1), 0)
+  await terminal.locator('.xterm-screen').hover()
+  // Herdr answers nothing here, so each batch waits for the timeout.
+  await page.mouse.wheel(0, -220)
+  await expect.poll(() => steps('wheel', 'up')).toBe(5)
+  await page.waitForTimeout(400)
+  await page.mouse.wheel(0, -132)
+  await expect.poll(() => steps('wheel', 'up')).toBe(8)
+  await page.waitForTimeout(400)
+  await page.mouse.wheel(0, 44)
+  await expect.poll(() => steps('wheel', 'down')).toBe(1)
+  await page.waitForTimeout(400)
+  await terminal.locator('.xterm-helper-textarea').focus()
+  await page.keyboard.press('PageUp')
+  await expect.poll(() => steps('page_key', 'up')).toBe(1)
+  await expect(jump).toBeVisible()
+
+  await jump.click()
+  // Net 7 wheel steps and 1 page up, undone after the reset in gated
+  // batches, like the scrolls that went up.
+  await expect.poll(() => steps('wheel', 'down')).toBe(8)
+  await expect.poll(() => steps('page_key', 'down')).toBe(1)
+  const reset = state.terminalMessages.findIndex(
+    (message) => message.type === 'terminal.scroll_reset',
+  )
+  expect(reset).toBeGreaterThan(-1)
+  expect(
+    state.terminalMessages
+      .slice(reset + 1)
+      .flatMap((message) =>
+        message.type === 'terminal.scroll'
+          ? [[message.source, message.direction, message.count ?? 1]]
+          : [],
+      ),
+  ).toEqual([
+    ['page_key', 'down', 1],
+    ['wheel', 'down', 4],
+    ['wheel', 'down', 3],
+  ])
+  await expect(jump).toHaveCount(0)
+  expect(terminalMessagesOfType(state, 'terminal.input')).toHaveLength(0)
+
+  // Typing returns Herdr's scrollback by itself and sends no extra scrolls.
+  await terminal.locator('.xterm-screen').hover()
+  await page.mouse.wheel(0, -44)
+  await expect(jump).toBeVisible()
+  const before = terminalMessagesOfType(state, 'terminal.scroll').length
+  await terminal.locator('.xterm-helper-textarea').pressSequentially('x')
+  await expect(jump).toHaveCount(0)
+  await page.waitForTimeout(300)
+  expect(terminalMessagesOfType(state, 'terminal.scroll')).toHaveLength(before)
+})
+
+test('Jump to latest keeps a long return through a wheel-down and the unsent rest when cancelled', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open terminal', exact: true }).click()
+  const terminal = page.locator('.terminal-session')
+  const status = terminal.getByRole('status')
+  const jump = terminal.getByRole('button', { name: 'Jump to latest' })
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+
+  const steps = (direction: string, from = 0) =>
+    state.terminalMessages
+      .slice(from)
+      .flatMap((message) =>
+        message.type === 'terminal.scroll' &&
+        message.source === 'wheel' &&
+        message.direction === direction
+          ? [message.count ?? 1]
+          : [],
+      )
+      .reduce((total, count) => total + count, 0)
+  const lastReset = () =>
+    state.terminalMessages.findLastIndex(
+      (message) => message.type === 'terminal.scroll_reset',
+    )
+  const screen = terminal.locator('.xterm-screen')
+  // Herdr answers nothing here, so each batch of 5 waits for the timeout.
+  const scrollUp20 = async () => {
+    const before = steps('up')
+    for (let fling = 1; fling <= 4; fling += 1) {
+      await page.mouse.wheel(0, -220)
+      await expect.poll(() => steps('up')).toBe(before + fling * 5)
+      await page.waitForTimeout(400)
+    }
+  }
+  await screen.hover()
+  await scrollUp20()
+  await expect(jump).toBeVisible()
+
+  // A wheel-down while the 20-step return is under way adds to it: none of
+  // the return is dropped by the input cap.
+  await jump.click()
+  let reset = lastReset()
+  await expect.poll(() => steps('down', reset), { intervals: [20] }).toBe(5)
+  await screen.hover()
+  await page.mouse.wheel(0, 44)
+  await expect.poll(() => steps('down', reset), { timeout: 5_000 }).toBe(21)
+  await page.waitForTimeout(400)
+  expect(steps('down', reset)).toBe(21)
+  await expect(status).toHaveText('Connected')
+  await expect(jump).toHaveCount(0)
+
+  // Scrolling up during a return cancels it; the unsent rest stays counted,
+  // so the next Jump to latest sends it and the new scroll back down.
+  await screen.hover()
+  await scrollUp20()
+  await jump.click()
+  reset = lastReset()
+  await expect.poll(() => steps('down', reset), { intervals: [20] }).toBe(5)
+  await screen.hover()
+  await page.mouse.wheel(0, -44)
+  await expect(jump).toBeVisible()
+  await page.waitForTimeout(400)
+  const returned = steps('down', reset)
+  expect(returned).toBeLessThan(20)
+  const cancelUps = steps('up', reset)
+  expect(cancelUps).toBe(1)
+  await jump.click()
+  reset = lastReset()
+  await expect
+    .poll(() => steps('down', reset), { timeout: 5_000 })
+    .toBe(20 - returned + cancelUps)
+  await page.waitForTimeout(400)
+  expect(steps('down', reset)).toBe(20 - returned + cancelUps)
+  await expect(jump).toHaveCount(0)
+})
+
+test('keeps one scroll batch in flight until Herdr first answers, then sends the input that accumulated', async ({
   page,
 }) => {
   const state = await mockApi(page)
@@ -11577,10 +11752,18 @@ test('keeps one scroll batch in flight until Herdr answers, then sends the input
         ),
       ).find((button) => button.textContent?.includes('Jump to latest'))
       if (!jump) throw new Error('Jump to latest is not shown')
-      jump.click()
       let before = scrolls.length
+      jump.click()
+      // The jump undoes this view's net scrolling: its first batch of
+      // wheel steps back down leaves at once, so the next wheel (the other
+      // way) waits one send interval.
+      const returnBatch = scrolls.slice(before)
+      before = scrolls.length
       wheel(-44)
       const sentAfterJump = scrolls.length - before
+      await sleep(400)
+      const sentAfterReturn = scrolls.length - before
+      before = scrolls.length
       const enter = new KeyboardEvent('keydown', {
         bubbles: true,
         cancelable: true,
@@ -11599,7 +11782,13 @@ test('keeps one scroll batch in flight until Herdr answers, then sends the input
           ...scroll,
           at: scroll.at - start,
         })),
+        returnBatch: returnBatch.map(({ count, direction, source }) => ({
+          count: count ?? 1,
+          direction,
+          source,
+        })),
         sentAfterJump,
+        sentAfterReturn,
         sentAfterTyping,
         sentAtOnce,
         sentWhileWaiting,
@@ -11633,14 +11822,23 @@ test('keeps one scroll batch in flight until Herdr answers, then sends the input
     // at most five commands. The fling was capped at five pending steps.
     pageUp,
     { ...wheelUp, count: 4 },
-    // Nothing answers that batch, so the last step waits for the timeout.
+    // The answer measured the round trip, so the last step no longer waits
+    // for that batch (nothing answers it): it leaves one send interval
+    // later instead of at the 300 ms timeout.
     wheelUp,
   ])
-  const [, answerBatch, , afterTimeout] = run.scrolls
+  const [, answerBatch, , nextBatch] = run.scrolls
   expect(answerBatch.at).toBeGreaterThanOrEqual(run.answeredAt)
   expect(answerBatch.at).toBeLessThan(300)
-  expect(afterTimeout.at - answerBatch.at).toBeGreaterThanOrEqual(290)
-  expect(run.sentAfterJump).toBe(1)
+  expect(nextBatch.at - answerBatch.at).toBeGreaterThanOrEqual(15)
+  expect(nextBatch.at - answerBatch.at).toBeLessThan(150)
+  // Net 8 wheel steps and 1 PageUp: the PageDown goes first.
+  expect(run.returnBatch).toEqual([
+    { count: 1, direction: 'down', source: 'page_key' },
+    { count: 4, direction: 'down', source: 'wheel' },
+  ])
+  expect(run.sentAfterJump).toBe(0)
+  expect(run.sentAfterReturn).toBe(1)
   expect(run.sentAfterTyping).toBe(1)
   // The Enter key really was typed input.
   await expect
@@ -11648,6 +11846,140 @@ test('keeps one scroll batch in flight until Herdr answers, then sends the input
     .toBeGreaterThan(0)
   await expect(terminal.locator('.xterm-rows')).toContainText(
     'earlier output from Herdr',
+  )
+})
+
+test('pipelines scroll batches once a tagged answer has measured the round trip', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open terminal', exact: true }).click()
+  const terminal = page.locator('.terminal-session')
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+  const url = new URL(state.terminalConnectionUrls[0])
+  const cols = Number(url.searchParams.get('cols'))
+  const rows = Number(url.searchParams.get('rows'))
+  sendHerdrFrame(state.terminalSockets[0], {
+    bytes: herdrScreen(['latest output'], { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+
+  const herdrFrame = (seq: number, line: string) => ({
+    type: 'terminal.frame',
+    bytes: Buffer.from(herdrScreen([line], { width: cols })).toString(
+      'base64',
+    ),
+    seq,
+    width: cols,
+    height: rows,
+    full: false,
+  })
+  const frames = {
+    first: herdrFrame(2, 'first answer'),
+    window: herdrFrame(3, 'window answered'),
+  }
+  const wheelSteps = 10
+  const run = await page.evaluate(async ({ frames, wheelSteps }) => {
+    const frameEvent = (frame: object, scrolls: number) =>
+      new MessageEvent('message', {
+        data: JSON.stringify({ ...frame, scrolls }),
+      })
+    const scrolls: { at: number; count: number }[] = []
+    const captured: { socket?: WebSocket } = {}
+    const send = WebSocket.prototype.send
+    WebSocket.prototype.send = function (
+      this: WebSocket,
+      data: Parameters<WebSocket['send']>[0],
+    ) {
+      captured.socket = this
+      if (typeof data === 'string') {
+        const message = JSON.parse(data)
+        if (message.type === 'terminal.scroll') {
+          scrolls.push({ at: performance.now(), count: message.count ?? 1 })
+        }
+      }
+      return send.call(this, data)
+    }
+    const sleep = (ms: number) =>
+      new Promise((resolve) => window.setTimeout(resolve, ms))
+    const screen = document.querySelector<HTMLElement>(
+      '.terminal-session .xterm-screen',
+    )
+    if (!screen) throw new Error('The terminal is not rendered')
+    const box = screen.getBoundingClientRect()
+    const wheel = (deltaY: number) =>
+      screen.dispatchEvent(
+        new WheelEvent('wheel', {
+          bubbles: true,
+          cancelable: true,
+          clientX: box.left + 10,
+          clientY: box.top + 10,
+          deltaMode: 0,
+          deltaY,
+        }),
+      )
+    try {
+      // The first batch is alone in flight; its answer takes ~100 ms.
+      wheel(-44)
+      if (!captured.socket) throw new Error('No terminal socket was used')
+      const socket = captured.socket
+      await sleep(100)
+      socket.dispatchEvent(frameEvent(frames.first, 1))
+      await sleep(5)
+      // A steady wheel, one step every 20 ms, and no answers: batches keep
+      // leaving until the window (one per 16 ms of round trip, plus one) is
+      // full, then the input waits.
+      const start = scrolls.length
+      for (let event = 0; event < wheelSteps; event += 1) {
+        wheel(-44)
+        await sleep(20)
+      }
+      // Still well inside the oldest batch's 300 ms timeout.
+      await sleep(40)
+      const pipelined = scrolls.slice(start)
+      // One frame tagged with all of them answers the whole window. The
+      // window depends on the measured latency, so the tag follows the run.
+      socket.dispatchEvent(frameEvent(frames.window, 1 + pipelined.length))
+      await sleep(50)
+      return {
+        pipelined,
+        afterAnswer: scrolls.slice(start + pipelined.length),
+      }
+    } finally {
+      WebSocket.prototype.send = send
+    }
+  }, { frames, wheelSteps })
+
+  // The first answer took at least 100 ms: a window of at least
+  // ceil(100 / 16) + 1 = 8. A slow machine measures a longer round trip and
+  // a wider window; the input still waited if the window filled before the
+  // wheel stopped.
+  const windowSize = run.pipelined.length
+  expect(windowSize).toBeGreaterThanOrEqual(Math.ceil(100 / 16) + 1)
+  expect(windowSize).toBeLessThan(wheelSteps)
+  expect(run.pipelined.map((scroll) => scroll.count)).toEqual(
+    Array(windowSize).fill(1),
+  )
+  const gaps = run.pipelined
+    .slice(1)
+    .map((scroll, index) => scroll.at - run.pipelined[index].at)
+  expect(Math.min(...gaps)).toBeGreaterThanOrEqual(15)
+  // The steps that waited go as one batch once the window opens.
+  expect(run.afterAnswer.map((scroll) => scroll.count)).toEqual([
+    wheelSteps - windowSize,
+  ])
+  await expect(terminal.locator('.xterm-rows')).toContainText(
+    'window answered',
   )
 })
 

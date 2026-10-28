@@ -87,6 +87,9 @@ a release is tagged.
 
 ### Changed
 
+- Jump to latest now returns full-screen (alternate-screen, mouse-reporting)
+  agents to their latest output, and terminal scroll batches are pipelined
+  across the round trip so long scrolls no longer lag.
 - Expanded Herdr compatibility from protocol 19 through protocol 22, including
   Herdr 0.8.2 protocol 20.
 - Reconciled interactive workers without provider-session metadata by using
