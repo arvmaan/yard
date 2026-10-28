@@ -593,6 +593,7 @@ impl AgentConsole for YardConsole {
                 let input = TerminalClientMessage::Input {
                     text: Some((*key).to_owned()),
                     bytes: None,
+                    key: None,
                 };
                 timeout(TERMINAL_TIMEOUT, opened.session.send(input))
                     .await

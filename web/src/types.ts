@@ -1914,10 +1914,15 @@ export type TerminalServerMessage =
   | TerminalFrameMessage
   | TerminalClosedMessage
 
-export interface TerminalInputMessage {
-  type: 'terminal.input'
-  text: string
-}
+/**
+ * A modified key whose bytes depend on the keyboard mode the pane's app
+ * enabled, so Yard asks Herdr to encode it (see `terminalModifiedKey`).
+ */
+export type TerminalKey = 'ctrl+enter' | 'shift+enter'
+
+export type TerminalInputMessage =
+  | { type: 'terminal.input'; text: string; key?: never }
+  | { type: 'terminal.input'; key: TerminalKey; text?: never }
 
 export interface TerminalResizeMessage {
   type: 'terminal.resize'

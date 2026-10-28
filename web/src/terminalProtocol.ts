@@ -6,7 +6,7 @@
 // (its pane scrollback, or a full-screen app's own transcript) and is reached
 // by sending `terminal.scroll`, which makes Herdr repaint the viewport.
 
-import type { TerminalScrollMessage } from './types'
+import type { TerminalKey, TerminalScrollMessage } from './types'
 
 // Mirrors `MIN/MAX_TERMINAL_COLS/ROWS` in yard-server's terminal_service.rs.
 export const MIN_TERMINAL_COLS = 20
@@ -697,4 +697,37 @@ export function readTerminalScreenReaderPreference(
     return false
   }
   return value === 'on' || value === 'true' || value === '1'
+}
+
+/**
+ * Ctrl+Enter and Shift+Enter, with no other modifier, are sent as a key for
+ * Herdr to encode. xterm.js turns both into a bare CR, the same byte as
+ * Enter, so an app could never tell them apart (Claude Code's "ctrl+enter to
+ * send now" never fired, and Shift+Enter submitted instead of adding a line).
+ * The app's keyboard-mode request (kitty `CSI > flags u`) reaches Herdr's
+ * emulator, not xterm.js, so only Herdr knows whether to send the CSI-u form
+ * (`ESC [ 13 ; 5 u`) or the legacy CR. Plain Enter and every other key stay
+ * ordinary xterm input.
+ */
+export function terminalModifiedKey(
+  event: Pick<
+    KeyboardEvent,
+    | 'altKey'
+    | 'ctrlKey'
+    | 'isComposing'
+    | 'key'
+    | 'keyCode'
+    | 'metaKey'
+    | 'shiftKey'
+  >,
+): TerminalKey | null {
+  if (event.key !== 'Enter') return null
+  // An IME commit: WebKit can send the committing keydown with key "Enter"
+  // and keyCode 229 but isComposing false, so check both and leave it to
+  // xterm's composition handling.
+  if (event.isComposing || event.keyCode === 229) return null
+  if (event.altKey || event.metaKey) return null
+  if (event.ctrlKey && !event.shiftKey) return 'ctrl+enter'
+  if (event.shiftKey && !event.ctrlKey) return 'shift+enter'
+  return null
 }

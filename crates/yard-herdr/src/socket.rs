@@ -44,10 +44,9 @@ async fn send_request_line(socket_path: &Path, request: Vec<u8>) -> Result<UnixS
     })
     .await
     .map_err(|error| HerdrError::SocketWrite(std::io::Error::other(error)))??;
-    let mut stream = UnixStream::from_std(stream).map_err(|source| HerdrError::SocketConnect {
-        path: socket_path.to_path_buf(),
-        source,
-    })?;
+    // The request may already be (partly) written, so this is a write error,
+    // not a connect error: see `HerdrError::request_not_delivered`.
+    let mut stream = UnixStream::from_std(stream).map_err(HerdrError::SocketWrite)?;
     if written < request.len() {
         stream
             .write_all(&request[written..])

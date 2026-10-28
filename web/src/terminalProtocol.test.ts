@@ -35,6 +35,7 @@ import {
   SCROLL_BATCH_TIMEOUT_MS,
   SCROLL_SEND_INTERVAL_MS,
   takeScrollBatch,
+  terminalModifiedKey,
   TERMINAL_SCREEN_READER_STORAGE_KEY,
   WHEEL_PIXELS_PER_STEP,
   wheelEventSteps,
@@ -756,5 +757,45 @@ describe('returning a scrolled-back view to the latest output', () => {
       wheel: -MAX_PENDING_SCROLL_STEPS,
       returning: false,
     })
+  })
+})
+
+describe('terminalModifiedKey', () => {
+  const press = (key: string, modifiers: Partial<KeyboardEvent> = {}) =>
+    terminalModifiedKey({
+      altKey: false,
+      ctrlKey: false,
+      isComposing: false,
+      key,
+      keyCode: key === 'Enter' ? 13 : 0,
+      metaKey: false,
+      shiftKey: false,
+      ...modifiers,
+    })
+
+  it('maps Ctrl+Enter and Shift+Enter to keys Herdr encodes', () => {
+    expect(press('Enter', { ctrlKey: true })).toBe('ctrl+enter')
+    expect(press('Enter', { shiftKey: true })).toBe('shift+enter')
+  })
+
+  it('leaves plain Enter and other modifier mixes to xterm', () => {
+    expect(press('Enter')).toBeNull()
+    expect(press('Enter', { ctrlKey: true, shiftKey: true })).toBeNull()
+    expect(press('Enter', { altKey: true })).toBeNull()
+    expect(press('Enter', { ctrlKey: true, altKey: true })).toBeNull()
+    expect(press('Enter', { metaKey: true })).toBeNull()
+    expect(press('Enter', { shiftKey: true, metaKey: true })).toBeNull()
+    expect(press('a', { ctrlKey: true })).toBeNull()
+    expect(press('j', { ctrlKey: true })).toBeNull()
+  })
+
+  it('leaves an IME composition commit to xterm', () => {
+    expect(press('Enter', { ctrlKey: true, isComposing: true })).toBeNull()
+    expect(press('Enter', { shiftKey: true, isComposing: true })).toBeNull()
+  })
+
+  it('leaves a WebKit IME commit (keyCode 229, not composing) to xterm', () => {
+    expect(press('Enter', { ctrlKey: true, keyCode: 229 })).toBeNull()
+    expect(press('Enter', { shiftKey: true, keyCode: 229 })).toBeNull()
   })
 })

@@ -70,6 +70,7 @@ import {
   scrolledBackCommands,
   takeScrollBatch,
   type TerminalCell,
+  terminalModifiedKey,
   type TerminalSize,
   WHEEL_LINES_PER_SCROLL,
   wheelEventSteps,
@@ -84,6 +85,7 @@ import {
 import type {
   TerminalClientMessage,
   TerminalFrameMessage,
+  TerminalKey,
   TerminalScrollMessage,
   TerminalServerMessage,
 } from './types'
@@ -1236,9 +1238,34 @@ export function TerminalSession({ target }: { target: TerminalTarget }) {
       }, control)
     })
 
-    // PageUp/PageDown (plain or with Shift) scroll through Herdr. Every other
-    // key stays ordinary xterm input.
+    // Ctrl+Enter / Shift+Enter go to Herdr as a key it encodes for the app's
+    // keyboard mode (see terminalModifiedKey); like typed input they leave
+    // history mode and return to the live view.
+    const sendModifiedKey = (key: TerminalKey) => {
+      exitHistory()
+      resetHistoryProbe()
+      afterImagePastes(() => {
+        if (!socket) return
+        if (sendMessage(socket, { type: 'terminal.input', key })) {
+          clearScrolledBack()
+          resetScrollGate()
+        }
+      })
+    }
+
+    // PageUp/PageDown (plain or with Shift) scroll through Herdr. Ctrl+Enter
+    // and Shift+Enter are sent as keys. Every other key stays ordinary xterm
+    // input.
     terminal.attachCustomKeyEventHandler((event) => {
+      const modifiedKey = terminalModifiedKey(event)
+      if (modifiedKey) {
+        // Swallow every phase so xterm never also sends its bare CR.
+        if (event.type === 'keydown') {
+          event.preventDefault()
+          sendModifiedKey(modifiedKey)
+        }
+        return false
+      }
       if (history) {
         // In history mode PageUp/PageDown page locally and Escape returns
         // to the live terminal; any other key is typed input (onData).

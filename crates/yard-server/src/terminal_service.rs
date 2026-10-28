@@ -36,6 +36,8 @@ const fn one_scroll() -> u8 {
 pub struct OpenTerminalRequest {
     pub session: String,
     pub terminal_id: String,
+    /// The pane hosting the terminal, for key presses Herdr must encode.
+    pub pane_id: String,
     pub cols: u16,
     pub rows: u16,
 }
@@ -114,15 +116,30 @@ pub enum TerminalScrollSource {
     PageKey,
 }
 
+/// A modified key whose bytes depend on the keyboard mode the pane's app
+/// enabled. xterm.js sends a bare `CR` for Ctrl+Enter and Shift+Enter, and
+/// Herdr consumes the app's mode requests (its frames are repaints), so the
+/// browser cannot encode them; Herdr does (see `yard_herdr::PaneKey`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum TerminalKey {
+    #[serde(rename = "ctrl+enter")]
+    CtrlEnter,
+    #[serde(rename = "shift+enter")]
+    ShiftEnter,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type")]
 pub enum TerminalClientMessage {
+    /// Exactly one of `text`, `bytes` (base64), or `key`.
     #[serde(rename = "terminal.input")]
     Input {
         #[serde(default)]
         text: Option<String>,
         #[serde(default)]
         bytes: Option<String>,
+        #[serde(default)]
+        key: Option<TerminalKey>,
     },
     #[serde(rename = "terminal.resize")]
     Resize { cols: u16, rows: u16 },
@@ -161,20 +178,21 @@ impl TerminalClientMessage {
     /// oversized, or out-of-range commands.
     pub fn validate(&self) -> Result<(), TerminalServiceError> {
         match self {
-            Self::Input { text, bytes } => match (text, bytes) {
-                (Some(text), None)
+            Self::Input { text, bytes, key } => match (text, bytes, key) {
+                (Some(text), None, None)
                     if !text.is_empty() && text.len() <= MAX_TERMINAL_INPUT_BYTES =>
                 {
                     Ok(())
                 }
-                (None, Some(bytes))
+                (None, Some(bytes), None)
                     if !bytes.is_empty()
                         && bytes.len() <= MAX_TERMINAL_INPUT_BYTES.saturating_mul(4) / 3 + 4 =>
                 {
                     Ok(())
                 }
+                (None, None, Some(_)) => Ok(()),
                 _ => Err(TerminalServiceError::InvalidCommand(
-                    "terminal.input requires exactly one non-empty bounded text or bytes field"
+                    "terminal.input requires exactly one non-empty bounded text, bytes, or key field"
                         .to_owned(),
                 )),
             },
@@ -389,6 +407,7 @@ impl TerminalService {
             .open_terminal(OpenTerminalRequest {
                 session: binding.session.clone(),
                 terminal_id: binding.terminal_id.clone(),
+                pane_id: binding.pane_id.clone(),
                 cols,
                 rows,
             })
@@ -430,6 +449,7 @@ impl TerminalService {
             .open_terminal(OpenTerminalRequest {
                 session: binding.session.clone(),
                 terminal_id: binding.terminal_id.clone(),
+                pane_id: binding.pane_id.clone(),
                 cols,
                 rows,
             })
@@ -472,6 +492,7 @@ impl TerminalService {
             .open_terminal(OpenTerminalRequest {
                 session: binding.session.clone(),
                 terminal_id: binding.terminal_id.clone(),
+                pane_id: binding.pane_id.clone(),
                 cols,
                 rows,
             })
@@ -513,6 +534,7 @@ impl TerminalService {
             .open_terminal(OpenTerminalRequest {
                 session: binding.session.clone(),
                 terminal_id: binding.terminal_id.clone(),
+                pane_id: binding.pane_id.clone(),
                 cols,
                 rows,
             })
@@ -857,7 +879,7 @@ pub fn sequence_continues(previous: Option<u64>, current: u64, full: bool) -> bo
 mod tests {
     use super::{
         MAX_TERMINAL_COLS, MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_MESSAGE_BYTES, MAX_TERMINAL_ROWS,
-        MAX_TERMINAL_SCROLL_COUNT, TerminalClientMessage, TerminalScrollDirection,
+        MAX_TERMINAL_SCROLL_COUNT, TerminalClientMessage, TerminalKey, TerminalScrollDirection,
         TerminalScrollSource, TerminalServiceError, sequence_continues, validate_dimensions,
     };
 
@@ -872,6 +894,7 @@ mod tests {
             TerminalClientMessage::Input {
                 text: Some("ls\r".to_owned()),
                 bytes: None,
+                key: None,
             }
             .validate()
             .is_ok()
@@ -880,10 +903,73 @@ mod tests {
             TerminalClientMessage::Input {
                 text: Some("ls".to_owned()),
                 bytes: Some("bHM=".to_owned()),
+                key: None,
             }
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_a_modified_key_as_the_only_input_field() {
+        for (wire, key) in [
+            ("ctrl+enter", TerminalKey::CtrlEnter),
+            ("shift+enter", TerminalKey::ShiftEnter),
+        ] {
+            let message: TerminalClientMessage = serde_json::from_value(serde_json::json!({
+                "type": "terminal.input",
+                "key": wire,
+            }))
+            .unwrap();
+            assert_eq!(
+                message,
+                TerminalClientMessage::Input {
+                    text: None,
+                    bytes: None,
+                    key: Some(key),
+                }
+            );
+            assert!(message.validate().is_ok());
+        }
+        // A key is never combined with text or bytes.
+        assert!(
+            TerminalClientMessage::Input {
+                text: Some("\r".to_owned()),
+                bytes: None,
+                key: Some(TerminalKey::CtrlEnter),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            TerminalClientMessage::Input {
+                text: None,
+                bytes: Some("DQ==".to_owned()),
+                key: Some(TerminalKey::ShiftEnter),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            TerminalClientMessage::Input {
+                text: None,
+                bytes: None,
+                key: None,
+            }
+            .validate()
+            .is_err()
+        );
+        // Only the keys Herdr is asked to encode are accepted.
+        for wire in ["enter", "ctrl+c", "Ctrl+Enter", ""] {
+            assert!(
+                serde_json::from_value::<TerminalClientMessage>(serde_json::json!({
+                    "type": "terminal.input",
+                    "key": wire,
+                }))
+                .is_err(),
+                "{wire}"
+            );
+        }
     }
 
     #[test]
@@ -1011,6 +1097,7 @@ mod tests {
             TerminalClientMessage::Input {
                 text: Some(paste),
                 bytes: None,
+                key: None,
             }
             .validate()
             .is_ok()
@@ -1019,6 +1106,7 @@ mod tests {
             TerminalClientMessage::Input {
                 text: Some("x".repeat(MAX_TERMINAL_INPUT_BYTES + 1)),
                 bytes: None,
+                key: None,
             }
             .validate()
             .is_err()

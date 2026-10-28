@@ -68,3 +68,27 @@ pub enum HerdrError {
     #[error("invalid Herdr topology: {0}")]
     InvalidTopology(String),
 }
+
+impl HerdrError {
+    /// Whether this error proves Herdr never acted on the request: nothing
+    /// was sent (discovery failed, the session is gone, the socket would not
+    /// connect) or Herdr answered with a structured refusal. Any other
+    /// failure (a timeout, a read or write error, a malformed or unexpected
+    /// reply) can come after Herdr received and carried out the request, so
+    /// the outcome is unknown.
+    #[must_use]
+    pub fn request_not_delivered(&self) -> bool {
+        matches!(
+            self,
+            Self::DiscoveryIo(_)
+                | Self::DiscoveryTimeout
+                | Self::DiscoveryResponseTooLarge { .. }
+                | Self::DiscoveryFailed { .. }
+                | Self::DiscoveryDecode(_)
+                | Self::SessionNotFound(_)
+                | Self::SessionNotRunning(_)
+                | Self::SocketConnect { .. }
+                | Self::Api { .. }
+        )
+    }
+}

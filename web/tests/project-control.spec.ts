@@ -11359,6 +11359,99 @@ test('connects the assignment terminal and relays frames, input, resize, and rel
   await expect(openTerminal).toBeFocused()
 })
 
+test('sends Ctrl+Enter and Shift+Enter as keys Herdr encodes, and Enter as CR', async ({
+  page,
+}) => {
+  const state = await mockApi(page)
+  seedActiveAssignment(state)
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/')
+
+  await page.locator('.assigned-worker-marker').click()
+  await page.getByRole('button', { name: 'Open terminal', exact: true }).click()
+  const terminal = page.locator('.terminal-session')
+  await expect(terminal).toHaveAttribute('data-state', 'connected')
+  await expect.poll(() => state.terminalSockets.length).toBe(1)
+
+  const input = terminal.locator('.xterm-helper-textarea')
+  await input.focus()
+  await page.keyboard.press('Enter')
+  await page.keyboard.press('Control+Enter')
+  await page.keyboard.press('Shift+Enter')
+  await input.pressSequentially('ok')
+  // Other modifier mixes stay ordinary xterm input (a bare CR, or ESC CR).
+  await page.keyboard.press('Control+Shift+Enter')
+  await page.keyboard.press('Alt+Enter')
+
+  // One terminal.input per key, in order, and no stray CR from xterm.
+  await expect
+    .poll(() => terminalMessagesOfType(state, 'terminal.input'))
+    .toEqual([
+      { type: 'terminal.input', text: '\r' },
+      { type: 'terminal.input', key: 'ctrl+enter' },
+      { type: 'terminal.input', key: 'shift+enter' },
+      { type: 'terminal.input', text: 'o' },
+      { type: 'terminal.input', text: 'k' },
+      { type: 'terminal.input', text: '\r' },
+      { type: 'terminal.input', text: '\u001b\r' },
+    ])
+})
+
+test('leaves history on Ctrl+Enter and Shift+Enter and sends each as one key', async ({
+  page,
+}) => {
+  const transcript = Array.from({ length: 200 }, (_, index) => `line ${index + 1}`)
+  let paneRows = 0
+  const state = await mockApi(page, {
+    terminalHistory: () => ({
+      text: herdrHistoryText(transcript),
+      scroll: {
+        offset_from_bottom: 3,
+        max_offset_from_bottom: transcript.length - paneRows,
+        viewport_rows: paneRows,
+      },
+    }),
+  })
+  seedActiveAssignment(state)
+  const { terminal, socket, cols, rows, history } = await openHistoryTerminal(
+    page,
+    state,
+  )
+  paneRows = rows
+  sendHerdrFrame(socket, {
+    bytes: herdrScreen(transcript.slice(-rows), { clear: true, width: cols }),
+    full: true,
+    height: rows,
+    seq: 1,
+    width: cols,
+  })
+  await expect(terminal).toHaveAttribute('data-frame-sequence', '1')
+  const enterHistory = async (reads: number) => {
+    await terminal.locator('.xterm-screen').first().hover()
+    await page.mouse.wheel(0, -44)
+    await expect.poll(() => historyReads(state).length).toBe(reads)
+    await expect(terminal).toHaveAttribute('data-terminal-view', 'history')
+    await expect(history).toHaveAttribute('data-ready', 'true')
+  }
+
+  await enterHistory(1)
+  await page.keyboard.press('Control+Enter')
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live')
+  await expect(history).toHaveCount(0)
+
+  await enterHistory(2)
+  await page.keyboard.press('Shift+Enter')
+  await expect(terminal).toHaveAttribute('data-terminal-view', 'live')
+  await expect(history).toHaveCount(0)
+
+  await expect
+    .poll(() => terminalMessagesOfType(state, 'terminal.input'))
+    .toEqual([
+      { type: 'terminal.input', key: 'ctrl+enter' },
+      { type: 'terminal.input', key: 'shift+enter' },
+    ])
+})
+
 test('scrolls earlier output through Herdr instead of a stale local snapshot', async ({
   page,
 }) => {
@@ -13680,13 +13773,20 @@ test('uploads a pasted or dropped image and types its host path into the pane', 
   await expect.poll(() => uploads.length).toBe(4)
   await expect(terminal.getByRole('alert')).toHaveText('Uploading image…')
   await transfer('paste', [], 'after the image')
+  // So does a Ctrl+Enter pressed meanwhile.
+  await textarea.focus()
+  await page.keyboard.press('Control+Enter')
   expect(inputs()).toHaveLength(5)
   mode = 'store'
   held.release?.()
-  await expect.poll(() => inputs().length).toBe(7)
-  expect(inputs().slice(5)).toEqual([
-    '\u001b[200~/data/yard/pastes/worker-1/20261017-4.png\u001b[201~ ',
-    '\u001b[200~after the image\u001b[201~',
+  await expect.poll(() => inputs().length).toBe(8)
+  expect(terminalMessagesOfType(state, 'terminal.input').slice(5)).toEqual([
+    {
+      type: 'terminal.input',
+      text: '\u001b[200~/data/yard/pastes/worker-1/20261017-4.png\u001b[201~ ',
+    },
+    { type: 'terminal.input', text: '\u001b[200~after the image\u001b[201~' },
+    { type: 'terminal.input', key: 'ctrl+enter' },
   ])
 
   // Unsupported types, refused uploads and an unreachable Yard are explained;
@@ -13707,7 +13807,7 @@ test('uploads a pasted or dropped image and types its host path into the pane', 
     'Image not pasted: Yard is offline or unreachable',
   )
   expect(uploads).toHaveLength(6)
-  expect(inputs()).toHaveLength(7)
+  expect(inputs()).toHaveLength(8)
 
   // The socket closes while an upload is held: once it finishes, nothing is
   // typed into the old socket or the one that replaces it.
@@ -13720,7 +13820,7 @@ test('uploads a pasted or dropped image and types its host path into the pane', 
   await expect(terminal.getByRole('alert')).toHaveText(
     'Image not pasted: the terminal disconnected during the upload',
   )
-  expect(inputs()).toHaveLength(7)
+  expect(inputs()).toHaveLength(8)
 })
 
 test('control keys reach the pane during a stalled image upload, never ahead of earlier typing', async ({

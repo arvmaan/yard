@@ -10593,6 +10593,197 @@ done
         server.abort();
     }
 
+    /// A fake Herdr CLI for the key path: `session list` names one running
+    /// session at `socket`, and `terminal session control` behaves like
+    /// [`fake_herdr_terminal_controller`] without the split frame.
+    fn fake_herdr_key_cli(
+        directory: &std::path::Path,
+        socket: &std::path::Path,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let sessions = serde_json::json!({
+            "sessions": [{
+                "default": true,
+                "name": "default",
+                "running": true,
+                "socket_path": socket,
+                "session_dir": directory.join("session-default"),
+            }],
+        });
+        let body = format!(
+            r#"#!/bin/sh
+set -eu
+case "$*" in
+    *"session list"*)
+        printf '%s\n' '{sessions}'
+        exit 0
+        ;;
+esac
+printf '%s\n' '{{"type":"terminal.frame","seq":1,"encoding":"ansi","width":80,"height":24,"full":true,"bytes":"cmVhZHk="}}'
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$0.stdin"
+    case "$line" in
+        *'"terminal.release"'*)
+            printf '%s\n' '{{"type":"terminal.closed","reason":"released"}}'
+            exit 0
+            ;;
+    esac
+done
+"#
+        );
+        let path = directory.join("fake-herdr-keys");
+        let temporary = directory.join(".fake-herdr-keys.tmp");
+        std::fs::write(&temporary, body).unwrap();
+        let mut permissions = std::fs::metadata(&temporary).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&temporary, permissions).unwrap();
+        std::fs::rename(temporary, &path).unwrap();
+        path
+    }
+
+    /// Ctrl+Enter and Shift+Enter reach Herdr's `pane.send_keys` for the
+    /// terminal's pane (Herdr encodes them for the app's keyboard mode),
+    /// after a scroll reset. If Herdr refuses the key or its socket is gone,
+    /// the CR xterm.js would have sent goes through the terminal stream
+    /// instead; if Herdr never answers (it may have pressed the key), Yard
+    /// gives up after about a second, sends nothing, and keeps the terminal.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn presses_modified_keys_through_herdr_and_falls_back_to_cr() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let scripts = TempDir::new().unwrap();
+        let socket_path = scripts.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let (requests_tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let (hung_tx, hung) = tokio::sync::oneshot::channel();
+        let hang_socket = socket_path.clone();
+        let herdr = tokio::spawn(async move {
+            for answer in [
+                r#"{"id":"ID","result":{"type":"ok"}}"#,
+                r#"{"id":"ID","result":{"type":"ok"}}"#,
+                r#"{"id":"ID","error":{"code":"invalid_key","message":"unsupported key"}}"#,
+                // A wedged Herdr: reads the press and never answers.
+                "",
+            ] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                tokio::io::BufReader::new(reader)
+                    .read_line(&mut line)
+                    .await
+                    .unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].as_str().unwrap().to_owned();
+                requests_tx.send(request).unwrap();
+                if answer.is_empty() {
+                    // Then the session goes away: later presses cannot
+                    // connect. Keep the wedged connection open meanwhile.
+                    drop(listener);
+                    std::fs::remove_file(&hang_socket).unwrap();
+                    hung_tx.send(writer).unwrap();
+                    return;
+                }
+                writer
+                    .write_all(format!("{}\n", answer.replace("ID", &id)).as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let binary = fake_herdr_key_cli(scripts.path(), &socket_path);
+        let (app, _temp) = herdr_terminal_test_router(&binary).await;
+        let (project_id, assignment_id) = create_active_assignment(&app).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+        let mut request = format!(
+            "ws://{address}/api/v1/projects/{project_id}/assignments/{assignment_id}/terminal?cols=80&rows=24"
+        )
+        .into_client_request()
+        .unwrap();
+        request.headers_mut().insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://127.0.0.1:5173"),
+        );
+        let (mut socket, _) = connect_async(request).await.unwrap();
+        let first = next_terminal_json(&mut socket).await;
+        assert_eq!(first["type"], "terminal.frame");
+
+        for message in [
+            serde_json::json!({"type": "terminal.input", "key": "ctrl+enter"}),
+            serde_json::json!({"type": "terminal.input", "key": "shift+enter"}),
+            serde_json::json!({"type": "terminal.input", "text": "x"}),
+            // Herdr rejects this one: Yard sends a CR instead.
+            serde_json::json!({"type": "terminal.input", "key": "ctrl+enter"}),
+            // Herdr never answers: it may have pressed the key, so no CR,
+            // and the terminal stays open.
+            serde_json::json!({"type": "terminal.input", "key": "shift+enter"}),
+            serde_json::json!({"type": "terminal.input", "text": "y"}),
+            // The socket is gone: nothing was pressed, so a CR.
+            serde_json::json!({"type": "terminal.input", "key": "ctrl+enter"}),
+            serde_json::json!({"type": "terminal.release"}),
+        ] {
+            socket
+                .send(TungsteniteMessage::Text(message.to_string().into()))
+                .await
+                .unwrap();
+        }
+        let started = std::time::Instant::now();
+        let closed = next_terminal_json(&mut socket).await;
+        assert_eq!(closed["reason"], "released", "{closed}");
+        // Only the wedged press waited, for about a second, well inside the
+        // terminal operation timeout that would close the socket.
+        assert!(started.elapsed() < Duration::from_secs(4));
+
+        let mut pressed = Vec::new();
+        for _ in 0..4 {
+            let request = timeout(Duration::from_secs(5), requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request["method"], "pane.send_keys");
+            assert_eq!(
+                request["params"]["pane_id"],
+                "pane-yard-prompta-345234a24b29951c"
+            );
+            pressed.push(request["params"]["keys"].clone());
+        }
+        assert_eq!(
+            pressed,
+            [
+                serde_json::json!(["ctrl+enter"]),
+                serde_json::json!(["shift+enter"]),
+                serde_json::json!(["ctrl+enter"]),
+                serde_json::json!(["shift+enter"]),
+            ]
+        );
+        herdr.await.unwrap();
+        drop(hung.await.unwrap());
+        let stdin = std::fs::read_to_string(scripts.path().join("fake-herdr-keys.stdin")).unwrap();
+        let lines: Vec<serde_json::Value> = stdin
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let reset = serde_json::json!({"type": "terminal.input", "text": ""});
+        assert_eq!(
+            lines,
+            [
+                reset.clone(),
+                reset.clone(),
+                serde_json::json!({"type": "terminal.input", "text": "x"}),
+                reset.clone(),
+                serde_json::json!({"type": "terminal.input", "text": "\r"}),
+                reset.clone(),
+                serde_json::json!({"type": "terminal.input", "text": "y"}),
+                reset,
+                serde_json::json!({"type": "terminal.input", "text": "\r"}),
+                serde_json::json!({"type": "terminal.release"}),
+            ]
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn relays_browser_scroll_commands_to_herdr_terminal_scroll() {
         let scripts = TempDir::new().unwrap();
